@@ -49,6 +49,24 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_PROJECT_ID: Optional[str] = None
 
+    # ---- Google OAuth (Gmail + Calendar for the assistant) -------------
+    # Created in Google Cloud Console under
+    #   APIs & Services → Credentials → Create OAuth client ID
+    #     Application type: Web application
+    #     Authorized redirect URI: <GOOGLE_OAUTH_REDIRECT_URI>
+    # The redirect URI must match exactly. ``http://localhost`` is allowed
+    # by Google specifically for desktop/local-dev workflows; no public
+    # domain is required.
+    GOOGLE_OAUTH_CLIENT_ID: Optional[str] = None
+    GOOGLE_OAUTH_CLIENT_SECRET: Optional[str] = None
+    GOOGLE_OAUTH_REDIRECT_URI: str = (
+        "http://localhost:8000/api/admin/google/oauth/callback"
+    )
+    # After the callback succeeds, where to send the user's browser back
+    # to in the React admin app. Leave at the default for ``npm run dev``;
+    # adjust if you serve the UI from a different origin.
+    GOOGLE_OAUTH_POST_LOGIN_REDIRECT: str = "http://localhost:5173/admin"
+
     # ---- Local AI assistant (Avi) --------------------------------------
     # Base URL for the local Ollama daemon that hosts the chat LLM.
     AI_OLLAMA_HOST: str = "http://localhost:11434"

@@ -14,6 +14,7 @@ queries never need to touch ciphertext.
 
 from .family import Family
 from .assistant import Assistant
+from .google_oauth_credential import GoogleOAuthCredential
 from .person import Person
 from .person_photo import PersonPhoto
 from .face_embedding import FaceEmbedding
@@ -47,6 +48,7 @@ from .live_session_message import (
 __all__ = [
     "Family",
     "Assistant",
+    "GoogleOAuthCredential",
     "Person",
     "PersonPhoto",
     "FaceEmbedding",

@@ -35,6 +35,7 @@ from .routers import (
     families,
     financial_accounts,
     goals,
+    google,
     identity_documents,
     insurance_policies,
     live_sessions,
@@ -100,6 +101,7 @@ def create_app() -> FastAPI:
         insurance_policies.router,
         financial_accounts.router,
         documents.router,
+        google.router,
     ]
     for r in admin_routers:
         app.include_router(r, prefix=ADMIN_PREFIX)

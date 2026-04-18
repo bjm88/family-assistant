@@ -414,6 +414,97 @@ AI_TTS_SPEED=1.0
 AI_TTS_MODEL_DIR=./resources/models/kokoro
 ```
 
+### 6b. Google OAuth (Avi's Gmail + Calendar)
+
+This is optional but unlocks two big things for Avi: sending email
+from his own Gmail address, and reading any calendar shared with him
+(including yours, for free/busy lookups). It works entirely on
+`http://localhost` — no public domain, no tunnel, no app verification.
+
+1. **Create the Google account Avi will use.** A regular gmail.com
+   address is fine. You can also use a Google Workspace address.
+
+2. **Spin up a Google Cloud project** (one-time, free tier is enough):
+   - Go to <https://console.cloud.google.com/> → create a new project,
+     e.g. `family-assistant`.
+   - **APIs & Services → Library** → enable **Gmail API** and
+     **Google Calendar API**.
+
+3. **Configure the OAuth consent screen:**
+   - **APIs & Services → OAuth consent screen** → User type =
+     **External**.
+   - App name = `Family Assistant (local)`, user support email = you.
+   - **Scopes:** add `gmail.send` and `calendar.readonly` (the rest —
+     `openid`, `email`, `profile` — are non-sensitive and are added
+     automatically).
+   - **Test users:** add Avi's gmail and your own. While the app is
+     in "Testing" mode (the default) only listed test users can log in,
+     and you don't need Google's app review.
+
+4. **Create the OAuth client:**
+   - **APIs & Services → Credentials → Create credentials → OAuth
+     client ID**.
+   - Application type = **Web application**.
+   - Authorized redirect URIs: add exactly
+     `http://localhost:8000/api/admin/google/oauth/callback`.
+   - Save and copy the client id + client secret into `.env`:
+
+   ```ini
+   GOOGLE_OAUTH_CLIENT_ID=<paste here>.apps.googleusercontent.com
+   GOOGLE_OAUTH_CLIENT_SECRET=<paste here>
+   GOOGLE_OAUTH_REDIRECT_URI=http://localhost:8000/api/admin/google/oauth/callback
+   GOOGLE_OAUTH_POST_LOGIN_REDIRECT=http://localhost:5173/admin
+   ```
+
+5. **Restart the API** (`./start-services.sh`) and open the admin
+   console → **Assistant** page. The "Google account" card shows a
+   **Connect with Google** button. Click it, sign in as Avi, and
+   approve the scopes. You'll land back on the admin page with a
+   green confirmation toast.
+
+6. **Test it.** The same card has two smoke-test buttons:
+   - **Send test email to self** — proves the Gmail scope works.
+   - **Show next 72h of events** — proves the Calendar scope works.
+
+7. **Share your personal calendar with Avi** so he can see your
+   schedule:
+   <https://calendar.google.com/> → your calendar → Settings → Share
+   with specific people → add Avi's gmail with permission **See all
+   event details** (or **Free/busy** if you don't want titles
+   exposed). Avi will then see your events alongside his own when he
+   queries the calendar.
+
+Tokens are stored Fernet-encrypted in the
+`google_oauth_credentials` table. Refresh tokens never leave the
+server, and the only plaintext columns are the granted email,
+scopes, and access-token expiry (kept plain so the admin UI can
+render a status badge without decryption).
+
+**Important — token lifetime.** Google issues two tokens: an
+**access_token** (1-hour TTL — what the UI shows under "Access
+token rotates") and a long-lived **refresh_token** (used silently
+to mint new access tokens before each call, so you never see the
+1-hour rotation). For sensitive scopes like `gmail.send` and
+`calendar.readonly`, **the refresh_token's lifetime depends on
+your OAuth consent screen publishing status**:
+
+| Status | Refresh token lifetime |
+| --- | --- |
+| **Testing** (default) | **7 days** — you'll have to reconnect each week |
+| **In production**, unverified | Indefinite (until revoked or 6 months idle) |
+| **In production**, verified | Indefinite |
+
+For a local personal tool, **publish the app to Production** to
+escape the 7-day cap. You don't need to complete Google's
+verification process — Google only blocks *third-party* users from
+unverified apps; the app owner can always click "Advanced → Go to
+(unsafe)" past the warning. Steps:
+
+1. Visit <https://console.cloud.google.com/apis/credentials/consent>
+2. In the "Publishing status" card click **Publish App** → confirm.
+3. Disconnect + reconnect from the admin UI. The new refresh token
+   issued under Production status is good indefinitely.
+
 ### 7. Run database migrations
 
 ```bash
