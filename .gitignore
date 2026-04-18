@@ -45,6 +45,10 @@ resources/models/
 *.tmp
 *.pid
 
+# Runtime state from scripts/start.sh (PID files, logs)
+.run/
+logs/
+
 # OS
 .DS_Store
 Thumbs.db

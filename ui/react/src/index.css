@@ -13,6 +13,45 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* ============================================================ */
+/* Avi (live AI assistant) animations                           */
+/* ============================================================ */
+/* Gentle idle "breathing" — always on so the avatar never looks frozen. */
+@keyframes avi-breathe {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.015); }
+}
+
+/* Subtle head-bob layered in while audio is playing. Uses only
+   translate so it composes cleanly with the breathing scale. */
+@keyframes avi-bob {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-4px); }
+}
+
+/* Waving hand — fires for a short burst when a new face is greeted. */
+@keyframes avi-wave {
+  0%   { transform: rotate(0deg); }
+  15%  { transform: rotate(22deg); }
+  35%  { transform: rotate(-16deg); }
+  55%  { transform: rotate(18deg); }
+  75%  { transform: rotate(-10deg); }
+  100% { transform: rotate(0deg); }
+}
+
+/* Expanding echo rings around the avatar while speaking. Each ring has
+   its own delay so they fan out like a sonar ping. */
+@keyframes avi-echo {
+  0%   { transform: scale(0.6); opacity: 0.55; }
+  80%  { opacity: 0; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+
+.animate-avi-breathe { animation: avi-breathe 4s ease-in-out infinite; }
+.animate-avi-bob     { animation: avi-bob 520ms ease-in-out infinite; }
+.animate-avi-wave    { animation: avi-wave 700ms ease-in-out 4; transform-origin: 80% 90%; }
+.animate-avi-echo    { animation: avi-echo 1.8s ease-out infinite; }
+
 @layer components {
   .btn {
     @apply inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-50 disabled:pointer-events-none;

@@ -33,6 +33,11 @@ The project has three cooperating layers:
    LLM-generated follow-up question about their top goal — spoken out
    loud when the greeting finishes. A microphone toggle enables
    Web-Speech-API voice input, and a header speaker toggle mutes Avi.
+   Avi himself is rendered on stage as a **rigged Live2D character**
+   (Pixi.js + Cubism 4) — real lip-sync driven by the playing TTS
+   clip, auto-blinking, hair/clothing physics, a wave-and-smile on
+   greet, and pupils that follow the viewer's cursor. The Gemini-
+   generated portrait still appears as a small badge in the corner.
 3. **Shared backend** (`/api/*`) — FastAPI on top of SQLAlchemy 2.0 and
    Postgres. The schema is intentionally verbose and self-describing:
    every table and column carries a Postgres `COMMENT`, and a read-only
@@ -169,6 +174,14 @@ sequenceDiagram
 | Text-to-speech | **kokoro-onnx** · `soundfile` · `espeakng-loader` | Kokoro-82M neural voices, 24 kHz mono WAV, ONNX Runtime (~300 MB weights) |
 | Image gen (optional) | `google-genai` | Avatar generation for Avi's profile image |
 
+### Frontend avatar rendering
+
+| Category | Package | Why |
+|---|---|---|
+| 2D character | **Live2D Cubism 4** runtime (self-hosted) · `pixi.js@7` · `pixi-live2d-display-lipsyncpatch` | Rigged character with real lip-sync, auto-blink, breathing + hair physics, greet/tap motions, pupil tracking |
+| Starter model | **Natori** (Live2D Inc., Free Material License) | Bundled under `ui/react/public/live2d/natori/`. Swap in any other Cubism 4 model by dropping its folder next to Natori's and updating the constants at the top of `AiAssistantPage.tsx`. |
+| SVG mouth fallback | Inline component `SpeakingMouth.tsx` | Real amplitude-driven lip-sync *without* Live2D — used on mobile browsers, when the Cubism runtime fails to load, or while the rigged model is still downloading. Morphs a single path between closed, open, and smiling shapes, with a teeth hint on louder syllables. |
+
 ### Frontend · Node, Vite
 
 | Category | Package | Why |
@@ -192,47 +205,51 @@ sequenceDiagram
 ## Running
 
 Once dependencies are installed and migrations applied, the app runs as
-two processes plus the Ollama daemon. Keep them in three separate
-terminals (or `tmux` panes) during active development.
+two processes plus the Ollama daemon. The managed scripts under
+`scripts/` take care of PID tracking, log files, and health probes so
+you don't have to juggle three terminals.
 
-| Service | URL | Command |
+| Service | URL | Managed by |
 |---|---|---|
-| Backend API | <http://localhost:8000> (docs at `/docs`) | `uv run uvicorn api.main:app --app-dir python --reload` |
-| Frontend dev server | <http://localhost:5173> | `cd ui/react && npm run dev` |
-| Ollama daemon | <http://localhost:11434> | `ollama serve` (auto-starts on macOS) |
+| Backend API | <http://localhost:8000> (docs at `/docs`) | `scripts/start.sh` → `.run/backend.pid` |
+| Frontend dev server | <http://localhost:5173> | `scripts/start.sh` → `.run/frontend.pid` |
+| Ollama daemon | <http://localhost:11434> | managed separately (`ollama serve`) |
 
-### Starting
+### Managed scripts
+
+All scripts live in `scripts/`, print timestamped output, and store
+state under `.run/` (PIDs) and `logs/` (stdout + stderr). Both
+directories are git-ignored.
 
 ```bash
-# 1. ensure Postgres + Ollama are running
-brew services start postgresql@16
-ollama serve &                       # no-op if already running
+scripts/deploy.sh                # one-shot: uv sync + npm install + alembic upgrade
+scripts/deploy.sh --build        # also produce a production frontend bundle
+scripts/deploy.sh --clean        # wipe .venv and node_modules first
 
-# 2. start the backend (terminal 1)
-cd /path/to/family-assistant
-uv run uvicorn api.main:app --app-dir python --reload
+scripts/start.sh                 # start backend + frontend (waits for health)
+scripts/start.sh backend         # start just one service
+scripts/start.sh --force         # kill orphans on :8000/:5173 before starting
 
-# 3. start the frontend (terminal 2)
-cd /path/to/family-assistant/ui/react
-npm run dev
+scripts/stop.sh                  # graceful SIGTERM (then SIGKILL fallback)
+scripts/stop.sh --force          # also sweep anything still bound to the ports
 
-# 4. open the app
-open http://localhost:5173
+scripts/restart.sh               # stop --force + start
+scripts/restart.sh backend       # restart a single service
+
+tail -f logs/backend.log logs/frontend.log
 ```
 
-The sidebar's purple "Live AI Assistant" button jumps straight to
+Typical daily flow: `scripts/start.sh` in the morning, `scripts/restart.sh`
+after pulling new commits, `scripts/stop.sh` at end of day. The sidebar's
+purple "Live AI Assistant" button jumps straight to
 `/aiassistant/:familyId` for the currently-selected family.
 
-### Stopping
+### Stopping background services (rarely needed)
 
 ```bash
-# stop the dev servers: Ctrl-C in each terminal, or by port
-lsof -ti :8000  | xargs -r kill -9   # FastAPI
-lsof -ti :5173  | xargs -r kill -9   # Vite
-
-# stop background services (only if you want them fully off)
-brew services stop postgresql@16
-pkill -f 'ollama serve'
+scripts/stop.sh --force                 # app services only
+brew services stop postgresql@16        # fully stop Postgres
+pkill -f 'ollama serve'                 # fully stop Ollama
 ```
 
 ## Syncing
@@ -446,6 +463,46 @@ curl -s -X POST http://localhost:8000/api/aiassistant/tts \
   --output /tmp/hello.wav
 afplay /tmp/hello.wav   # macOS
 ```
+
+### 10. Live2D character assets
+
+Avi's rigged body on the live page comes from the free **Natori**
+model shipped by Live2D Inc. under their
+[Free Material License](https://www.live2d.com/en/terms/live2d-free-material-license-agreement/).
+The model files (moc3, textures, physics, motions, expressions) live
+under `ui/react/public/live2d/natori/` and are served statically by
+Vite. The proprietary Cubism 4 Core JS runtime
+(`live2dcubismcore.min.js`, ~200 KB) is **self-hosted** alongside the
+model — it's redistributable under Live2D's Proprietary Software
+License (see `public/live2d/CORE_LICENSE.md`). No npm install, no CDN
+dependency, works offline on the Mac Studio.
+
+If the Cubism runtime or the model files can't load for any reason
+(older mobile browser, corporate firewall, offline dev), the stage
+automatically degrades to an **animated SVG fallback**: the Gemini
+portrait with a real amplitude-driven mouth overlay and a smile curve
+on greetings. Kids still see Avi talking and smiling, just without the
+hair physics / pupil tracking / idle motions. The mode is shown in the
+header as `Avatar: live` (Live2D) vs `Avatar: SVG fallback`.
+
+To **swap characters**:
+
+1. Download any Cubism 4 sample from
+   [`Live2D/CubismWebSamples`](https://github.com/Live2D/CubismWebSamples/tree/develop/Samples/Resources)
+   or a ready-made model from Nizima / BOOTH.
+2. Drop the folder under `ui/react/public/live2d/<name>/`.
+3. Update the two constants at the top of
+   `ui/react/src/pages/AiAssistantPage.tsx`:
+
+   ```ts
+   const AVI_LIVE2D_MODEL_PATH = "<name>";           // folder
+   const AVI_LIVE2D_MODEL_FILE = "<Name>.model3.json"; // entry file
+   ```
+
+If the Cubism runtime fails to load (offline, CSP blocking) or a model
+is missing, `AviLive2D` silently falls back to the static Gemini
+portrait with the existing CSS-driven mouth-pulse + wave animations,
+so the live page never breaks.
 
 ---
 

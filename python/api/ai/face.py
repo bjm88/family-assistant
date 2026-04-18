@@ -118,6 +118,78 @@ def _normalize(v: np.ndarray) -> np.ndarray:
     return (v / n).astype(np.float32, copy=False)
 
 
+def detect_face_landmarks(image_bytes: bytes) -> Optional[dict]:
+    """Return face geometry for the dominant face in an image, normalized to 0..1.
+
+    Returns a dict::
+
+        {
+            "image_w": int, "image_h": int,
+            "bbox":  {"x": float, "y": float, "w": float, "h": float},
+            "mouth": {"cx": float, "cy": float, "w": float, "h": float},
+            "eyes":  {"lx": float, "ly": float, "rx": float, "ry": float},
+        }
+
+    All geometric values are expressed as percentages of the source image
+    (``0..1``) so the frontend can overlay them onto a responsive
+    <img> without having to know the raw pixel size. Returns ``None``
+    when no face is detected or the image can't be decoded.
+
+    Why this lives here rather than in its own module: we already ship
+    InsightFace for face *recognition*, and the same ``buffalo_l`` pack
+    exposes 5-point keypoints (left eye, right eye, nose, left mouth
+    corner, right mouth corner) as ``face.kps``. Reusing it means no
+    extra native deps and no extra model download just to place a mouth.
+    """
+    import cv2
+
+    analyzer = _build_analyzer()
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    faces = analyzer.get(img)
+    if not faces:
+        return None
+
+    def area(f):
+        x1, y1, x2, y2 = f.bbox
+        return max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
+
+    face = max(faces, key=area)
+    img_h, img_w = img.shape[:2]
+
+    def norm_xy(px: float, py: float) -> Tuple[float, float]:
+        return (float(px) / img_w, float(py) / img_h)
+
+    x1, y1, x2, y2 = face.bbox
+    bx, by = norm_xy(x1, y1)
+    bw = float(x2 - x1) / img_w
+    bh = float(y2 - y1) / img_h
+
+    kps = getattr(face, "kps", None)
+    if kps is None or len(kps) < 5:
+        return None
+    # buffalo_l ordering: [left_eye, right_eye, nose, left_mouth, right_mouth]
+    (lex, ley), (rex, rey) = norm_xy(*kps[0]), norm_xy(*kps[1])
+    (lmx, lmy), (rmx, rmy) = norm_xy(*kps[3]), norm_xy(*kps[4])
+    mouth_cx = (lmx + rmx) / 2.0
+    mouth_cy = (lmy + rmy) / 2.0
+    mouth_w = abs(rmx - lmx) * 1.9  # a touch wider than corner-to-corner
+    # Height estimate: mouth tends to be ~35% as tall as it is wide for
+    # a natural resting pose; we can't measure it from 5 keypoints
+    # alone, so approximate and let the SVG morph handle the rest.
+    mouth_h = mouth_w * 0.55
+
+    return {
+        "image_w": int(img_w),
+        "image_h": int(img_h),
+        "bbox":  {"x": bx, "y": by, "w": bw, "h": bh},
+        "mouth": {"cx": mouth_cx, "cy": mouth_cy, "w": mouth_w, "h": mouth_h},
+        "eyes":  {"lx": lex, "ly": ley, "rx": rex, "ry": rey},
+    }
+
+
 def extract_embedding(
     image_bytes: bytes,
 ) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:

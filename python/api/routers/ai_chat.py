@@ -124,7 +124,10 @@ async def status() -> StatusResponse:
 
 
 def _display_name(person: models.Person) -> str:
-    return person.preferred_name or person.first_name or f"Person {person.person_id}"
+    # For the out-loud greeting we want Avi to use the person's main
+    # name (first_name) rather than a household nickname. Falls back to
+    # preferred_name only if first_name is missing.
+    return person.first_name or person.preferred_name or f"Person {person.person_id}"
 
 
 @router.post("/greet", response_model=GreetResponse)

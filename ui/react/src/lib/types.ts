@@ -36,6 +36,19 @@ export interface Person {
   updated_at: string;
 }
 
+/**
+ * Face geometry detected on the assistant's generated avatar by
+ * InsightFace. All coordinates are expressed as percentages of the
+ * image (0..1), so the UI can overlay a responsive <img> without
+ * knowing pixel dimensions. `null` when no face was detected or the
+ * detector hasn't been initialised yet.
+ */
+export interface AvatarLandmarks {
+  bbox: { x: number; y: number; w: number; h: number };
+  mouth: { cx: number; cy: number; w: number; h: number };
+  eyes: { lx: number; ly: number; rx: number; ry: number };
+}
+
 export interface Assistant {
   assistant_id: number;
   family_id: number;
@@ -45,6 +58,7 @@ export interface Assistant {
   personality_description: string | null;
   profile_image_path: string | null;
   avatar_generation_note: string | null;
+  avatar_landmarks: AvatarLandmarks | null;
   created_at: string;
   updated_at: string;
 }

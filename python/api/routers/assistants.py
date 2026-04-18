@@ -10,7 +10,9 @@ can surface the reason.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+import threading
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -18,12 +20,103 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, storage
+from ..config import get_settings
 from ..db import get_db
 from ..integrations.gemini import GeminiClient, GeminiError, GeminiUnavailable
 
 
 router = APIRouter(prefix="/assistants", tags=["assistants"])
 logger = logging.getLogger(__name__)
+
+
+# ---------- avatar landmark detection + cache -------------------------------
+# InsightFace is heavy (~300 MB model, ~600 ms cold detect), so we cache
+# per-image results in-process keyed by ``profile_image_path`` + mtime.
+# The cache is invalidated automatically whenever the avatar file is
+# rewritten (new mtime) or explicitly on regenerate.
+
+_landmarks_cache: Dict[Tuple[str, float], Optional[dict]] = {}
+_landmarks_lock = threading.Lock()
+_landmarks_failed: set[Tuple[str, float]] = set()
+
+
+def _avatar_landmarks_for(assistant: models.Assistant) -> Optional[dict]:
+    """Return cached mouth/eye landmarks for the assistant avatar, or None.
+
+    Detection is best-effort and swallows all exceptions — a missing
+    avatar, an image the detector can't parse, or an uninitialised
+    InsightFace model should never break the main assistant GET. On
+    failure the ``(path, mtime)`` is memoised as "no face" so we don't
+    keep re-running the expensive detector for an image we've already
+    given up on.
+    """
+    rel = assistant.profile_image_path
+    if not rel:
+        return None
+    root = Path(get_settings().FA_STORAGE_ROOT)
+    abs_path = root / rel
+    try:
+        mtime = abs_path.stat().st_mtime
+    except OSError:
+        return None
+    key = (rel, mtime)
+    with _landmarks_lock:
+        if key in _landmarks_cache:
+            return _landmarks_cache[key]
+        if key in _landmarks_failed:
+            return None
+    try:
+        from ..ai import face as face_ai
+
+        data = abs_path.read_bytes()
+        result = face_ai.detect_face_landmarks(data)
+    except Exception:
+        logger.debug("avatar landmark detection failed for %s", rel, exc_info=True)
+        with _landmarks_lock:
+            _landmarks_failed.add(key)
+        return None
+    with _landmarks_lock:
+        if result is None:
+            _landmarks_failed.add(key)
+        else:
+            _landmarks_cache[key] = result
+    return result
+
+
+def _invalidate_landmarks(rel_path: Optional[str]) -> None:
+    if not rel_path:
+        return
+    with _landmarks_lock:
+        for k in list(_landmarks_cache):
+            if k[0] == rel_path:
+                _landmarks_cache.pop(k, None)
+        for k in list(_landmarks_failed):
+            if k[0] == rel_path:
+                _landmarks_failed.discard(k)
+
+
+def _to_read_dict(assistant: models.Assistant) -> Dict[str, Any]:
+    """Convert an ORM Assistant into the AssistantRead-shaped dict.
+
+    We can't rely on FastAPI's automatic ORM serialization here because
+    we want to tack on the derived ``avatar_landmarks`` field, which
+    isn't a SQLAlchemy column. Building the dict explicitly keeps the
+    shape obvious and avoids the "how do I add a non-column attribute
+    to an orm_mode model" dance.
+    """
+    return {
+        "assistant_id": assistant.assistant_id,
+        "family_id": assistant.family_id,
+        "assistant_name": assistant.assistant_name,
+        "gender": assistant.gender,
+        "visual_description": assistant.visual_description,
+        "personality_description": assistant.personality_description,
+        "profile_image_path": assistant.profile_image_path,
+        "avatar_generation_note": assistant.avatar_generation_note,
+        "avatar_landmarks": _avatar_landmarks_for(assistant),
+        "created_at": assistant.created_at,
+        "updated_at": assistant.updated_at,
+    }
 
 
 PROMPT_FIELDS = {"assistant_name", "gender", "visual_description"}
@@ -68,6 +161,8 @@ def _generate_avatar_best_effort(assistant: models.Assistant) -> None:
         assistant.avatar_generation_note = None
         if previous and previous != rel_path:
             storage.delete_if_exists(previous)
+            _invalidate_landmarks(previous)
+        _invalidate_landmarks(rel_path)
     except GeminiUnavailable as exc:
         assistant.avatar_generation_note = (
             f"Gemini is not configured: {exc}. Add GEMINI_API_KEY to .env "
@@ -106,19 +201,22 @@ def _summarize_exception(exc: Exception) -> str:
 def list_assistants(
     family_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
-) -> List[models.Assistant]:
+) -> List[Dict[str, Any]]:
     stmt = select(models.Assistant)
     if family_id is not None:
         stmt = stmt.where(models.Assistant.family_id == family_id)
-    return list(db.execute(stmt).scalars())
+    rows = list(db.execute(stmt).scalars())
+    return [_to_read_dict(a) for a in rows]
 
 
 @router.get("/{assistant_id}", response_model=schemas.AssistantRead)
-def get_assistant(assistant_id: int, db: Session = Depends(get_db)) -> models.Assistant:
+def get_assistant(
+    assistant_id: int, db: Session = Depends(get_db)
+) -> Dict[str, Any]:
     assistant = db.get(models.Assistant, assistant_id)
     if assistant is None:
         raise HTTPException(status_code=404, detail="Assistant not found")
-    return assistant
+    return _to_read_dict(assistant)
 
 
 @router.post(
@@ -127,7 +225,7 @@ def get_assistant(assistant_id: int, db: Session = Depends(get_db)) -> models.As
 def create_assistant(
     payload: schemas.AssistantCreate,
     db: Session = Depends(get_db),
-) -> models.Assistant:
+) -> Dict[str, Any]:
     family = db.get(models.Family, payload.family_id)
     if family is None:
         raise HTTPException(status_code=404, detail="Family not found")
@@ -146,7 +244,7 @@ def create_assistant(
     _generate_avatar_best_effort(assistant)
     db.flush()
     db.refresh(assistant)
-    return assistant
+    return _to_read_dict(assistant)
 
 
 @router.patch("/{assistant_id}", response_model=schemas.AssistantRead)
@@ -154,7 +252,7 @@ def update_assistant(
     assistant_id: int,
     payload: schemas.AssistantUpdate,
     db: Session = Depends(get_db),
-) -> models.Assistant:
+) -> Dict[str, Any]:
     assistant = db.get(models.Assistant, assistant_id)
     if assistant is None:
         raise HTTPException(status_code=404, detail="Assistant not found")
@@ -170,7 +268,7 @@ def update_assistant(
         db.flush()
 
     db.refresh(assistant)
-    return assistant
+    return _to_read_dict(assistant)
 
 
 @router.post(
@@ -178,14 +276,17 @@ def update_assistant(
 )
 def regenerate_avatar(
     assistant_id: int, db: Session = Depends(get_db)
-) -> models.Assistant:
+) -> Dict[str, Any]:
     assistant = db.get(models.Assistant, assistant_id)
     if assistant is None:
         raise HTTPException(status_code=404, detail="Assistant not found")
+    # Always invalidate before regenerating — the new portrait may have
+    # a mouth in a completely different place.
+    _invalidate_landmarks(assistant.profile_image_path)
     _generate_avatar_best_effort(assistant)
     db.flush()
     db.refresh(assistant)
-    return assistant
+    return _to_read_dict(assistant)
 
 
 @router.delete("/{assistant_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -194,5 +295,6 @@ def delete_assistant(assistant_id: int, db: Session = Depends(get_db)) -> None:
     if assistant is None:
         raise HTTPException(status_code=404, detail="Assistant not found")
     if assistant.profile_image_path:
+        _invalidate_landmarks(assistant.profile_image_path)
         storage.delete_if_exists(assistant.profile_image_path)
     db.delete(assistant)

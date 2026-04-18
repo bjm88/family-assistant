@@ -16,17 +16,27 @@ import {
   Mic,
   MicOff,
   Send,
+  Sparkles,
   User,
   Video,
   VideoOff,
   Volume2,
   VolumeX,
+  Zap,
 } from "lucide-react";
 import { api, resolveApiPath } from "@/lib/api";
 import type { Assistant, Family } from "@/lib/types";
-import { AssistantAvatar } from "@/pages/AssistantPage";
 import { useToast } from "@/components/Toast";
 import { cn } from "@/lib/cn";
+import AviLive2D, { type AviLive2DState } from "./AviLive2D";
+import SpeakingMouth from "./SpeakingMouth";
+
+// Live2D character bundled under /public/live2d. Keep this folder name
+// in sync with the directory you drop a new model into. (We use the
+// free "Natori" model from Live2D's CubismWebSamples — see
+// public/live2d/LICENSE.md.)
+const AVI_LIVE2D_MODEL_PATH = "natori";
+const AVI_LIVE2D_MODEL_FILE = "Natori.model3.json";
 
 /**
  * Live AI assistant page.
@@ -105,6 +115,19 @@ const GREETING_SUPPRESSION_MS = 90_000;
 type AudioQueueHandle = {
   enqueue: (text: string, opts?: { gender_hint?: string | null }) => void;
   setMuted: (muted: boolean) => void;
+  // True while a WAV is actively playing out of the speakers.
+  isSpeaking: boolean;
+  // Real-time 0..1 audio amplitude (RMS). Drives Avi's speaking
+  // animations — aura intensity, echo rings, mouth glow. The ref is
+  // updated on every rAF tick for ~60 Hz consumers (e.g. the Live2D
+  // Pixi ticker driving ParamMouthOpenY); `amplitude` is the React
+  // state mirror for CSS-driven effects.
+  amplitude: number;
+  amplitudeRef: React.MutableRefObject<number>;
+  // The single HTMLAudioElement we play Kokoro clips through. Exposed
+  // so AviLive2D can subscribe to play/pause events if it wants to
+  // kick off motions precisely in sync with speech.
+  audioEl: HTMLAudioElement | null;
 };
 
 function useAudioQueue(muted: boolean): AudioQueueHandle {
@@ -117,10 +140,82 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
 
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [amplitude, setAmplitude] = useState(0);
+  const amplitudeRef = useRef(0);
+  // Mirror the audio element as React state so consumers (Live2D) can
+  // re-run effects when it becomes available on the first render.
+  const [audioEl, setAudioEl] = useState<HTMLAudioElement | null>(null);
+
+  // Web Audio analyser — wired the first time we actually play a clip
+  // so AudioContext creation happens after a user gesture (avoids the
+  // "was not allowed to start" warning in Chrome/Safari).
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafRef = useRef<number | null>(null);
+
   useEffect(() => {
     if (!audioRef.current) {
-      audioRef.current = new Audio();
+      const el = new Audio();
+      el.crossOrigin = "anonymous";
+      audioRef.current = el;
+      setAudioEl(el);
     }
+  }, []);
+
+  const ensureAnalyser = useCallback(() => {
+    if (analyserRef.current) return analyserRef.current;
+    const audio = audioRef.current;
+    if (!audio) return null;
+    try {
+      const Ctor =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      const ctx = new Ctor();
+      const src = ctx.createMediaElementSource(audio);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.6;
+      // Keep the audio audible by teeing through the analyser.
+      src.connect(analyser);
+      analyser.connect(ctx.destination);
+      audioCtxRef.current = ctx;
+      analyserRef.current = analyser;
+      return analyser;
+    } catch (e) {
+      console.debug("Avi: analyser init failed (animations will be silent)", e);
+      return null;
+    }
+  }, []);
+
+  const startAmplitudeLoop = useCallback(() => {
+    const analyser = analyserRef.current;
+    if (!analyser) return;
+    const buf = new Uint8Array(analyser.fftSize);
+    const tick = () => {
+      analyser.getByteTimeDomainData(buf);
+      let sumSq = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const v = (buf[i] - 128) / 128;
+        sumSq += v * v;
+      }
+      const rms = Math.sqrt(sumSq / buf.length);
+      // RMS of speech rarely exceeds ~0.3; scale for visual punch.
+      const a = Math.min(1, rms * 3.2);
+      amplitudeRef.current = a;
+      setAmplitude(a);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    tick();
+  }, []);
+
+  const stopAmplitudeLoop = useCallback(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    amplitudeRef.current = 0;
+    setAmplitude(0);
   }, []);
 
   const playNext = useCallback(async () => {
@@ -148,28 +243,42 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
       audio.onended = () => {
         URL.revokeObjectURL(url);
         playingRef.current = false;
+        setIsSpeaking(false);
+        stopAmplitudeLoop();
         void playNext();
       };
       audio.onerror = () => {
         URL.revokeObjectURL(url);
         playingRef.current = false;
+        setIsSpeaking(false);
+        stopAmplitudeLoop();
         void playNext();
       };
       try {
+        ensureAnalyser();
+        // Resume the context if it was suspended (autoplay policy).
+        if (audioCtxRef.current?.state === "suspended") {
+          await audioCtxRef.current.resume().catch(() => undefined);
+        }
         await audio.play();
+        setIsSpeaking(true);
+        startAmplitudeLoop();
       } catch (err) {
         // Autoplay was blocked — surface a hint in the console so the
         // user knows to interact with the page once.
         console.warn("Avi: audio playback blocked until first user gesture", err);
         playingRef.current = false;
-        // Don't keep retrying — wait for a later enqueue after user interacts.
+        setIsSpeaking(false);
+        stopAmplitudeLoop();
       }
     } catch (err) {
       console.debug("Avi TTS failed", err);
       playingRef.current = false;
+      setIsSpeaking(false);
+      stopAmplitudeLoop();
       void playNext();
     }
-  }, []);
+  }, [ensureAnalyser, startAmplitudeLoop, stopAmplitudeLoop]);
 
   const enqueue = useCallback(
     (text: string, opts?: { gender_hint?: string | null }) => {
@@ -185,21 +294,26 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
     [playNext]
   );
 
-  const setMuted = useCallback((m: boolean) => {
-    mutedRef.current = m;
-    const audio = audioRef.current;
-    if (audio && m) {
-      try {
-        audio.pause();
-      } catch {
-        /* noop */
+  const setMuted = useCallback(
+    (m: boolean) => {
+      mutedRef.current = m;
+      const audio = audioRef.current;
+      if (audio && m) {
+        try {
+          audio.pause();
+        } catch {
+          /* noop */
+        }
+        queueRef.current = [];
+        playingRef.current = false;
+        setIsSpeaking(false);
+        stopAmplitudeLoop();
       }
-      queueRef.current = [];
-      playingRef.current = false;
-    }
-  }, []);
+    },
+    [stopAmplitudeLoop]
+  );
 
-  return { enqueue, setMuted };
+  return { enqueue, setMuted, isSpeaking, amplitude, amplitudeRef, audioEl };
 }
 
 export default function AiAssistantPage() {
@@ -253,11 +367,62 @@ export default function AiAssistantPage() {
     localStorage.setItem("avi:speakerOn", speakerOn ? "1" : "0");
   }, [speakerOn]);
 
+  // Animation mode — "live" mounts the rigged Live2D character (heavy
+  // but way more expressive); "basic" skips Live2D entirely and shows
+  // the lightweight SVG portrait with mouth lip-sync. Useful on mobile,
+  // older browsers, or when a family member just prefers the Gemini
+  // avatar. Persisted so the choice survives reloads.
+  type AnimationMode = "live" | "basic";
+  const [animationMode, setAnimationMode] = useState<AnimationMode>(() => {
+    const v = localStorage.getItem("avi:animationMode");
+    return v === "basic" ? "basic" : "live";
+  });
+  useEffect(() => {
+    localStorage.setItem("avi:animationMode", animationMode);
+  }, [animationMode]);
+
   const audio = useAudioQueue(!speakerOn);
 
   // Gender hint used to pick Kokoro's voice pack. Falls back to female
   // if the admin didn't set a gender on the assistant.
   const voiceGender = assistant?.gender === "male" ? "male" : "female";
+
+  // Live2D character render state — surfaced as a header badge so you
+  // can tell at a glance whether the rigged model is on stage or the
+  // SVG fallback is doing the work.
+  const [live2dState, setLive2dState] = useState<AviLive2DState>("init");
+  const [live2dError, setLive2dError] = useState<string | null>(null);
+  const onLive2DStateChange = useCallback(
+    (s: AviLive2DState, err?: string | null) => {
+      setLive2dState(s);
+      setLive2dError(err ?? null);
+    },
+    []
+  );
+
+  // Wave-hand flag. Flipped on for ~2.8 s whenever a new face triggers a
+  // greeting so Avi visibly waves as he says "Hi".
+  const [isWaving, setIsWaving] = useState(false);
+  const waveTimeoutRef = useRef<number | null>(null);
+  useEffect(() => {
+    const handler = () => {
+      setIsWaving(true);
+      if (waveTimeoutRef.current) {
+        window.clearTimeout(waveTimeoutRef.current);
+      }
+      waveTimeoutRef.current = window.setTimeout(
+        () => setIsWaving(false),
+        2800
+      );
+    };
+    window.addEventListener("avi:greet", handler);
+    return () => {
+      window.removeEventListener("avi:greet", handler);
+      if (waveTimeoutRef.current) {
+        window.clearTimeout(waveTimeoutRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-background to-muted">
@@ -280,6 +445,47 @@ export default function AiAssistantPage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {/* Animation mode — two-option segmented toggle. Basic is
+                the SVG portrait with amplitude-driven mouth + smile;
+                Live mounts the rigged Live2D character. */}
+            <div
+              className="inline-flex rounded-full border border-border overflow-hidden text-xs bg-white"
+              role="tablist"
+              aria-label="Animation mode"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={animationMode === "basic"}
+                onClick={() => setAnimationMode("basic")}
+                className={cn(
+                  "inline-flex items-center gap-1 px-3 py-1 transition-colors",
+                  animationMode === "basic"
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-muted"
+                )}
+                title="Lightweight SVG portrait with amplitude-driven mouth + smile. Works on every browser."
+              >
+                <Zap className="h-3.5 w-3.5" />
+                Basic
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={animationMode === "live"}
+                onClick={() => setAnimationMode("live")}
+                className={cn(
+                  "inline-flex items-center gap-1 px-3 py-1 transition-colors",
+                  animationMode === "live"
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-muted"
+                )}
+                title="Rigged Live2D character — real lip-sync, blink, hair physics, gestures. Heavier, best on the Mac Studio."
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                Live
+              </button>
+            </div>
             <button
               onClick={() => setSpeakerOn((s) => !s)}
               className={cn(
@@ -301,17 +507,33 @@ export default function AiAssistantPage() {
               )}
               {speakerOn ? "Voice on" : "Voice off"}
             </button>
-            <StatusBadges llm={llmStatus} face={faceStatus} tts={ttsStatus} />
+            <StatusBadges
+              llm={llmStatus}
+              face={faceStatus}
+              tts={ttsStatus}
+              live2d={live2dState}
+              live2dError={live2dError}
+              animationMode={animationMode}
+            />
           </div>
         </div>
       </header>
 
       <main className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-6">
-        <LiveCameraPanel
-          familyId={familyId}
-          assistant={assistant}
-          assistantName={assistantName}
-        />
+        <div className="flex flex-col gap-6">
+          <AviStage
+            assistant={assistant}
+            assistantName={assistantName}
+            isSpeaking={audio.isSpeaking}
+            isWaving={isWaving}
+            amplitude={audio.amplitude}
+            amplitudeRef={audio.amplitudeRef}
+            audioEl={audio.audioEl}
+            onLive2DStateChange={onLive2DStateChange}
+            animationMode={animationMode}
+          />
+          <LiveCameraPanel familyId={familyId} />
+        </div>
         <ChatPanel
           familyId={familyId}
           assistantName={assistantName}
@@ -325,6 +547,305 @@ export default function AiAssistantPage() {
 }
 
 // ============================================================================
+// Avi stage — the big animated avatar that occupies the top half of the
+// left column. Composites four layers around the assistant's profile image:
+//   1. A soft background glow whose intensity tracks audio amplitude.
+//   2. Concentric "echo" rings that pulse outward while speaking.
+//   3. The avatar itself, breathing idly and bobbing slightly when speaking.
+//   4. A waving hand emoji that fires for a few seconds on greet.
+// ============================================================================
+function AviStage({
+  assistant,
+  assistantName,
+  isSpeaking,
+  isWaving,
+  amplitude,
+  amplitudeRef,
+  audioEl,
+  onLive2DStateChange,
+  animationMode,
+}: {
+  assistant: Assistant | undefined;
+  assistantName: string;
+  isSpeaking: boolean;
+  isWaving: boolean;
+  amplitude: number;
+  amplitudeRef: React.MutableRefObject<number>;
+  audioEl: HTMLAudioElement | null;
+  onLive2DStateChange?: (
+    state: AviLive2DState,
+    error?: string | null
+  ) => void;
+  animationMode: "live" | "basic";
+}) {
+  // When the user picks Basic we want the Avatar status badge to stop
+  // claiming "Live2D loading…" (which is misleading) and the AviStage
+  // to unmount the Pixi canvas entirely so we're not burning a GPU
+  // context needlessly. Push a synthetic state through the callback so
+  // the parent reflects the off state in the header.
+  useEffect(() => {
+    if (animationMode === "basic") {
+      onLive2DStateChange?.("unavailable", null);
+    }
+    // Intentionally only re-notifies when the user flips the mode —
+    // while in "live" mode, AviLive2D's own effect drives transitions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [animationMode]);
+  // Clamp + ease the raw RMS so the glow doesn't feel jittery.
+  const amp = Math.min(1, Math.max(0, amplitude));
+  const glowPx = 30 + amp * 80;
+  const glowAlpha = 0.15 + amp * 0.45;
+  const hasImage = !!assistant?.profile_image_path;
+
+  return (
+    <div className="card overflow-hidden">
+      <div
+        className={cn(
+          "relative flex items-center justify-center",
+          "bg-gradient-to-br from-indigo-50 via-background to-fuchsia-50",
+          "aspect-[16/10] lg:aspect-[5/3]"
+        )}
+      >
+        {/* Ambient background glow — also visible behind the Live2D
+            canvas, so the stage keeps its "alive" feel whether Avi is
+            rendered as a rigged character or the static fallback. */}
+        <div
+          className="absolute inset-0 flex items-center justify-center pointer-events-none"
+          aria-hidden="true"
+        >
+          <div
+            className="rounded-full transition-[filter,opacity] duration-150"
+            style={{
+              width: "55%",
+              height: "80%",
+              background: `radial-gradient(circle, rgba(99,102,241,${glowAlpha}) 0%, rgba(99,102,241,0) 70%)`,
+              filter: `blur(${glowPx}px)`,
+            }}
+          />
+        </div>
+
+        {/* Sonar echo rings — layered behind the character while speaking. */}
+        {isSpeaking && (
+          <div
+            className="absolute inset-0 flex items-center justify-center pointer-events-none"
+            aria-hidden="true"
+          >
+            {[0, 0.6, 1.2].map((delay) => (
+              <span
+                key={delay}
+                className="absolute rounded-full border-2 border-primary/40 animate-avi-echo"
+                style={{
+                  width: "42%",
+                  height: "72%",
+                  animationDelay: `${delay}s`,
+                }}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Avi's character. In "live" mode we mount the rigged Live2D
+            model with a StaticAvatarFallback behind it; if the model
+            fails to load, AviLive2D shows the fallback automatically.
+            In "basic" mode we skip Live2D entirely so the page is
+            lightweight — just the Gemini portrait with the amplitude-
+            driven SVG mouth overlay and CSS breathing/bobbing. */}
+        <div className="absolute inset-0 z-10">
+          {animationMode === "live" ? (
+            <AviLive2D
+              modelPath={AVI_LIVE2D_MODEL_PATH}
+              modelFile={AVI_LIVE2D_MODEL_FILE}
+              audioEl={audioEl}
+              amplitudeRef={amplitudeRef}
+              isSpeaking={isSpeaking}
+              isWaving={isWaving}
+              onStateChange={onLive2DStateChange}
+              debug
+              fallback={
+                <StaticAvatarFallback
+                  assistant={assistant}
+                  assistantName={assistantName}
+                  isSpeaking={isSpeaking}
+                  isWaving={isWaving}
+                  amplitude={amp}
+                />
+              }
+            />
+          ) : (
+            <StaticAvatarFallback
+              assistant={assistant}
+              assistantName={assistantName}
+              isSpeaking={isSpeaking}
+              isWaving={isWaving}
+              amplitude={amp}
+            />
+          )}
+        </div>
+
+        {/* Gemini-generated portrait badge, top-right. Admin can open
+            the assistant edit page to regenerate it; on this live page
+            it just provides a visual link between the admin console
+            and the rigged character on stage. */}
+        {hasImage && (
+          <div className="absolute top-4 right-4 z-20">
+            <div
+              className="rounded-full overflow-hidden border-2 border-white shadow-lg bg-white/80 backdrop-blur"
+              title="Gemini-generated portrait. Avi is animated with Live2D on this page."
+              style={{ width: 64, height: 64 }}
+            >
+              <img
+                src={`/api/media/${assistant!.profile_image_path}`}
+                alt={`${assistantName} portrait`}
+                className="w-full h-full object-cover"
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Bottom caption */}
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20">
+          <div className="inline-flex items-center gap-2 bg-white/90 backdrop-blur px-4 py-1.5 rounded-full shadow-sm text-sm">
+            <Bot className="h-4 w-4 text-primary" />
+            <span className="font-semibold">{assistantName}</span>
+            <span
+              className={cn(
+                "text-xs transition-colors",
+                isSpeaking ? "text-primary" : "text-muted-foreground"
+              )}
+            >
+              {isSpeaking ? "speaking…" : "listening"}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Original static-avatar presentation, extracted as a standalone block
+ * so AviLive2D can use it as its loading/error fallback. Keeps all the
+ * charming details — breathing, bobbing, mouth-pulse, waving hand —
+ * exactly as they were before we introduced Live2D.
+ */
+function StaticAvatarFallback({
+  assistant,
+  assistantName,
+  isSpeaking,
+  isWaving,
+  amplitude,
+}: {
+  assistant: Assistant | undefined;
+  assistantName: string;
+  isSpeaking: boolean;
+  isWaving: boolean;
+  amplitude: number;
+}) {
+  const amp = amplitude;
+  const hasImage = !!assistant?.profile_image_path;
+
+  return (
+    <div
+      className={cn(
+        "relative w-full h-full flex items-center justify-center pointer-events-none"
+      )}
+    >
+      <div
+        className={cn(
+          "relative animate-avi-breathe",
+          isSpeaking && "animate-avi-bob"
+        )}
+        style={{
+          filter: `drop-shadow(0 20px 40px rgba(0,0,0,0.18)) drop-shadow(0 0 ${
+            20 + amp * 40
+          }px rgba(99,102,241,${0.25 + amp * 0.4}))`,
+        }}
+      >
+        {hasImage ? (
+          <img
+            src={`/api/media/${assistant!.profile_image_path}`}
+            alt={assistant!.assistant_name}
+            className="aspect-square rounded-full object-cover border-[5px] border-white shadow-xl"
+            style={{
+              width: "min(44vh, 360px)",
+              height: "min(44vh, 360px)",
+            }}
+          />
+        ) : (
+          <div
+            className="rounded-full bg-gradient-to-br from-primary/20 via-primary/10 to-transparent border-[5px] border-white shadow-xl flex flex-col items-center justify-center text-primary"
+            style={{
+              width: "min(44vh, 360px)",
+              height: "min(44vh, 360px)",
+            }}
+          >
+            <Bot className="h-24 w-24" />
+            <div className="text-lg mt-1 font-semibold">
+              {assistantName[0]?.toUpperCase() ?? "?"}
+            </div>
+          </div>
+        )}
+
+        {/* SVG mouth overlay. Sits over the portrait's own mouth, fades
+            in when speaking or smiling, morphs shape with amplitude.
+
+            Positioning strategy:
+            • Prefer ``assistant.avatar_landmarks.mouth`` — the backend
+              ran InsightFace on the Gemini portrait and returned mouth
+              center + width as fractions of the image. This keeps the
+              SVG aligned even when Gemini draws the face higher or
+              lower than average.
+            • Fall back to hard-coded "roughly 72% down, 22% wide"
+              defaults when no face was detected (stylised portrait,
+              Bot placeholder, detector not yet warm).
+
+            Width multiplier ``* 1.0`` leaves the detected mouth box
+            as-is; nudge higher if the smile pads need more horizontal
+            room. */}
+        {(() => {
+          const lm = assistant?.avatar_landmarks?.mouth;
+          const topPct = lm ? `${(lm.cy * 100).toFixed(2)}%` : "72%";
+          const widthPct = lm ? `${Math.max(12, lm.w * 100).toFixed(2)}%` : "22%";
+          const heightPct = lm ? `${Math.max(6, lm.h * 100).toFixed(2)}%` : "11%";
+          const leftPct = lm ? `${(lm.cx * 100).toFixed(2)}%` : "50%";
+          return (
+            <div
+              className="absolute pointer-events-none"
+              style={{
+                top: topPct,
+                left: leftPct,
+                width: widthPct,
+                height: heightPct,
+                transform: "translate(-50%, -50%)",
+              }}
+            >
+              {/* Smile factor:
+                    greeting → full smile (1.0)
+                    speaking → gentle engaged smile (0.35)
+                    idle     → no smile (0.0), overlay fades out entirely */}
+              <SpeakingMouth
+                amplitude={amp}
+                smile={isWaving ? 1.0 : isSpeaking ? 0.35 : 0}
+              />
+            </div>
+          );
+        })()}
+
+        {isWaving && (
+          <div
+            className="absolute text-7xl select-none pointer-events-none animate-avi-wave"
+            style={{ right: "-6%", bottom: "4%" }}
+            aria-hidden="true"
+          >
+            👋
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // Status
 // ============================================================================
 
@@ -332,11 +853,52 @@ function StatusBadges({
   llm,
   face,
   tts,
+  live2d,
+  live2dError,
+  animationMode,
 }: {
   llm: LlmStatus | undefined;
   face: FaceStatus | undefined;
   tts: TtsStatus | undefined;
+  live2d: AviLive2DState;
+  live2dError: string | null;
+  animationMode: "live" | "basic";
 }) {
+  // When the user explicitly picks Basic we want a dedicated label
+  // rather than re-using the "fallback" wording (which implies
+  // something went wrong).
+  const avatarLabel = (() => {
+    if (animationMode === "basic") return "Avatar: basic";
+    switch (live2d) {
+      case "init":
+        return "Avatar…";
+      case "loading":
+        return "Avatar loading…";
+      case "ready":
+        return "Avatar: live";
+      case "unavailable":
+      case "error":
+        return "Avatar: SVG fallback";
+    }
+  })();
+  const avatarHint = (() => {
+    if (animationMode === "basic")
+      return "Basic mode — lightweight Gemini portrait with SVG mouth lip-sync. Click Live in the header to switch to the rigged Live2D character.";
+    switch (live2d) {
+      case "init":
+        return "Mounting the Live2D stage.";
+      case "loading":
+        return "Downloading Natori model files…";
+      case "ready":
+        return "Live2D Cubism 4 character is on stage with real lip-sync + gestures.";
+      case "unavailable":
+        return "Cubism Core runtime didn't load. Showing the animated SVG portrait — still has live lip-sync and smile.";
+      case "error":
+        return `Model failed to load${
+          live2dError ? ` (${live2dError})` : ""
+        }. Showing the animated SVG portrait.`;
+    }
+  })();
   return (
     <div className="flex items-center gap-2">
       <Badge
@@ -401,6 +963,15 @@ function StatusBadges({
             : `${tts.engine} not yet loaded — first clip downloads ~330 MB.`
         }
       />
+      <Badge
+        ok={live2d === "ready" || animationMode === "basic"}
+        warn={
+          animationMode === "live" &&
+          (live2d === "init" || live2d === "loading")
+        }
+        label={avatarLabel}
+        title={avatarHint}
+      />
     </div>
   );
 }
@@ -442,15 +1013,7 @@ function Badge({
 // Live camera + face recognition loop
 // ============================================================================
 
-function LiveCameraPanel({
-  familyId,
-  assistant,
-  assistantName,
-}: {
-  familyId: number;
-  assistant: Assistant | undefined;
-  assistantName: string;
-}) {
+function LiveCameraPanel({ familyId }: { familyId: number }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [cameraOn, setCameraOn] = useState(true);
@@ -555,23 +1118,11 @@ function LiveCameraPanel({
             </button>
           </div>
         </div>
-        <div className="card-body flex items-center gap-4">
-          <AssistantAvatar
-            assistant={
-              assistant ?? {
-                assistant_name: assistantName,
-                profile_image_path: null,
-              }
-            }
-            size={64}
-          />
-          <div className="min-w-0">
-            <div className="font-semibold">{assistantName}</div>
-            <div className="text-xs text-muted-foreground">
-              {cameraOn
-                ? "Watching for family members. When I recognize someone I'll say hi in chat."
-                : "Camera paused — recognition is idle."}
-            </div>
+        <div className="card-body py-2 px-4">
+          <div className="text-xs text-muted-foreground">
+            {cameraOn
+              ? "Watching for family members. I'll wave and say hi when I recognize someone."
+              : "Camera paused — recognition is idle."}
           </div>
         </div>
       </div>
