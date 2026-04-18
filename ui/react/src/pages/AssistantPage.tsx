@@ -17,6 +17,7 @@ import { GENDERS } from "@/lib/enums";
 type AssistantForm = {
   assistant_name: string;
   gender: "male" | "female" | "";
+  email_address: string;
   visual_description: string;
   personality_description: string;
 };
@@ -67,6 +68,7 @@ function CreateAssistantCard({
     defaultValues: {
       assistant_name: "Avi",
       gender: "",
+      email_address: "",
       visual_description: "",
       personality_description: "",
     },
@@ -78,6 +80,7 @@ function CreateAssistantCard({
         family_id: familyId,
         assistant_name: v.assistant_name,
         gender: v.gender || null,
+        email_address: v.email_address.trim() || null,
         visual_description: v.visual_description || null,
         personality_description: v.personality_description || null,
       }),
@@ -127,6 +130,22 @@ function CreateAssistantCard({
               ))}
             </select>
           </Field>
+          <div className="col-span-2">
+            <Field
+              label="Email address"
+              htmlFor="email_address"
+              hint="Gmail address Avi will use to send mail and read the family calendar (free/busy lookups). Optional — leave blank if Avi doesn't have a mailbox yet."
+            >
+              <input
+                id="email_address"
+                type="email"
+                autoComplete="off"
+                placeholder="avi@example.com"
+                className="input"
+                {...register("email_address")}
+              />
+            </Field>
+          </div>
           <div className="col-span-2">
             <Field
               label="Visual description"
@@ -186,6 +205,7 @@ function AssistantEditor({
     reset({
       assistant_name: assistant.assistant_name,
       gender: (assistant.gender as AssistantForm["gender"]) ?? "",
+      email_address: assistant.email_address ?? "",
       visual_description: assistant.visual_description ?? "",
       personality_description: assistant.personality_description ?? "",
     });
@@ -196,6 +216,7 @@ function AssistantEditor({
       api.patch<Assistant>(`/api/assistants/${assistant.assistant_id}`, {
         assistant_name: v.assistant_name,
         gender: v.gender || null,
+        email_address: v.email_address.trim() || null,
         visual_description: v.visual_description || null,
         personality_description: v.personality_description || null,
       }),
@@ -281,6 +302,22 @@ function AssistantEditor({
                 ))}
               </select>
             </Field>
+            <div className="col-span-2">
+              <Field
+                label="Email address"
+                htmlFor="email_address"
+                hint="Gmail address Avi will use to send mail and read the family calendar (free/busy lookups). Optional — leave blank if Avi doesn't have a mailbox yet."
+              >
+                <input
+                  id="email_address"
+                  type="email"
+                  autoComplete="off"
+                  placeholder="avi@example.com"
+                  className="input"
+                  {...register("email_address")}
+                />
+              </Field>
+            </div>
             <div className="col-span-2">
               <Field
                 label="Visual description"

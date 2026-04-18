@@ -25,7 +25,10 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..ai import ollama
 from ..ai import rag
+from ..ai import schema_catalog
 from ..ai import session as live_session
+from ..ai import sql_tool
+from ..config import get_settings
 from ..db import SessionLocal, get_db
 
 logger = logging.getLogger(__name__)
@@ -112,6 +115,11 @@ def _load_assistant(db: Session, family_id: int) -> tuple[str, Optional[str]]:
 def _build_rag_block(
     db: Session, family_id: int, person_id: Optional[int]
 ) -> str:
+    """Static context block: family overview + (optional) speaker focus.
+
+    Excludes the schema catalog — that's appended separately by
+    :func:`_build_system_prompt` so it can be reused across the planner
+    + main chat call without rebuilding."""
     family = db.get(models.Family, family_id)
     if family is None:
         return ""
@@ -121,6 +129,34 @@ def _build_rag_block(
         if person is not None and person.family_id == family_id:
             parts.append("Currently talking to:\n" + rag.build_person_context(db, person))
     return "\n\n".join(parts).strip()
+
+
+def _build_system_prompt(
+    db: Session,
+    *,
+    assistant_name: str,
+    family_name: Optional[str],
+    rag_block: str,
+    live_data_block: Optional[str] = None,
+) -> str:
+    """Assemble the full system prompt: persona + context + schema."""
+    parts: List[str] = [ollama.system_prompt_for_avi(assistant_name, family_name)]
+    if rag_block:
+        parts.append("--- Known household context ---\n" + rag_block)
+    parts.append(
+        "--- Database schema you can query ---\n"
+        "You have read-only access to the family Postgres database. "
+        "When the household context above isn't enough, the orchestrator "
+        "may run additional SELECT queries on your behalf and inject the "
+        "results below as 'Live data'. Tables and columns are documented "
+        "with comments — read them carefully. Sensitive columns (VINs, "
+        "account numbers, SSNs) are stored encrypted and are NOT exposed; "
+        "use the *_last_four helper columns instead.\n\n"
+        + schema_catalog.dump_text(db)
+    )
+    if live_data_block:
+        parts.append("--- Live data (just queried for this turn) ---\n" + live_data_block)
+    return "\n\n".join(parts)
 
 
 # ---------- Status --------------------------------------------------------
@@ -188,6 +224,39 @@ async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetRe
     participant = live_session.upsert_participant(
         db, session, person_id=person.person_id
     )
+
+    # If the user is already mid-conversation in this session — e.g.
+    # they were typing chat messages for a few minutes and only just
+    # now glanced at the camera — a sudden "Hi Ben!" is jarring. Mark
+    # them greeted silently and stay quiet. We use the same atomic
+    # CAS so concurrent /greet calls still resolve to a single
+    # winner; only the caller that flipped False→True needs to do
+    # any work, and even that work becomes a no-op return here.
+    has_chat_history = (
+        db.query(models.LiveSessionMessage)
+        .filter(
+            models.LiveSessionMessage.live_session_id == session.live_session_id,
+            models.LiveSessionMessage.role.in_(("user", "assistant")),
+        )
+        .filter(
+            (models.LiveSessionMessage.meta.is_(None))
+            | (models.LiveSessionMessage.meta["kind"].as_string() == "chat")
+        )
+        .first()
+        is not None
+    )
+    if has_chat_history:
+        live_session.mark_greeted(db, participant)
+        return GreetResponse(
+            family_id=payload.family_id,
+            person_id=payload.person_id,
+            greeting="",
+            skipped=True,
+            skipped_reason="session_already_active",
+            used_model="template",
+            context_preview=context,
+        )
+
     # Atomic CAS: only the caller that flips False→True actually greets.
     greeted_now = live_session.mark_greeted(db, participant)
     if not greeted_now:
@@ -267,9 +336,16 @@ async def followup(
 
     system = ollama.system_prompt_for_avi(assistant_name, family_name)
 
+    # One-sentence follow-up — perfect fit for the lightweight model.
+    # The fallback wrapper transparently uses the main chat model if
+    # the fast tag isn't pulled yet.
     try:
-        question = await ollama.generate(
-            prompt, system=system, temperature=0.8, max_tokens=120
+        question, followup_model = await ollama.generate_with_fallback(
+            prompt,
+            primary_model=ollama.fast_model(),
+            system=system,
+            temperature=0.8,
+            max_tokens=120,
         )
     except ollama.OllamaUnavailable as e:
         raise HTTPException(
@@ -298,7 +374,7 @@ async def followup(
                     "kind": "followup",
                     "person_id": person.person_id,
                     "goal_name": goal.goal_name if goal else None,
-                    "used_model": ollama._model(),
+                    "used_model": followup_model,
                 },
             )
 
@@ -307,8 +383,162 @@ async def followup(
         person_id=payload.person_id,
         question=final_question,
         goal_name=goal.goal_name if goal else None,
-        used_model=ollama._model(),
+        used_model=followup_model,
     )
+
+
+# ---------- Direct SQL (debug + LLM tool) --------------------------------
+
+
+class SqlRequest(BaseModel):
+    family_id: int
+    query: str = Field(..., min_length=1, max_length=4000)
+    max_rows: int = Field(200, ge=1, le=1000)
+
+
+class SqlResponse(BaseModel):
+    sql: str
+    columns: List[str]
+    rows: List[dict]
+    row_count: int
+    truncated: bool
+
+
+@router.post("/sql", response_model=SqlResponse)
+def run_sql(payload: SqlRequest, db: Session = Depends(get_db)) -> SqlResponse:
+    """Execute a sandboxed read-only SELECT.
+
+    Used by the chat planner under the hood and exposed directly so
+    operators can poke at the schema with the same allow-list /
+    timeouts the LLM operates under.
+    """
+    if db.get(models.Family, payload.family_id) is None:
+        raise HTTPException(status_code=404, detail="Family not found")
+    try:
+        result = sql_tool.run_safe_query(
+            db,
+            payload.query,
+            family_id=payload.family_id,
+            max_rows=payload.max_rows,
+        )
+    except sql_tool.SqlToolError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return SqlResponse(**result.to_dict())
+
+
+# ---------- Planner: pick which SELECTs to run before chatting -----------
+
+
+_PLANNER_INSTRUCTIONS = (
+    "You are the data-fetching layer for a family AI assistant. Decide "
+    "which database SELECT queries (if any) would help answer the user's "
+    "next message. Use the schema documentation in the system prompt.\n\n"
+    "Rules:\n"
+    "* Reply with ONLY a JSON object: {\"queries\": [\"SELECT ...\", ...]}.\n"
+    "* Use [] when the household context already contains the answer.\n"
+    "* Each query MUST be a single SELECT or WITH ... SELECT, no semicolons.\n"
+    "* Always scope by family_id = {family_id} where the table has it.\n"
+    "* Prefer narrow column lists; never SELECT * on people, vehicles, "
+    "  insurance_policies, or financial_accounts.\n"
+    "* Do not query encrypted columns (anything ending in _encrypted) — "
+    "  use the *_last_four helpers.\n"
+    "* Cap at 3 queries per turn.\n"
+)
+
+
+async def _plan_queries(
+    *,
+    family_id: int,
+    rag_block: str,
+    schema_dump: str,
+    last_user_message: str,
+) -> List[str]:
+    """Ask the LLM which SELECTs (if any) to pre-run for this turn."""
+    instructions = _PLANNER_INSTRUCTIONS.replace("{family_id}", str(family_id))
+    prompt = (
+        f"{instructions}\n\n"
+        f"--- Household context ---\n{rag_block}\n\n"
+        f"--- Schema ---\n{schema_dump}\n\n"
+        f"--- User just said ---\n{last_user_message}\n\n"
+        'Reply with a JSON object only, e.g. {"queries": []}.'
+    )
+    # The planner is a structured-output task — Gemma's tiny e2b
+    # variant runs it in well under a second on Apple Silicon, so we
+    # never want to burn a 26B-parameter pass on it. The fallback
+    # wrapper auto-routes to the main chat model when the fast tag
+    # isn't pulled (yet), so a missing model doesn't break chat.
+    try:
+        raw, _ = await ollama.generate_with_fallback(
+            prompt,
+            primary_model=ollama.fast_model(),
+            system="You return strict JSON. No prose. No markdown fences.",
+            temperature=0.1,
+            max_tokens=400,
+        )
+    except ollama.OllamaError as e:
+        logger.warning("Planner call failed: %s", e)
+        return []
+
+    queries = _parse_planner_output(raw)
+    return queries[:3]
+
+
+def _parse_planner_output(raw: str) -> List[str]:
+    """Extract a JSON queries list from the planner reply, tolerantly."""
+    if not raw:
+        return []
+    text_value = raw.strip()
+    # Strip ``` fences if the model added them despite instructions.
+    if text_value.startswith("```"):
+        text_value = text_value.strip("`")
+        # drop optional `json` language tag
+        if text_value.lower().startswith("json"):
+            text_value = text_value[4:]
+        text_value = text_value.strip()
+    # Locate the first {...} block to be resilient to leading text.
+    start = text_value.find("{")
+    end = text_value.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        obj = json.loads(text_value[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    qs = obj.get("queries") if isinstance(obj, dict) else None
+    if not isinstance(qs, list):
+        return []
+    return [q.strip() for q in qs if isinstance(q, str) and q.strip()]
+
+
+def _execute_planner_queries(
+    db: Session, family_id: int, queries: List[str]
+) -> str:
+    """Run each planner-generated query, return a prompt-ready block.
+
+    Failures are surfaced inline so the LLM can see what didn't work and
+    avoid suggesting the same query the next turn.
+    """
+    if not queries:
+        return ""
+    sections: List[str] = []
+    for i, q in enumerate(queries, 1):
+        header = f"### Query {i}\n```sql\n{q}\n```"
+        try:
+            result = sql_tool.run_safe_query(db, q, family_id=family_id)
+        except sql_tool.SqlToolError as e:
+            sections.append(f"{header}\nError: {e}")
+            continue
+        if not result.rows:
+            sections.append(f"{header}\nNo rows.")
+            continue
+        # Render as a tiny table — small enough that the model can read
+        # it, structured enough that it doesn't get parsed as prose.
+        body = json.dumps(result.rows, ensure_ascii=False, default=str)
+        truncation = " (truncated)" if result.truncated else ""
+        sections.append(
+            f"{header}\nRows ({result.row_count}{truncation}): {body}"
+        )
+    return "\n\n".join(sections)
 
 
 # ---------- Chat stream ---------------------------------------------------
@@ -336,9 +566,53 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
 
     assistant_name, family_name = _load_assistant(db, payload.family_id)
     rag_block = _build_rag_block(db, payload.family_id, payload.recognized_person_id)
-    system = ollama.system_prompt_for_avi(assistant_name, family_name)
-    if rag_block:
-        system += "\n\n--- Known household context ---\n" + rag_block
+
+    # Optional dynamic-SQL planner. Disabled by default because a
+    # 26B-parameter local model needs 5-10 s for the extra non-
+    # streaming round trip — too slow for conversational use when the
+    # static RAG block already dumps every household entity into the
+    # system prompt. Flip AI_RAG_PLANNER_ENABLED=true in .env if you're
+    # experimenting with tool-use prompts.
+    live_data_block: Optional[str] = None
+    if get_settings().AI_RAG_PLANNER_ENABLED:
+        latest_user = next(
+            (m.content for m in reversed(payload.messages) if m.role == "user"),
+            "",
+        )
+        if latest_user:
+            try:
+                planner_queries = await _plan_queries(
+                    family_id=payload.family_id,
+                    rag_block=rag_block,
+                    schema_dump=schema_catalog.dump_text(db),
+                    last_user_message=latest_user,
+                )
+            except Exception:  # noqa: BLE001 — planner is best-effort
+                logger.exception(
+                    "Planner step crashed; continuing without live data"
+                )
+                planner_queries = []
+            if planner_queries:
+                logger.info(
+                    "RAG planner ran %d query/queries for family_id=%s: %s",
+                    len(planner_queries),
+                    payload.family_id,
+                    [q[:80] for q in planner_queries],
+                )
+                live_data_block = (
+                    _execute_planner_queries(
+                        db, payload.family_id, planner_queries
+                    )
+                    or None
+                )
+
+    system = _build_system_prompt(
+        db,
+        assistant_name=assistant_name,
+        family_name=family_name,
+        rag_block=rag_block,
+        live_data_block=live_data_block,
+    )
 
     messages = [m.model_dump() for m in payload.messages]
 

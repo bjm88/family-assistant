@@ -111,6 +111,7 @@ def _to_read_dict(assistant: models.Assistant) -> Dict[str, Any]:
         "gender": assistant.gender,
         "visual_description": assistant.visual_description,
         "personality_description": assistant.personality_description,
+        "email_address": assistant.email_address,
         "profile_image_path": assistant.profile_image_path,
         "avatar_generation_note": assistant.avatar_generation_note,
         "avatar_landmarks": _avatar_landmarks_for(assistant),

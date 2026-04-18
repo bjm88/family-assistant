@@ -12,7 +12,7 @@ from datetime import date
 from typing import List, Optional
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from .. import models
 
@@ -136,34 +136,233 @@ def build_person_context(db: Session, person: models.Person) -> str:
 
 
 def build_family_overview(db: Session, family: models.Family) -> str:
-    """High-level RAG block describing the whole household."""
-    lines: List[str] = [f"Family: {family.family_name}"]
+    """High-level RAG block describing the whole household.
+
+    The output is intentionally dense, sectioned, and bulletised so a
+    small local model (Gemma 4) can scan it for a specific entity in
+    the conversation. Sensitive identifiers (full account numbers,
+    VINs, plate numbers, SSNs) are *never* surfaced — only their
+    last-four helpers, which is what humans actually quote anyway.
+    """
+    # Pre-load the per-person collections we render below in a single
+    # round trip per relationship, so the overview stays N+1-free even
+    # for big households. Without this we'd issue one ``SELECT FROM
+    # goals`` and one ``SELECT FROM identity_documents`` per Person
+    # instance — fine on six rows, but unnecessary every chat turn.
+    if family.people:
+        person_ids = [p.person_id for p in family.people]
+        db.execute(
+            select(models.Person)
+            .where(models.Person.person_id.in_(person_ids))
+            .options(
+                selectinload(models.Person.goals),
+                selectinload(models.Person.identity_documents),
+            )
+        ).all()
+
+    lines: List[str] = []
+    lines.append(f"Family: {family.family_name} (family_id={family.family_id})")
+    if family.assistant:
+        a = family.assistant
+        lines.append(
+            f"Assistant: {a.assistant_name}"
+            + (f" ({a.gender})" if a.gender else "")
+        )
+    if family.head_of_household_notes:
+        lines.append("Household notes: " + _short(family.head_of_household_notes))
+
+    # ---- People ------------------------------------------------------
     people = family.people or []
     if people:
-        roster = []
+        lines.append("")
+        lines.append(f"## People ({len(people)})")
         for p in people:
-            bit = _person_display_name(p)
+            bits = [f"{_person_display_name(p)}"]
             if p.primary_family_relationship:
-                bit += f" ({p.primary_family_relationship.replace('_', ' ')})"
-            roster.append(bit)
-        lines.append("Members: " + ", ".join(roster))
+                bits.append(p.primary_family_relationship.replace("_", " "))
+            age = _age_years(p.date_of_birth)
+            if age is not None:
+                bits.append(f"age {age}")
+            elif p.date_of_birth:
+                bits.append(f"DOB {p.date_of_birth.isoformat()}")
+            if p.gender:
+                bits.append(p.gender)
+            line = "- " + " · ".join(bits) + f" [person_id={p.person_id}]"
+            lines.append(line)
+            if p.interests_and_activities:
+                lines.append(
+                    "    interests: " + _short(p.interests_and_activities, 200)
+                )
+            goals = p.goals or []
+            if goals:
+                priority_rank = {"urgent": 0, "semi_urgent": 1, "normal": 2, "low": 3}
+                top = sorted(
+                    goals,
+                    key=lambda g: (
+                        priority_rank.get(g.priority, 9),
+                        g.goal_name or "",
+                    ),
+                )[:3]
+                lines.append(
+                    "    goals: "
+                    + "; ".join(
+                        f"{g.goal_name} ({g.priority.replace('_', '-')})"
+                        for g in top
+                    )
+                )
+
+    # ---- Pets --------------------------------------------------------
     pets = family.pets or []
     if pets:
-        lines.append(
-            "Pets: "
-            + ", ".join(
-                f"{p.pet_name} ({p.animal_type.replace('_', ' ')})" for p in pets
-            )
-        )
+        lines.append("")
+        lines.append(f"## Pets ({len(pets)})")
+        for pet in pets:
+            bits = [f"{pet.pet_name}", pet.animal_type.replace("_", " ")]
+            if pet.breed:
+                bits.append(pet.breed)
+            if pet.color:
+                bits.append(pet.color)
+            age = _age_years(pet.date_of_birth)
+            if age is not None:
+                bits.append(f"age {age}")
+            lines.append("- " + " · ".join(bits) + f" [pet_id={pet.pet_id}]")
+
+    # ---- Residences --------------------------------------------------
     residences = family.residences or []
-    primary = next((r for r in residences if r.is_primary_residence), None)
-    if primary:
-        lines.append(
-            f"Home: {primary.label} at {primary.street_line_1}, "
-            f"{primary.city}"
-            + (f", {primary.state_or_region}" if primary.state_or_region else "")
-        )
-    return "\n".join(lines)
+    if residences:
+        lines.append("")
+        lines.append(f"## Residences ({len(residences)})")
+        for r in residences:
+            tag = " (PRIMARY)" if r.is_primary_residence else ""
+            location = ", ".join(
+                x for x in [r.street_line_1, r.city, r.state_or_region] if x
+            )
+            lines.append(
+                f"- {r.label}{tag}: {location} [residence_id={r.residence_id}]"
+            )
+
+    # ---- Vehicles ----------------------------------------------------
+    vehicles = family.vehicles or []
+    if vehicles:
+        lines.append("")
+        lines.append(f"## Vehicles ({len(vehicles)})")
+        # Build a quick driver lookup so we can show names instead of ids.
+        people_by_id = {p.person_id: _person_display_name(p) for p in people}
+        residence_label_by_id = {r.residence_id: r.label for r in residences}
+        for v in vehicles:
+            head_bits: List[str] = [v.vehicle_type or "vehicle"]
+            if v.year:
+                head_bits.append(str(v.year))
+            head_bits.append(v.make)
+            head_bits.append(v.model)
+            if v.trim:
+                head_bits.append(v.trim)
+            line = "- " + " ".join(head_bits)
+            if v.nickname:
+                line += f' — "{v.nickname}"'
+            line += f" [vehicle_id={v.vehicle_id}]"
+            lines.append(line)
+            extras: List[str] = []
+            if v.color:
+                extras.append(f"color {v.color}")
+            if v.fuel_type:
+                extras.append(f"fuel {v.fuel_type}")
+            if v.license_plate_number_last_four:
+                extras.append(
+                    f"plate ****{v.license_plate_number_last_four}"
+                    + (
+                        f" ({v.license_plate_state_or_region})"
+                        if v.license_plate_state_or_region
+                        else ""
+                    )
+                )
+            if v.vehicle_identification_number_last_four:
+                extras.append(
+                    f"VIN ****{v.vehicle_identification_number_last_four}"
+                )
+            if v.registration_expiration_date:
+                extras.append(
+                    f"registration expires {v.registration_expiration_date.isoformat()}"
+                )
+            if v.primary_driver_person_id in people_by_id:
+                extras.append(
+                    f"primary driver {people_by_id[v.primary_driver_person_id]}"
+                )
+            if v.residence_id in residence_label_by_id:
+                extras.append(f"parked at {residence_label_by_id[v.residence_id]}")
+            if extras:
+                lines.append("    " + " · ".join(extras))
+
+    # ---- Insurance ---------------------------------------------------
+    policies = family.insurance_policies or []
+    if policies:
+        lines.append("")
+        lines.append(f"## Insurance policies ({len(policies)})")
+        for pol in policies:
+            head = (
+                f"- {pol.policy_type} · {pol.carrier_name}"
+                + (f" — {pol.plan_name}" if pol.plan_name else "")
+                + f" [insurance_policy_id={pol.insurance_policy_id}]"
+            )
+            lines.append(head)
+            extras: List[str] = []
+            if pol.policy_number_last_four:
+                extras.append(f"policy ****{pol.policy_number_last_four}")
+            if pol.premium_amount_usd:
+                freq = (
+                    f"/{pol.premium_billing_frequency}"
+                    if pol.premium_billing_frequency
+                    else ""
+                )
+                extras.append(f"premium ${pol.premium_amount_usd:.2f}{freq}")
+            if pol.deductible_amount_usd:
+                extras.append(f"deductible ${pol.deductible_amount_usd:.2f}")
+            if pol.expiration_date:
+                extras.append(f"expires {pol.expiration_date.isoformat()}")
+            if pol.agent_name:
+                extras.append(f"agent {pol.agent_name}")
+            if extras:
+                lines.append("    " + " · ".join(extras))
+
+    # ---- Financial accounts -----------------------------------------
+    accounts = family.financial_accounts or []
+    if accounts:
+        lines.append("")
+        lines.append(f"## Financial accounts ({len(accounts)})")
+        for fa in accounts:
+            bits = [
+                f"{fa.account_type}",
+                fa.institution_name,
+            ]
+            if fa.account_nickname:
+                bits.append(f'"{fa.account_nickname}"')
+            if fa.account_number_last_four:
+                bits.append(f"****{fa.account_number_last_four}")
+            lines.append(
+                "- " + " · ".join(bits)
+                + f" [financial_account_id={fa.financial_account_id}]"
+            )
+
+    # ---- Identity documents (counts only — content is sensitive) -----
+    id_doc_count_by_person: dict[int, int] = {}
+    for p in people:
+        n = len(p.identity_documents or [])
+        if n:
+            id_doc_count_by_person[p.person_id] = n
+    if id_doc_count_by_person:
+        lines.append("")
+        lines.append("## Identity documents on file")
+        names = {p.person_id: _person_display_name(p) for p in people}
+        for pid, n in id_doc_count_by_person.items():
+            lines.append(f"- {names.get(pid, f'Person {pid}')}: {n} document(s)")
+
+    return "\n".join(lines).strip()
+
+
+def _short(s: str, limit: int = 240) -> str:
+    """Collapse and truncate a free-text blob for prompt embedding."""
+    flat = " ".join(s.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
 def pick_goal_for_question(person: models.Person) -> Optional[models.Goal]:

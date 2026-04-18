@@ -67,6 +67,17 @@ class Assistant(Base, TimestampMixin):
             "prompt during live conversation."
         ),
     )
+    email_address: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment=(
+            "Gmail / Google Workspace address that owns the assistant's "
+            "inbox and calendar. The Gmail and Google Calendar APIs use "
+            "this address to send mail on Avi's behalf and to read the "
+            "shared family calendars (free/busy lookups, upcoming events). "
+            "Leave blank if the assistant doesn't have its own mailbox yet."
+        ),
+    )
     profile_image_path: Mapped[Optional[str]] = mapped_column(
         String(500),
         nullable=True,

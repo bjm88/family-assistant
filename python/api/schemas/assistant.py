@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
 from ._base import OrmModel
 
@@ -16,6 +16,10 @@ class AssistantBase(BaseModel):
     gender: Optional[Gender] = None
     visual_description: Optional[str] = None
     personality_description: Optional[str] = None
+    # Gmail address Avi uses to send email and read the shared family
+    # calendar. Optional — the assistant works fine without it, just
+    # without the email/calendar tool surface.
+    email_address: Optional[EmailStr] = None
 
 
 class AssistantCreate(AssistantBase):
@@ -27,6 +31,7 @@ class AssistantUpdate(BaseModel):
     gender: Optional[Gender] = None
     visual_description: Optional[str] = None
     personality_description: Optional[str] = None
+    email_address: Optional[EmailStr] = None
 
 
 # ---- Face landmark geometry (derived, not stored) --------------------------
@@ -78,6 +83,7 @@ class AssistantRead(OrmModel):
     gender: Optional[str]
     visual_description: Optional[str]
     personality_description: Optional[str]
+    email_address: Optional[str]
     profile_image_path: Optional[str]
     avatar_generation_note: Optional[str]
     avatar_landmarks: Optional[AvatarLandmarks] = None

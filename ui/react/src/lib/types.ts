@@ -104,6 +104,7 @@ export interface Assistant {
   gender: "male" | "female" | null;
   visual_description: string | null;
   personality_description: string | null;
+  email_address: string | null;
   profile_image_path: string | null;
   avatar_generation_note: string | null;
   avatar_landmarks: AvatarLandmarks | null;

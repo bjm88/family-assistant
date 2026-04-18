@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     # user has running (``gemma4``); override in .env to point at any
     # other tag like ``gemma3:27b`` or a custom local model.
     AI_OLLAMA_MODEL: str = "gemma4"
+    # Lightweight companion model for fast/structured tasks: the RAG
+    # planner ("which SELECTs should I run?"), greeting follow-up
+    # generation, query classification, etc. Pick something an order
+    # of magnitude faster than the main chat model — ``gemma4:e2b`` is
+    # the natural choice when the user has pulled it; falls back to
+    # the main model if this one isn't installed in Ollama.
+    AI_OLLAMA_FAST_MODEL: str = "gemma4:e2b"
     # Cosine-similarity threshold for a face recognition match. Higher =
     # stricter. 0.40–0.45 is a good default for InsightFace buffalo_l
     # embeddings (ArcFace, 512-dim).
@@ -91,6 +98,17 @@ class Settings(BaseSettings):
     # participant, new message, or an explicit ensure-active ping from
     # the live page. Override via env when testing: AI_LIVE_SESSION_IDLE_MINUTES=2
     AI_LIVE_SESSION_IDLE_MINUTES: int = 30
+
+    # Dynamic-SQL planner. When true the chat endpoint makes a quick
+    # non-streaming LLM call before each message asking which SELECT
+    # queries (if any) to run for additional context. With a 26B model
+    # this adds 5-10 s of latency per turn, which is rarely worth it
+    # because the static RAG block already dumps every household entity
+    # (people, vehicles, pets, residences, insurance, accounts) into
+    # the system prompt. Leave OFF unless you're experimenting with
+    # tool-use prompts. The /api/aiassistant/sql endpoint and the
+    # underlying sandboxed sql_tool are always available either way.
+    AI_RAG_PLANNER_ENABLED: bool = False
 
     @property
     def database_url(self) -> str:

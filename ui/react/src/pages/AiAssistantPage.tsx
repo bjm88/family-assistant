@@ -113,6 +113,15 @@ const FACE_RECOG_INTERVAL_MS = 2500;
 // doesn't loop "Hi Sam!" every time they blink.
 const GREETING_SUPPRESSION_MS = 90_000;
 
+// Echo cancellation: how long to keep the microphone disarmed AFTER
+// Avi finishes a TTS clip. The browser's mic capture buffer + the
+// SpeechRecognition engine's lookback both retain a beat of audio
+// past the speaker silencing, so re-arming immediately is what was
+// causing Avi's tail words to be transcribed as user input. 700 ms
+// is comfortably longer than typical engine lookback (~300-500 ms)
+// without feeling laggy in conversation.
+const ECHO_GRACE_MS = 700;
+
 // -------------------------------------------------------------------------
 // Audio queue — plays Kokoro WAV clips one after another without overlap.
 // Returns a handle with `enqueue(text, voiceHint)` and `mute`/`unmute`.
@@ -1492,6 +1501,18 @@ function ChatPanel({
     audioSpeakingRef.current = audio.isSpeaking;
   }, [audio.isSpeaking]);
 
+  // Echo-cancellation guard. The browser SpeechRecognition engine
+  // happily transcribes whatever the laptop speakers play back —
+  // including Avi's own TTS — and reports the result a beat AFTER
+  // playback has stopped. Gating onresult only on
+  // `audio.isSpeaking` therefore loses the race: the audio was
+  // captured during playback but processed afterward. We use this
+  // ref as a "ignore any recognition events whose audio could have
+  // overlapped Avi" wall clock, and pair it with a hard
+  // stop()/start() of the recognizer (see the combined effect
+  // below) so the engine doesn't even hear him in the first place.
+  const wasSpeakingUntilRef = useRef(0);
+
   const isStreamingRef = useRef(false);
   useEffect(() => {
     isStreamingRef.current = isStreaming;
@@ -1911,7 +1932,17 @@ function ChatPanel({
         [k: number]: { transcript: string };
       }[];
     }) => {
-      if (audioSpeakingRef.current) {
+      // Belt-and-suspenders echo cancellation. The combined effect
+      // below stops the recognizer during TTS playback so this
+      // branch should rarely fire — but if Avi's voice still leaks
+      // through (e.g. browser races a buffered result before our
+      // stop() lands), drop it on the floor. The grace window also
+      // catches results whose audio captured Avi's trailing
+      // syllables right before he finished.
+      if (
+        audioSpeakingRef.current ||
+        Date.now() < wasSpeakingUntilRef.current
+      ) {
         pendingFinal = "";
         setInput("");
         return;
@@ -1963,7 +1994,10 @@ function ChatPanel({
       // Flush any tail still parked from a mid-sentence pause before
       // the engine ended (rare but possible on an engine-side timeout).
       const tail = pendingFinal.trim();
-      if (tail && !audioSpeakingRef.current && !isStreamingRef.current) {
+      const inEchoWindow =
+        audioSpeakingRef.current ||
+        Date.now() < wasSpeakingUntilRef.current;
+      if (tail && !inEchoWindow && !isStreamingRef.current) {
         pendingFinal = "";
         setInput("");
         sendUserMessageRef.current(tail);
@@ -2048,30 +2082,68 @@ function ChatPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [speechSupported]);
 
-  // Drive the existing recognizer from the listening toggle. No
-  // tear-down / rebuild — just `.start()` / `.stop()`.
+  // Drive the existing recognizer from BOTH the user's listening
+  // toggle AND Avi's playback state. No tear-down / rebuild — just
+  // `.start()` / `.stop()` on the singleton recognizer.
+  //
+  // Echo-cancellation contract:
+  //   * Avi starts speaking → stop the mic immediately, clear any
+  //     interim transcript that's already in the form input, and
+  //     remember a wall-clock until-time we should stay quiet past
+  //     (= now + ECHO_GRACE_MS). The browser's mic buffer + the
+  //     SpeechRecognition engine's own lookback both need a beat to
+  //     drain after the speakers go silent; jumping back in too
+  //     early is what was causing Avi's tail words to land in the
+  //     user-message log.
+  //   * Avi stops speaking → wait the remainder of the grace window,
+  //     then re-arm the mic only if the user still wants to listen.
+  //   * User toggles listening off → stop and stay stopped.
   useEffect(() => {
     const rec = recRef.current;
     if (!rec) return;
-    if (listening) {
-      try {
-        rec.start();
-        console.info("[speech] start() called from listening-toggle");
-      } catch (err) {
-        console.warn(
-          "[speech] start() threw from listening-toggle (probably already running):",
-          err
-        );
-      }
-    } else {
+
+    const stop = () => {
       try {
         rec.stop();
-        console.info("[speech] stop() called from listening-toggle");
       } catch {
-        /* noop */
+        /* already stopped — ignore */
       }
+    };
+    const start = () => {
+      if (!shouldListenRef.current) return;
+      try {
+        rec.start();
+      } catch {
+        /* already started — ignore */
+      }
+    };
+
+    if (audio.isSpeaking) {
+      wasSpeakingUntilRef.current = Date.now() + ECHO_GRACE_MS;
+      setInput("");
+      stop();
+      console.info("[speech] paused for TTS playback");
+      return;
     }
-  }, [listening]);
+
+    if (!listening) {
+      stop();
+      console.info("[speech] stopped (listening toggled off)");
+      return;
+    }
+
+    const remaining = Math.max(
+      0,
+      wasSpeakingUntilRef.current - Date.now()
+    );
+    if (remaining === 0) {
+      start();
+      return;
+    }
+    console.info(`[speech] re-arming mic in ${remaining} ms (echo grace)`);
+    const t = window.setTimeout(start, remaining);
+    return () => window.clearTimeout(t);
+  }, [listening, audio.isSpeaking]);
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();

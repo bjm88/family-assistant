@@ -40,6 +40,79 @@ def _model() -> str:
     return get_settings().AI_OLLAMA_MODEL
 
 
+def fast_model() -> str:
+    """Lightweight Gemma tag used for structured/planner-style calls.
+
+    Falls back to the main chat model when no fast model is configured
+    so callers never have to handle a None case. Operators tier the
+    workload by setting :envvar:`AI_OLLAMA_FAST_MODEL` to a small
+    model (``gemma4:e2b``) and leaving :envvar:`AI_OLLAMA_MODEL` on
+    the heavyweight one (``gemma4:26b``).
+
+    Note: this returns the configured tag even when it isn't actually
+    pulled in Ollama. Callers route around the resulting
+    :class:`OllamaUnavailable` via :func:`generate_with_fallback` so
+    a missing fast model never breaks live chat.
+    """
+    s = get_settings()
+    return s.AI_OLLAMA_FAST_MODEL or s.AI_OLLAMA_MODEL
+
+
+# Models we've already warned about being unpulled — keeps the log
+# clean when the fast tag is intentionally absent (e.g. user is still
+# pulling it, or running on a small dev box).
+_warned_unavailable: set[str] = set()
+
+
+async def generate_with_fallback(
+    prompt: str,
+    *,
+    primary_model: str,
+    fallback_model: Optional[str] = None,
+    system: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 300,
+) -> tuple[str, str]:
+    """Try ``primary_model`` and transparently fall back if it's not
+    pulled. Returns ``(text, model_actually_used)``.
+
+    Designed for the tiered-model workload where we *prefer* the
+    lightweight Gemma but still want the request to succeed against
+    the main model when the fast tag isn't installed yet.
+    """
+    fb = fallback_model or _model()
+    try:
+        text_value = await generate(
+            prompt,
+            system=system,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            model=primary_model,
+        )
+        return text_value, primary_model
+    except OllamaUnavailable as e:
+        if primary_model == fb:
+            raise
+        if primary_model not in _warned_unavailable:
+            _warned_unavailable.add(primary_model)
+            logger.warning(
+                "Fast model %r is unavailable (%s) — falling back to %r. "
+                "Run `ollama pull %s` to enable the tiered path.",
+                primary_model,
+                e,
+                fb,
+                primary_model,
+            )
+        text_value = await generate(
+            prompt,
+            system=system,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            model=fb,
+        )
+        return text_value, fb
+
+
 async def health() -> Dict[str, object]:
     """Report whether Ollama is reachable and whether the model is pulled."""
     out: Dict[str, object] = {
@@ -75,10 +148,17 @@ async def generate(
     system: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 300,
+    model: Optional[str] = None,
 ) -> str:
-    """One-shot, non-streaming completion. Used for greetings."""
+    """One-shot, non-streaming completion.
+
+    ``model`` defaults to :envvar:`AI_OLLAMA_MODEL`; pass a different
+    tag (typically the value returned by :func:`fast_model`) to route
+    a quick structured-output call to a cheaper model.
+    """
+    target_model = model or _model()
     payload: Dict[str, object] = {
-        "model": _model(),
+        "model": target_model,
         "prompt": prompt,
         "stream": False,
         "options": {
@@ -99,7 +179,8 @@ async def generate(
 
     if r.status_code == 404:
         raise OllamaUnavailable(
-            f"Model '{_model()}' is not pulled. Run `ollama pull {_model()}`."
+            f"Model '{target_model}' is not pulled. "
+            f"Run `ollama pull {target_model}`."
         )
     if r.status_code >= 400:
         raise OllamaError(
@@ -204,7 +285,9 @@ __all__ = [
     "OllamaError",
     "OllamaUnavailable",
     "chat_stream",
+    "fast_model",
     "generate",
+    "generate_with_fallback",
     "health",
     "sync_health",
     "system_prompt_for_avi",
