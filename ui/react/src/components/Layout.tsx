@@ -5,6 +5,7 @@ import {
   Building2,
   Car,
   FileText,
+  History,
   Home,
   Landmark,
   Network,
@@ -51,13 +52,20 @@ export default function Layout() {
             {family?.family_name ?? "Loading…"}
           </div>
         </div>
-        <div className="p-3 border-b border-border">
+        <div className="p-3 border-b border-border space-y-2">
           <NavLink
             to={`/aiassistant/${familyId}`}
             className="flex items-center gap-2 rounded-md px-3 py-2 text-sm bg-primary text-primary-foreground hover:bg-primary/90 transition-colors font-medium"
           >
             <Sparkles className="h-4 w-4" />
             Live AI Assistant
+          </NavLink>
+          <NavLink
+            to={`/aiassistant/${familyId}/sessions`}
+            className="flex items-center gap-2 rounded-md px-3 py-2 text-xs text-foreground/70 hover:bg-muted hover:text-foreground transition-colors"
+          >
+            <History className="h-4 w-4" />
+            Session history
           </NavLink>
         </div>
         <nav className="flex-1 p-3 space-y-1">

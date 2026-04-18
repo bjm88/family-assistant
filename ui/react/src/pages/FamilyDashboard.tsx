@@ -175,9 +175,24 @@ export default function FamilyDashboard() {
           </div>
         </div>
 
-        <Link
-          to={`/admin/families/${familyId}/assistant`}
-          className="card hover:shadow-md transition-shadow self-start"
+        {/* Two CTAs on this card: clicking the body opens the
+            assistant editor; the corner pill goes straight to the
+            live page. We can't nest `<Link>` inside `<Link>` (DOM
+            spec forbids `<a>` inside `<a>`), so the outer container
+            is a `<div>` that navigates programmatically and the pill
+            is a real `<Link>` with stopPropagation so the body click
+            doesn't also fire. */}
+        <div
+          role="link"
+          tabIndex={0}
+          onClick={() => navigate(`/admin/families/${familyId}/assistant`)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              navigate(`/admin/families/${familyId}/assistant`);
+            }
+          }}
+          className="card hover:shadow-md transition-shadow self-start cursor-pointer"
         >
           <div className="card-header">
             <div className="card-title flex items-center gap-2">
@@ -220,7 +235,7 @@ export default function FamilyDashboard() {
               </>
             )}
           </div>
-        </Link>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">

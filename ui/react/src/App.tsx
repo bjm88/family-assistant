@@ -14,6 +14,8 @@ import InsurancePoliciesPage from "./pages/InsurancePoliciesPage";
 import FinancialAccountsPage from "./pages/FinancialAccountsPage";
 import DocumentsPage from "./pages/DocumentsPage";
 import AiAssistantPage from "./pages/AiAssistantPage";
+import AiSessionsListPage from "./pages/AiSessionsListPage";
+import AiSessionDetailPage from "./pages/AiSessionDetailPage";
 
 export default function App() {
   return (
@@ -47,6 +49,14 @@ export default function App() {
       {/* Live AI assistant (separate top-level namespace so it can evolve
           independently of the admin routes, with different auth later). */}
       <Route path="/aiassistant/:familyId" element={<AiAssistantPage />} />
+      <Route
+        path="/aiassistant/:familyId/sessions"
+        element={<AiSessionsListPage />}
+      />
+      <Route
+        path="/aiassistant/:familyId/sessions/:sessionId"
+        element={<AiSessionDetailPage />}
+      />
 
       <Route path="*" element={<Navigate to="/admin/families" replace />} />
     </Routes>

@@ -34,6 +34,12 @@ from .insurance_policy import (
 )
 from .financial_account import FinancialAccount
 from .document import Document
+from .live_session import LiveSession, LIVE_SESSION_END_REASONS
+from .live_session_participant import LiveSessionParticipant
+from .live_session_message import (
+    LiveSessionMessage,
+    LIVE_SESSION_MESSAGE_ROLES,
+)
 
 __all__ = [
     "Family",
@@ -59,4 +65,9 @@ __all__ = [
     "InsurancePolicyVehicle",
     "FinancialAccount",
     "Document",
+    "LiveSession",
+    "LIVE_SESSION_END_REASONS",
+    "LiveSessionParticipant",
+    "LiveSessionMessage",
+    "LIVE_SESSION_MESSAGE_ROLES",
 ]

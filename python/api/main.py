@@ -37,6 +37,7 @@ from .routers import (
     goals,
     identity_documents,
     insurance_policies,
+    live_sessions,
     media,
     people,
     person_photos,
@@ -102,6 +103,7 @@ def create_app() -> FastAPI:
     app.include_router(ai_face.router, prefix=AI_PREFIX)
     app.include_router(ai_chat.router, prefix=AI_PREFIX)
     app.include_router(ai_tts.router, prefix=AI_PREFIX)
+    app.include_router(live_sessions.router, prefix=AI_PREFIX)
 
     @app.get("/api/health", tags=["health"])
     def health() -> dict:

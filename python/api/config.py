@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     # first use. Relative paths are resolved against the project root.
     AI_TTS_MODEL_DIR: str = "./resources/models/kokoro"
 
+    # Minutes of inactivity after which a live AI-assistant session is
+    # automatically closed with end_reason="timeout". Activity = new
+    # participant, new message, or an explicit ensure-active ping from
+    # the live page. Override via env when testing: AI_LIVE_SESSION_IDLE_MINUTES=2
+    AI_LIVE_SESSION_IDLE_MINUTES: int = 30
+
     @property
     def database_url(self) -> str:
         return (

@@ -45,6 +45,16 @@ from .financial_account import (
     FinancialAccountRead,
 )
 from .document import DocumentRead, DocumentUpdate
+from .live_session import (
+    EndSessionRequest,
+    EnsureActiveSessionRequest,
+    LiveSessionDetail,
+    LiveSessionEndReason,
+    LiveSessionMessageRead,
+    LiveSessionMessageRole,
+    LiveSessionParticipantRead,
+    LiveSessionRead,
+)
 
 __all__ = [
     "FamilyCreate",
@@ -96,4 +106,12 @@ __all__ = [
     "FinancialAccountRead",
     "DocumentRead",
     "DocumentUpdate",
+    "LiveSessionRead",
+    "LiveSessionDetail",
+    "LiveSessionParticipantRead",
+    "LiveSessionMessageRead",
+    "LiveSessionMessageRole",
+    "LiveSessionEndReason",
+    "EnsureActiveSessionRequest",
+    "EndSessionRequest",
 ]

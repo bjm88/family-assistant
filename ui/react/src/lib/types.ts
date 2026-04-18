@@ -49,6 +49,53 @@ export interface AvatarLandmarks {
   eyes: { lx: number; ly: number; rx: number; ry: number };
 }
 
+// ============================================================================
+// Live AI-assistant sessions
+// ============================================================================
+
+export type LiveSessionMessageRole = "user" | "assistant" | "system";
+export type LiveSessionEndReason = "timeout" | "manual" | "superseded";
+
+export interface LiveSessionParticipant {
+  live_session_participant_id: number;
+  live_session_id: number;
+  person_id: number;
+  person_name: string | null;
+  joined_at: string;
+  greeted_already: boolean;
+}
+
+export interface LiveSessionMessage {
+  live_session_message_id: number;
+  live_session_id: number;
+  role: LiveSessionMessageRole;
+  person_id: number | null;
+  person_name: string | null;
+  content: string;
+  meta: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface LiveSession {
+  live_session_id: number;
+  family_id: number;
+  started_at: string;
+  ended_at: string | null;
+  last_activity_at: string;
+  start_context: string | null;
+  end_reason: LiveSessionEndReason | null;
+  is_active: boolean;
+  participant_count: number;
+  message_count: number;
+  participants_preview: string[];
+  last_message_preview: string | null;
+}
+
+export interface LiveSessionDetail extends LiveSession {
+  participants: LiveSessionParticipant[];
+  messages: LiveSessionMessage[];
+}
+
 export interface Assistant {
   assistant_id: number;
   family_id: number;

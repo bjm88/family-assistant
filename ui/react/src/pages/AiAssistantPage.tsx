@@ -6,18 +6,21 @@ import {
   useState,
 } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ArrowLeft,
   Bot,
   Camera,
   CheckCircle2,
+  History,
   Mic,
   MicOff,
   Send,
   Sparkles,
+  Square,
   User,
+  Users,
   Video,
   VideoOff,
   Volume2,
@@ -25,7 +28,12 @@ import {
   Zap,
 } from "lucide-react";
 import { api, resolveApiPath } from "@/lib/api";
-import type { Assistant, Family } from "@/lib/types";
+import type {
+  Assistant,
+  Family,
+  LiveSession,
+  LiveSessionDetail,
+} from "@/lib/types";
 import { useToast } from "@/components/Toast";
 import { cn } from "@/lib/cn";
 import AviLive2D, { type AviLive2DState } from "./AviLive2D";
@@ -316,6 +324,91 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
   return { enqueue, setMuted, isSpeaking, amplitude, amplitudeRef, audioEl };
 }
 
+// ============================================================================
+// Live session state
+// ----------------------------------------------------------------------------
+// The backend opens a `live_session` the first time we either recognize a
+// face or post a chat message. This hook:
+//   1. Pings `/sessions/ensure-active` on mount so a session always exists
+//      while the page is open (and so the backend can sweep stale ones).
+//   2. Polls `/sessions/active` every 5 s to surface new participants and
+//      refreshed activity timestamps in the session pill.
+// The returned `sessionId` is threaded into `/greet`, `/followup`, and
+// `/chat` so the server can log the transcript and enforce "greet once
+// per session" without the client having to track it.
+// ============================================================================
+function useLiveSession(familyId: number) {
+  const enabled = Number.isFinite(familyId);
+  const [session, setSession] = useState<LiveSession | null>(null);
+  // Guard against tight retry loops if the backend is down: only one
+  // ensure-active call may be in flight at a time, and we wait at
+  // least 2s between attempts before re-triggering from the null-poll.
+  const ensureInFlightRef = useRef(false);
+  const lastEnsureAtRef = useRef(0);
+
+  const ensureActive = useCallback(async () => {
+    if (!enabled) return null;
+    if (ensureInFlightRef.current) return null;
+    if (Date.now() - lastEnsureAtRef.current < 2_000) return null;
+    ensureInFlightRef.current = true;
+    lastEnsureAtRef.current = Date.now();
+    try {
+      const s = await api.post<LiveSession>(
+        "/api/aiassistant/sessions/ensure-active",
+        { family_id: familyId, start_context: "page_opened" }
+      );
+      setSession(s);
+      return s;
+    } catch (err) {
+      console.warn("[useLiveSession] ensure-active failed", err);
+      return null;
+    } finally {
+      ensureInFlightRef.current = false;
+    }
+  }, [enabled, familyId]);
+
+  useEffect(() => {
+    void ensureActive();
+  }, [ensureActive]);
+
+  // Poll the lightweight `/active` endpoint; this is what keeps the
+  // participant pill fresh as the camera identifies more people, and —
+  // critically — what notices that the backend has no active session
+  // (because the user just clicked "End & reset" or the 30-min idle
+  // sweep ran). When that happens we open a fresh session inline so
+  // the next greet/chat has somewhere to land.
+  const { data: activeSession } = useQuery<LiveSession | null>({
+    queryKey: ["ai-active-session", familyId],
+    queryFn: async () =>
+      api.get<LiveSession | null>(
+        `/api/aiassistant/sessions/active?family_id=${familyId}`
+      ),
+    enabled,
+    refetchInterval: 5_000,
+  });
+
+  useEffect(() => {
+    if (activeSession) {
+      // Don't overwrite the freshly-created session from ensureActive
+      // with a stale ended one returned by an in-flight poll.
+      if (activeSession.is_active || !session?.is_active) {
+        setSession(activeSession);
+      }
+    } else if (activeSession === null) {
+      // Server explicitly says "no active session" — clear local state
+      // and open a new one so the next face-detect / chat can be
+      // attributed correctly (with greeted_already=false for everyone).
+      setSession(null);
+      void ensureActive();
+    }
+    // `session` is intentionally omitted from deps to avoid re-running
+    // the effect on every setSession from inside it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSession, ensureActive]);
+
+  return session;
+}
+
 export default function AiAssistantPage() {
   const { familyId: familyIdParam } = useParams();
   const familyId = Number(familyIdParam);
@@ -359,23 +452,30 @@ export default function AiAssistantPage() {
   // Speaker toggle — persisted across reloads so a family keeps their
   // chosen default. Start muted until the user clicks once, to stay on
   // the right side of browser autoplay policies.
-  const [speakerOn, setSpeakerOn] = useState<boolean>(() => {
-    const v = localStorage.getItem("avi:speakerOn");
-    return v === null ? true : v === "1";
-  });
-  useEffect(() => {
-    localStorage.setItem("avi:speakerOn", speakerOn ? "1" : "0");
-  }, [speakerOn]);
+  // Speaker (Avi's voice playback). We intentionally do NOT seed this
+  // from localStorage — the family expects "Voice on" every time they
+  // open the page, and a stale "0" from a previous testing session was
+  // silently muting Avi on reload. The toggle still works mid-session
+  // for a deliberate "shh"; it just doesn't survive a refresh.
+  const [speakerOn, setSpeakerOn] = useState<boolean>(true);
 
-  // Animation mode — "live" mounts the rigged Live2D character (heavy
-  // but way more expressive); "basic" skips Live2D entirely and shows
-  // the lightweight SVG portrait with mouth lip-sync. Useful on mobile,
-  // older browsers, or when a family member just prefers the Gemini
-  // avatar. Persisted so the choice survives reloads.
-  type AnimationMode = "live" | "basic";
+  // Animation mode — both modes are "live" in the sense of being
+  // animated in real time; the distinction is the *fidelity* of the
+  // animation:
+  //   - "basic"    → the Gemini-generated portrait with an SVG mouth
+  //                  driven by audio amplitude. Fast, works everywhere.
+  //   - "advanced" → the rigged Live2D character (Natori) with full
+  //                  lip-sync, blink, hair physics, gestures. Heavier;
+  //                  best on the Mac Studio.
+  // Default is "basic" for now — Live2D is still finicky to set up and
+  // most family members don't notice the difference. We honour an
+  // explicit "advanced" pick from localStorage, but fall back to
+  // "basic" otherwise (including the legacy "live" value some browsers
+  // may still have stored from the previous build).
+  type AnimationMode = "advanced" | "basic";
   const [animationMode, setAnimationMode] = useState<AnimationMode>(() => {
     const v = localStorage.getItem("avi:animationMode");
-    return v === "basic" ? "basic" : "live";
+    return v === "advanced" ? "advanced" : "basic";
   });
   useEffect(() => {
     localStorage.setItem("avi:animationMode", animationMode);
@@ -399,6 +499,9 @@ export default function AiAssistantPage() {
     },
     []
   );
+
+  const liveSession = useLiveSession(familyId);
+  const liveSessionId = liveSession?.live_session_id ?? null;
 
   // Wave-hand flag. Flipped on for ~2.8 s whenever a new face triggers a
   // greeting so Avi visibly waves as he says "Hi".
@@ -445,9 +548,10 @@ export default function AiAssistantPage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {/* Animation mode — two-option segmented toggle. Basic is
-                the SVG portrait with amplitude-driven mouth + smile;
-                Live mounts the rigged Live2D character. */}
+            {/* Animation mode — two-option segmented toggle. Both
+                modes animate in real time; "Basic" is the SVG portrait
+                with amplitude-driven mouth + smile, "Advanced" mounts
+                the rigged Live2D character. */}
             <div
               className="inline-flex rounded-full border border-border overflow-hidden text-xs bg-white"
               role="tablist"
@@ -472,18 +576,18 @@ export default function AiAssistantPage() {
               <button
                 type="button"
                 role="tab"
-                aria-selected={animationMode === "live"}
-                onClick={() => setAnimationMode("live")}
+                aria-selected={animationMode === "advanced"}
+                onClick={() => setAnimationMode("advanced")}
                 className={cn(
                   "inline-flex items-center gap-1 px-3 py-1 transition-colors",
-                  animationMode === "live"
+                  animationMode === "advanced"
                     ? "bg-primary text-primary-foreground"
                     : "text-muted-foreground hover:bg-muted"
                 )}
                 title="Rigged Live2D character — real lip-sync, blink, hair physics, gestures. Heavier, best on the Mac Studio."
               >
                 <Sparkles className="h-3.5 w-3.5" />
-                Live
+                Advanced
               </button>
             </div>
             <button
@@ -517,6 +621,7 @@ export default function AiAssistantPage() {
             />
           </div>
         </div>
+        <LiveSessionPill session={liveSession} familyId={familyId} />
       </header>
 
       <main className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-6">
@@ -540,6 +645,7 @@ export default function AiAssistantPage() {
           llmStatus={llmStatus}
           audio={audio}
           voiceGender={voiceGender}
+          liveSessionId={liveSessionId}
         />
       </main>
     </div>
@@ -576,7 +682,7 @@ function AviStage({
     state: AviLive2DState,
     error?: string | null
   ) => void;
-  animationMode: "live" | "basic";
+  animationMode: "advanced" | "basic";
 }) {
   // When the user picks Basic we want the Avatar status badge to stop
   // claiming "Live2D loading…" (which is misleading) and the AviStage
@@ -588,7 +694,7 @@ function AviStage({
       onLive2DStateChange?.("unavailable", null);
     }
     // Intentionally only re-notifies when the user flips the mode —
-    // while in "live" mode, AviLive2D's own effect drives transitions.
+    // while in "advanced" mode, AviLive2D's own effect drives transitions.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [animationMode]);
   // Clamp + ease the raw RMS so the glow doesn't feel jittery.
@@ -644,14 +750,14 @@ function AviStage({
           </div>
         )}
 
-        {/* Avi's character. In "live" mode we mount the rigged Live2D
-            model with a StaticAvatarFallback behind it; if the model
-            fails to load, AviLive2D shows the fallback automatically.
-            In "basic" mode we skip Live2D entirely so the page is
-            lightweight — just the Gemini portrait with the amplitude-
-            driven SVG mouth overlay and CSS breathing/bobbing. */}
+        {/* Avi's character. In "advanced" mode we mount the rigged
+            Live2D model with a StaticAvatarFallback behind it; if the
+            model fails to load, AviLive2D shows the fallback
+            automatically. In "basic" mode we skip Live2D entirely so
+            the page is lightweight — just the Gemini portrait with the
+            amplitude-driven SVG mouth overlay and CSS breathing/bobbing. */}
         <div className="absolute inset-0 z-10">
-          {animationMode === "live" ? (
+          {animationMode === "advanced" ? (
             <AviLive2D
               modelPath={AVI_LIVE2D_MODEL_PATH}
               modelFile={AVI_LIVE2D_MODEL_FILE}
@@ -846,6 +952,115 @@ function StaticAvatarFallback({
 }
 
 // ============================================================================
+// Session pill
+// ----------------------------------------------------------------------------
+// Small, always-visible strip under the header that shows:
+//   - the session start time (so the family knows "how long have we been
+//     chatting with Avi?")
+//   - the list of people Avi has recognised in this session
+//   - a link to the session history (past conversations)
+// ============================================================================
+function LiveSessionPill({
+  session,
+  familyId,
+}: {
+  session: LiveSession | null;
+  familyId: number;
+}) {
+  const qc = useQueryClient();
+  const formatStart = (iso: string) => {
+    const d = new Date(iso);
+    // `HH:MM · 4/18` in local time — short enough to sit inline.
+    return `${d.toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+    })} · ${d.getMonth() + 1}/${d.getDate()}`;
+  };
+
+  const endMut = useMutation({
+    mutationFn: () => {
+      if (!session) throw new Error("no session");
+      return api.post(`/api/aiassistant/sessions/${session.live_session_id}/end`, {
+        end_reason: "manual",
+      });
+    },
+    onSuccess: () => {
+      // Force the hook's `/active` poll to re-run immediately so the
+      // pill flips to "Opening session…" and ensure-active can create
+      // a fresh one (with greeted_already=false for everyone).
+      qc.invalidateQueries({ queryKey: ["ai-active-session", familyId] });
+      qc.invalidateQueries({ queryKey: ["ai-sessions-list", familyId] });
+    },
+  });
+
+  const participants = session?.participants_preview ?? [];
+  const hasParticipants = participants.length > 0;
+
+  return (
+    <div className="bg-muted/30 border-t border-border">
+      <div className="max-w-7xl mx-auto px-6 py-2 flex flex-wrap items-center gap-3 text-xs">
+        <div
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1",
+            session?.is_active
+              ? "bg-emerald-500/15 text-emerald-700 border border-emerald-500/30"
+              : "bg-muted text-muted-foreground border border-border"
+          )}
+          title={
+            session
+              ? `Session #${session.live_session_id} · ${
+                  session.is_active ? "active" : `ended (${session.end_reason ?? "?"})`
+                }`
+              : "No active session"
+          }
+        >
+          <span
+            className={cn(
+              "h-1.5 w-1.5 rounded-full",
+              session?.is_active ? "bg-emerald-500 animate-pulse" : "bg-muted-foreground/50"
+            )}
+          />
+          {session
+            ? session.is_active
+              ? `Session · started ${formatStart(session.started_at)}`
+              : "Session ended"
+            : "Opening session…"}
+        </div>
+        <div className="inline-flex items-center gap-1.5 text-muted-foreground">
+          <Users className="h-3.5 w-3.5" />
+          {hasParticipants ? (
+            <span className="font-medium text-foreground">
+              {participants.join(", ")}
+            </span>
+          ) : (
+            <span>Waiting for someone to be recognised…</span>
+          )}
+        </div>
+        <div className="ml-auto flex items-center gap-3">
+          {session?.is_active && (
+            <button
+              type="button"
+              onClick={() => endMut.mutate()}
+              disabled={endMut.isPending}
+              className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-50 px-2 py-0.5 text-amber-800 hover:bg-amber-100 disabled:opacity-60"
+              title="Close this session. A new one will open on the next face detection or chat, with greetings reset for everyone."
+            >
+              <Square className="h-3 w-3" /> End & reset
+            </button>
+          )}
+          <Link
+            to={`/aiassistant/${familyId}/sessions`}
+            className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"
+          >
+            <History className="h-3.5 w-3.5" /> Session history
+          </Link>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // Status
 // ============================================================================
 
@@ -862,7 +1077,7 @@ function StatusBadges({
   tts: TtsStatus | undefined;
   live2d: AviLive2DState;
   live2dError: string | null;
-  animationMode: "live" | "basic";
+  animationMode: "advanced" | "basic";
 }) {
   // When the user explicitly picks Basic we want a dedicated label
   // rather than re-using the "fallback" wording (which implies
@@ -875,7 +1090,7 @@ function StatusBadges({
       case "loading":
         return "Avatar loading…";
       case "ready":
-        return "Avatar: live";
+        return "Avatar: advanced";
       case "unavailable":
       case "error":
         return "Avatar: SVG fallback";
@@ -883,7 +1098,7 @@ function StatusBadges({
   })();
   const avatarHint = (() => {
     if (animationMode === "basic")
-      return "Basic mode — lightweight Gemini portrait with SVG mouth lip-sync. Click Live in the header to switch to the rigged Live2D character.";
+      return "Basic mode — lightweight Gemini portrait with SVG mouth lip-sync. Click Advanced in the header to switch to the rigged Live2D character.";
     switch (live2d) {
       case "init":
         return "Mounting the Live2D stage.";
@@ -966,7 +1181,7 @@ function StatusBadges({
       <Badge
         ok={live2d === "ready" || animationMode === "basic"}
         warn={
-          animationMode === "live" &&
+          animationMode === "advanced" &&
           (live2d === "init" || live2d === "loading")
         }
         label={avatarLabel}
@@ -1239,12 +1454,14 @@ function ChatPanel({
   llmStatus,
   audio,
   voiceGender,
+  liveSessionId,
 }: {
   familyId: number;
   assistantName: string;
   llmStatus: LlmStatus | undefined;
   audio: AudioQueueHandle;
   voiceGender: "male" | "female";
+  liveSessionId: number | null;
 }) {
   const toast = useToast();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -1253,10 +1470,35 @@ function ChatPanel({
   const [recognizedPersonId, setRecognizedPersonId] = useState<number | null>(
     null
   );
-  const [listening, setListening] = useState(false);
+  // Mic defaults to ON every page load so the family can just walk up
+  // and start talking — same "always on for now" pattern as the
+  // speaker. We intentionally do NOT seed from localStorage; an old
+  // "0" value from a previous testing session was the reason the mic
+  // appeared dead on refresh. The toggle still works mid-session.
+  // Note: the browser still requires a user gesture for the permission
+  // prompt the first time, which happens automatically when the effect
+  // below attempts to `rec.start()` on mount.
+  const [listening, setListening] = useState<boolean>(true);
   const [speechSupported, setSpeechSupported] = useState(false);
   const messagesRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Refs the speech-recognition handler relies on. `rec.onresult` is
+  // bound exactly once per listening session, so anything it needs from
+  // React state has to be mirrored into a ref that we keep in sync on
+  // every render.
+  const audioSpeakingRef = useRef(audio.isSpeaking);
+  useEffect(() => {
+    audioSpeakingRef.current = audio.isSpeaking;
+  }, [audio.isSpeaking]);
+
+  const isStreamingRef = useRef(false);
+  useEffect(() => {
+    isStreamingRef.current = isStreaming;
+  }, [isStreaming]);
+
+  // Assigned just after `sendUserMessage` is defined below.
+  const sendUserMessageRef = useRef<(text: string) => void>(() => undefined);
 
   // Auto-scroll to bottom on every new chunk.
   useEffect(() => {
@@ -1264,6 +1506,57 @@ function ChatPanel({
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [messages]);
+
+  // Rehydrate the chat from the active session's persisted transcript.
+  //
+  // Why: navigating away from the live page (or refreshing) used to
+  // leave you with an empty chat box even though the backend had the
+  // full conversation logged. Now we fetch the session detail the
+  // moment we know which active session we're attached to and replace
+  // the local message list with what's on the server, so the user
+  // picks up exactly where they left off.
+  //
+  // Hydration runs once per `liveSessionId` (a ref tracks which id we
+  // already loaded). When the id changes — e.g. after "End & reset"
+  // creates a fresh session — we wipe the chat and rehydrate from the
+  // (empty) new session. We deliberately skip rehydration mid-stream
+  // so we don't yank the streaming bubble out from under the user.
+  const hydratedSessionIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (liveSessionId === null) {
+      hydratedSessionIdRef.current = null;
+      return;
+    }
+    if (hydratedSessionIdRef.current === liveSessionId) return;
+    if (isStreamingRef.current) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const detail = await api.get<LiveSessionDetail>(
+          `/api/aiassistant/sessions/${liveSessionId}`
+        );
+        if (cancelled) return;
+        hydratedSessionIdRef.current = liveSessionId;
+        const restored: ChatMessage[] = detail.messages.map((m) => ({
+          id: `restored-${m.live_session_message_id}`,
+          role: m.role,
+          content: m.content,
+        }));
+        setMessages(restored);
+        // If anyone in the participants was greeted already, surface
+        // the most recent one as our "recognized person" so a follow-up
+        // chat carries the right context. Falls back to null when the
+        // session has no participants yet.
+        const greeted = detail.participants.find((p) => p.greeted_already);
+        if (greeted) setRecognizedPersonId(greeted.person_id);
+      } catch (err) {
+        console.warn("[chat] failed to load session transcript", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [liveSessionId]);
 
   // Detect speech recognition support (Chrome / Safari).
   useEffect(() => {
@@ -1311,11 +1604,26 @@ function ChatPanel({
     try {
       const resp = await api.post<{
         greeting: string;
+        skipped?: boolean;
+        skipped_reason?: string | null;
         context_preview: string;
       }>("/api/aiassistant/greet", {
         family_id: familyId,
         person_id: personId,
+        live_session_id: liveSessionId,
       });
+      if (resp.skipped) {
+        // Server says "already greeted in this session" — silently
+        // drop the placeholder instead of announcing a suppressed
+        // greeting. We also skip the follow-up question: if they've
+        // been in the room with Avi already, we don't want to ambush
+        // them again just because they reappeared on camera.
+        console.info(
+          `[greet] suppressed for person ${personId}: ${resp.skipped_reason ?? "already greeted"}`
+        );
+        setMessages((prev) => prev.filter((m) => m.id !== greetingMsg.id));
+        return;
+      }
       greetingText = resp.greeting;
       setMessages((prev) =>
         prev.map((m) =>
@@ -1365,6 +1673,7 @@ function ChatPanel({
       }>("/api/aiassistant/followup", {
         family_id: familyId,
         person_id: personId,
+        live_session_id: liveSessionId,
       });
       setMessages((prev) =>
         prev.map((m) =>
@@ -1422,6 +1731,7 @@ function ChatPanel({
           family_id: familyId,
           messages: historyForServer,
           recognized_person_id: recognizedPersonId,
+          live_session_id: liveSessionId,
         }),
       });
       if (!res.ok || !res.body) {
@@ -1431,6 +1741,7 @@ function ChatPanel({
       const decoder = new TextDecoder();
       let buf = "";
       let lastError: string | null = null;
+      let assistantReply = "";
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -1445,6 +1756,7 @@ function ChatPanel({
             const parsed = JSON.parse(line);
             if (parsed.delta) {
               const delta: string = parsed.delta;
+              assistantReply += delta;
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === assistantMsg.id
@@ -1473,6 +1785,16 @@ function ChatPanel({
             : m
         )
       );
+      // Speak the assistant's reply out loud once the stream settles.
+      // `enqueue` is a no-op when the speaker toggle is off, so the
+      // user's mute preference is automatically respected. We send the
+      // whole reply as a single chunk rather than per-token so Kokoro
+      // gets a coherent sentence to inflect (and we don't pile up a
+      // hundred tiny TTS requests for one answer).
+      const speakable = assistantReply.trim();
+      if (!lastError && speakable) {
+        audio.enqueue(speakable, { gender_hint: voiceGender });
+      }
     } catch (e) {
       setMessages((prev) =>
         prev.map((m) =>
@@ -1495,14 +1817,45 @@ function ChatPanel({
     }
   }
 
-  // ---- Microphone / Web Speech API --------------------------------------
-  const recognitionRef = useRef<{
-    start: () => void;
-    stop: () => void;
-  } | null>(null);
+  // Keep the recognition handler pointed at the latest closure so the
+  // captured `messages` / `recognizedPersonId` / `liveSessionId` are
+  // always fresh when a pause triggers an auto-submit.
+  sendUserMessageRef.current = sendUserMessage;
 
+  // ---- Microphone / Web Speech API --------------------------------------
+  //
+  // Design (deliberately simple):
+  //   * Build ONE SpeechRecognition instance per page load — created
+  //     in a mount-once effect that fires as soon as we know the
+  //     browser supports it. Handlers are bound exactly once and read
+  //     React state through refs, so we never tear down + rebuild on
+  //     every render.
+  //   * The `listening` toggle just calls `.start()` / `.stop()` on
+  //     that single instance (separate effect below). No re-creation,
+  //     no re-binding, no double-start race.
+  //   * Pause-based auto-submit: the browser engine flips `isFinal`
+  //     when it hears trailing silence (~700-1000 ms). That's our
+  //     "natural pause" detector — no extra VAD library needed.
+  //   * Echo suppression: anything captured while Avi is speaking is
+  //     dropped on the floor (it's almost certainly his own voice
+  //     coming back through the speakers).
+  //   * Reconnect with backoff: continuous mode quietly ends every
+  //     ~30-60 s on Chrome. We restart it after a short delay; on
+  //     consecutive non-benign errors we back off exponentially so a
+  //     stuck "not-allowed" can't spin into a toast-spam loop.
+  //   * Errors toast at most ONCE per kind per page load.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recRef = useRef<any | null>(null);
+  // What the user *wants*: read by the recognizer's onend callback so
+  // it knows whether to restart itself after each chunk.
+  const shouldListenRef = useRef(listening);
   useEffect(() => {
-    if (!listening || !speechSupported) return;
+    shouldListenRef.current = listening;
+  }, [listening]);
+
+  // Mount-once: create the recognizer the moment we detect support.
+  useEffect(() => {
+    if (!speechSupported) return;
     const W = window as unknown as {
       SpeechRecognition?: new () => unknown;
       webkitSpeechRecognition?: new () => unknown;
@@ -1514,7 +1867,43 @@ function ChatPanel({
     rec.lang = "en-US";
     rec.continuous = true;
     rec.interimResults = true;
-    let finalText = "";
+
+    // Accumulates finalised fragments between auto-submits. An
+    // utterance can produce more than one `isFinal` chunk in a row,
+    // so we concatenate until the user pauses *and* Avi isn't
+    // speaking — only then do we submit and clear.
+    let pendingFinal = "";
+    // Backoff bookkeeping for the auto-restart loop.
+    let restartTimer: number | null = null;
+    let consecutiveErrors = 0;
+    const reportedErrors = new Set<string>();
+
+    const scheduleRestart = () => {
+      if (restartTimer !== null) return;
+      if (!shouldListenRef.current) return;
+      // 250 ms when healthy; exponential up to 15 s on errors.
+      const delay =
+        consecutiveErrors === 0
+          ? 250
+          : Math.min(15_000, 500 * 2 ** (consecutiveErrors - 1));
+      restartTimer = window.setTimeout(() => {
+        restartTimer = null;
+        if (!shouldListenRef.current) return;
+        try {
+          rec.start();
+        } catch {
+          /* already started — ignore */
+        }
+      }, delay);
+    };
+
+    let running = false;
+    rec.onstart = () => {
+      running = true;
+      consecutiveErrors = 0;
+      console.info("[speech] recognizer started");
+    };
+
     rec.onresult = (e: {
       resultIndex: number;
       results: {
@@ -1522,51 +1911,167 @@ function ChatPanel({
         [k: number]: { transcript: string };
       }[];
     }) => {
+      if (audioSpeakingRef.current) {
+        pendingFinal = "";
+        setInput("");
+        return;
+      }
       let interim = "";
+      let sawFinal = false;
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
         if (r.isFinal) {
-          finalText += r[0].transcript;
+          pendingFinal += r[0].transcript;
+          sawFinal = true;
         } else {
           interim += r[0].transcript;
         }
       }
-      setInput((finalText + " " + interim).trim());
+      setInput((pendingFinal + " " + interim).trim());
+      if (!sawFinal) return;
+      if (isStreamingRef.current) return;
+      const toSend = pendingFinal.trim();
+      if (!toSend) return;
+      pendingFinal = "";
+      setInput("");
+      sendUserMessageRef.current(toSend);
     };
-    rec.onerror = () => setListening(false);
-    rec.onend = () => {
-      if (finalText.trim()) {
-        void sendUserMessage(finalText);
-        finalText = "";
-      }
-      // Auto-restart while the toggle is on.
-      if (listening) {
-        try {
-          rec.start();
-        } catch {
-          /* noop */
+
+    rec.onerror = (evt: { error?: string }) => {
+      const code = evt?.error;
+      // "no-speech" and "aborted" are normal in continuous mode.
+      if (!code || code === "no-speech" || code === "aborted") return;
+      consecutiveErrors += 1;
+      console.warn(`[speech] error #${consecutiveErrors}:`, code);
+      // Toast at most once per error kind for the lifetime of the page.
+      if (!reportedErrors.has(code)) {
+        reportedErrors.add(code);
+        if (code === "not-allowed" || code === "service-not-allowed") {
+          toast.error(
+            "Microphone is blocked. Allow mic access in your browser's site settings, then click the mic button to retry."
+          );
+        } else if (code === "audio-capture") {
+          toast.error("No microphone detected on this device.");
+        } else {
+          toast.error(`Mic recognition error: ${code}`);
         }
       }
     };
-    try {
-      rec.start();
-    } catch {
-      /* noop */
-    }
-    recognitionRef.current = {
-      start: () => rec.start(),
-      stop: () => rec.stop(),
+
+    rec.onend = () => {
+      running = false;
+      // Flush any tail still parked from a mid-sentence pause before
+      // the engine ended (rare but possible on an engine-side timeout).
+      const tail = pendingFinal.trim();
+      if (tail && !audioSpeakingRef.current && !isStreamingRef.current) {
+        pendingFinal = "";
+        setInput("");
+        sendUserMessageRef.current(tail);
+      }
+      scheduleRestart();
     };
-    return () => {
+
+    // Single helper: attempt to start the recognizer iff the user
+    // wants to listen and we're not already running. Logs both the
+    // success path (via `onstart`) and any synchronous throw so we
+    // can debug "I never saw the prompt" reports from devtools.
+    const tryStart = (origin: string) => {
+      if (!shouldListenRef.current) return;
+      if (running) return;
       try {
+        rec.start();
+        console.info(`[speech] start() called from ${origin}`);
+      } catch (err) {
+        console.warn(`[speech] start() threw from ${origin}:`, err);
+      }
+    };
+
+    recRef.current = rec;
+
+    // Best-effort autostart on mount. In modern Chrome this works
+    // when mic permission is already "granted"; if it's "prompt" or
+    // gesture-gated, the call is silently rejected (no onerror, no
+    // prompt) and we fall back to the first-click listener below.
+    tryStart("mount");
+
+    // Permission-state-aware bootstrap. If we can read the permission
+    // we log it for debugging, and if it's currently "prompt" we wait
+    // for the state to flip to "granted" (e.g., user grants via the
+    // address-bar prompt) and start automatically.
+    let permStatus: PermissionStatus | null = null;
+    const onPermChange = () => {
+      console.info(`[speech] mic permission changed → ${permStatus?.state}`);
+      if (permStatus?.state === "granted") tryStart("perm-grant");
+    };
+    (async () => {
+      try {
+        // The TS dom typings only know a few PermissionName values;
+        // "microphone" is valid in Chrome/Edge/Safari but flagged.
+        const status = await navigator.permissions.query({
+          name: "microphone" as PermissionName,
+        });
+        permStatus = status;
+        console.info(`[speech] mic permission state: ${status.state}`);
+        if (status.state === "granted") tryStart("perm-query");
+        status.addEventListener("change", onPermChange);
+      } catch (err) {
+        console.debug("[speech] permission query unsupported", err);
+      }
+    })();
+
+    // Safety net: the FIRST user interaction with the page is a
+    // guaranteed user gesture. If autostart was silently refused we
+    // try again here. Any subsequent clicks are no-ops because
+    // `running` is true.
+    const onFirstGesture = () => {
+      tryStart("first-gesture");
+    };
+    document.addEventListener("pointerdown", onFirstGesture, { once: false });
+    document.addEventListener("keydown", onFirstGesture, { once: false });
+
+    return () => {
+      document.removeEventListener("pointerdown", onFirstGesture);
+      document.removeEventListener("keydown", onFirstGesture);
+      if (permStatus) permStatus.removeEventListener("change", onPermChange);
+      if (restartTimer !== null) {
+        clearTimeout(restartTimer);
+        restartTimer = null;
+      }
+      try {
+        rec.onend = null;
         rec.stop();
       } catch {
         /* noop */
       }
-      recognitionRef.current = null;
+      recRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [listening, speechSupported]);
+  }, [speechSupported]);
+
+  // Drive the existing recognizer from the listening toggle. No
+  // tear-down / rebuild — just `.start()` / `.stop()`.
+  useEffect(() => {
+    const rec = recRef.current;
+    if (!rec) return;
+    if (listening) {
+      try {
+        rec.start();
+        console.info("[speech] start() called from listening-toggle");
+      } catch (err) {
+        console.warn(
+          "[speech] start() threw from listening-toggle (probably already running):",
+          err
+        );
+      }
+    } else {
+      try {
+        rec.stop();
+        console.info("[speech] stop() called from listening-toggle");
+      } catch {
+        /* noop */
+      }
+    }
+  }, [listening]);
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();

@@ -66,3 +66,7 @@ class Family(Base, TimestampMixin):
     residences: Mapped[List["Residence"]] = relationship(  # noqa: F821
         back_populates="family", cascade="all, delete-orphan"
     )
+    live_sessions: Mapped[List["LiveSession"]] = relationship(  # noqa: F821
+        cascade="all, delete-orphan",
+        order_by="LiveSession.started_at.desc()",
+    )
