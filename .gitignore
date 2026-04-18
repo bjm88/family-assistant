@@ -6,9 +6,19 @@ dist/
 wheels/
 *.egg-info
 
+# Python tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
 # Virtual environments
 .venv
 .env
+.env.*
+!.env.example
 
 # Node / React
 node_modules/
@@ -19,5 +29,22 @@ ui/react/.vite/
 resources/family/*
 !resources/family/.gitkeep
 
+# Lazy-downloaded AI model weights (hundreds of MB each — fetched on
+# first use of InsightFace face recognition and Kokoro TTS).
+resources/models/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs & tempfiles
+*.log
+*.bak
+*.tmp
+*.pid
+
 # OS
 .DS_Store
+Thumbs.db

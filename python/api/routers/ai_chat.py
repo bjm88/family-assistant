@@ -42,15 +42,32 @@ class ChatMessage(BaseModel):
 class GreetRequest(BaseModel):
     family_id: int
     person_id: int
-    include_goal_question: bool = True
+    # Kept for backwards compatibility with any early caller; the greet
+    # path is now pure template and never hits the LLM. Use /followup
+    # for the goal-based question.
+    include_goal_question: bool = False
 
 
 class GreetResponse(BaseModel):
     family_id: int
     person_id: int
     greeting: str
+    # "template" for the instant path, "<model>" when the LLM was used.
     used_model: str
     context_preview: str
+
+
+class FollowupRequest(BaseModel):
+    family_id: int
+    person_id: int
+
+
+class FollowupResponse(BaseModel):
+    family_id: int
+    person_id: int
+    question: str
+    goal_name: Optional[str]
+    used_model: str
 
 
 class ChatRequest(BaseModel):
@@ -106,48 +123,78 @@ async def status() -> StatusResponse:
 # ---------- Greet ---------------------------------------------------------
 
 
+def _display_name(person: models.Person) -> str:
+    return person.preferred_name or person.first_name or f"Person {person.person_id}"
+
+
 @router.post("/greet", response_model=GreetResponse)
 async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetResponse:
+    """Instant, no-LLM greeting so Avi can *start talking* within a few
+    hundred milliseconds of spotting a face. The contextual question
+    ("how's your diet going?") comes from ``/followup`` and is spoken
+    after the greeting finishes playing.
+    """
+    person = db.get(models.Person, payload.person_id)
+    if person is None or person.family_id != payload.family_id:
+        raise HTTPException(status_code=404, detail="Person not found in this family")
+
+    context = rag.build_person_context(db, person)
+    return GreetResponse(
+        family_id=payload.family_id,
+        person_id=payload.person_id,
+        greeting=f"Hi {_display_name(person)}!",
+        used_model="template",
+        context_preview=context,
+    )
+
+
+# ---------- Follow-up question (LLM) -------------------------------------
+
+
+@router.post("/followup", response_model=FollowupResponse)
+async def followup(
+    payload: FollowupRequest, db: Session = Depends(get_db)
+) -> FollowupResponse:
+    """LLM-generated, one-sentence follow-up aimed at the person's most
+    salient goal (or a generic "how are you?" when they haven't set one).
+    Runs asynchronously while the instant greeting is already playing.
+    """
     person = db.get(models.Person, payload.person_id)
     if person is None or person.family_id != payload.family_id:
         raise HTTPException(status_code=404, detail="Person not found in this family")
 
     assistant_name, family_name = _load_assistant(db, payload.family_id)
     context = rag.build_person_context(db, person)
-    family = db.get(models.Family, payload.family_id)
-    family_overview = rag.build_family_overview(db, family) if family else ""
+    goal = rag.pick_goal_for_question(person)
 
-    goal = rag.pick_goal_for_question(person) if payload.include_goal_question else None
-
-    instructions: List[str] = [
-        "Greet them warmly by their preferred name (use exactly one greeting line).",
-        "Keep the full response to 2 short sentences, maximum 40 words.",
-    ]
     if goal is not None:
-        instructions.append(
-            "After the greeting, ask ONE genuinely curious, specific follow-up "
-            f"question about their goal: \"{goal.goal_name}\""
+        task = (
+            "Ask ONE short, specific, warmly-phrased follow-up question about "
+            f"their goal: \"{goal.goal_name}\""
             + (f" — {goal.description}" if goal.description else "")
-            + ". Make the question feel fresh, not templated."
+            + ". Make it conversational, not templated. Single sentence only."
         )
     else:
-        instructions.append(
-            "After the greeting, ask one short, open-ended question about "
-            "how they're doing today."
+        task = (
+            "Ask ONE short, open-ended question about how they're doing today. "
+            "Single sentence only."
         )
 
     prompt = (
-        "You just saw the following family member walk into the room.\n\n"
-        f"--- Family context ---\n{family_overview}\n\n"
+        "You just greeted this family member and want to keep the "
+        "conversation going.\n\n"
         f"--- Who you are talking to ---\n{context}\n\n"
-        f"--- Your task ---\n" + "\n".join(f"- {x}" for x in instructions)
-        + "\n\nReply with only the spoken greeting, no preamble, no quotes."
+        f"--- Your task ---\n{task}\n\n"
+        "Reply with only the spoken question — no preamble, no quotes, "
+        "no restating their name."
     )
 
     system = ollama.system_prompt_for_avi(assistant_name, family_name)
 
     try:
-        greeting = await ollama.generate(prompt, system=system, temperature=0.8)
+        question = await ollama.generate(
+            prompt, system=system, temperature=0.8, max_tokens=120
+        )
     except ollama.OllamaUnavailable as e:
         raise HTTPException(
             status_code=503,
@@ -159,12 +206,12 @@ async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetRe
     except ollama.OllamaError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    return GreetResponse(
+    return FollowupResponse(
         family_id=payload.family_id,
         person_id=payload.person_id,
-        greeting=greeting or f"Hi {person.preferred_name or person.first_name}!",
+        question=(question or "How's your day going?").strip(),
+        goal_name=goal.goal_name if goal else None,
         used_model=ollama._model(),
-        context_preview=context,
     )
 
 

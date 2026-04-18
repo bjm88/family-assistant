@@ -19,6 +19,8 @@ import {
   User,
   Video,
   VideoOff,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import { api, resolveApiPath } from "@/lib/api";
 import type { Assistant, Family } from "@/lib/types";
@@ -59,6 +61,15 @@ type FaceStatus = {
   enrolled_embeddings: number;
 };
 
+type TtsStatus = {
+  enabled: boolean;
+  engine: string;
+  default_voice: string;
+  model_present: boolean;
+  voices_present: boolean;
+  initialized: boolean;
+};
+
 type RecognizeResponse = {
   matched: boolean;
   person_id: number | null;
@@ -83,6 +94,113 @@ const FACE_RECOG_INTERVAL_MS = 2500;
 // After we greet someone, suppress re-greetings for this long so Avi
 // doesn't loop "Hi Sam!" every time they blink.
 const GREETING_SUPPRESSION_MS = 90_000;
+
+// -------------------------------------------------------------------------
+// Audio queue — plays Kokoro WAV clips one after another without overlap.
+// Returns a handle with `enqueue(text, voiceHint)` and `mute`/`unmute`.
+// We keep a single <audio> element and an array of pending blob URLs so
+// the "instant greeting" and the "LLM follow-up" can be fired in parallel
+// but played sequentially.
+// -------------------------------------------------------------------------
+type AudioQueueHandle = {
+  enqueue: (text: string, opts?: { gender_hint?: string | null }) => void;
+  setMuted: (muted: boolean) => void;
+};
+
+function useAudioQueue(muted: boolean): AudioQueueHandle {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const queueRef = useRef<
+    Array<{ text: string; gender_hint?: string | null; token: number }>
+  >([]);
+  const playingRef = useRef(false);
+  const tokenRef = useRef(0);
+  const mutedRef = useRef(muted);
+  mutedRef.current = muted;
+
+  useEffect(() => {
+    if (!audioRef.current) {
+      audioRef.current = new Audio();
+    }
+  }, []);
+
+  const playNext = useCallback(async () => {
+    if (playingRef.current) return;
+    const next = queueRef.current.shift();
+    if (!next) return;
+    if (mutedRef.current) {
+      return playNext();
+    }
+    playingRef.current = true;
+    try {
+      const resp = await fetch(resolveApiPath("/api/aiassistant/tts"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: next.text,
+          gender_hint: next.gender_hint ?? undefined,
+        }),
+      });
+      if (!resp.ok) throw new Error(`TTS HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = audioRef.current!;
+      audio.src = url;
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        playingRef.current = false;
+        void playNext();
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        playingRef.current = false;
+        void playNext();
+      };
+      try {
+        await audio.play();
+      } catch (err) {
+        // Autoplay was blocked — surface a hint in the console so the
+        // user knows to interact with the page once.
+        console.warn("Avi: audio playback blocked until first user gesture", err);
+        playingRef.current = false;
+        // Don't keep retrying — wait for a later enqueue after user interacts.
+      }
+    } catch (err) {
+      console.debug("Avi TTS failed", err);
+      playingRef.current = false;
+      void playNext();
+    }
+  }, []);
+
+  const enqueue = useCallback(
+    (text: string, opts?: { gender_hint?: string | null }) => {
+      if (!text.trim()) return;
+      tokenRef.current += 1;
+      queueRef.current.push({
+        text: text.trim(),
+        gender_hint: opts?.gender_hint ?? null,
+        token: tokenRef.current,
+      });
+      void playNext();
+    },
+    [playNext]
+  );
+
+  const setMuted = useCallback((m: boolean) => {
+    mutedRef.current = m;
+    const audio = audioRef.current;
+    if (audio && m) {
+      try {
+        audio.pause();
+      } catch {
+        /* noop */
+      }
+      queueRef.current = [];
+      playingRef.current = false;
+    }
+  }, []);
+
+  return { enqueue, setMuted };
+}
 
 export default function AiAssistantPage() {
   const { familyId: familyIdParam } = useParams();
@@ -118,6 +236,29 @@ export default function AiAssistantPage() {
     enabled: Number.isFinite(familyId),
   });
 
+  const { data: ttsStatus } = useQuery<TtsStatus>({
+    queryKey: ["ai-tts-status"],
+    queryFn: () => api.get<TtsStatus>("/api/aiassistant/tts/status"),
+    refetchInterval: 20_000,
+  });
+
+  // Speaker toggle — persisted across reloads so a family keeps their
+  // chosen default. Start muted until the user clicks once, to stay on
+  // the right side of browser autoplay policies.
+  const [speakerOn, setSpeakerOn] = useState<boolean>(() => {
+    const v = localStorage.getItem("avi:speakerOn");
+    return v === null ? true : v === "1";
+  });
+  useEffect(() => {
+    localStorage.setItem("avi:speakerOn", speakerOn ? "1" : "0");
+  }, [speakerOn]);
+
+  const audio = useAudioQueue(!speakerOn);
+
+  // Gender hint used to pick Kokoro's voice pack. Falls back to female
+  // if the admin didn't set a gender on the assistant.
+  const voiceGender = assistant?.gender === "male" ? "male" : "female";
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-background to-muted">
       <header className="border-b border-border bg-white">
@@ -138,7 +279,30 @@ export default function AiAssistantPage() {
               </div>
             </div>
           </div>
-          <StatusBadges llm={llmStatus} face={faceStatus} />
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSpeakerOn((s) => !s)}
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs border",
+                speakerOn
+                  ? "bg-primary/10 text-primary border-primary/30 hover:bg-primary/20"
+                  : "bg-muted text-muted-foreground border-border hover:bg-muted/70"
+              )}
+              title={
+                speakerOn
+                  ? "Avi speaks out loud. Click to mute."
+                  : "Avi is muted. Click to enable voice."
+              }
+            >
+              {speakerOn ? (
+                <Volume2 className="h-3.5 w-3.5" />
+              ) : (
+                <VolumeX className="h-3.5 w-3.5" />
+              )}
+              {speakerOn ? "Voice on" : "Voice off"}
+            </button>
+            <StatusBadges llm={llmStatus} face={faceStatus} tts={ttsStatus} />
+          </div>
         </div>
       </header>
 
@@ -152,6 +316,8 @@ export default function AiAssistantPage() {
           familyId={familyId}
           assistantName={assistantName}
           llmStatus={llmStatus}
+          audio={audio}
+          voiceGender={voiceGender}
         />
       </main>
     </div>
@@ -165,9 +331,11 @@ export default function AiAssistantPage() {
 function StatusBadges({
   llm,
   face,
+  tts,
 }: {
   llm: LlmStatus | undefined;
   face: FaceStatus | undefined;
+  tts: TtsStatus | undefined;
 }) {
   return (
     <div className="flex items-center gap-2">
@@ -209,6 +377,28 @@ function StatusBadges({
           face === undefined
             ? undefined
             : `Providers: ${face.providers.join(", ")}. Threshold: ${face.threshold}.`
+        }
+      />
+      <Badge
+        ok={
+          !!tts?.enabled && !!tts?.model_present && !!tts?.voices_present
+        }
+        warn={!!tts?.enabled && (!tts?.model_present || !tts?.voices_present)}
+        label={
+          tts === undefined
+            ? "Voice…"
+            : !tts.enabled
+            ? "Voice off"
+            : !tts.model_present || !tts.voices_present
+            ? "Voice: download pending"
+            : `Voice: ${tts.engine}`
+        }
+        title={
+          tts === undefined
+            ? undefined
+            : tts.initialized
+            ? `${tts.engine} ready.`
+            : `${tts.engine} not yet loaded — first clip downloads ~330 MB.`
         }
       />
     </div>
@@ -496,10 +686,14 @@ function ChatPanel({
   familyId,
   assistantName,
   llmStatus,
+  audio,
+  voiceGender,
 }: {
   familyId: number;
   assistantName: string;
   llmStatus: LlmStatus | undefined;
+  audio: AudioQueueHandle;
+  voiceGender: "male" | "female";
 }) {
   const toast = useToast();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -530,42 +724,39 @@ function ChatPanel({
   }, []);
 
   // Listen for face-recognition greetings fired by the camera loop.
+  // We stash the greeter in a ref so the event handler always calls
+  // the latest closure (audio queue, llmStatus, voiceGender can all
+  // change during the session without re-subscribing).
+  const triggerGreetRef = useRef<(id: number) => void>(() => undefined);
   useEffect(() => {
     const handler = (evt: Event) => {
       const detail = (evt as CustomEvent<GreetEventDetail>).detail;
       if (!detail) return;
       setRecognizedPersonId(detail.person_id);
-      void triggerGreet(detail.person_id);
+      triggerGreetRef.current(detail.person_id);
     };
     window.addEventListener("avi:greet", handler as EventListener);
     return () =>
       window.removeEventListener("avi:greet", handler as EventListener);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [familyId]);
+  }, []);
 
   const appendMessage = useCallback((m: ChatMessage) => {
     setMessages((prev) => [...prev, m]);
   }, []);
 
   async function triggerGreet(personId: number) {
-    if (!llmStatus?.available || !llmStatus.model_pulled) {
-      appendMessage({
-        id: crypto.randomUUID(),
-        role: "system",
-        content: `I spotted someone but can't greet them yet — the local LLM (${
-          llmStatus?.model ?? "?"
-        }) isn't ready.`,
-      });
-      return;
-    }
-    const placeholder: ChatMessage = {
+    // Phase 1 — instant template greeting. No LLM in this path, so it
+    // returns in ~50 ms and we can ship the audio clip immediately.
+    const greetingMsg: ChatMessage = {
       id: crypto.randomUUID(),
       role: "assistant",
       content: "",
       streaming: true,
       meta: "recognized someone",
     };
-    appendMessage(placeholder);
+    appendMessage(greetingMsg);
+
+    let greetingText = "";
     try {
       const resp = await api.post<{
         greeting: string;
@@ -574,17 +765,19 @@ function ChatPanel({
         family_id: familyId,
         person_id: personId,
       });
+      greetingText = resp.greeting;
       setMessages((prev) =>
         prev.map((m) =>
-          m.id === placeholder.id
-            ? { ...m, content: resp.greeting, streaming: false }
+          m.id === greetingMsg.id
+            ? { ...m, content: greetingText, streaming: false }
             : m
         )
       );
+      audio.enqueue(greetingText, { gender_hint: voiceGender });
     } catch (e) {
       setMessages((prev) =>
         prev.map((m) =>
-          m.id === placeholder.id
+          m.id === greetingMsg.id
             ? {
                 ...m,
                 content:
@@ -597,8 +790,56 @@ function ChatPanel({
             : m
         )
       );
+      return;
+    }
+
+    // Phase 2 — LLM-generated follow-up question. Runs in parallel with
+    // the greeting audio so it's usually queued and ready to play the
+    // moment the greeting finishes.
+    if (!llmStatus?.available || !llmStatus.model_pulled) {
+      return;
+    }
+    const followupMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: "",
+      streaming: true,
+      meta: "thinking of a follow-up…",
+    };
+    appendMessage(followupMsg);
+    try {
+      const resp = await api.post<{
+        question: string;
+        goal_name: string | null;
+      }>("/api/aiassistant/followup", {
+        family_id: familyId,
+        person_id: personId,
+      });
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === followupMsg.id
+            ? {
+                ...m,
+                content: resp.question,
+                streaming: false,
+                meta: resp.goal_name
+                  ? `about your goal: ${resp.goal_name}`
+                  : undefined,
+              }
+            : m
+        )
+      );
+      audio.enqueue(resp.question, { gender_hint: voiceGender });
+    } catch (e) {
+      setMessages((prev) =>
+        prev.filter((m) => m.id !== followupMsg.id)
+      );
+      console.debug("Followup failed", e);
     }
   }
+
+  // Keep the ref pointed at the latest closure on every render.
+  triggerGreetRef.current = triggerGreet;
 
   async function sendUserMessage(text: string) {
     const content = text.trim();

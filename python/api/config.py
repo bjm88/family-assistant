@@ -69,6 +69,23 @@ class Settings(BaseSettings):
     # Where InsightFace stores downloaded model packs (~300 MB on first run).
     AI_INSIGHTFACE_HOME: Optional[str] = None
 
+    # ---- Local text-to-speech ------------------------------------------
+    # Master switch for on-device TTS. When false the ``/tts`` endpoint
+    # still responds but returns 503, and the UI falls back to silent text.
+    AI_TTS_ENABLED: bool = True
+    # Which engine to use. Only "kokoro" is implemented today; "chattts"
+    # is reserved for a richer expressive voice later.
+    AI_TTS_ENGINE: str = "kokoro"
+    # Default voice pack. Kokoro ships dozens (af_bella, af_nicole,
+    # am_adam, bm_lewis, …). The assistant's ``gender`` picks a gendered
+    # default when this is left at "auto".
+    AI_TTS_VOICE: str = "auto"
+    # Playback speed multiplier. 1.0 = natural, 1.1 feels a touch snappier.
+    AI_TTS_SPEED: float = 1.0
+    # Where Kokoro ONNX weights + voice pack live. Lazy-downloaded on
+    # first use. Relative paths are resolved against the project root.
+    AI_TTS_MODEL_DIR: str = "./resources/models/kokoro"
+
     @property
     def database_url(self) -> str:
         return (
@@ -81,6 +98,20 @@ class Settings(BaseSettings):
         p = Path(self.FA_STORAGE_ROOT)
         if not p.is_absolute():
             p = (PROJECT_ROOT / p).resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def tts_model_dir(self) -> Path:
+        p = Path(self.AI_TTS_MODEL_DIR)
+        if not p.is_absolute():
+            p = (PROJECT_ROOT / p).resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def tts_cache_dir(self) -> Path:
+        p = self.storage_root / "tts_cache"
         p.mkdir(parents=True, exist_ok=True)
         return p
 

@@ -29,6 +29,7 @@ from .routers import (
     addresses,
     ai_chat,
     ai_face,
+    ai_tts,
     assistants,
     documents,
     families,
@@ -100,6 +101,7 @@ def create_app() -> FastAPI:
 
     app.include_router(ai_face.router, prefix=AI_PREFIX)
     app.include_router(ai_chat.router, prefix=AI_PREFIX)
+    app.include_router(ai_tts.router, prefix=AI_PREFIX)
 
     @app.get("/api/health", tags=["health"])
     def health() -> dict:

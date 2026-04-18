@@ -27,8 +27,12 @@ The project has three cooperating layers:
    that opens the webcam, runs continuous face recognition against the
    enrolled gallery, hands structured context ("who is in front of the
    camera, what are their goals, who are their siblings") to a local
-   LLM, and streams the reply back into a chat panel. A microphone
-   toggle enables Web-Speech-API voice input.
+   LLM, and streams the reply back into a chat panel. Recognized
+   family members get an **instant spoken greeting** (no-LLM template
+   → Kokoro-82M TTS, ~300 ms end-to-end) followed by a contextual
+   LLM-generated follow-up question about their top goal — spoken out
+   loud when the greeting finishes. A microphone toggle enables
+   Web-Speech-API voice input, and a header speaker toggle mutes Avi.
 3. **Shared backend** (`/api/*`) — FastAPI on top of SQLAlchemy 2.0 and
    Postgres. The schema is intentionally verbose and self-describing:
    every table and column carries a Postgres `COMMENT`, and a read-only
@@ -49,13 +53,14 @@ flowchart LR
         direction TB
         AdminRouters["/api/admin/*<br/>families · people · relationships<br/>goals · pets · residences · vehicles<br/>insurance · finances · documents<br/>identity · assistants"]
         MediaRouter["/api/media/*<br/>static file proxy"]
-        AIRouters["/api/aiassistant/*<br/>face/enroll · face/recognize<br/>greet · chat (SSE)"]
+        AIRouters["/api/aiassistant/*<br/>face/enroll · face/recognize<br/>greet · followup · chat (SSE)<br/>tts (audio/wav)"]
 
         subgraph AIModules["AI subsystem (python/api/ai/)"]
             direction TB
             FaceSvc["face.py<br/>InsightFace buffalo_l<br/>CoreML / CPU providers"]
             OllamaSvc["ollama.py<br/>HTTP client · streaming chat"]
             RAG["rag.py<br/>person + goals + tree<br/>→ prompt context"]
+            TTSSvc["tts.py<br/>Kokoro-82M · ONNX Runtime<br/>voice by gender · disk cache"]
         end
 
         Crypto["crypto.py<br/>Fernet envelope"]
@@ -161,6 +166,7 @@ sequenceDiagram
 | File uploads | `python-multipart` · Pillow | Photo + document ingest |
 | Face recognition | **InsightFace** · `onnxruntime` · OpenCV | ArcFace 512-d embeddings, CoreML provider on Apple Silicon |
 | Local LLM client | `httpx` | Streaming Ollama HTTP client |
+| Text-to-speech | **kokoro-onnx** · `soundfile` · `espeakng-loader` | Kokoro-82M neural voices, 24 kHz mono WAV, ONNX Runtime (~300 MB weights) |
 | Image gen (optional) | `google-genai` | Avatar generation for Avi's profile image |
 
 ### Frontend · Node, Vite
@@ -181,6 +187,7 @@ sequenceDiagram
 |---|---|
 | **Ollama** | Serves the chat LLM on `localhost:11434`. Default model is `gemma4`; any Ollama-compatible model works via `AI_OLLAMA_MODEL`. |
 | **InsightFace (buffalo_l)** | Face detection + 512-d ArcFace embeddings. First run downloads ~300 MB into `~/.insightface/`. Uses CoreML provider when `AI_MAC_STUDIO_OPTIMIZED=true` (default). |
+| **Kokoro-82M (kokoro-onnx)** | Neural text-to-speech for Avi's spoken greetings + follow-up questions. Weights (~330 MB total: `kokoro-v1.0.onnx` + `voices-v1.0.bin`) are lazy-downloaded on first `/api/aiassistant/tts` call into `resources/models/kokoro/`. Cached synthesis results live in `resources/family/tts_cache/` so repeat phrases return in ~8 ms. Voice is picked from the assistant's `gender` (female → `af_bella`, male → `am_adam`) or forced via `AI_TTS_VOICE`. |
 
 ## Running
 
@@ -244,8 +251,11 @@ cd ui/react && npm install && cd -
 # 3. Database schema (forward-only; safe to run repeatedly)
 uv run alembic upgrade head
 
-# 4. Re-enroll face embeddings if new recognition photos were added
-curl -s -X POST 'http://localhost:8000/api/aiassistant/face/enroll?family_id=1'
+# 4. Face embeddings for newly uploaded photos enroll automatically via a
+#    background task (see step 8 of Initial Setup). Run this only if you
+#    imported photos directly into the DB or want to force a full
+#    re-enroll of every flagged photo that's missing an embedding.
+# curl -s -X POST 'http://localhost:8000/api/aiassistant/face/enroll?family_id=1'
 ```
 
 If the backend was already running, restart it so freshly added routers
@@ -373,9 +383,18 @@ GEMINI_PROJECT_ID=
 
 # Local AI assistant (Avi)
 AI_OLLAMA_HOST=http://localhost:11434
-AI_OLLAMA_MODEL=gemma4
+AI_OLLAMA_MODEL=gemma4:26b
 AI_FACE_MATCH_THRESHOLD=0.40
 AI_MAC_STUDIO_OPTIMIZED=true
+
+# Text-to-speech (Kokoro-82M). First `/tts` call lazy-downloads ~330 MB.
+AI_TTS_ENABLED=true
+AI_TTS_ENGINE=kokoro
+# "auto" lets the assistant's gender pick the voice pack. Override
+# with any Kokoro voice name (af_bella, af_nicole, am_adam, bm_lewis, ...).
+AI_TTS_VOICE=auto
+AI_TTS_SPEED=1.0
+AI_TTS_MODEL_DIR=./resources/models/kokoro
 ```
 
 ### 7. Run database migrations
@@ -389,18 +408,44 @@ exposes each table/column along with its natural-language description.
 A local LLM can `SELECT * FROM llm_schema_catalog` to discover the
 schema when generating dynamic SQL.
 
-### 8. Enroll faces (after uploading recognition photos)
+### 8. Enroll faces (usually automatic)
 
-In the admin console, open a person, upload photos, tick
-**"Use for face recognition"**, then:
+Uploading a photo through the admin console with **"Use for face
+recognition"** ticked **automatically schedules a background task** that
+extracts an InsightFace embedding and writes it to `face_embeddings`.
+The same is true for toggling the flag on/off on an existing photo, and
+cascade-deletes take care of cleanup when a photo is removed. You
+usually don't need to do anything — the Live AI page's face-status
+badge will tick up from "N faces" to "N+1 faces" a few seconds after
+the upload.
+
+For bulk backfill (e.g. after importing photos straight into the
+database, or on a fresh install where the InsightFace model pack needs
+to download), kick off a one-shot full-family enrollment pass:
 
 ```bash
 curl -s -X POST 'http://localhost:8000/api/aiassistant/face/enroll?family_id=1'
 ```
 
-That walks every flagged photo, extracts an InsightFace embedding, and
-writes it to `face_embeddings`. The Live AI page will start recognizing
-those people on the next webcam frame.
+That walks every flagged photo that doesn't already have an embedding
+and processes them in a single request.
+
+### 9. Warm up the voice (optional, first run only)
+
+The first `POST /api/aiassistant/tts` call downloads the Kokoro-82M
+ONNX weights + voice pack (~330 MB) into `resources/models/kokoro/`
+and initializes the inference session. Everything after is cached;
+identical phrases re-play in ~8 ms and fresh syntheses land in ~300 ms
+on an M-series Mac. To pre-warm so a family member doesn't stare at a
+silent greeting on your very first camera test:
+
+```bash
+curl -s -X POST http://localhost:8000/api/aiassistant/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Hello, I am Avi."}' \
+  --output /tmp/hello.wav
+afplay /tmp/hello.wav   # macOS
+```
 
 ---
 
