@@ -47,6 +47,39 @@ export const PET_ANIMAL_TYPES = [
   "other",
 ] as const;
 
+// Vehicle high-level categories. Mirrors COMMON_VEHICLE_TYPES in
+// ``python/api/models/vehicle.py``. The dashboard's "Cars" gallery
+// filters on the literal value "car".
+export const VEHICLE_TYPES = [
+  "car",
+  "truck",
+  "motorcycle",
+  "boat",
+  "atv",
+  "rv",
+  "airplane",
+  "bicycle",
+  "golf_cart",
+  "tractor",
+  "trailer",
+  "other",
+] as const;
+
+export const VEHICLE_TYPE_LABELS: Record<(typeof VEHICLE_TYPES)[number], string> = {
+  car: "Car",
+  truck: "Truck",
+  motorcycle: "Motorcycle",
+  boat: "Boat",
+  atv: "ATV",
+  rv: "RV",
+  airplane: "Airplane",
+  bicycle: "Bicycle",
+  golf_cart: "Golf cart",
+  tractor: "Tractor",
+  trailer: "Trailer",
+  other: "Other",
+};
+
 export const PRIMARY_RELATIONSHIPS = [
   "self",
   "spouse",

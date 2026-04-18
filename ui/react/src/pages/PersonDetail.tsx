@@ -61,6 +61,7 @@ type PersonForm = {
   mobile_phone_number?: string;
   home_phone_number?: string;
   work_phone_number?: string;
+  interests_and_activities?: string;
   notes?: string;
 };
 
@@ -90,6 +91,7 @@ export default function PersonDetail() {
         mobile_phone_number: person.mobile_phone_number ?? "",
         home_phone_number: person.home_phone_number ?? "",
         work_phone_number: person.work_phone_number ?? "",
+        interests_and_activities: person.interests_and_activities ?? "",
         notes: person.notes ?? "",
       });
     }
@@ -268,6 +270,21 @@ export default function PersonDetail() {
                   {...register("work_phone_number")}
                 />
               </Field>
+              <div className="col-span-2">
+                <Field
+                  label="Interests and activities"
+                  htmlFor="interests_and_activities"
+                  hint="Hobbies, sports, instruments, fandoms — anything Avi can use as conversation starters."
+                >
+                  <textarea
+                    id="interests_and_activities"
+                    className="input"
+                    rows={3}
+                    placeholder="e.g. Plays piano and soccer, loves Lego Star Wars, baking on weekends."
+                    {...register("interests_and_activities")}
+                  />
+                </Field>
+              </div>
               <div className="col-span-2">
                 <Field label="Notes" htmlFor="notes">
                   <textarea id="notes" className="input" rows={3} {...register("notes")} />

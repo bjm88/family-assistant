@@ -26,7 +26,7 @@ from .residence import Residence
 from .residence_photo import ResidencePhoto
 from .identity_document import IdentityDocument
 from .sensitive_identifier import SensitiveIdentifier
-from .vehicle import Vehicle
+from .vehicle import Vehicle, COMMON_VEHICLE_TYPES
 from .insurance_policy import (
     InsurancePolicy,
     InsurancePolicyPerson,
@@ -60,6 +60,7 @@ __all__ = [
     "IdentityDocument",
     "SensitiveIdentifier",
     "Vehicle",
+    "COMMON_VEHICLE_TYPES",
     "InsurancePolicy",
     "InsurancePolicyPerson",
     "InsurancePolicyVehicle",

@@ -31,6 +31,7 @@ export interface Person {
   home_phone_number: string | null;
   work_phone_number: string | null;
   profile_photo_path: string | null;
+  interests_and_activities: string | null;
   notes: string | null;
   created_at: string;
   updated_at: string;
@@ -178,6 +179,8 @@ export interface Vehicle {
   vehicle_id: number;
   family_id: number;
   primary_driver_person_id: number | null;
+  residence_id: number | null;
+  vehicle_type: string;
   nickname: string | null;
   year: number | null;
   make: string;
@@ -193,6 +196,7 @@ export interface Vehicle {
   purchase_date: string | null;
   purchase_price_usd: string | null;
   current_mileage: number | null;
+  profile_image_path: string | null;
   notes: string | null;
 }
 

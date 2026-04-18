@@ -74,6 +74,15 @@ class Person(Base, TimestampMixin):
         ),
     )
 
+    interests_and_activities: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment=(
+            "Free-form list of hobbies, sports, clubs, instruments, "
+            "fandoms, and other recurring activities. Used by the AI "
+            "assistant to seed conversational follow-ups."
+        ),
+    )
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     family: Mapped["Family"] = relationship(back_populates="people")  # noqa: F821

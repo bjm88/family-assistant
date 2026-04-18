@@ -10,6 +10,7 @@ from ._base import OrmModel
 
 
 class VehicleBase(BaseModel):
+    vehicle_type: Optional[str] = Field(None, max_length=40)
     nickname: Optional[str] = Field(None, max_length=60)
     year: Optional[int] = None
     make: str = Field(..., max_length=60)
@@ -24,6 +25,7 @@ class VehicleBase(BaseModel):
     purchase_price_usd: Optional[Decimal] = None
     current_mileage: Optional[int] = None
     primary_driver_person_id: Optional[int] = None
+    residence_id: Optional[int] = None
     notes: Optional[str] = None
 
 
@@ -34,6 +36,7 @@ class VehicleCreate(VehicleBase):
 
 
 class VehicleUpdate(BaseModel):
+    vehicle_type: Optional[str] = Field(None, max_length=40)
     nickname: Optional[str] = None
     year: Optional[int] = None
     make: Optional[str] = None
@@ -48,6 +51,7 @@ class VehicleUpdate(BaseModel):
     purchase_price_usd: Optional[Decimal] = None
     current_mileage: Optional[int] = None
     primary_driver_person_id: Optional[int] = None
+    residence_id: Optional[int] = None
     notes: Optional[str] = None
     vehicle_identification_number: Optional[str] = None
     license_plate_number: Optional[str] = None
@@ -57,6 +61,8 @@ class VehicleRead(OrmModel):
     vehicle_id: int
     family_id: int
     primary_driver_person_id: Optional[int]
+    residence_id: Optional[int]
+    vehicle_type: str
     nickname: Optional[str]
     year: Optional[int]
     make: str
@@ -72,4 +78,5 @@ class VehicleRead(OrmModel):
     purchase_date: Optional[date]
     purchase_price_usd: Optional[Decimal]
     current_mileage: Optional[int]
+    profile_image_path: Optional[str]
     notes: Optional[str]

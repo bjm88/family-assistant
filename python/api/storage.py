@@ -111,6 +111,26 @@ def save_pet_photo(
     return str(dest_path.relative_to(root)), size, mime or "image/jpeg"
 
 
+def save_vehicle_profile_photo(
+    family_id: int,
+    vehicle_id: int,
+    upload_file: BinaryIO,
+    original_filename: str,
+) -> Tuple[str, int]:
+    """Persist a vehicle's profile picture. Returns ``(relative_path, size)``."""
+    root = get_settings().storage_root
+    dest_dir = _ensure_dir(
+        root / f"family_{family_id}" / "vehicles" / f"vehicle_{vehicle_id}"
+    )
+    ext = _ext_from_filename(original_filename) or ".jpg"
+    filename = f"{uuid.uuid4().hex}{ext}"
+    dest_path = dest_dir / filename
+    with open(dest_path, "wb") as out:
+        shutil.copyfileobj(upload_file, out)
+    size = dest_path.stat().st_size
+    return str(dest_path.relative_to(root)), size
+
+
 def save_residence_photo(
     family_id: int,
     residence_id: int,

@@ -4,14 +4,10 @@ import {
   Bot,
   Building2,
   Car,
-  FileText,
   Home,
-  Landmark,
   Network,
   PawPrint,
-  ShieldCheck,
   Star,
-  Users,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
@@ -22,35 +18,10 @@ import type {
   Pet,
   Residence,
   Vehicle,
-  InsurancePolicy,
-  FinancialAccount,
-  DocumentRecord,
 } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
 import { FamilyTreeView } from "@/components/FamilyTreeView";
 import { AssistantAvatar } from "@/pages/AssistantPage";
-
-interface StatCardProps {
-  to: string;
-  label: string;
-  value: number | string;
-  icon: typeof Users;
-}
-function StatCard({ to, label, value, icon: Icon }: StatCardProps) {
-  return (
-    <Link to={to} className="card hover:shadow-md transition-shadow">
-      <div className="card-body flex items-center gap-4">
-        <div className="rounded-md bg-primary/10 text-primary p-3">
-          <Icon className="h-5 w-5" />
-        </div>
-        <div>
-          <div className="text-2xl font-semibold">{value}</div>
-          <div className="text-sm text-muted-foreground">{label}</div>
-        </div>
-      </div>
-    </Link>
-  );
-}
 
 export default function FamilyDashboard() {
   const { familyId } = useParams();
@@ -79,20 +50,11 @@ export default function FamilyDashboard() {
     queryKey: ["vehicles", familyId],
     queryFn: () => api.get<Vehicle[]>(`/api/vehicles?family_id=${familyId}`),
   });
-  const { data: policies } = useQuery<InsurancePolicy[]>({
-    queryKey: ["insurance", familyId],
-    queryFn: () =>
-      api.get<InsurancePolicy[]>(`/api/insurance-policies?family_id=${familyId}`),
-  });
-  const { data: accounts } = useQuery<FinancialAccount[]>({
-    queryKey: ["finances", familyId],
-    queryFn: () =>
-      api.get<FinancialAccount[]>(`/api/financial-accounts?family_id=${familyId}`),
-  });
-  const { data: documents } = useQuery<DocumentRecord[]>({
-    queryKey: ["documents", familyId],
-    queryFn: () => api.get<DocumentRecord[]>(`/api/documents?family_id=${familyId}`),
-  });
+  // Daily-driver gallery — cars and trucks. Boats, ATVs, RVs, etc.
+  // still live on the full Vehicles page reachable from the side nav.
+  const dailyDrivers = (vehicles ?? []).filter(
+    (v) => v.vehicle_type === "car" || v.vehicle_type === "truck"
+  );
   const { data: pets } = useQuery<Pet[]>({
     queryKey: ["pets", Number(familyId)],
     queryFn: () => api.get<Pet[]>(`/api/pets?family_id=${familyId}`),
@@ -110,40 +72,7 @@ export default function FamilyDashboard() {
         description="A quick glance at everything we know about your household."
       />
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-        <StatCard
-          to={`/admin/families/${familyId}/people`}
-          label="People"
-          value={people?.length ?? "—"}
-          icon={Users}
-        />
-        <StatCard
-          to={`/admin/families/${familyId}/vehicles`}
-          label="Vehicles"
-          value={vehicles?.length ?? "—"}
-          icon={Car}
-        />
-        <StatCard
-          to={`/admin/families/${familyId}/insurance`}
-          label="Insurance policies"
-          value={policies?.length ?? "—"}
-          icon={ShieldCheck}
-        />
-        <StatCard
-          to={`/admin/families/${familyId}/finances`}
-          label="Financial accounts"
-          value={accounts?.length ?? "—"}
-          icon={Landmark}
-        />
-        <StatCard
-          to={`/admin/families/${familyId}/documents`}
-          label="Documents"
-          value={documents?.length ?? "—"}
-          icon={FileText}
-        />
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="card lg:col-span-2">
           <div className="card-header">
             <div>
@@ -340,6 +269,64 @@ export default function FamilyDashboard() {
                       </div>
                       <div className="text-xs text-muted-foreground truncate">
                         {[r.city, r.state_or_region].filter(Boolean).join(", ")}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </Link>
+      </div>
+
+      <div className="mt-6">
+        <Link
+          to={`/admin/families/${familyId}/vehicles`}
+          className="card hover:shadow-md transition-shadow block"
+        >
+          <div className="card-header">
+            <div className="card-title flex items-center gap-2">
+              <Car className="h-4 w-4 text-primary" /> Cars &amp; trucks
+              {dailyDrivers.length > 0 && (
+                <span className="badge ml-1">{dailyDrivers.length}</span>
+              )}
+            </div>
+            <span className="text-xs text-primary hover:underline">Manage →</span>
+          </div>
+          <div className="card-body">
+            {dailyDrivers.length === 0 ? (
+              <div className="text-sm text-muted-foreground flex items-center gap-2">
+                <Car className="h-4 w-4" />
+                No cars or trucks yet. Click to add the daily-driver fleet —
+                boats, ATVs, and other vehicles live on the full Vehicles page.
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+                {dailyDrivers.map((v) => (
+                  <div
+                    key={v.vehicle_id}
+                    className="border border-border rounded-lg overflow-hidden bg-white flex flex-col"
+                  >
+                    <div className="aspect-video bg-muted overflow-hidden">
+                      {v.profile_image_path ? (
+                        <img
+                          src={`/api/media/${v.profile_image_path}`}
+                          alt={`${v.make} ${v.model}`}
+                          className="h-full w-full object-cover"
+                        />
+                      ) : (
+                        <div className="h-full w-full flex items-center justify-center text-muted-foreground">
+                          <Car className="h-8 w-8" />
+                        </div>
+                      )}
+                    </div>
+                    <div className="p-3">
+                      <div className="text-sm font-medium truncate">
+                        {v.year ? `${v.year} ` : ""}
+                        {v.make} {v.model}
+                      </div>
+                      <div className="text-xs text-muted-foreground truncate">
+                        {v.nickname ?? v.color ?? v.trim ?? ""}
                       </div>
                     </div>
                   </div>

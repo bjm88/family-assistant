@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import crypto, models, schemas
+from .. import crypto, models, schemas, storage
 from ..db import get_db
 
 router = APIRouter(prefix="/vehicles", tags=["vehicles"])
@@ -85,4 +85,44 @@ def delete_vehicle(vehicle_id: int, db: Session = Depends(get_db)) -> None:
     v = db.get(models.Vehicle, vehicle_id)
     if v is None:
         raise HTTPException(status_code=404, detail="Vehicle not found")
+    storage.delete_if_exists(v.profile_image_path)
     db.delete(v)
+
+
+@router.post("/{vehicle_id}/profile-photo", response_model=schemas.VehicleRead)
+def upload_vehicle_profile_photo(
+    vehicle_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> models.Vehicle:
+    v = db.get(models.Vehicle, vehicle_id)
+    if v is None:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Profile photo must be an image.")
+    storage.delete_if_exists(v.profile_image_path)
+    rel_path, _ = storage.save_vehicle_profile_photo(
+        v.family_id, v.vehicle_id, file.file, file.filename or "vehicle.jpg"
+    )
+    v.profile_image_path = rel_path
+    db.flush()
+    db.refresh(v)
+    return v
+
+
+@router.delete(
+    "/{vehicle_id}/profile-photo",
+    response_model=schemas.VehicleRead,
+)
+def delete_vehicle_profile_photo(
+    vehicle_id: int,
+    db: Session = Depends(get_db),
+) -> models.Vehicle:
+    v = db.get(models.Vehicle, vehicle_id)
+    if v is None:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    storage.delete_if_exists(v.profile_image_path)
+    v.profile_image_path = None
+    db.flush()
+    db.refresh(v)
+    return v

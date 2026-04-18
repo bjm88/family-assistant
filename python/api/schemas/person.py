@@ -20,6 +20,7 @@ class PersonBase(BaseModel):
     mobile_phone_number: Optional[str] = Field(None, max_length=40)
     home_phone_number: Optional[str] = Field(None, max_length=40)
     work_phone_number: Optional[str] = Field(None, max_length=40)
+    interests_and_activities: Optional[str] = None
     notes: Optional[str] = None
 
 
@@ -39,6 +40,7 @@ class PersonUpdate(BaseModel):
     mobile_phone_number: Optional[str] = Field(None, max_length=40)
     home_phone_number: Optional[str] = Field(None, max_length=40)
     work_phone_number: Optional[str] = Field(None, max_length=40)
+    interests_and_activities: Optional[str] = None
     notes: Optional[str] = None
 
 
@@ -57,6 +59,7 @@ class PersonRead(OrmModel):
     home_phone_number: Optional[str]
     work_phone_number: Optional[str]
     profile_photo_path: Optional[str]
+    interests_and_activities: Optional[str]
     notes: Optional[str]
     created_at: datetime
     updated_at: datetime
