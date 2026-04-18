@@ -247,6 +247,39 @@ export interface Goal {
   priority: GoalPriority;
 }
 
+export interface MedicalCondition {
+  medical_condition_id: number;
+  person_id: number;
+  condition_name: string;
+  icd10_code: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  description: string | null;
+}
+
+export interface Medication {
+  medication_id: number;
+  person_id: number;
+  ndc_number: string | null;
+  generic_name: string | null;
+  brand_name: string | null;
+  dosage: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  notes: string | null;
+}
+
+export interface Physician {
+  physician_id: number;
+  person_id: number;
+  physician_name: string;
+  specialty: string | null;
+  address: string | null;
+  phone_number: string | null;
+  email_address: string | null;
+  description: string | null;
+}
+
 export interface Pet {
   pet_id: number;
   family_id: number;

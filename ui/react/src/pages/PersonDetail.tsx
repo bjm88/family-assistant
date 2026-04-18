@@ -7,15 +7,18 @@ import {
 } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { useEffect, useState } from "react";
-import { ArrowLeft, Camera, Image as ImageIcon, Pencil, Plus, Target, Trash2, Upload, X } from "lucide-react";
+import { ArrowLeft, Camera, HeartPulse, Image as ImageIcon, Pencil, Pill, Plus, Stethoscope, Target, Trash2, Upload, X } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   Goal,
   GoalPriority,
   IdentityDocument,
   IdentityDocumentImageSide,
+  MedicalCondition,
+  Medication,
   Person,
   PersonPhoto,
+  Physician,
   SensitiveIdentifier,
 } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
@@ -324,6 +327,15 @@ export default function PersonDetail() {
         </div>
         <div className="lg:col-span-3">
           <GoalsSection personId={Number(personId)} />
+        </div>
+        <div className="lg:col-span-3">
+          <MedicalConditionsSection personId={Number(personId)} />
+        </div>
+        <div className="lg:col-span-3">
+          <MedicationsSection personId={Number(personId)} />
+        </div>
+        <div className="lg:col-span-3">
+          <PhysiciansSection personId={Number(personId)} />
         </div>
         <div className="lg:col-span-3">
           <IdentityDocumentsSection personId={Number(personId)} />
@@ -1400,6 +1412,921 @@ function GoalModal({
               rows={3}
               className="input"
               placeholder="Why this matters, what success looks like…"
+              {...register("description")}
+            />
+          </Field>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// ---------- Medical conditions --------------------------------------------
+
+function MedicalConditionsSection({ personId }: { personId: number }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [editingId, setEditingId] = useState<number | "new" | null>(null);
+
+  const { data: conditions } = useQuery<MedicalCondition[]>({
+    queryKey: ["medical-conditions", personId],
+    queryFn: () =>
+      api.get<MedicalCondition[]>(
+        `/api/medical-conditions?person_id=${personId}`
+      ),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => api.del(`/api/medical-conditions/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["medical-conditions", personId] });
+      toast.success("Condition removed.");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const editing =
+    typeof editingId === "number"
+      ? conditions?.find((c) => c.medical_condition_id === editingId) ?? null
+      : null;
+
+  return (
+    <div className="card">
+      <div className="card-header flex items-center justify-between">
+        <div className="card-title flex items-center gap-2">
+          <HeartPulse className="h-4 w-4 text-rose-500" /> Medical conditions
+        </div>
+        <button className="btn-secondary" onClick={() => setEditingId("new")}>
+          <Plus className="h-4 w-4" /> Add condition
+        </button>
+      </div>
+      <div className="card-body">
+        {!conditions || conditions.length === 0 ? (
+          <div className="text-sm text-muted-foreground">
+            No conditions on file. Add diagnoses (current or past) so Avi can
+            keep them in mind.
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="text-xs text-muted-foreground">
+              <tr className="border-b border-border">
+                <th className="text-left py-2">Condition</th>
+                <th className="text-left">ICD-10</th>
+                <th className="text-left">Started</th>
+                <th className="text-left">Status</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {conditions.map((c) => (
+                <tr
+                  key={c.medical_condition_id}
+                  className="border-b border-border table-row-hover cursor-pointer"
+                  onClick={() => setEditingId(c.medical_condition_id)}
+                >
+                  <td className="py-2">
+                    <div className="font-medium">{c.condition_name}</div>
+                    {c.description && (
+                      <div className="text-xs text-muted-foreground line-clamp-2">
+                        {c.description}
+                      </div>
+                    )}
+                  </td>
+                  <td>
+                    {c.icd10_code ? (
+                      <code className="text-xs">{c.icd10_code}</code>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
+                  <td>{c.start_date ?? "—"}</td>
+                  <td>
+                    {c.end_date ? (
+                      <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-100 text-slate-700 px-2 py-0.5 text-xs">
+                        Resolved {c.end_date}
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 px-2 py-0.5 text-xs">
+                        Active
+                      </span>
+                    )}
+                  </td>
+                  <td className="text-right whitespace-nowrap">
+                    <button
+                      className="text-muted-foreground hover:text-foreground mr-3"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditingId(c.medical_condition_id);
+                      }}
+                      aria-label="Edit condition"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </button>
+                    <button
+                      className="text-destructive hover:text-destructive/80"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (confirm("Delete this condition?"))
+                          del.mutate(c.medical_condition_id);
+                      }}
+                      aria-label="Delete condition"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <MedicalConditionModal
+        open={editingId !== null}
+        mode={editingId === "new" ? "create" : "edit"}
+        condition={editing}
+        personId={personId}
+        onClose={() => setEditingId(null)}
+      />
+    </div>
+  );
+}
+
+type ConditionForm = {
+  condition_name: string;
+  icd10_code?: string;
+  start_date?: string;
+  end_date?: string;
+  description?: string;
+};
+
+const emptyConditionForm = (): ConditionForm => ({
+  condition_name: "",
+  icd10_code: "",
+  start_date: "",
+  end_date: "",
+  description: "",
+});
+
+function MedicalConditionModal({
+  open,
+  mode,
+  condition,
+  personId,
+  onClose,
+}: {
+  open: boolean;
+  mode: "create" | "edit";
+  condition: MedicalCondition | null;
+  personId: number;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { register, handleSubmit, reset } = useForm<ConditionForm>({
+    defaultValues: emptyConditionForm(),
+  });
+
+  useEffect(() => {
+    if (mode === "edit" && condition) {
+      reset({
+        condition_name: condition.condition_name,
+        icd10_code: condition.icd10_code ?? "",
+        start_date: condition.start_date ?? "",
+        end_date: condition.end_date ?? "",
+        description: condition.description ?? "",
+      });
+    } else if (mode === "create") {
+      reset(emptyConditionForm());
+    }
+  }, [mode, condition, reset, open]);
+
+  const create = useMutation({
+    mutationFn: (v: ConditionForm) =>
+      api.post<MedicalCondition>(
+        "/api/medical-conditions",
+        cleanPayload({ ...v, person_id: personId })
+      ),
+    onSuccess: (c) => {
+      qc.invalidateQueries({ queryKey: ["medical-conditions", personId] });
+      toast.success(`Added "${c.condition_name}".`);
+      onClose();
+    },
+    onError: (err: Error) =>
+      toast.error(`Could not add condition: ${err.message}`),
+  });
+
+  const update = useMutation({
+    mutationFn: (v: ConditionForm) => {
+      if (!condition) throw new Error("No condition to update");
+      return api.patch<MedicalCondition>(
+        `/api/medical-conditions/${condition.medical_condition_id}`,
+        cleanPayload(v)
+      );
+    },
+    onSuccess: (c) => {
+      qc.invalidateQueries({ queryKey: ["medical-conditions", personId] });
+      toast.success(`Saved "${c.condition_name}".`);
+      onClose();
+    },
+    onError: (err: Error) => toast.error(`Save failed: ${err.message}`),
+  });
+
+  const pending = create.isPending || update.isPending;
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={mode === "create" ? "Add medical condition" : "Edit medical condition"}
+      footer={
+        <>
+          <button className="btn-secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn-primary"
+            disabled={pending}
+            onClick={handleSubmit((v) =>
+              mode === "create" ? create.mutate(v) : update.mutate(v)
+            )}
+          >
+            {pending
+              ? "Saving…"
+              : mode === "create"
+              ? "Add condition"
+              : "Save changes"}
+          </button>
+        </>
+      }
+    >
+      <form className="grid grid-cols-2 gap-4" onSubmit={(e) => e.preventDefault()}>
+        <div className="col-span-2">
+          <Field label="Condition" htmlFor="condition_name">
+            <input
+              id="condition_name"
+              className="input"
+              placeholder="Type 2 diabetes"
+              {...register("condition_name", { required: true })}
+            />
+          </Field>
+        </div>
+        <Field
+          label="ICD-10 code"
+          htmlFor="icd10_code"
+          hint="Optional — e.g. E11.9"
+        >
+          <input
+            id="icd10_code"
+            className="input"
+            placeholder="E11.9"
+            {...register("icd10_code")}
+          />
+        </Field>
+        <div />
+        <Field label="Start date" htmlFor="condition_start_date">
+          <input
+            id="condition_start_date"
+            type="date"
+            className="input"
+            {...register("start_date")}
+          />
+        </Field>
+        <Field
+          label="End date"
+          htmlFor="condition_end_date"
+          hint="Leave blank if still active."
+        >
+          <input
+            id="condition_end_date"
+            type="date"
+            className="input"
+            {...register("end_date")}
+          />
+        </Field>
+        <div className="col-span-2">
+          <Field label="Description" htmlFor="condition_description">
+            <textarea
+              id="condition_description"
+              rows={3}
+              className="input"
+              placeholder="Symptoms, severity, triggers, treatment plan…"
+              {...register("description")}
+            />
+          </Field>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// ---------- Medications ----------------------------------------------------
+
+function MedicationsSection({ personId }: { personId: number }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [editingId, setEditingId] = useState<number | "new" | null>(null);
+
+  const { data: meds } = useQuery<Medication[]>({
+    queryKey: ["medications", personId],
+    queryFn: () =>
+      api.get<Medication[]>(`/api/medications?person_id=${personId}`),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => api.del(`/api/medications/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["medications", personId] });
+      toast.success("Medication removed.");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const editing =
+    typeof editingId === "number"
+      ? meds?.find((m) => m.medication_id === editingId) ?? null
+      : null;
+
+  const displayName = (m: Medication) =>
+    m.brand_name || m.generic_name || m.ndc_number || `Medication ${m.medication_id}`;
+
+  return (
+    <div className="card">
+      <div className="card-header flex items-center justify-between">
+        <div className="card-title flex items-center gap-2">
+          <Pill className="h-4 w-4 text-indigo-500" /> Medications
+        </div>
+        <button className="btn-secondary" onClick={() => setEditingId("new")}>
+          <Plus className="h-4 w-4" /> Add medication
+        </button>
+      </div>
+      <div className="card-body">
+        {!meds || meds.length === 0 ? (
+          <div className="text-sm text-muted-foreground">
+            No medications on file.
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="text-xs text-muted-foreground">
+              <tr className="border-b border-border">
+                <th className="text-left py-2">Medication</th>
+                <th className="text-left">NDC</th>
+                <th className="text-left">Dosage</th>
+                <th className="text-left">Started</th>
+                <th className="text-left">Status</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {meds.map((m) => (
+                <tr
+                  key={m.medication_id}
+                  className="border-b border-border table-row-hover cursor-pointer"
+                  onClick={() => setEditingId(m.medication_id)}
+                >
+                  <td className="py-2">
+                    <div className="font-medium">{displayName(m)}</div>
+                    {m.brand_name && m.generic_name && (
+                      <div className="text-xs text-muted-foreground">
+                        generic: {m.generic_name}
+                      </div>
+                    )}
+                  </td>
+                  <td>
+                    {m.ndc_number ? (
+                      <code className="text-xs">{m.ndc_number}</code>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
+                  <td>{m.dosage ?? "—"}</td>
+                  <td>{m.start_date ?? "—"}</td>
+                  <td>
+                    {m.end_date ? (
+                      <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-100 text-slate-700 px-2 py-0.5 text-xs">
+                        Stopped {m.end_date}
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 px-2 py-0.5 text-xs">
+                        Active
+                      </span>
+                    )}
+                  </td>
+                  <td className="text-right whitespace-nowrap">
+                    <button
+                      className="text-muted-foreground hover:text-foreground mr-3"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditingId(m.medication_id);
+                      }}
+                      aria-label="Edit medication"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </button>
+                    <button
+                      className="text-destructive hover:text-destructive/80"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (confirm("Delete this medication?"))
+                          del.mutate(m.medication_id);
+                      }}
+                      aria-label="Delete medication"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <MedicationModal
+        open={editingId !== null}
+        mode={editingId === "new" ? "create" : "edit"}
+        medication={editing}
+        personId={personId}
+        onClose={() => setEditingId(null)}
+      />
+    </div>
+  );
+}
+
+type MedicationForm = {
+  ndc_number?: string;
+  generic_name?: string;
+  brand_name?: string;
+  dosage?: string;
+  start_date?: string;
+  end_date?: string;
+  notes?: string;
+};
+
+const emptyMedicationForm = (): MedicationForm => ({
+  ndc_number: "",
+  generic_name: "",
+  brand_name: "",
+  dosage: "",
+  start_date: "",
+  end_date: "",
+  notes: "",
+});
+
+function MedicationModal({
+  open,
+  mode,
+  medication,
+  personId,
+  onClose,
+}: {
+  open: boolean;
+  mode: "create" | "edit";
+  medication: Medication | null;
+  personId: number;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { register, handleSubmit, reset } = useForm<MedicationForm>({
+    defaultValues: emptyMedicationForm(),
+  });
+
+  useEffect(() => {
+    if (mode === "edit" && medication) {
+      reset({
+        ndc_number: medication.ndc_number ?? "",
+        generic_name: medication.generic_name ?? "",
+        brand_name: medication.brand_name ?? "",
+        dosage: medication.dosage ?? "",
+        start_date: medication.start_date ?? "",
+        end_date: medication.end_date ?? "",
+        notes: medication.notes ?? "",
+      });
+    } else if (mode === "create") {
+      reset(emptyMedicationForm());
+    }
+  }, [mode, medication, reset, open]);
+
+  const create = useMutation({
+    mutationFn: (v: MedicationForm) =>
+      api.post<Medication>(
+        "/api/medications",
+        cleanPayload({ ...v, person_id: personId })
+      ),
+    onSuccess: (m) => {
+      qc.invalidateQueries({ queryKey: ["medications", personId] });
+      toast.success(
+        `Added ${m.brand_name || m.generic_name || m.ndc_number || "medication"}.`
+      );
+      onClose();
+    },
+    onError: (err: Error) =>
+      toast.error(`Could not add medication: ${err.message}`),
+  });
+
+  const update = useMutation({
+    mutationFn: (v: MedicationForm) => {
+      if (!medication) throw new Error("No medication to update");
+      return api.patch<Medication>(
+        `/api/medications/${medication.medication_id}`,
+        cleanPayload(v)
+      );
+    },
+    onSuccess: (m) => {
+      qc.invalidateQueries({ queryKey: ["medications", personId] });
+      toast.success(
+        `Saved ${m.brand_name || m.generic_name || m.ndc_number || "medication"}.`
+      );
+      onClose();
+    },
+    onError: (err: Error) => toast.error(`Save failed: ${err.message}`),
+  });
+
+  const pending = create.isPending || update.isPending;
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={mode === "create" ? "Add medication" : "Edit medication"}
+      footer={
+        <>
+          <button className="btn-secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn-primary"
+            disabled={pending}
+            onClick={handleSubmit((v) =>
+              mode === "create" ? create.mutate(v) : update.mutate(v)
+            )}
+          >
+            {pending
+              ? "Saving…"
+              : mode === "create"
+              ? "Add medication"
+              : "Save changes"}
+          </button>
+        </>
+      }
+    >
+      <p className="text-xs text-muted-foreground mb-3">
+        Provide at least one of NDC, generic name, or brand name so the
+        medication is identifiable.
+      </p>
+      <form className="grid grid-cols-2 gap-4" onSubmit={(e) => e.preventDefault()}>
+        <Field label="Brand name" htmlFor="brand_name">
+          <input
+            id="brand_name"
+            className="input"
+            placeholder="Advil"
+            {...register("brand_name")}
+          />
+        </Field>
+        <Field label="Generic name" htmlFor="generic_name">
+          <input
+            id="generic_name"
+            className="input"
+            placeholder="ibuprofen"
+            {...register("generic_name")}
+          />
+        </Field>
+        <Field label="NDC number" htmlFor="ndc_number" hint="FDA National Drug Code, e.g. 0093-7146-01">
+          <input
+            id="ndc_number"
+            className="input"
+            placeholder="0093-7146-01"
+            {...register("ndc_number")}
+          />
+        </Field>
+        <Field label="Dosage" htmlFor="dosage" hint="e.g. 20mg once daily">
+          <input
+            id="dosage"
+            className="input"
+            placeholder="200mg as needed"
+            {...register("dosage")}
+          />
+        </Field>
+        <Field label="Start date" htmlFor="med_start_date">
+          <input
+            id="med_start_date"
+            type="date"
+            className="input"
+            {...register("start_date")}
+          />
+        </Field>
+        <Field label="End date" htmlFor="med_end_date" hint="Leave blank if still taking.">
+          <input
+            id="med_end_date"
+            type="date"
+            className="input"
+            {...register("end_date")}
+          />
+        </Field>
+        <div className="col-span-2">
+          <Field label="Notes" htmlFor="med_notes">
+            <textarea
+              id="med_notes"
+              rows={3}
+              className="input"
+              placeholder="Prescriber, side effects, refill cadence…"
+              {...register("notes")}
+            />
+          </Field>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// ---------- Physicians ----------------------------------------------------
+
+function PhysiciansSection({ personId }: { personId: number }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [editingId, setEditingId] = useState<number | "new" | null>(null);
+
+  const { data: docs } = useQuery<Physician[]>({
+    queryKey: ["physicians", personId],
+    queryFn: () =>
+      api.get<Physician[]>(`/api/physicians?person_id=${personId}`),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => api.del(`/api/physicians/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["physicians", personId] });
+      toast.success("Physician removed.");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const editing =
+    typeof editingId === "number"
+      ? docs?.find((d) => d.physician_id === editingId) ?? null
+      : null;
+
+  return (
+    <div className="card">
+      <div className="card-header flex items-center justify-between">
+        <div className="card-title flex items-center gap-2">
+          <Stethoscope className="h-4 w-4 text-sky-500" /> Physicians
+        </div>
+        <button className="btn-secondary" onClick={() => setEditingId("new")}>
+          <Plus className="h-4 w-4" /> Add physician
+        </button>
+      </div>
+      <div className="card-body">
+        {!docs || docs.length === 0 ? (
+          <div className="text-sm text-muted-foreground">
+            No physicians on file yet.
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="text-xs text-muted-foreground">
+              <tr className="border-b border-border">
+                <th className="text-left py-2">Physician</th>
+                <th className="text-left">Specialty</th>
+                <th className="text-left">Contact</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {docs.map((d) => (
+                <tr
+                  key={d.physician_id}
+                  className="border-b border-border table-row-hover cursor-pointer align-top"
+                  onClick={() => setEditingId(d.physician_id)}
+                >
+                  <td className="py-2">
+                    <div className="font-medium">{d.physician_name}</div>
+                    {d.address && (
+                      <div className="text-xs text-muted-foreground whitespace-pre-line">
+                        {d.address}
+                      </div>
+                    )}
+                  </td>
+                  <td>{d.specialty ?? "—"}</td>
+                  <td>
+                    <div className="text-xs">
+                      {d.phone_number && <div>{d.phone_number}</div>}
+                      {d.email_address && (
+                        <div className="text-muted-foreground">
+                          {d.email_address}
+                        </div>
+                      )}
+                      {!d.phone_number && !d.email_address && "—"}
+                    </div>
+                  </td>
+                  <td className="text-right whitespace-nowrap">
+                    <button
+                      className="text-muted-foreground hover:text-foreground mr-3"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditingId(d.physician_id);
+                      }}
+                      aria-label="Edit physician"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </button>
+                    <button
+                      className="text-destructive hover:text-destructive/80"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (confirm("Delete this physician?"))
+                          del.mutate(d.physician_id);
+                      }}
+                      aria-label="Delete physician"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <PhysicianModal
+        open={editingId !== null}
+        mode={editingId === "new" ? "create" : "edit"}
+        physician={editing}
+        personId={personId}
+        onClose={() => setEditingId(null)}
+      />
+    </div>
+  );
+}
+
+type PhysicianForm = {
+  physician_name: string;
+  specialty?: string;
+  address?: string;
+  phone_number?: string;
+  email_address?: string;
+  description?: string;
+};
+
+const emptyPhysicianForm = (): PhysicianForm => ({
+  physician_name: "",
+  specialty: "",
+  address: "",
+  phone_number: "",
+  email_address: "",
+  description: "",
+});
+
+function PhysicianModal({
+  open,
+  mode,
+  physician,
+  personId,
+  onClose,
+}: {
+  open: boolean;
+  mode: "create" | "edit";
+  physician: Physician | null;
+  personId: number;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { register, handleSubmit, reset } = useForm<PhysicianForm>({
+    defaultValues: emptyPhysicianForm(),
+  });
+
+  useEffect(() => {
+    if (mode === "edit" && physician) {
+      reset({
+        physician_name: physician.physician_name,
+        specialty: physician.specialty ?? "",
+        address: physician.address ?? "",
+        phone_number: physician.phone_number ?? "",
+        email_address: physician.email_address ?? "",
+        description: physician.description ?? "",
+      });
+    } else if (mode === "create") {
+      reset(emptyPhysicianForm());
+    }
+  }, [mode, physician, reset, open]);
+
+  const create = useMutation({
+    mutationFn: (v: PhysicianForm) =>
+      api.post<Physician>(
+        "/api/physicians",
+        cleanPayload({ ...v, person_id: personId })
+      ),
+    onSuccess: (d) => {
+      qc.invalidateQueries({ queryKey: ["physicians", personId] });
+      toast.success(`Added ${d.physician_name}.`);
+      onClose();
+    },
+    onError: (err: Error) =>
+      toast.error(`Could not add physician: ${err.message}`),
+  });
+
+  const update = useMutation({
+    mutationFn: (v: PhysicianForm) => {
+      if (!physician) throw new Error("No physician to update");
+      return api.patch<Physician>(
+        `/api/physicians/${physician.physician_id}`,
+        cleanPayload(v)
+      );
+    },
+    onSuccess: (d) => {
+      qc.invalidateQueries({ queryKey: ["physicians", personId] });
+      toast.success(`Saved ${d.physician_name}.`);
+      onClose();
+    },
+    onError: (err: Error) => toast.error(`Save failed: ${err.message}`),
+  });
+
+  const pending = create.isPending || update.isPending;
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={mode === "create" ? "Add physician" : "Edit physician"}
+      footer={
+        <>
+          <button className="btn-secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn-primary"
+            disabled={pending}
+            onClick={handleSubmit((v) =>
+              mode === "create" ? create.mutate(v) : update.mutate(v)
+            )}
+          >
+            {pending
+              ? "Saving…"
+              : mode === "create"
+              ? "Add physician"
+              : "Save changes"}
+          </button>
+        </>
+      }
+    >
+      <form className="grid grid-cols-2 gap-4" onSubmit={(e) => e.preventDefault()}>
+        <div className="col-span-2">
+          <Field label="Name" htmlFor="physician_name">
+            <input
+              id="physician_name"
+              className="input"
+              placeholder="Dr. Sarah Patel"
+              {...register("physician_name", { required: true })}
+            />
+          </Field>
+        </div>
+        <Field label="Specialty" htmlFor="specialty">
+          <input
+            id="specialty"
+            className="input"
+            placeholder="Pediatrics"
+            {...register("specialty")}
+          />
+        </Field>
+        <Field label="Phone" htmlFor="physician_phone">
+          <input
+            id="physician_phone"
+            className="input"
+            placeholder="(973) 555-0123"
+            {...register("phone_number")}
+          />
+        </Field>
+        <div className="col-span-2">
+          <Field label="Email" htmlFor="physician_email">
+            <input
+              id="physician_email"
+              type="email"
+              className="input"
+              placeholder="office@example.com"
+              {...register("email_address")}
+            />
+          </Field>
+        </div>
+        <div className="col-span-2">
+          <Field label="Address" htmlFor="physician_address">
+            <textarea
+              id="physician_address"
+              rows={2}
+              className="input"
+              placeholder="100 Main St, Suite 400, Mendham, NJ 07945"
+              {...register("address")}
+            />
+          </Field>
+        </div>
+        <div className="col-span-2">
+          <Field label="Notes" htmlFor="physician_description">
+            <textarea
+              id="physician_description"
+              rows={3}
+              className="input"
+              placeholder="What this physician treats, scheduling notes, etc."
               {...register("description")}
             />
           </Field>

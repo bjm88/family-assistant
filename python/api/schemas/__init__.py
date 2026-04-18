@@ -14,6 +14,21 @@ from .person_relationship import (
     PersonRelationshipRead,
 )
 from .goal import GoalCreate, GoalUpdate, GoalRead, GoalPriority
+from .medical_condition import (
+    MedicalConditionCreate,
+    MedicalConditionUpdate,
+    MedicalConditionRead,
+)
+from .medication import (
+    MedicationCreate,
+    MedicationUpdate,
+    MedicationRead,
+)
+from .physician import (
+    PhysicianCreate,
+    PhysicianUpdate,
+    PhysicianRead,
+)
 from .pet import PetCreate, PetUpdate, PetRead
 from .pet_photo import PetPhotoRead, PetPhotoUpdate
 from .address import AddressCreate, AddressUpdate, AddressRead
@@ -76,6 +91,15 @@ __all__ = [
     "GoalUpdate",
     "GoalRead",
     "GoalPriority",
+    "MedicalConditionCreate",
+    "MedicalConditionUpdate",
+    "MedicalConditionRead",
+    "MedicationCreate",
+    "MedicationUpdate",
+    "MedicationRead",
+    "PhysicianCreate",
+    "PhysicianUpdate",
+    "PhysicianRead",
     "PetCreate",
     "PetUpdate",
     "PetRead",

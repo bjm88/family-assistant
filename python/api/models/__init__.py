@@ -19,6 +19,9 @@ from .person_photo import PersonPhoto
 from .face_embedding import FaceEmbedding
 from .person_relationship import PersonRelationship, RELATIONSHIP_TYPES
 from .goal import Goal, GOAL_PRIORITIES
+from .medical_condition import MedicalCondition
+from .medication import Medication
+from .physician import Physician
 from .pet import Pet, COMMON_PET_ANIMAL_TYPES
 from .pet_photo import PetPhoto
 from .address import Address
@@ -51,6 +54,9 @@ __all__ = [
     "RELATIONSHIP_TYPES",
     "Goal",
     "GOAL_PRIORITIES",
+    "MedicalCondition",
+    "Medication",
+    "Physician",
     "Pet",
     "COMMON_PET_ANIMAL_TYPES",
     "PetPhoto",

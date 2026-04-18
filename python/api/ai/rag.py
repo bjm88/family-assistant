@@ -157,6 +157,9 @@ def build_family_overview(db: Session, family: models.Family) -> str:
             .options(
                 selectinload(models.Person.goals),
                 selectinload(models.Person.identity_documents),
+                selectinload(models.Person.medical_conditions),
+                selectinload(models.Person.medications),
+                selectinload(models.Person.physicians),
             )
         ).all()
 
@@ -208,6 +211,44 @@ def build_family_overview(db: Session, family: models.Family) -> str:
                     + "; ".join(
                         f"{g.goal_name} ({g.priority.replace('_', '-')})"
                         for g in top
+                    )
+                )
+            # Active medical conditions / meds inline so the LLM sees
+            # them right next to the person without having to crawl a
+            # second section. Closed conditions (with end_date) are
+            # left out of the per-person summary; they're available
+            # via SQL for follow-up questions about history.
+            active_conditions = [
+                c for c in (p.medical_conditions or []) if c.end_date is None
+            ]
+            if active_conditions:
+                lines.append(
+                    "    conditions: "
+                    + "; ".join(
+                        c.condition_name
+                        + (f" ({c.icd10_code})" if c.icd10_code else "")
+                        for c in active_conditions[:6]
+                    )
+                )
+            active_meds = [
+                m for m in (p.medications or []) if m.end_date is None
+            ]
+            if active_meds:
+                lines.append(
+                    "    medications: "
+                    + "; ".join(
+                        (m.brand_name or m.generic_name or m.ndc_number or "?")
+                        + (f" {m.dosage}" if m.dosage else "")
+                        for m in active_meds[:6]
+                    )
+                )
+            if p.physicians:
+                lines.append(
+                    "    physicians: "
+                    + "; ".join(
+                        doc.physician_name
+                        + (f" ({doc.specialty})" if doc.specialty else "")
+                        for doc in p.physicians[:5]
                     )
                 )
 

@@ -101,3 +101,12 @@ class Person(Base, TimestampMixin):
     goals: Mapped[List["Goal"]] = relationship(  # noqa: F821
         back_populates="person", cascade="all, delete-orphan"
     )
+    medical_conditions: Mapped[List["MedicalCondition"]] = relationship(  # noqa: F821
+        back_populates="person", cascade="all, delete-orphan"
+    )
+    medications: Mapped[List["Medication"]] = relationship(  # noqa: F821
+        back_populates="person", cascade="all, delete-orphan"
+    )
+    physicians: Mapped[List["Physician"]] = relationship(  # noqa: F821
+        back_populates="person", cascade="all, delete-orphan"
+    )
