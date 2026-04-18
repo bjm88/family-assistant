@@ -13,6 +13,7 @@ queries never need to touch ciphertext.
 """
 
 from .family import Family
+from .assistant import Assistant
 from .person import Person
 from .person_photo import PersonPhoto
 from .person_relationship import PersonRelationship, RELATIONSHIP_TYPES
@@ -30,6 +31,7 @@ from .document import Document
 
 __all__ = [
     "Family",
+    "Assistant",
     "Person",
     "PersonPhoto",
     "PersonRelationship",

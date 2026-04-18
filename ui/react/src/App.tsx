@@ -6,6 +6,7 @@ import FamilySettings from "./pages/FamilySettings";
 import PeoplePage from "./pages/PeoplePage";
 import PersonDetail from "./pages/PersonDetail";
 import RelationshipsPage from "./pages/RelationshipsPage";
+import AssistantPage from "./pages/AssistantPage";
 import VehiclesPage from "./pages/VehiclesPage";
 import InsurancePoliciesPage from "./pages/InsurancePoliciesPage";
 import FinancialAccountsPage from "./pages/FinancialAccountsPage";
@@ -22,6 +23,7 @@ export default function App() {
         <Route path="/families/:familyId/people" element={<PeoplePage />} />
         <Route path="/families/:familyId/people/:personId" element={<PersonDetail />} />
         <Route path="/families/:familyId/relationships" element={<RelationshipsPage />} />
+        <Route path="/families/:familyId/assistant" element={<AssistantPage />} />
         <Route path="/families/:familyId/vehicles" element={<VehiclesPage />} />
         <Route path="/families/:familyId/insurance" element={<InsurancePoliciesPage />} />
         <Route path="/families/:familyId/finances" element={<FinancialAccountsPage />} />

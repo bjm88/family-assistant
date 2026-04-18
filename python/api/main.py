@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import get_settings
 from .routers import (
     addresses,
+    assistants,
     documents,
     families,
     financial_accounts,
@@ -50,6 +51,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(families.router)
+    app.include_router(assistants.router)
     app.include_router(people.router)
     app.include_router(person_photos.router)
     app.include_router(person_relationships.router)

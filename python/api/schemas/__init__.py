@@ -6,6 +6,7 @@ columns expose only their ``*_last_four`` counterpart, plus a boolean
 """
 
 from .family import FamilyCreate, FamilyUpdate, FamilyRead, FamilySummary
+from .assistant import AssistantCreate, AssistantUpdate, AssistantRead
 from .person import PersonCreate, PersonUpdate, PersonRead, PersonSummary
 from .person_photo import PersonPhotoRead, PersonPhotoUpdate
 from .person_relationship import (
@@ -41,6 +42,9 @@ __all__ = [
     "FamilyUpdate",
     "FamilyRead",
     "FamilySummary",
+    "AssistantCreate",
+    "AssistantUpdate",
+    "AssistantRead",
     "PersonCreate",
     "PersonUpdate",
     "PersonRead",

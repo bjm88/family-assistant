@@ -1,6 +1,7 @@
 import { NavLink, Outlet, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
+  Bot,
   Car,
   FileText,
   Home,
@@ -18,6 +19,7 @@ const NAV = [
   { to: "", label: "Overview", icon: Home, end: true },
   { to: "people", label: "People", icon: Users },
   { to: "relationships", label: "Relationships", icon: Network },
+  { to: "assistant", label: "Assistant", icon: Bot },
   { to: "vehicles", label: "Vehicles", icon: Car },
   { to: "insurance", label: "Insurance", icon: ShieldCheck },
   { to: "finances", label: "Finances", icon: Landmark },

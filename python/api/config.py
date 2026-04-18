@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -43,6 +43,11 @@ class Settings(BaseSettings):
 
     FA_STORAGE_ROOT: str = "./resources/family"
     FA_CORS_ORIGINS: str = "http://localhost:5173"
+
+    # Third-party model providers. These are unprefixed because they are
+    # shared with other experiments in the same repo.
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_PROJECT_ID: Optional[str] = None
 
     @property
     def database_url(self) -> str:

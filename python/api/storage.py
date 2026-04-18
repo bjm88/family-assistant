@@ -53,6 +53,22 @@ def save_profile_photo(
     return str(dest_path.relative_to(root)), size
 
 
+def save_assistant_avatar(
+    family_id: int, image_bytes: bytes, extension: str = ".png"
+) -> Tuple[str, int]:
+    """Save a freshly generated assistant avatar to disk.
+
+    Returns ``(relative_path, bytes_written)``.
+    """
+    root = get_settings().storage_root
+    dest_dir = _ensure_dir(root / f"family_{family_id}" / "assistant")
+    filename = f"{uuid.uuid4().hex}{extension or '.png'}"
+    dest_path = dest_dir / filename
+    with open(dest_path, "wb") as out:
+        out.write(image_bytes)
+    return str(dest_path.relative_to(root)), len(image_bytes)
+
+
 def save_person_photo(
     family_id: int,
     person_id: int,

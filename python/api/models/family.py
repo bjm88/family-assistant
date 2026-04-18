@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy import String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -54,4 +54,9 @@ class Family(Base, TimestampMixin):
     )
     addresses: Mapped[List["Address"]] = relationship(  # noqa: F821
         back_populates="family", cascade="all, delete-orphan"
+    )
+    assistant: Mapped[Optional["Assistant"]] = relationship(  # noqa: F821
+        back_populates="family",
+        cascade="all, delete-orphan",
+        uselist=False,
     )

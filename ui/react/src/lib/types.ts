@@ -36,6 +36,19 @@ export interface Person {
   updated_at: string;
 }
 
+export interface Assistant {
+  assistant_id: number;
+  family_id: number;
+  assistant_name: string;
+  gender: "male" | "female" | null;
+  visual_description: string | null;
+  personality_description: string | null;
+  profile_image_path: string | null;
+  avatar_generation_note: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface PersonPhoto {
   person_photo_id: number;
   person_id: number;
