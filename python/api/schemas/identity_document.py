@@ -48,3 +48,5 @@ class IdentityDocumentRead(OrmModel):
     issue_date: Optional[date]
     expiration_date: Optional[date]
     notes: Optional[str]
+    front_image_path: Optional[str] = None
+    back_image_path: Optional[str] = None

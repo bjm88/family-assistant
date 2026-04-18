@@ -1,15 +1,29 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import crypto, models, schemas
+from .. import crypto, models, schemas, storage
 from ..db import get_db
 
 router = APIRouter(prefix="/api/identity-documents", tags=["identity_documents"])
+
+Side = Literal["front", "back"]
+
+
+def _image_path_attr(side: Side) -> str:
+    return "front_image_path" if side == "front" else "back_image_path"
 
 
 @router.get("", response_model=List[schemas.IdentityDocumentRead])
@@ -73,4 +87,75 @@ def delete_identity_document(identity_document_id: int, db: Session = Depends(ge
     doc = db.get(models.IdentityDocument, identity_document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Identity document not found")
+    # Clean up any image scans we stored for this document.
+    storage.delete_if_exists(doc.front_image_path)
+    storage.delete_if_exists(doc.back_image_path)
     db.delete(doc)
+
+
+@router.post(
+    "/{identity_document_id}/images/{side}",
+    response_model=schemas.IdentityDocumentRead,
+)
+def upload_identity_document_image(
+    identity_document_id: int,
+    side: Side,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> models.IdentityDocument:
+    """Attach a front- or back-side scan/photo to an identity document.
+
+    Replaces any previous image stored for that side. The old file (if any)
+    is deleted from disk after the new one is written.
+    """
+    doc = db.get(models.IdentityDocument, identity_document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Identity document not found")
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400, detail="Identity document scans must be images."
+        )
+
+    person = db.get(models.Person, doc.person_id)
+    if person is None:
+        # Should not happen given FK constraints, but guard anyway.
+        raise HTTPException(status_code=404, detail="Person not found")
+
+    rel_path, _, _ = storage.save_identity_document_image(
+        person.family_id,
+        person.person_id,
+        doc.identity_document_id,
+        side,
+        file.file,
+        file.filename or f"{side}.jpg",
+    )
+
+    attr = _image_path_attr(side)
+    previous = getattr(doc, attr)
+    setattr(doc, attr, rel_path)
+    db.flush()
+    if previous and previous != rel_path:
+        storage.delete_if_exists(previous)
+    db.refresh(doc)
+    return doc
+
+
+@router.delete(
+    "/{identity_document_id}/images/{side}",
+    response_model=schemas.IdentityDocumentRead,
+)
+def delete_identity_document_image(
+    identity_document_id: int,
+    side: Side,
+    db: Session = Depends(get_db),
+) -> models.IdentityDocument:
+    doc = db.get(models.IdentityDocument, identity_document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Identity document not found")
+    attr = _image_path_attr(side)
+    previous = getattr(doc, attr)
+    setattr(doc, attr, None)
+    db.flush()
+    storage.delete_if_exists(previous)
+    db.refresh(doc)
+    return doc

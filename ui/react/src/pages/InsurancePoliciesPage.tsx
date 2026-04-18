@@ -9,6 +9,8 @@ import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
+import { useToast } from "@/components/Toast";
+import { stripEmpty } from "@/lib/form";
 
 const POLICY_TYPES = [
   "auto",
@@ -30,6 +32,7 @@ const BILLING = ["monthly", "quarterly", "semi_annual", "annual"];
 export default function InsurancePoliciesPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
+  const toast = useToast();
   const [open, setOpen] = useState(false);
 
   const { data } = useQuery<InsurancePolicy[]>({
@@ -47,25 +50,35 @@ export default function InsurancePoliciesPage() {
   });
 
   const create = useMutation({
-    mutationFn: (v: any) => {
-      const body: any = { ...v, family_id: Number(familyId) };
-      body.covered_person_ids = Array.isArray(v.covered_person_ids)
-        ? v.covered_person_ids.map(Number)
-        : [];
-      body.covered_vehicle_ids = Array.isArray(v.covered_vehicle_ids)
-        ? v.covered_vehicle_ids.map(Number)
-        : [];
-      return api.post("/api/insurance-policies", body);
+    mutationFn: (v: Record<string, unknown>) => {
+      const cleaned = stripEmpty(v);
+      const body: Record<string, unknown> = {
+        ...cleaned,
+        family_id: Number(familyId),
+        covered_person_ids: Array.isArray(v.covered_person_ids)
+          ? (v.covered_person_ids as string[]).map(Number)
+          : [],
+        covered_vehicle_ids: Array.isArray(v.covered_vehicle_ids)
+          ? (v.covered_vehicle_ids as string[]).map(Number)
+          : [],
+      };
+      return api.post<InsurancePolicy>("/api/insurance-policies", body);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["insurance", familyId] });
       setOpen(false);
       reset();
+      toast.success("Insurance policy added.");
     },
+    onError: (err: Error) => toast.error(`Could not add policy: ${err.message}`),
   });
   const del = useMutation({
     mutationFn: (id: number) => api.del(`/api/insurance-policies/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["insurance", familyId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["insurance", familyId] });
+      toast.success("Policy removed.");
+    },
+    onError: (err: Error) => toast.error(`Could not remove policy: ${err.message}`),
   });
 
   const { register, handleSubmit, reset } = useForm<any>();

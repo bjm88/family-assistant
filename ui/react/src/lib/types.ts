@@ -99,7 +99,11 @@ export interface IdentityDocument {
   issue_date: string | null;
   expiration_date: string | null;
   notes: string | null;
+  front_image_path: string | null;
+  back_image_path: string | null;
 }
+
+export type IdentityDocumentImageSide = "front" | "back";
 
 export interface SensitiveIdentifier {
   sensitive_identifier_id: number;
@@ -164,6 +168,41 @@ export interface FinancialAccount {
   credit_limit_usd: string | null;
   online_login_url: string | null;
   notes: string | null;
+}
+
+export type GoalPriority = "urgent" | "semi_urgent" | "normal" | "low";
+
+export interface Goal {
+  goal_id: number;
+  person_id: number;
+  goal_name: string;
+  description: string | null;
+  start_date: string | null;
+  priority: GoalPriority;
+}
+
+export interface Pet {
+  pet_id: number;
+  family_id: number;
+  pet_name: string;
+  animal_type: string;
+  breed: string | null;
+  color: string | null;
+  date_of_birth: string | null;
+  notes: string | null;
+}
+
+export interface PetPhoto {
+  pet_photo_id: number;
+  pet_id: number;
+  title: string;
+  description: string | null;
+  stored_file_path: string;
+  original_file_name: string;
+  mime_type: string | null;
+  file_size_bytes: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface DocumentRecord {

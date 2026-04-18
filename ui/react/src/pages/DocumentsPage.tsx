@@ -9,6 +9,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
+import { useToast } from "@/components/Toast";
 
 const CATEGORIES = [
   "tax",
@@ -26,6 +27,7 @@ const CATEGORIES = [
 export default function DocumentsPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
+  const toast = useToast();
   const [open, setOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -58,11 +60,17 @@ export default function DocumentsPage() {
       setOpen(false);
       reset();
       if (fileRef.current) fileRef.current.value = "";
+      toast.success("Document uploaded.");
     },
+    onError: (err: Error) => toast.error(`Upload failed: ${err.message}`),
   });
   const del = useMutation({
     mutationFn: (id: number) => api.del(`/api/documents/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["documents", familyId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["documents", familyId] });
+      toast.success("Document removed.");
+    },
+    onError: (err: Error) => toast.error(`Could not remove document: ${err.message}`),
   });
 
   const { register, handleSubmit, reset } = useForm<any>();

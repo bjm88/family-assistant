@@ -9,6 +9,8 @@ import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
+import { useToast } from "@/components/Toast";
+import { cleanPayload } from "@/lib/form";
 
 const BODY_STYLES = [
   "sedan",
@@ -24,9 +26,12 @@ const BODY_STYLES = [
 ];
 const FUEL_TYPES = ["gasoline", "diesel", "hybrid", "plug_in_hybrid", "electric"];
 
+type VehicleForm = Record<string, string | undefined>;
+
 export default function VehiclesPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
+  const toast = useToast();
   const [open, setOpen] = useState(false);
 
   const { data: vehicles } = useQuery<Vehicle[]>({
@@ -39,27 +44,38 @@ export default function VehiclesPage() {
   });
 
   const create = useMutation({
-    mutationFn: (v: any) => {
-      const cleaned = { ...v, family_id: Number(familyId) };
-      if (cleaned.year) cleaned.year = Number(cleaned.year);
-      if (cleaned.current_mileage) cleaned.current_mileage = Number(cleaned.current_mileage);
-      if (cleaned.primary_driver_person_id)
-        cleaned.primary_driver_person_id = Number(cleaned.primary_driver_person_id);
-      else delete cleaned.primary_driver_person_id;
-      return api.post("/api/vehicles", cleaned);
+    mutationFn: (v: VehicleForm) => {
+      const cleaned = cleanPayload(v, [
+        "year",
+        "current_mileage",
+        "primary_driver_person_id",
+        "purchase_price_usd",
+      ]);
+      return api.post<Vehicle>("/api/vehicles", {
+        ...cleaned,
+        family_id: Number(familyId),
+      });
     },
-    onSuccess: () => {
+    onSuccess: (v) => {
       qc.invalidateQueries({ queryKey: ["vehicles", familyId] });
       setOpen(false);
       reset();
+      toast.success(
+        `Added ${v.year ? `${v.year} ` : ""}${v.make} ${v.model}.`
+      );
     },
+    onError: (err: Error) => toast.error(`Could not add vehicle: ${err.message}`),
   });
   const del = useMutation({
     mutationFn: (id: number) => api.del(`/api/vehicles/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["vehicles", familyId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["vehicles", familyId] });
+      toast.success("Vehicle removed.");
+    },
+    onError: (err: Error) => toast.error(`Could not remove vehicle: ${err.message}`),
   });
 
-  const { register, handleSubmit, reset } = useForm<any>();
+  const { register, handleSubmit, reset } = useForm<VehicleForm>();
 
   const peopleById = new Map((people ?? []).map((p) => [p.person_id, p]));
 

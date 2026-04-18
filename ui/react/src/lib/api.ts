@@ -27,13 +27,33 @@ async function request<T>(
     } catch {
       /* noop */
     }
-    const message =
-      (body as { detail?: string } | null)?.detail ||
-      `Request to ${path} failed with ${res.status}`;
+    const message = formatErrorMessage(res.status, path, body);
     throw new ApiError(res.status, message, body);
   }
   if (!parseJson || res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+// FastAPI's 422 body looks like `{"detail": [{"loc": ["body", "field"],
+// "msg": "Field required", "type": "..."}, ...]}`. Flatten it into a
+// readable one-line string so toasts say exactly which field broke.
+function formatErrorMessage(status: number, path: string, body: unknown): string {
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  if (typeof detail === "string" && detail) return detail;
+  if (Array.isArray(detail) && detail.length > 0) {
+    const parts: string[] = [];
+    for (const item of detail) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as { loc?: unknown[]; msg?: string };
+      const loc = Array.isArray(rec.loc)
+        ? rec.loc.filter((p) => p !== "body").join(".")
+        : "";
+      const msg = rec.msg ?? "Invalid value";
+      parts.push(loc ? `${loc}: ${msg}` : msg);
+    }
+    if (parts.length > 0) return parts.join("; ");
+  }
+  return `Request to ${path} failed with ${status}`;
 }
 
 export const api = {

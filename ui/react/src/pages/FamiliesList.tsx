@@ -9,6 +9,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
+import { useToast } from "@/components/Toast";
 
 interface NewFamilyForm {
   family_name: string;
@@ -18,6 +19,7 @@ interface NewFamilyForm {
 export default function FamiliesList() {
   const qc = useQueryClient();
   const navigate = useNavigate();
+  const toast = useToast();
   const [isOpen, setOpen] = useState(false);
 
   const { data, isLoading } = useQuery<FamilySummary[]>({
@@ -29,8 +31,10 @@ export default function FamiliesList() {
     mutationFn: (form: NewFamilyForm) => api.post<Family>("/api/families", form),
     onSuccess: (family) => {
       qc.invalidateQueries({ queryKey: ["families"] });
+      toast.success(`Created ${family.family_name}.`);
       navigate(`/families/${family.family_id}`);
     },
+    onError: (err: Error) => toast.error(`Could not create family: ${err.message}`),
   });
 
   const { register, handleSubmit, reset, formState } = useForm<NewFamilyForm>();

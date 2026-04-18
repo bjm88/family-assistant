@@ -89,3 +89,6 @@ class Person(Base, TimestampMixin):
     photos: Mapped[List["PersonPhoto"]] = relationship(  # noqa: F821
         back_populates="person", cascade="all, delete-orphan"
     )
+    goals: Mapped[List["Goal"]] = relationship(  # noqa: F821
+        back_populates="person", cascade="all, delete-orphan"
+    )

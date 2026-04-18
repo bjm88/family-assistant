@@ -9,6 +9,8 @@ import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
+import { useToast } from "@/components/Toast";
+import { cleanPayload } from "@/lib/form";
 
 const ACCOUNT_TYPES = [
   "checking",
@@ -32,6 +34,7 @@ const ACCOUNT_TYPES = [
 export default function FinancialAccountsPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
+  const toast = useToast();
   const [open, setOpen] = useState(false);
 
   const { data } = useQuery<FinancialAccount[]>({
@@ -45,25 +48,35 @@ export default function FinancialAccountsPage() {
   });
 
   const create = useMutation({
-    mutationFn: (v: any) => {
-      const body: any = { ...v, family_id: Number(familyId) };
-      if (body.primary_holder_person_id)
-        body.primary_holder_person_id = Number(body.primary_holder_person_id);
-      else delete body.primary_holder_person_id;
-      return api.post("/api/financial-accounts", body);
+    mutationFn: (v: Record<string, unknown>) => {
+      const cleaned = cleanPayload(v, [
+        "primary_holder_person_id",
+        "current_balance_usd",
+        "credit_limit_usd",
+      ]);
+      return api.post<FinancialAccount>("/api/financial-accounts", {
+        ...cleaned,
+        family_id: Number(familyId),
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["finances", familyId] });
       setOpen(false);
       reset();
+      toast.success("Financial account added.");
     },
+    onError: (err: Error) => toast.error(`Could not add account: ${err.message}`),
   });
   const del = useMutation({
     mutationFn: (id: number) => api.del(`/api/financial-accounts/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["finances", familyId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["finances", familyId] });
+      toast.success("Account removed.");
+    },
+    onError: (err: Error) => toast.error(`Could not remove account: ${err.message}`),
   });
 
-  const { register, handleSubmit, reset } = useForm<any>();
+  const { register, handleSubmit, reset } = useForm<Record<string, unknown>>();
   const peopleById = new Map((people ?? []).map((p) => [p.person_id, p]));
 
   return (

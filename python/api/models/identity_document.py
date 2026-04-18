@@ -70,4 +70,21 @@ class IdentityDocument(Base, TimestampMixin):
 
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    front_image_path: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
+        comment=(
+            "Path, relative to FA_STORAGE_ROOT, of a scan or photo of the "
+            "front of the document (e.g. license face, passport photo page)."
+        ),
+    )
+    back_image_path: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
+        comment=(
+            "Path, relative to FA_STORAGE_ROOT, of a scan or photo of the "
+            "back of the document, when applicable."
+        ),
+    )
+
     person: Mapped["Person"] = relationship(back_populates="identity_documents")  # noqa: F821

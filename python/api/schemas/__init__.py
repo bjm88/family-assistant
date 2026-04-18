@@ -13,6 +13,9 @@ from .person_relationship import (
     PersonRelationshipCreate,
     PersonRelationshipRead,
 )
+from .goal import GoalCreate, GoalUpdate, GoalRead, GoalPriority
+from .pet import PetCreate, PetUpdate, PetRead
+from .pet_photo import PetPhotoRead, PetPhotoUpdate
 from .address import AddressCreate, AddressUpdate, AddressRead
 from .identity_document import (
     IdentityDocumentCreate,
@@ -53,6 +56,15 @@ __all__ = [
     "PersonPhotoUpdate",
     "PersonRelationshipCreate",
     "PersonRelationshipRead",
+    "GoalCreate",
+    "GoalUpdate",
+    "GoalRead",
+    "GoalPriority",
+    "PetCreate",
+    "PetUpdate",
+    "PetRead",
+    "PetPhotoRead",
+    "PetPhotoUpdate",
     "AddressCreate",
     "AddressUpdate",
     "AddressRead",

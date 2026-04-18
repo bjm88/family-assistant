@@ -19,12 +19,15 @@ from .routers import (
     documents,
     families,
     financial_accounts,
+    goals,
     identity_documents,
     insurance_policies,
     media,
     people,
     person_photos,
     person_relationships,
+    pet_photos,
+    pets,
     sensitive_identifiers,
     vehicles,
 )
@@ -55,6 +58,9 @@ def create_app() -> FastAPI:
     app.include_router(people.router)
     app.include_router(person_photos.router)
     app.include_router(person_relationships.router)
+    app.include_router(goals.router)
+    app.include_router(pets.router)
+    app.include_router(pet_photos.router)
     app.include_router(addresses.router)
     app.include_router(identity_documents.router)
     app.include_router(sensitive_identifiers.router)

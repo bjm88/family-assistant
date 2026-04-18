@@ -90,6 +90,62 @@ def save_person_photo(
     return str(dest_path.relative_to(root)), size, mime or "image/jpeg"
 
 
+def save_pet_photo(
+    family_id: int,
+    pet_id: int,
+    upload_file: BinaryIO,
+    original_filename: str,
+) -> Tuple[str, int, str]:
+    """Persist an extra pet photo. Returns ``(relative_path, size, mime)``."""
+    root = get_settings().storage_root
+    dest_dir = _ensure_dir(
+        root / f"family_{family_id}" / "pets" / f"pet_{pet_id}" / "photos"
+    )
+    ext = _ext_from_filename(original_filename) or ".jpg"
+    filename = f"{uuid.uuid4().hex}{ext}"
+    dest_path = dest_dir / filename
+    with open(dest_path, "wb") as out:
+        shutil.copyfileobj(upload_file, out)
+    size = dest_path.stat().st_size
+    mime, _ = mimetypes.guess_type(original_filename)
+    return str(dest_path.relative_to(root)), size, mime or "image/jpeg"
+
+
+def save_identity_document_image(
+    family_id: int,
+    person_id: int,
+    identity_document_id: int,
+    side: str,
+    upload_file: BinaryIO,
+    original_filename: str,
+) -> Tuple[str, int, str]:
+    """Persist a front/back scan of an identity document.
+
+    ``side`` should be ``"front"`` or ``"back"``. Files land in
+    ``family_<id>/people/person_<id>/identity_documents/<doc_id>/``. Returns
+    ``(relative_path, size_bytes, mime_type)``.
+    """
+    if side not in ("front", "back"):
+        raise ValueError("side must be 'front' or 'back'")
+    root = get_settings().storage_root
+    dest_dir = _ensure_dir(
+        root
+        / f"family_{family_id}"
+        / "people"
+        / f"person_{person_id}"
+        / "identity_documents"
+        / str(identity_document_id)
+    )
+    ext = _ext_from_filename(original_filename) or ".jpg"
+    filename = f"{side}_{uuid.uuid4().hex}{ext}"
+    dest_path = dest_dir / filename
+    with open(dest_path, "wb") as out:
+        shutil.copyfileobj(upload_file, out)
+    size = dest_path.stat().st_size
+    mime, _ = mimetypes.guess_type(original_filename)
+    return str(dest_path.relative_to(root)), size, mime or "image/jpeg"
+
+
 def save_document(
     family_id: int,
     person_id: int | None,
