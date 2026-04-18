@@ -39,3 +39,4 @@ class PetRead(OrmModel):
     color: Optional[str]
     date_of_birth: Optional[date]
     notes: Optional[str]
+    cover_photo_path: Optional[str] = None

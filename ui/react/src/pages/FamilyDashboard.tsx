@@ -1,12 +1,26 @@
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Bot, Car, FileText, Landmark, Network, ShieldCheck, Users } from "lucide-react";
+import {
+  Bot,
+  Building2,
+  Car,
+  FileText,
+  Home,
+  Landmark,
+  Network,
+  PawPrint,
+  ShieldCheck,
+  Star,
+  Users,
+} from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   Assistant,
   Family,
   Person,
   PersonRelationship,
+  Pet,
+  Residence,
   Vehicle,
   InsurancePolicy,
   FinancialAccount,
@@ -78,6 +92,15 @@ export default function FamilyDashboard() {
   const { data: documents } = useQuery<DocumentRecord[]>({
     queryKey: ["documents", familyId],
     queryFn: () => api.get<DocumentRecord[]>(`/api/documents?family_id=${familyId}`),
+  });
+  const { data: pets } = useQuery<Pet[]>({
+    queryKey: ["pets", Number(familyId)],
+    queryFn: () => api.get<Pet[]>(`/api/pets?family_id=${familyId}`),
+  });
+  const { data: residences } = useQuery<Residence[]>({
+    queryKey: ["residences", Number(familyId)],
+    queryFn: () =>
+      api.get<Residence[]>(`/api/residences?family_id=${familyId}`),
   });
 
   return (
@@ -186,6 +209,118 @@ export default function FamilyDashboard() {
                   No assistant yet. Click to create one.
                 </div>
               </>
+            )}
+          </div>
+        </Link>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+        <Link
+          to={`/families/${familyId}/pets`}
+          className="card hover:shadow-md transition-shadow self-start"
+        >
+          <div className="card-header">
+            <div className="card-title flex items-center gap-2">
+              <PawPrint className="h-4 w-4 text-primary" /> Pets
+              {pets && pets.length > 0 && (
+                <span className="badge ml-1">{pets.length}</span>
+              )}
+            </div>
+            <span className="text-xs text-primary hover:underline">Manage →</span>
+          </div>
+          <div className="card-body">
+            {!pets || pets.length === 0 ? (
+              <div className="text-sm text-muted-foreground flex items-center gap-2">
+                <PawPrint className="h-4 w-4" />
+                No pets yet. Click to add one.
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                {pets.map((p) => (
+                  <div
+                    key={p.pet_id}
+                    className="flex flex-col items-center text-center gap-1"
+                  >
+                    <div className="h-20 w-20 rounded-full bg-muted overflow-hidden flex items-center justify-center">
+                      {p.cover_photo_path ? (
+                        <img
+                          src={`/api/media/${p.cover_photo_path}`}
+                          alt={p.pet_name}
+                          className="h-full w-full object-cover"
+                        />
+                      ) : (
+                        <PawPrint className="h-8 w-8 text-muted-foreground" />
+                      )}
+                    </div>
+                    <div className="text-sm font-medium truncate w-full">
+                      {p.pet_name}
+                    </div>
+                    <div className="text-xs text-muted-foreground capitalize truncate w-full">
+                      {p.animal_type.replace(/_/g, " ")}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </Link>
+
+        <Link
+          to={`/families/${familyId}/residences`}
+          className="card hover:shadow-md transition-shadow self-start"
+        >
+          <div className="card-header">
+            <div className="card-title flex items-center gap-2">
+              <Building2 className="h-4 w-4 text-primary" /> Residences
+              {residences && residences.length > 0 && (
+                <span className="badge ml-1">{residences.length}</span>
+              )}
+            </div>
+            <span className="text-xs text-primary hover:underline">Manage →</span>
+          </div>
+          <div className="card-body">
+            {!residences || residences.length === 0 ? (
+              <div className="text-sm text-muted-foreground flex items-center gap-2">
+                <Home className="h-4 w-4" />
+                No residences yet. Click to add one.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {residences.map((r) => (
+                  <div
+                    key={r.residence_id}
+                    className="border border-border rounded-lg overflow-hidden bg-white flex flex-col"
+                  >
+                    <div className="aspect-video bg-muted overflow-hidden">
+                      {r.cover_photo_path ? (
+                        <img
+                          src={`/api/media/${r.cover_photo_path}`}
+                          alt={r.label}
+                          className="h-full w-full object-cover"
+                        />
+                      ) : (
+                        <div className="h-full w-full flex items-center justify-center text-muted-foreground">
+                          <Home className="h-8 w-8" />
+                        </div>
+                      )}
+                    </div>
+                    <div className="p-3">
+                      <div className="text-sm font-medium truncate flex items-center gap-1">
+                        {r.label}
+                        {r.is_primary_residence && (
+                          <Star
+                            className="h-3 w-3 text-primary"
+                            aria-label="Primary residence"
+                          />
+                        )}
+                      </div>
+                      <div className="text-xs text-muted-foreground truncate">
+                        {[r.city, r.state_or_region].filter(Boolean).join(", ")}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
             )}
           </div>
         </Link>

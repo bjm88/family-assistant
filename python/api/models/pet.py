@@ -99,3 +99,10 @@ class Pet(Base, TimestampMixin):
     photos: Mapped[List["PetPhoto"]] = relationship(  # noqa: F821
         back_populates="pet", cascade="all, delete-orphan"
     )
+
+    @property
+    def cover_photo_path(self) -> Optional[str]:
+        """Most-recent photo of the pet, if any — used for list thumbnails."""
+        if not self.photos:
+            return None
+        return max(self.photos, key=lambda p: p.created_at).stored_file_path

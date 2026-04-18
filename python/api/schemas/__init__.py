@@ -17,6 +17,12 @@ from .goal import GoalCreate, GoalUpdate, GoalRead, GoalPriority
 from .pet import PetCreate, PetUpdate, PetRead
 from .pet_photo import PetPhotoRead, PetPhotoUpdate
 from .address import AddressCreate, AddressUpdate, AddressRead
+from .residence import (
+    ResidenceCreate,
+    ResidenceUpdate,
+    ResidenceRead,
+)
+from .residence_photo import ResidencePhotoRead, ResidencePhotoUpdate
 from .identity_document import (
     IdentityDocumentCreate,
     IdentityDocumentUpdate,
@@ -68,6 +74,11 @@ __all__ = [
     "AddressCreate",
     "AddressUpdate",
     "AddressRead",
+    "ResidenceCreate",
+    "ResidenceUpdate",
+    "ResidenceRead",
+    "ResidencePhotoRead",
+    "ResidencePhotoUpdate",
     "IdentityDocumentCreate",
     "IdentityDocumentUpdate",
     "IdentityDocumentRead",

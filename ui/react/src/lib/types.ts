@@ -190,6 +190,35 @@ export interface Pet {
   color: string | null;
   date_of_birth: string | null;
   notes: string | null;
+  cover_photo_path: string | null;
+}
+
+export interface Residence {
+  residence_id: number;
+  family_id: number;
+  label: string;
+  street_line_1: string;
+  street_line_2: string | null;
+  city: string;
+  state_or_region: string | null;
+  postal_code: string | null;
+  country: string;
+  is_primary_residence: boolean;
+  notes: string | null;
+  cover_photo_path: string | null;
+}
+
+export interface ResidencePhoto {
+  residence_photo_id: number;
+  residence_id: number;
+  title: string;
+  description: string | null;
+  stored_file_path: string;
+  original_file_name: string;
+  mime_type: string | null;
+  file_size_bytes: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface PetPhoto {

@@ -21,6 +21,8 @@ from .goal import Goal, GOAL_PRIORITIES
 from .pet import Pet, COMMON_PET_ANIMAL_TYPES
 from .pet_photo import PetPhoto
 from .address import Address
+from .residence import Residence
+from .residence_photo import ResidencePhoto
 from .identity_document import IdentityDocument
 from .sensitive_identifier import SensitiveIdentifier
 from .vehicle import Vehicle
@@ -45,6 +47,8 @@ __all__ = [
     "COMMON_PET_ANIMAL_TYPES",
     "PetPhoto",
     "Address",
+    "Residence",
+    "ResidencePhoto",
     "IdentityDocument",
     "SensitiveIdentifier",
     "Vehicle",

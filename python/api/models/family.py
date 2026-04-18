@@ -63,3 +63,6 @@ class Family(Base, TimestampMixin):
     pets: Mapped[List["Pet"]] = relationship(  # noqa: F821
         back_populates="family", cascade="all, delete-orphan"
     )
+    residences: Mapped[List["Residence"]] = relationship(  # noqa: F821
+        back_populates="family", cascade="all, delete-orphan"
+    )
