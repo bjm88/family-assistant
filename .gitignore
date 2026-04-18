@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+
+# Node / React
+node_modules/
+ui/react/dist/
+ui/react/.vite/
+
+# Uploaded family data (private — never commit)
+resources/family/*
+!resources/family/.gitkeep
+
+# OS
+.DS_Store

@@ -1,0 +1,13 @@
+Alembic migrations for the Family Assistant database.
+
+Common commands
+---------------
+
+# Apply all pending migrations
+uv run alembic upgrade head
+
+# Create a new auto-generated migration after changing the models
+uv run alembic revision --autogenerate -m "describe your change"
+
+# Downgrade one step
+uv run alembic downgrade -1
