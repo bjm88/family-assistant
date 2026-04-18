@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas, storage
 from ..db import get_db
 
-router = APIRouter(prefix="/api/person-photos", tags=["person_photos"])
+router = APIRouter(prefix="/person-photos", tags=["person_photos"])
 
 
 @router.get("", response_model=List[schemas.PersonPhotoRead])

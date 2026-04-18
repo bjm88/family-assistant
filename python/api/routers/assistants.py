@@ -22,7 +22,7 @@ from ..db import get_db
 from ..integrations.gemini import GeminiClient, GeminiError, GeminiUnavailable
 
 
-router = APIRouter(prefix="/api/assistants", tags=["assistants"])
+router = APIRouter(prefix="/assistants", tags=["assistants"])
 logger = logging.getLogger(__name__)
 
 

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .. import crypto, models, schemas
 from ..db import get_db
 
-router = APIRouter(prefix="/api/sensitive-identifiers", tags=["sensitive_identifiers"])
+router = APIRouter(prefix="/sensitive-identifiers", tags=["sensitive_identifiers"])
 
 
 @router.get("", response_model=List[schemas.SensitiveIdentifierRead])

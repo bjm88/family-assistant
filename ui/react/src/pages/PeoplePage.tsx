@@ -86,7 +86,7 @@ export default function PeoplePage() {
           {people.map((p) => (
             <Link
               key={p.person_id}
-              to={`/families/${familyId}/people/${p.person_id}`}
+              to={`/admin/families/${familyId}/people/${p.person_id}`}
               className="card hover:shadow-md transition-shadow"
             >
               <div className="card-body flex items-center gap-4">

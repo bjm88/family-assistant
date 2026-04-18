@@ -13,27 +13,50 @@ import ResidencesPage from "./pages/ResidencesPage";
 import InsurancePoliciesPage from "./pages/InsurancePoliciesPage";
 import FinancialAccountsPage from "./pages/FinancialAccountsPage";
 import DocumentsPage from "./pages/DocumentsPage";
+import AiAssistantPage from "./pages/AiAssistantPage";
 
 export default function App() {
   return (
     <Routes>
-      <Route path="/" element={<Navigate to="/families" replace />} />
-      <Route path="/families" element={<FamiliesList />} />
+      <Route path="/" element={<Navigate to="/admin/families" replace />} />
+
+      {/* Legacy redirects — keep old /families links working. */}
+      <Route path="/families" element={<Navigate to="/admin/families" replace />} />
+      <Route
+        path="/families/:familyId/*"
+        element={<LegacyFamilyRedirect />}
+      />
+
+      {/* Admin console (CRUD + dashboard) */}
+      <Route path="/admin/families" element={<FamiliesList />} />
       <Route element={<Layout />}>
-        <Route path="/families/:familyId" element={<FamilyDashboard />} />
-        <Route path="/families/:familyId/settings" element={<FamilySettings />} />
-        <Route path="/families/:familyId/people" element={<PeoplePage />} />
-        <Route path="/families/:familyId/people/:personId" element={<PersonDetail />} />
-        <Route path="/families/:familyId/relationships" element={<RelationshipsPage />} />
-        <Route path="/families/:familyId/assistant" element={<AssistantPage />} />
-        <Route path="/families/:familyId/vehicles" element={<VehiclesPage />} />
-        <Route path="/families/:familyId/pets" element={<PetsPage />} />
-        <Route path="/families/:familyId/residences" element={<ResidencesPage />} />
-        <Route path="/families/:familyId/insurance" element={<InsurancePoliciesPage />} />
-        <Route path="/families/:familyId/finances" element={<FinancialAccountsPage />} />
-        <Route path="/families/:familyId/documents" element={<DocumentsPage />} />
+        <Route path="/admin/families/:familyId" element={<FamilyDashboard />} />
+        <Route path="/admin/families/:familyId/settings" element={<FamilySettings />} />
+        <Route path="/admin/families/:familyId/people" element={<PeoplePage />} />
+        <Route path="/admin/families/:familyId/people/:personId" element={<PersonDetail />} />
+        <Route path="/admin/families/:familyId/relationships" element={<RelationshipsPage />} />
+        <Route path="/admin/families/:familyId/assistant" element={<AssistantPage />} />
+        <Route path="/admin/families/:familyId/vehicles" element={<VehiclesPage />} />
+        <Route path="/admin/families/:familyId/pets" element={<PetsPage />} />
+        <Route path="/admin/families/:familyId/residences" element={<ResidencesPage />} />
+        <Route path="/admin/families/:familyId/insurance" element={<InsurancePoliciesPage />} />
+        <Route path="/admin/families/:familyId/finances" element={<FinancialAccountsPage />} />
+        <Route path="/admin/families/:familyId/documents" element={<DocumentsPage />} />
       </Route>
-      <Route path="*" element={<Navigate to="/families" replace />} />
+
+      {/* Live AI assistant (separate top-level namespace so it can evolve
+          independently of the admin routes, with different auth later). */}
+      <Route path="/aiassistant/:familyId" element={<AiAssistantPage />} />
+
+      <Route path="*" element={<Navigate to="/admin/families" replace />} />
     </Routes>
   );
+}
+
+// Preserve deep links shared before the /admin refactor — rewrite the path
+// in place instead of sending every old link back to the top-level list.
+function LegacyFamilyRedirect() {
+  const url = new URL(window.location.href);
+  const rewritten = url.pathname.replace(/^\/families/, "/admin/families");
+  return <Navigate to={rewritten + url.search + url.hash} replace />;
 }

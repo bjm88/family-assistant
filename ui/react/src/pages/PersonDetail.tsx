@@ -115,7 +115,7 @@ export default function PersonDetail() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["people", familyId] });
       toast.success("Person deleted.");
-      navigate(`/families/${familyId}/people`);
+      navigate(`/admin/families/${familyId}/people`);
     },
     onError: (err: Error) => toast.error(`Delete failed: ${err.message}`),
   });
@@ -139,7 +139,7 @@ export default function PersonDetail() {
     <div>
       <button
         className="text-sm text-muted-foreground hover:text-foreground mb-3 inline-flex items-center gap-1"
-        onClick={() => navigate(`/families/${familyId}/people`)}
+        onClick={() => navigate(`/admin/families/${familyId}/people`)}
       >
         <ArrowLeft className="h-4 w-4" /> Back to people
       </button>

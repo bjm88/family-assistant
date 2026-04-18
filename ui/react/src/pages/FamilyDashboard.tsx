@@ -112,31 +112,31 @@ export default function FamilyDashboard() {
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         <StatCard
-          to={`/families/${familyId}/people`}
+          to={`/admin/families/${familyId}/people`}
           label="People"
           value={people?.length ?? "—"}
           icon={Users}
         />
         <StatCard
-          to={`/families/${familyId}/vehicles`}
+          to={`/admin/families/${familyId}/vehicles`}
           label="Vehicles"
           value={vehicles?.length ?? "—"}
           icon={Car}
         />
         <StatCard
-          to={`/families/${familyId}/insurance`}
+          to={`/admin/families/${familyId}/insurance`}
           label="Insurance policies"
           value={policies?.length ?? "—"}
           icon={ShieldCheck}
         />
         <StatCard
-          to={`/families/${familyId}/finances`}
+          to={`/admin/families/${familyId}/finances`}
           label="Financial accounts"
           value={accounts?.length ?? "—"}
           icon={Landmark}
         />
         <StatCard
-          to={`/families/${familyId}/documents`}
+          to={`/admin/families/${familyId}/documents`}
           label="Documents"
           value={documents?.length ?? "—"}
           icon={FileText}
@@ -156,7 +156,7 @@ export default function FamilyDashboard() {
               </div>
             </div>
             <Link
-              to={`/families/${familyId}/relationships`}
+              to={`/admin/families/${familyId}/relationships`}
               className="text-xs text-primary hover:underline"
             >
               Edit →
@@ -167,20 +167,29 @@ export default function FamilyDashboard() {
               <FamilyTreeView
                 people={people}
                 edges={edges ?? []}
-                onSelect={() => navigate(`/families/${familyId}/relationships`)}
+                onSelect={() =>
+                  navigate(`/admin/families/${familyId}/relationships`)
+                }
               />
             )}
           </div>
         </div>
 
         <Link
-          to={`/families/${familyId}/assistant`}
+          to={`/admin/families/${familyId}/assistant`}
           className="card hover:shadow-md transition-shadow self-start"
         >
           <div className="card-header">
             <div className="card-title flex items-center gap-2">
               <Bot className="h-4 w-4 text-primary" /> Assistant
             </div>
+            <Link
+              to={`/aiassistant/${familyId}`}
+              onClick={(e) => e.stopPropagation()}
+              className="text-xs inline-flex items-center gap-1 rounded-full bg-primary text-primary-foreground px-2 py-0.5 font-medium hover:bg-primary/90"
+            >
+              Go live →
+            </Link>
           </div>
           <div className="card-body flex flex-col items-center gap-3 text-center">
             {assistant ? (
@@ -216,7 +225,7 @@ export default function FamilyDashboard() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
         <Link
-          to={`/families/${familyId}/pets`}
+          to={`/admin/families/${familyId}/pets`}
           className="card hover:shadow-md transition-shadow self-start"
         >
           <div className="card-header">
@@ -266,7 +275,7 @@ export default function FamilyDashboard() {
         </Link>
 
         <Link
-          to={`/families/${familyId}/residences`}
+          to={`/admin/families/${familyId}/residences`}
           className="card hover:shadow-md transition-shadow self-start"
         >
           <div className="card-header">

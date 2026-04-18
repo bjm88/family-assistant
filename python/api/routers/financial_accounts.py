@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .. import crypto, models, schemas
 from ..db import get_db
 
-router = APIRouter(prefix="/api/financial-accounts", tags=["financial_accounts"])
+router = APIRouter(prefix="/financial-accounts", tags=["financial_accounts"])
 
 
 @router.get("", response_model=List[schemas.FinancialAccountRead])

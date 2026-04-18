@@ -46,7 +46,7 @@ export default function FamilySettings() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["families"] });
       toast.success("Family deleted.");
-      navigate("/families");
+      navigate("/admin/families");
     },
     onError: (err: Error) => toast.error(`Delete failed: ${err.message}`),
   });

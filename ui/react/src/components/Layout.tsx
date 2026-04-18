@@ -11,6 +11,7 @@ import {
   PawPrint,
   Settings,
   ShieldCheck,
+  Sparkles,
   Users,
 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -50,11 +51,24 @@ export default function Layout() {
             {family?.family_name ?? "Loading…"}
           </div>
         </div>
+        <div className="p-3 border-b border-border">
+          <NavLink
+            to={`/aiassistant/${familyId}`}
+            className="flex items-center gap-2 rounded-md px-3 py-2 text-sm bg-primary text-primary-foreground hover:bg-primary/90 transition-colors font-medium"
+          >
+            <Sparkles className="h-4 w-4" />
+            Live AI Assistant
+          </NavLink>
+        </div>
         <nav className="flex-1 p-3 space-y-1">
           {NAV.map(({ to, label, icon: Icon, end }) => (
             <NavLink
               key={to}
-              to={to === "" ? `/families/${familyId}` : `/families/${familyId}/${to}`}
+              to={
+                to === ""
+                  ? `/admin/families/${familyId}`
+                  : `/admin/families/${familyId}/${to}`
+              }
               end={end}
               className={({ isActive }) =>
                 cn(
@@ -72,7 +86,7 @@ export default function Layout() {
         </nav>
         <div className="p-3 border-t border-border">
           <NavLink
-            to="/families"
+            to="/admin/families"
             className="text-xs text-muted-foreground hover:text-foreground"
           >
             ← All families

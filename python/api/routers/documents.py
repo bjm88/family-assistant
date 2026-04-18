@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas, storage
 from ..db import get_db
 
-router = APIRouter(prefix="/api/documents", tags=["documents"])
+router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 @router.get("", response_model=List[schemas.DocumentRead])

@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..db import get_db
 
-router = APIRouter(prefix="/api/person-relationships", tags=["person_relationships"])
+router = APIRouter(prefix="/person-relationships", tags=["person_relationships"])
 
 
 def _require_same_family(db: Session, a_id: int, b_id: int) -> None:

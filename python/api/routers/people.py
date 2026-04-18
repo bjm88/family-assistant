@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas, storage
 from ..db import get_db
 
-router = APIRouter(prefix="/api/people", tags=["people"])
+router = APIRouter(prefix="/people", tags=["people"])
 
 
 def _get_person_or_404(db: Session, person_id: int) -> models.Person:

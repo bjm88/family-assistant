@@ -49,6 +49,26 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_PROJECT_ID: Optional[str] = None
 
+    # ---- Local AI assistant (Avi) --------------------------------------
+    # Base URL for the local Ollama daemon that hosts the chat LLM.
+    AI_OLLAMA_HOST: str = "http://localhost:11434"
+    # Model pulled via ``ollama pull <name>``. Default matches what the
+    # user has running (``gemma4``); override in .env to point at any
+    # other tag like ``gemma3:27b`` or a custom local model.
+    AI_OLLAMA_MODEL: str = "gemma4"
+    # Cosine-similarity threshold for a face recognition match. Higher =
+    # stricter. 0.40–0.45 is a good default for InsightFace buffalo_l
+    # embeddings (ArcFace, 512-dim).
+    AI_FACE_MATCH_THRESHOLD: float = 0.40
+    # Apple-Silicon / Mac Studio optimization. When true we initialize
+    # InsightFace with the CoreML execution provider so face detection +
+    # embedding runs on the GPU / ANE instead of CPU. Set to false on a
+    # plain Linux box; the code auto-falls-back to CPU if CoreML isn't
+    # actually available.
+    AI_MAC_STUDIO_OPTIMIZED: bool = True
+    # Where InsightFace stores downloaded model packs (~300 MB on first run).
+    AI_INSIGHTFACE_HOME: Optional[str] = None
+
     @property
     def database_url(self) -> str:
         return (

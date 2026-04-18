@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..db import get_db
 
-router = APIRouter(prefix="/api/families", tags=["families"])
+router = APIRouter(prefix="/families", tags=["families"])
 
 
 @router.get("", response_model=List[schemas.FamilySummary])

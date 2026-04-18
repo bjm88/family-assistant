@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Users } from "lucide-react";
+import { Plus, Sparkles, Users } from "lucide-react";
 import { useForm } from "react-hook-form";
 import { api } from "@/lib/api";
 import type { Family, FamilySummary } from "@/lib/types";
@@ -32,7 +32,7 @@ export default function FamiliesList() {
     onSuccess: (family) => {
       qc.invalidateQueries({ queryKey: ["families"] });
       toast.success(`Created ${family.family_name}.`);
-      navigate(`/families/${family.family_id}`);
+      navigate(`/admin/families/${family.family_id}`);
     },
     onError: (err: Error) => toast.error(`Could not create family: ${err.message}`),
   });
@@ -70,12 +70,14 @@ export default function FamiliesList() {
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {data.map((f) => (
-              <button
+              <div
                 key={f.family_id}
-                onClick={() => navigate(`/families/${f.family_id}`)}
-                className="card text-left hover:shadow-md transition-shadow"
+                className="card hover:shadow-md transition-shadow flex flex-col"
               >
-                <div className="card-body">
+                <button
+                  onClick={() => navigate(`/admin/families/${f.family_id}`)}
+                  className="card-body text-left flex-1"
+                >
                   <div className="text-lg font-semibold">{f.family_name}</div>
                   <div className="mt-3 text-sm text-muted-foreground grid grid-cols-2 gap-y-1">
                     <div>{f.people_count} people</div>
@@ -84,8 +86,25 @@ export default function FamiliesList() {
                     <div>{f.financial_accounts_count} accounts</div>
                     <div>{f.documents_count} documents</div>
                   </div>
+                </button>
+                <div className="border-t border-border px-5 py-3 flex items-center justify-between">
+                  <button
+                    onClick={() =>
+                      navigate(`/admin/families/${f.family_id}`)
+                    }
+                    className="text-xs text-muted-foreground hover:text-foreground"
+                  >
+                    Open admin →
+                  </button>
+                  <button
+                    onClick={() => navigate(`/aiassistant/${f.family_id}`)}
+                    className="text-xs font-medium text-primary hover:underline inline-flex items-center gap-1"
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                    Live AI
+                  </button>
                 </div>
-              </button>
+              </div>
             ))}
           </div>
         )}

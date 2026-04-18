@@ -18,6 +18,10 @@ dependencies = [
     "pillow>=11.0.0",
     "email-validator>=2.2.0",
     "google-genai>=1.0.0",
+    "insightface>=0.7.3",
+    "onnxruntime>=1.24.4",
+    "numpy>=2.4.4",
+    "httpx>=0.28.1",
 ]
 
 [dependency-groups]

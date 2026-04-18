@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..db import get_db
 
-router = APIRouter(prefix="/api/residences", tags=["residences"])
+router = APIRouter(prefix="/residences", tags=["residences"])
 
 
 def _unset_other_primaries(

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .. import crypto, models, schemas
 from ..db import get_db
 
-router = APIRouter(prefix="/api/insurance-policies", tags=["insurance_policies"])
+router = APIRouter(prefix="/insurance-policies", tags=["insurance_policies"])
 
 
 def _to_read(policy: models.InsurancePolicy) -> schemas.InsurancePolicyRead:

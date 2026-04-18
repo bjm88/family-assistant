@@ -1,4 +1,26 @@
 // Thin fetch wrapper. Dev server proxies /api to http://localhost:8000 (see vite.config.ts).
+//
+// Admin CRUD endpoints all live under `/api/admin/*` on the backend so a
+// future auth layer can guard them independently. Rather than rewriting every
+// fetch call in every page, we transparently rewrite bare `/api/<resource>`
+// paths here. Routes that are intentionally outside the admin root —
+// `/api/media/*` (shared static files) and `/api/aiassistant/*` (live AI
+// endpoints) — are left untouched.
+const ADMIN_PREFIX = "/api/admin";
+const PASSTHROUGH_ROOTS = [
+  "/api/admin/",
+  "/api/aiassistant/",
+  "/api/media/",
+  "/api/health",
+];
+
+export function resolveApiPath(path: string): string {
+  if (!path.startsWith("/api/")) return path;
+  for (const root of PASSTHROUGH_ROOTS) {
+    if (path === root || path.startsWith(root)) return path;
+  }
+  return ADMIN_PREFIX + path.slice(4); // "/api/foo" -> "/api/admin/foo"
+}
 
 export class ApiError extends Error {
   status: number;
@@ -19,7 +41,8 @@ async function request<T>(
   if (!(init.body instanceof FormData) && init.body != null) {
     headers.set("Content-Type", "application/json");
   }
-  const res = await fetch(path, { ...init, headers });
+  const resolved = resolveApiPath(path);
+  const res = await fetch(resolved, { ...init, headers });
   if (!res.ok) {
     let body: unknown = null;
     try {

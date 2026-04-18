@@ -16,6 +16,7 @@ from .family import Family
 from .assistant import Assistant
 from .person import Person
 from .person_photo import PersonPhoto
+from .face_embedding import FaceEmbedding
 from .person_relationship import PersonRelationship, RELATIONSHIP_TYPES
 from .goal import Goal, GOAL_PRIORITIES
 from .pet import Pet, COMMON_PET_ANIMAL_TYPES
@@ -39,6 +40,7 @@ __all__ = [
     "Assistant",
     "Person",
     "PersonPhoto",
+    "FaceEmbedding",
     "PersonRelationship",
     "RELATIONSHIP_TYPES",
     "Goal",

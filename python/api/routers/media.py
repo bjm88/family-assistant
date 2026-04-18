@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 
 from .. import storage
 
-router = APIRouter(prefix="/api/media", tags=["media"])
+router = APIRouter(prefix="/media", tags=["media"])
 
 
 @router.get("/{relative_path:path}")

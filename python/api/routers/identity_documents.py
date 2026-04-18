@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from .. import crypto, models, schemas, storage
 from ..db import get_db
 
-router = APIRouter(prefix="/api/identity-documents", tags=["identity_documents"])
+router = APIRouter(prefix="/identity-documents", tags=["identity_documents"])
 
 Side = Literal["front", "back"]
 

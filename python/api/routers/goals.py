@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..db import get_db
 
-router = APIRouter(prefix="/api/goals", tags=["goals"])
+router = APIRouter(prefix="/goals", tags=["goals"])
 
 
 # Priorities sort urgent → low so the UI can render "what to do next" order.
