@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 from typing import List, Optional
 
-from sqlalchemy import Date, ForeignKey, String, Text
+from sqlalchemy import BigInteger, Date, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..db import Base
@@ -82,6 +82,27 @@ class Person(Base, TimestampMixin):
     mobile_phone_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     home_phone_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     work_phone_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+
+    telegram_user_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment=(
+            "Telegram numeric user id (message.from.id from the Bot "
+            "API). Stable for the lifetime of the account — unlike "
+            "telegram_username, which the user can change at any time. "
+            "The Telegram inbox poller looks this up first to decide "
+            "whether to reply."
+        ),
+    )
+    telegram_username: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+        comment=(
+            "Telegram @username (without the leading @). Fallback "
+            "lookup key when telegram_user_id has not yet been "
+            "captured. Matched case-insensitively."
+        ),
+    )
 
     profile_photo_path: Mapped[Optional[str]] = mapped_column(
         String(500),

@@ -52,6 +52,18 @@ stop_service() {
 
     log_step "Stopping ${label}"
 
+    # Heads-up if a LaunchAgent will instantly resurrect what we're
+    # about to kill. We could automatically `bootout` the agent here,
+    # but that would silently break "restart on next login" expectations
+    # — so just warn loudly and let the user run unregister_daemons.sh
+    # if that's actually what they want.
+    if launchagent_is_loaded "${label}"; then
+        log_warn "LaunchAgent ${LAUNCHAGENT_PREFIX}.${label} is loaded with KeepAlive=true."
+        log_warn "  launchd will respawn ${label} within ~10s of this stop."
+        log_warn "  • To restart cleanly:           scripts/restart.sh ${label}"
+        log_warn "  • To stop AND keep it stopped:  scripts/unregister_daemons.sh"
+    fi
+
     local pid
     pid="$(read_pid "${pidfile}")"
     if [[ -n "${pid}" ]]; then

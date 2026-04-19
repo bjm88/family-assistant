@@ -30,7 +30,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
-from .services import email_inbox
+from .services import email_inbox, telegram_inbox
 
 
 # Wire up Python logging the FIRST thing we do, so every ``logger.info``
@@ -110,6 +110,18 @@ async def _lifespan(app: FastAPI):
     else:
         logging.getLogger(__name__).info(
             "Email inbox poller disabled via AI_EMAIL_INBOX_ENABLED=false"
+        )
+
+    if settings.AI_TELEGRAM_INBOUND_ENABLED:
+        background_tasks.append(
+            asyncio.create_task(
+                telegram_inbox.run_telegram_inbox_loop(stop_event),
+                name="telegram_inbox_poller",
+            )
+        )
+    else:
+        logging.getLogger(__name__).info(
+            "Telegram inbox loop disabled via AI_TELEGRAM_INBOUND_ENABLED=false"
         )
 
     try:

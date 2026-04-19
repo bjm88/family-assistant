@@ -55,6 +55,27 @@ from .sms_inbox_message import (
     SmsInboxMessage,
     SMS_INBOX_STATUSES,
 )
+from .telegram_inbox_message import (
+    TelegramInboxAttachment,
+    TelegramInboxMessage,
+    TELEGRAM_ATTACHMENT_KINDS,
+    TELEGRAM_INBOX_STATUSES,
+)
+from .telegram_invite import (
+    TelegramInvite,
+    TELEGRAM_INVITE_CHANNELS,
+    TELEGRAM_INVITE_DEFAULT_TTL,
+    generate_invite_token,
+)
+from .telegram_contact_verification import (
+    TelegramContactVerification,
+    TELEGRAM_VERIFY_DEFAULT_TTL,
+    TELEGRAM_VERIFY_DEFAULT_MAX_ATTEMPTS,
+    TELEGRAM_VERIFY_DEFAULT_CODE_LENGTH,
+    generate_verification_code,
+    hash_verification_code,
+    verification_codes_match,
+)
 from .task import (
     Task,
     TaskAttachment,
@@ -108,6 +129,21 @@ __all__ = [
     "SmsInboxMessage",
     "SmsInboxAttachment",
     "SMS_INBOX_STATUSES",
+    "TelegramInboxMessage",
+    "TelegramInboxAttachment",
+    "TELEGRAM_ATTACHMENT_KINDS",
+    "TELEGRAM_INBOX_STATUSES",
+    "TelegramInvite",
+    "TELEGRAM_INVITE_CHANNELS",
+    "TELEGRAM_INVITE_DEFAULT_TTL",
+    "generate_invite_token",
+    "TelegramContactVerification",
+    "TELEGRAM_VERIFY_DEFAULT_TTL",
+    "TELEGRAM_VERIFY_DEFAULT_MAX_ATTEMPTS",
+    "TELEGRAM_VERIFY_DEFAULT_CODE_LENGTH",
+    "generate_verification_code",
+    "hash_verification_code",
+    "verification_codes_match",
     "Task",
     "TaskAttachment",
     "TaskComment",

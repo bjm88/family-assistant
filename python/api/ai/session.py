@@ -222,6 +222,51 @@ def find_or_create_sms_session(
     return session, True
 
 
+def find_or_create_telegram_session(
+    db: Session,
+    *,
+    family_id: int,
+    chat_id: int,
+) -> Tuple[models.LiveSession, bool]:
+    """Return ``(session, created)`` for an inbound Telegram chat.
+
+    Mirrors :func:`find_or_create_sms_session` but keys on the
+    Telegram numeric chat id (stringified to share the
+    ``external_thread_id`` column). For private chats the chat id
+    equals the user's id, so every message from one human accretes
+    into a single session row + transcript.
+
+    Like email and SMS threads, Telegram sessions deliberately skip
+    the live-page idle sweep — a back-and-forth that takes a week is
+    still one session.
+    """
+    key = str(chat_id)
+    existing = db.execute(
+        select(models.LiveSession)
+        .where(models.LiveSession.family_id == family_id)
+        .where(models.LiveSession.source == "telegram")
+        .where(models.LiveSession.external_thread_id == key)
+        .order_by(models.LiveSession.started_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.last_activity_at = _now()
+        if existing.ended_at is not None:
+            existing.ended_at = None
+            existing.end_reason = None
+        return existing, False
+
+    session = models.LiveSession(
+        family_id=family_id,
+        source="telegram",
+        external_thread_id=key,
+        start_context=f"telegram_thread:{key}",
+    )
+    db.add(session)
+    db.flush()
+    return session, True
+
+
 def touch_session(
     db: Session, session: models.LiveSession
 ) -> None:

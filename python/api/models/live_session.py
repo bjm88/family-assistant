@@ -50,14 +50,14 @@ LIVE_SESSION_END_REASONS: tuple[str, ...] = (
 
 # Where this session originated. Drives badging in the history UI and
 # the "should the email poller reopen this thread?" lookup.
-LIVE_SESSION_SOURCES: tuple[str, ...] = ("live", "email")
+LIVE_SESSION_SOURCES: tuple[str, ...] = ("live", "email", "sms", "telegram")
 
 
 class LiveSession(Base, TimestampMixin):
     __tablename__ = "live_sessions"
     __table_args__ = (
         CheckConstraint(
-            "source IN ('live', 'email')",
+            "source IN ('live', 'email', 'sms', 'telegram')",
             name="ck_live_sessions_source",
         ),
         # Partial unique index — only enforce uniqueness on rows that
@@ -138,9 +138,11 @@ class LiveSession(Base, TimestampMixin):
         comment=(
             "Which surface opened this session. 'live' = camera or "
             "in-page chat, 'email' = a Gmail thread routed through the "
-            "email-inbox poller. The UI uses this to badge rows and "
-            "the poller uses it (with external_thread_id) to find the "
-            "running session for an ongoing email thread."
+            "email-inbox poller, 'sms' = a Twilio thread, 'telegram' = "
+            "a Telegram chat routed through the bot poller. The UI "
+            "uses this to badge rows and the per-source pollers use "
+            "it (with external_thread_id) to find the running session "
+            "for an ongoing thread."
         ),
     )
     external_thread_id: Mapped[Optional[str]] = mapped_column(
@@ -148,10 +150,12 @@ class LiveSession(Base, TimestampMixin):
         nullable=True,
         comment=(
             "Opaque foreign id for the conversation upstream. For "
-            "source='email' this is the Gmail thread_id, which lets "
-            "the poller reuse one session row per multi-turn email "
-            "thread instead of opening a fresh session every reply. "
-            "NULL for source='live'."
+            "source='email' this is the Gmail thread_id; for "
+            "source='sms' it is the counterparty's E.164 phone; for "
+            "source='telegram' it is the chat id (stringified). Lets "
+            "the poller reuse one session row per multi-turn thread "
+            "instead of opening a fresh session every reply. NULL for "
+            "source='live'."
         ),
     )
 

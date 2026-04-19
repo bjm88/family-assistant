@@ -175,6 +175,63 @@ class Settings(BaseSettings):
     # OK reading on a phone screen.
     AI_SMS_REPLY_MAX_CHARS: int = 480
 
+    # ---- Telegram inbox ------------------------------------------------
+    # Master switch for the Telegram long-poll loop. When OFF the bot
+    # poller never starts and inbound messages pile up on Telegram's
+    # side until the loop is re-enabled (Telegram retains undelivered
+    # updates for ~24 h).
+    AI_TELEGRAM_INBOUND_ENABLED: bool = True
+    # Bot token from BotFather (e.g. ``123456:ABCdef...``). When unset
+    # the poller logs once at startup and stays idle — Telegram is the
+    # only surface that hard-requires a credential to do anything at
+    # all, so we degrade gracefully rather than crash.
+    TELEGRAM_BOT_TOKEN: Optional[str] = None
+    # Long-poll timeout passed to getUpdates. Telegram holds the
+    # request open for up to this many seconds when there's nothing
+    # new, which is the cheapest way to get near-instant delivery
+    # without webhooks or polling-storms.
+    AI_TELEGRAM_LONGPOLL_SECONDS: int = 25
+    # Hard cap on updates fetched per getUpdates call. Each one runs
+    # the full agent pipeline so a flood from one chatty user can't
+    # spawn dozens of LLM runs in parallel.
+    AI_TELEGRAM_INBOX_MAX_PER_TICK: int = 10
+    # Soft cap on outbound message length. Telegram allows 4096; we
+    # keep replies friendlier-sized by default but bump higher than
+    # SMS because Telegram has no carrier-segmenting cost.
+    AI_TELEGRAM_REPLY_MAX_CHARS: int = 3500
+
+    # When the inbox sees a sender it doesn't recognise, optionally
+    # reply with a one-tap "Share my phone number" button so Avi can
+    # auto-bind that Telegram identity to a Person row whose
+    # mobile/home/work phone matches. Disable to fall back to the
+    # original silent-drop behaviour (only out-of-band invites can
+    # link a sender). Telegram never exposes a sender's phone or
+    # email through any other Bot API surface — explicit consent via
+    # this prompt is the only path.
+    AI_TELEGRAM_AUTO_LINK_BY_PHONE: bool = True
+    # Don't re-prompt the same chat for a contact share more than
+    # once inside this window. Prevents Avi from spamming a button
+    # at every "what?" message a stranger sends.
+    AI_TELEGRAM_CONTACT_PROMPT_COOLDOWN_HOURS: int = 24
+
+    # Two-factor verification of a Telegram contact share via Twilio
+    # SMS. The phone number inside `message.contact` is supplied by
+    # the user's client and a custom MTProto client could forge it,
+    # so we don't trust the contact share alone. Instead we text a
+    # one-time code to the matched Person.mobile_phone_number and
+    # require the user to echo it back into Telegram before binding
+    # `Person.telegram_user_id`.
+    #
+    # TTL is the wall-clock deadline for replying with the code;
+    # 10 min covers "switch apps, copy the code, switch back" without
+    # leaving stale challenges around for hours. Max attempts gives
+    # the user room for typos but caps brute-force at a 5e-6 success
+    # rate against a 6-digit keyspace. Code length matches the
+    # universal SMS-2FA convention.
+    AI_TELEGRAM_VERIFY_TTL_MINUTES: int = 10
+    AI_TELEGRAM_VERIFY_MAX_ATTEMPTS: int = 5
+    AI_TELEGRAM_VERIFY_CODE_LENGTH: int = 6
+
     @property
     def database_url(self) -> str:
         return (

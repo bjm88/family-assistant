@@ -21,6 +21,18 @@ class PersonBase(BaseModel):
     mobile_phone_number: Optional[str] = Field(None, max_length=40)
     home_phone_number: Optional[str] = Field(None, max_length=40)
     work_phone_number: Optional[str] = Field(None, max_length=40)
+    telegram_user_id: Optional[int] = Field(
+        None,
+        description=(
+            "Numeric Telegram user id (message.from.id). Stable for "
+            "the lifetime of the account; preferred over telegram_username."
+        ),
+    )
+    telegram_username: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="Telegram @username without the leading @.",
+    )
     interests_and_activities: Optional[str] = None
     notes: Optional[str] = None
 
@@ -42,6 +54,8 @@ class PersonUpdate(BaseModel):
     mobile_phone_number: Optional[str] = Field(None, max_length=40)
     home_phone_number: Optional[str] = Field(None, max_length=40)
     work_phone_number: Optional[str] = Field(None, max_length=40)
+    telegram_user_id: Optional[int] = None
+    telegram_username: Optional[str] = Field(None, max_length=64)
     interests_and_activities: Optional[str] = None
     notes: Optional[str] = None
 
@@ -61,6 +75,8 @@ class PersonRead(OrmModel):
     mobile_phone_number: Optional[str]
     home_phone_number: Optional[str]
     work_phone_number: Optional[str]
+    telegram_user_id: Optional[int]
+    telegram_username: Optional[str]
     profile_photo_path: Optional[str]
     interests_and_activities: Optional[str]
     notes: Optional[str]

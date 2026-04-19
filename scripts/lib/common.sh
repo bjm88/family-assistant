@@ -418,3 +418,38 @@ launchagent_status() {
         echo "missing"
     fi
 }
+
+# launchagent_is_loaded <short> — exit 0 iff launchd currently knows about
+# the agent in the user's gui domain. Used by restart.sh to decide whether
+# the right move is `launchctl kickstart -k` (which lets launchd own the
+# kill→relaunch) or our manual stop→start pair (when nothing is managing
+# the service for us).
+launchagent_is_loaded() {
+    local label
+    label="$(launchagent_label "$1")"
+    launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1
+}
+
+# launchagent_kickstart <short> — atomic restart of a loaded agent.
+#
+# launchctl's `kickstart -k <service>` tells launchd to terminate the
+# current instance AND start a new one in a single operation it owns
+# end to end. That closes the race window the old "kill the PID then
+# rerun start.sh" path opened: with KeepAlive=true the agent would be
+# resurrected by launchd in the gap, our follow-up bind would fail
+# with "Address already in use", and we'd think the restart broke.
+launchagent_kickstart() {
+    local short="$1"
+    local label
+    label="$(launchagent_label "${short}")"
+    if ! launchagent_is_loaded "${short}"; then
+        log_error "LaunchAgent ${label} is not loaded — can't kickstart."
+        return 1
+    fi
+    log_info "Kickstarting ${label} (launchctl kickstart -k)…"
+    if ! launchctl kickstart -k "gui/$(id -u)/${label}"; then
+        log_error "launchctl kickstart failed for ${label}"
+        return 1
+    fi
+    return 0
+}
