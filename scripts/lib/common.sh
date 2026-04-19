@@ -28,10 +28,21 @@ FRONTEND_PID_FILE="${RUN_DIR}/frontend.pid"
 BACKEND_LOG="${LOG_DIR}/backend.log"
 FRONTEND_LOG="${LOG_DIR}/frontend.log"
 
-# Service configuration.
+# Service configuration. All ports are overridable from the environment so
+# the same scripts work in Docker / CI where ports are remapped.
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
+POSTGRES_PORT="${POSTGRES_PORT:-5432}"
+NGROK_AGENT_PORT="${NGROK_AGENT_PORT:-4040}"
+
+# Extra log files for the daemons that scripts/start.sh doesn't manage.
+NGROK_LOG="${LOG_DIR}/ngrok.log"
+OLLAMA_LOG="${LOG_DIR}/ollama.log"
+
+# macOS LaunchAgent layout.
+LAUNCHAGENTS_DIR="${HOME}/Library/LaunchAgents"
+LAUNCHAGENT_PREFIX="com.familyassistant"
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
@@ -157,5 +168,253 @@ require_cmd() {
         log_error "Required command '${cmd}' not found in PATH."
         [[ -n "${hint}" ]] && log_error "  Hint: ${hint}"
         return 1
+    fi
+}
+
+# resolve_cmd <cmd> — echoes the absolute path of <cmd> if available.
+# Used to bake real paths into LaunchAgent plists, since launchd runs
+# with a minimal PATH and resolving via "command -v" at boot is unsafe.
+resolve_cmd() {
+    command -v "$1" 2>/dev/null || true
+}
+
+# ---------- third-party daemon helpers --------------------------------------
+# Each daemon helper exposes two functions:
+#   <name>_is_running   → exit 0 iff the daemon is reachable RIGHT NOW.
+#   <name>_start        → bring it up, prefer Homebrew services when present.
+#
+# Helpers MUST be idempotent: calling _start while it's already running
+# should be a no-op that prints a friendly note.
+
+# ---- Postgres ---
+postgres_is_running() {
+    # ``pg_isready`` is the canonical Postgres health probe — it tries a
+    # real socket connection but doesn't authenticate, so it works even
+    # before our app user/database exist.
+    if command -v pg_isready >/dev/null 2>&1; then
+        pg_isready -h localhost -p "${POSTGRES_PORT}" -q
+    else
+        # Fallback: just check that something is listening on the port.
+        port_in_use "${POSTGRES_PORT}"
+    fi
+}
+
+# Returns the brew formula name for the user's installed Postgres
+# (postgresql@16, postgresql@15, …). Empty if Postgres isn't a brew formula.
+postgres_brew_formula() {
+    if ! command -v brew >/dev/null 2>&1; then echo ""; return; fi
+    brew services list 2>/dev/null | awk 'NR>1 && $1 ~ /^postgresql/ {print $1; exit}'
+}
+
+postgres_start() {
+    if postgres_is_running; then
+        log_success "Postgres is already running on :${POSTGRES_PORT}"
+        return 0
+    fi
+    local formula
+    formula="$(postgres_brew_formula)"
+    if [[ -n "${formula}" ]]; then
+        log_info "Starting Postgres via 'brew services start ${formula}'…"
+        brew services start "${formula}" >/dev/null
+    else
+        log_warn "Postgres isn't installed via Homebrew."
+        log_warn "  Start it manually (e.g. 'pg_ctl -D /usr/local/var/postgres start')"
+        log_warn "  or install via 'brew install postgresql@16'."
+        return 1
+    fi
+    # pg_isready can be racy on first boot — retry for a few seconds.
+    local i=0
+    while ! postgres_is_running && [[ $i -lt 15 ]]; do
+        sleep 0.5
+        i=$((i + 1))
+    done
+    if postgres_is_running; then
+        log_success "Postgres is up on :${POSTGRES_PORT}"
+        return 0
+    fi
+    log_error "Postgres did not come up within 8s"
+    return 1
+}
+
+# ---- Ollama ---
+ollama_is_running() {
+    curl -fsS -m 1 "http://localhost:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1
+}
+
+# Echoes "brew" if Ollama is registered as a brew service, "app" if the
+# Ollama.app menu-bar daemon is installed under /Applications, or "" if
+# neither — we'll fall back to a raw ``ollama serve`` in that case.
+ollama_install_kind() {
+    if command -v brew >/dev/null 2>&1 && \
+        brew services list 2>/dev/null | grep -q '^ollama'; then
+        echo "brew"
+    elif [[ -d "/Applications/Ollama.app" ]]; then
+        echo "app"
+    else
+        echo ""
+    fi
+}
+
+ollama_start() {
+    if ollama_is_running; then
+        log_success "Ollama daemon is already up on :${OLLAMA_PORT}"
+        return 0
+    fi
+    local kind
+    kind="$(ollama_install_kind)"
+    case "${kind}" in
+        brew)
+            log_info "Starting Ollama via 'brew services start ollama'…"
+            brew services start ollama >/dev/null
+            ;;
+        app)
+            log_info "Launching the Ollama menu-bar app…"
+            open -ga "Ollama"
+            ;;
+        *)
+            if ! command -v ollama >/dev/null 2>&1; then
+                log_error "ollama is not installed. Get it from https://ollama.com or 'brew install ollama'."
+                return 1
+            fi
+            log_info "Starting 'ollama serve' in the background → ${OLLAMA_LOG}"
+            nohup ollama serve >"${OLLAMA_LOG}" 2>&1 &
+            ;;
+    esac
+    local i=0
+    while ! ollama_is_running && [[ $i -lt 30 ]]; do
+        sleep 0.5
+        i=$((i + 1))
+    done
+    if ollama_is_running; then
+        log_success "Ollama daemon is up on :${OLLAMA_PORT}"
+        return 0
+    fi
+    log_error "Ollama did not come up within 15s — see ${OLLAMA_LOG}"
+    return 1
+}
+
+# ---- ngrok ---
+ngrok_is_running() {
+    curl -fsS -m 1 "http://localhost:${NGROK_AGENT_PORT}/api/tunnels" >/dev/null 2>&1
+}
+
+# Pull the configured public hostname from .env (NGROK_DOMAIN). Strips a
+# protocol or trailing slash if the user accidentally pasted a full URL.
+ngrok_domain() {
+    local raw="${NGROK_DOMAIN:-}"
+    if [[ -z "${raw}" && -f "${PROJECT_ROOT}/.env" ]]; then
+        raw="$(grep -E '^NGROK_DOMAIN=' "${PROJECT_ROOT}/.env" | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+    fi
+    raw="${raw#http://}"
+    raw="${raw#https://}"
+    raw="${raw%/}"
+    echo "${raw}"
+}
+
+ngrok_start() {
+    if ngrok_is_running; then
+        log_success "ngrok agent is already up on :${NGROK_AGENT_PORT}"
+        return 0
+    fi
+    if ! command -v ngrok >/dev/null 2>&1; then
+        log_error "ngrok is not installed. 'brew install ngrok' (then 'ngrok config add-authtoken …')."
+        return 1
+    fi
+    local domain
+    domain="$(ngrok_domain)"
+    if [[ -z "${domain}" ]]; then
+        log_error "NGROK_DOMAIN isn't set in .env — can't start the tunnel deterministically."
+        return 1
+    fi
+    log_info "Starting ngrok tunnel ${domain} → :${BACKEND_PORT} (log: ${NGROK_LOG})"
+    nohup ngrok http "--url=${domain}" "${BACKEND_PORT}" --log=stdout \
+        >"${NGROK_LOG}" 2>&1 &
+    local i=0
+    while ! ngrok_is_running && [[ $i -lt 20 ]]; do
+        sleep 0.25
+        i=$((i + 1))
+    done
+    if ngrok_is_running; then
+        log_success "ngrok agent is up; public URL: https://${domain}"
+        return 0
+    fi
+    log_error "ngrok did not come up within 5s — see ${NGROK_LOG}"
+    return 1
+}
+
+# ---------- LaunchAgent helpers ---------------------------------------------
+# All plists this repo manages live under ~/Library/LaunchAgents and are
+# named "${LAUNCHAGENT_PREFIX}.<short>.plist". Helpers favour the modern
+# launchctl bootstrap/bootout API and fall back to load/unload on older
+# macOS where bootstrap is rejected.
+
+# launchagent_path <short> — echoes the absolute plist path for the agent.
+launchagent_path() {
+    echo "${LAUNCHAGENTS_DIR}/${LAUNCHAGENT_PREFIX}.$1.plist"
+}
+
+# launchagent_label <short> — echoes the launchd label string.
+launchagent_label() {
+    echo "${LAUNCHAGENT_PREFIX}.$1"
+}
+
+# launchagent_install <short> <plist-content>
+#   Writes the plist to ~/Library/LaunchAgents and (re-)bootstraps it.
+#   Replaces any existing agent with the same label (so re-running the
+#   register script is safe).
+launchagent_install() {
+    local short="$1"
+    local content="$2"
+    local path
+    path="$(launchagent_path "${short}")"
+    local label
+    label="$(launchagent_label "${short}")"
+
+    mkdir -p "${LAUNCHAGENTS_DIR}"
+    if [[ -f "${path}" ]]; then
+        log_info "Replacing existing agent ${label}"
+        launchagent_unload "${short}" || true
+    fi
+    printf "%s" "${content}" >"${path}"
+    chmod 0644 "${path}"
+    log_info "Wrote ${path}"
+
+    # gui/<UID> is the per-user launchd domain — what `launchctl load`
+    # used to target by default. ``bootstrap`` is the supported path on
+    # macOS 11+; if that errors (older OS, SIP edge case) we retry with
+    # the legacy ``load`` so the script still works.
+    if launchctl bootstrap "gui/$(id -u)" "${path}" 2>/dev/null; then
+        :
+    else
+        launchctl load -w "${path}"
+    fi
+    launchctl enable "gui/$(id -u)/${label}" 2>/dev/null || true
+    log_success "Installed LaunchAgent ${label}"
+}
+
+# launchagent_unload <short> — best-effort unload + remove of the plist.
+launchagent_unload() {
+    local short="$1"
+    local path
+    path="$(launchagent_path "${short}")"
+    local label
+    label="$(launchagent_label "${short}")"
+    launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null \
+        || launchctl unload "${path}" 2>/dev/null \
+        || true
+    if [[ -f "${path}" ]]; then
+        rm -f "${path}"
+        log_success "Removed LaunchAgent ${label}"
+    fi
+}
+
+# launchagent_status <short> — prints "loaded" / "missing" for the agent.
+launchagent_status() {
+    local label
+    label="$(launchagent_label "$1")"
+    if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+        echo "loaded"
+    else
+        echo "missing"
     fi
 }

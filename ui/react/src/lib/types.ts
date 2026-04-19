@@ -418,3 +418,22 @@ export interface DocumentRecord {
   created_at: string;
   updated_at: string;
 }
+
+export type SystemStatusLevel = "ok" | "degraded" | "down" | "unknown";
+
+export interface SystemStatusCheck {
+  key: string;
+  label: string;
+  status: SystemStatusLevel;
+  latency_ms: number | null;
+  summary: string;
+  detail: Record<string, unknown>;
+  hint: string | null;
+  checked_at: string;
+}
+
+export interface SystemStatusReport {
+  overall: SystemStatusLevel;
+  generated_at: string;
+  checks: SystemStatusCheck[];
+}

@@ -77,6 +77,7 @@ from .routers import (
     residences,
     sensitive_identifiers,
     sms_webhook,
+    status,
     tasks,
     vehicles,
 )
@@ -171,6 +172,7 @@ def create_app() -> FastAPI:
         documents.router,
         tasks.router,
         google.router,
+        status.router,
     ]
     for r in admin_routers:
         app.include_router(r, prefix=ADMIN_PREFIX)
