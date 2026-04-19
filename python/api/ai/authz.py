@@ -127,6 +127,82 @@ class AccessDecision:
         return self.allowed
 
 
+def can_see_calendar_details(
+    db: Session,
+    *,
+    requestor_person_id: Optional[int],
+    subject_person_id: int,
+    family_id: Optional[int] = None,
+) -> AccessDecision:
+    """Decide whether ``requestor`` may see ``subject``'s calendar EVENT detail.
+
+    Calendar detail (event title, location, attendees, organizer) is
+    treated more strictly than the SSN-style sensitive matrix:
+
+    * ``self``   — always allowed.
+    * ``spouse`` — direct spouses are allowed.
+    * everyone else (including parents-of-adult-children, siblings,
+      grandparents, in-laws, anonymous speakers) — DENIED. They can
+      still see whether the subject is busy or free in a window
+      (which is what every other family member is permitted to see),
+      but the event title and location are private to the subject
+      and their spouse.
+
+    The "parent → child" carve-out from
+    :func:`can_access_sensitive` is intentionally NOT carried over
+    here because adults' work calendars frequently contain
+    confidential business detail (interview slots, performance
+    reviews, layoffs) that even a parent shouldn't see by default.
+    """
+    if requestor_person_id is None:
+        decision = AccessDecision(False, "anonymous", None, subject_person_id)
+        _log(decision, scope="cal_detail")
+        return decision
+
+    if requestor_person_id == subject_person_id:
+        decision = AccessDecision(
+            True, "self", requestor_person_id, subject_person_id
+        )
+        _log(decision, scope="cal_detail")
+        return decision
+
+    subject = db.get(models.Person, subject_person_id)
+    if subject is None:
+        decision = AccessDecision(
+            False, "unknown_subject", requestor_person_id, subject_person_id
+        )
+        _log(decision, scope="cal_detail")
+        return decision
+
+    requestor = db.get(models.Person, requestor_person_id)
+    if requestor is None:
+        decision = AccessDecision(
+            False, "unknown_subject", requestor_person_id, subject_person_id
+        )
+        _log(decision, scope="cal_detail")
+        return decision
+
+    if requestor.family_id != subject.family_id:
+        decision = AccessDecision(
+            False, "cross_family", requestor_person_id, subject_person_id
+        )
+        _log(decision, scope="cal_detail")
+        return decision
+
+    if _is_spouse(db, requestor_person_id, subject_person_id):
+        decision = AccessDecision(
+            True, "spouse", requestor_person_id, subject_person_id
+        )
+        _log(decision, scope="cal_detail")
+        return decision
+
+    decision = AccessDecision(
+        False, "unauthorized", requestor_person_id, subject_person_id
+    )
+    _log(decision, scope="cal_detail")
+    return decision
+
+
 def can_access_sensitive(
     db: Session,
     *,
@@ -433,12 +509,18 @@ def _names_for(db: Session, ids: Iterable[int]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def _log(decision: AccessDecision) -> None:
-    """One stable line per decision so audits are easy to grep."""
+def _log(decision: AccessDecision, *, scope: str = "sensitive") -> None:
+    """One stable line per decision so audits are easy to grep.
+
+    ``scope`` distinguishes the sensitive-data check from the
+    calendar-detail check so a future audit can answer "did anyone
+    other than Ben himself see Ben's work calendar this week?".
+    """
     verb = "ALLOW" if decision.allowed else "DENY "
     logger.info(
-        "[authz] %s requestor=%s subject=%s reason=%s",
+        "[authz] %s scope=%s requestor=%s subject=%s reason=%s",
         verb,
+        scope,
         decision.requestor_person_id,
         decision.subject_person_id,
         decision.label,
@@ -454,6 +536,7 @@ __all__ = [
     "SpeakerScope",
     "build_speaker_scope",
     "can_access_sensitive",
+    "can_see_calendar_details",
     "redact_row",
     "redact_rows",
     "render_speaker_scope_block",

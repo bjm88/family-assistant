@@ -543,15 +543,19 @@ def _lookup_family_member_by_email(
 ) -> Optional[models.Person]:
     if not email:
         return None
-    # Case-insensitive exact match. We don't strip plus-tags or domain
-    # aliases on purpose — if the user sends from ben+work@example.com
-    # we want them to register that exact alias rather than have Avi
-    # silently broaden the security gate.
+    # Case-insensitive exact match against EITHER the personal or
+    # work mailbox so a family member writing from their work email
+    # is still recognised. We don't strip plus-tags or domain
+    # aliases on purpose — if the user sends from
+    # ben+work@example.com we want them to register that exact
+    # alias rather than have Avi silently broaden the security gate.
     return db.execute(
         select(models.Person)
         .where(models.Person.family_id == family_id)
-        .where(models.Person.email_address.is_not(None))
-        .where(models.Person.email_address.ilike(email))
+        .where(
+            models.Person.email_address.ilike(email)
+            | models.Person.work_email.ilike(email)
+        )
         .limit(1)
     ).scalar_one_or_none()
 

@@ -27,6 +27,7 @@ export interface Person {
   gender: string | null;
   primary_family_relationship: string | null;
   email_address: string | null;
+  work_email: string | null;
   mobile_phone_number: string | null;
   home_phone_number: string | null;
   work_phone_number: string | null;

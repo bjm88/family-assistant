@@ -22,6 +22,7 @@ import {
   MicOff,
   Search,
   Send,
+  SkipForward,
   Sparkles,
   Square,
   User,
@@ -167,7 +168,10 @@ const ECHO_GRACE_MS = 700;
 // but played sequentially.
 // -------------------------------------------------------------------------
 type AudioQueueHandle = {
-  enqueue: (text: string, opts?: { gender_hint?: string | null }) => void;
+  enqueue: (
+    text: string,
+    opts?: { gender_hint?: string | null; messageId?: string }
+  ) => void;
   setMuted: (muted: boolean) => void;
   // True while a WAV is actively playing out of the speakers.
   isSpeaking: boolean;
@@ -182,19 +186,43 @@ type AudioQueueHandle = {
   // so AviLive2D can subscribe to play/pause events if it wants to
   // kick off motions precisely in sync with speech.
   audioEl: HTMLAudioElement | null;
+  // Stable id of the chat message currently being read aloud (passed
+  // through from `enqueue`). The chat UI uses this to render a
+  // "Skip" button on exactly the bubble Avi is reading right now.
+  // Null whenever nothing is playing.
+  currentMessageId: string | null;
+  // Stop reading the currently-playing clip immediately. Does NOT
+  // drop later items in the queue (greet → followup chains still
+  // play through), so "skip the long calendar dump" doesn't also
+  // silence the next conversational turn.
+  skipCurrent: () => void;
 };
 
 function useAudioQueue(muted: boolean): AudioQueueHandle {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const queueRef = useRef<
-    Array<{ text: string; gender_hint?: string | null; token: number }>
+    Array<{
+      text: string;
+      gender_hint?: string | null;
+      token: number;
+      messageId?: string;
+    }>
   >([]);
   const playingRef = useRef(false);
   const tokenRef = useRef(0);
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
+  // Bumped every time the user clicks Skip on a clip that's already
+  // mid-fetch from /tts. The fetch resolver checks the captured
+  // token against this ref and aborts the play if they don't match,
+  // so a tiny network delay can't cause a "skipped" clip to start
+  // talking a moment later.
+  const skipTokenRef = useRef(0);
 
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [currentMessageId, setCurrentMessageId] = useState<string | null>(
+    null
+  );
   const [amplitude, setAmplitude] = useState(0);
   const amplitudeRef = useRef(0);
   // Mirror the audio element as React state so consumers (Live2D) can
@@ -280,6 +308,12 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
       return playNext();
     }
     playingRef.current = true;
+    // Snapshot the skip generation when this clip is dispatched. If
+    // the user clicks Skip while we're mid-fetch the ref will have
+    // moved on — we then quietly drop the result instead of letting
+    // it start talking a beat after the click.
+    const startedAtSkipToken = skipTokenRef.current;
+    setCurrentMessageId(next.messageId ?? null);
     try {
       const resp = await fetch(resolveApiPath("/api/aiassistant/tts"), {
         method: "POST",
@@ -291,6 +325,15 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
       });
       if (!resp.ok) throw new Error(`TTS HTTP ${resp.status}`);
       const blob = await resp.blob();
+      if (startedAtSkipToken !== skipTokenRef.current) {
+        // Skipped while we were waiting on /tts — toss the audio.
+        playingRef.current = false;
+        setIsSpeaking(false);
+        setCurrentMessageId(null);
+        stopAmplitudeLoop();
+        void playNext();
+        return;
+      }
       const url = URL.createObjectURL(blob);
       const audio = audioRef.current!;
       audio.src = url;
@@ -298,6 +341,7 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
         URL.revokeObjectURL(url);
         playingRef.current = false;
         setIsSpeaking(false);
+        setCurrentMessageId(null);
         stopAmplitudeLoop();
         void playNext();
       };
@@ -305,6 +349,7 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
         URL.revokeObjectURL(url);
         playingRef.current = false;
         setIsSpeaking(false);
+        setCurrentMessageId(null);
         stopAmplitudeLoop();
         void playNext();
       };
@@ -323,25 +368,31 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
         console.warn("Avi: audio playback blocked until first user gesture", err);
         playingRef.current = false;
         setIsSpeaking(false);
+        setCurrentMessageId(null);
         stopAmplitudeLoop();
       }
     } catch (err) {
       console.debug("Avi TTS failed", err);
       playingRef.current = false;
       setIsSpeaking(false);
+      setCurrentMessageId(null);
       stopAmplitudeLoop();
       void playNext();
     }
   }, [ensureAnalyser, startAmplitudeLoop, stopAmplitudeLoop]);
 
   const enqueue = useCallback(
-    (text: string, opts?: { gender_hint?: string | null }) => {
+    (
+      text: string,
+      opts?: { gender_hint?: string | null; messageId?: string }
+    ) => {
       if (!text.trim()) return;
       tokenRef.current += 1;
       queueRef.current.push({
         text: text.trim(),
         gender_hint: opts?.gender_hint ?? null,
         token: tokenRef.current,
+        messageId: opts?.messageId,
       });
       void playNext();
     },
@@ -361,13 +412,51 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
         queueRef.current = [];
         playingRef.current = false;
         setIsSpeaking(false);
+        setCurrentMessageId(null);
         stopAmplitudeLoop();
       }
     },
     [stopAmplitudeLoop]
   );
 
-  return { enqueue, setMuted, isSpeaking, amplitude, amplitudeRef, audioEl };
+  // Stop reading the current clip but keep the rest of the queue.
+  // We bump skipTokenRef so any in-flight /tts fetch (clip not yet
+  // started playing) bails when it resolves; we also pause the
+  // <audio> element so a clip already mid-utterance goes silent
+  // immediately. Either way `audio.onended` won't fire — so we
+  // manually advance to the next item.
+  const skipCurrent = useCallback(() => {
+    if (!playingRef.current) return;
+    skipTokenRef.current += 1;
+    const audio = audioRef.current;
+    if (audio) {
+      try {
+        audio.pause();
+        audio.currentTime = 0;
+      } catch {
+        /* noop */
+      }
+      // Detach handlers so they can't fire after we've advanced.
+      audio.onended = null;
+      audio.onerror = null;
+    }
+    playingRef.current = false;
+    setIsSpeaking(false);
+    setCurrentMessageId(null);
+    stopAmplitudeLoop();
+    void playNext();
+  }, [playNext, stopAmplitudeLoop]);
+
+  return {
+    enqueue,
+    setMuted,
+    isSpeaking,
+    amplitude,
+    amplitudeRef,
+    audioEl,
+    currentMessageId,
+    skipCurrent,
+  };
 }
 
 // ============================================================================
@@ -1720,7 +1809,10 @@ function ChatPanel({
             : m
         )
       );
-      audio.enqueue(greetingText, { gender_hint: voiceGender });
+      audio.enqueue(greetingText, {
+        gender_hint: voiceGender,
+        messageId: greetingMsg.id,
+      });
     } catch (e) {
       setMessages((prev) =>
         prev.map((m) =>
@@ -1792,7 +1884,10 @@ function ChatPanel({
             : m
         )
       );
-      audio.enqueue(resp.question, { gender_hint: voiceGender });
+      audio.enqueue(resp.question, {
+        gender_hint: voiceGender,
+        messageId: followupMsg.id,
+      });
     } catch (e) {
       setMessages((prev) =>
         prev.filter((m) => m.id !== followupMsg.id)
@@ -1932,7 +2027,10 @@ function ChatPanel({
       // hundred tiny TTS requests for one answer).
       const speakable = assistantReply.trim();
       if (!lastError && speakable) {
-        audio.enqueue(speakable, { gender_hint: voiceGender });
+        audio.enqueue(speakable, {
+          gender_hint: voiceGender,
+          messageId: assistantMsg.id,
+        });
       }
     } catch (e) {
       setMessages((prev) =>
@@ -2304,7 +2402,15 @@ function ChatPanel({
           </div>
         )}
         {messages.map((m) => (
-          <MessageBubble key={m.id} message={m} assistantName={assistantName} />
+          <MessageBubble
+            key={m.id}
+            message={m}
+            assistantName={assistantName}
+            isSpeakingThis={
+              audio.currentMessageId === m.id && audio.isSpeaking
+            }
+            onSkipSpeech={audio.skipCurrent}
+          />
         ))}
       </div>
 
@@ -2366,9 +2472,17 @@ function ChatPanel({
 function MessageBubble({
   message,
   assistantName,
+  isSpeakingThis,
+  onSkipSpeech,
 }: {
   message: ChatMessage;
   assistantName: string;
+  // True only for the assistant bubble whose audio clip is the one
+  // currently playing through the speakers. Drives the Skip button.
+  isSpeakingThis?: boolean;
+  // Stops the current TTS clip mid-utterance without affecting
+  // anything queued behind it.
+  onSkipSpeech?: () => void;
 }) {
   if (message.role === "system") {
     return (
@@ -2390,7 +2504,8 @@ function MessageBubble({
           "max-w-[85%] rounded-2xl px-3 py-2 text-sm whitespace-pre-wrap",
           isUser
             ? "bg-primary text-primary-foreground rounded-br-sm"
-            : "bg-white border border-border rounded-bl-sm"
+            : "bg-white border border-border rounded-bl-sm",
+          isSpeakingThis && !isUser && "ring-2 ring-primary/40"
         )}
       >
         {!isUser && message.meta && (
@@ -2405,7 +2520,24 @@ function MessageBubble({
             streaming={message.streaming}
           />
         )}
-        {message.content || (message.streaming && (!message.steps || message.steps.length === 0) ? "…" : "")}
+        {message.content ||
+          (message.streaming &&
+          (!message.steps || message.steps.length === 0)
+            ? "…"
+            : "")}
+        {isSpeakingThis && !isUser && onSkipSpeech && (
+          <div className="mt-1.5 flex justify-end">
+            <button
+              type="button"
+              onClick={onSkipSpeech}
+              className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/5 px-2 py-0.5 text-[11px] text-primary hover:bg-primary/15 transition"
+              title="Stop reading this message aloud — keep the text on screen"
+            >
+              <SkipForward className="h-3 w-3" />
+              Skip voice
+            </button>
+          </div>
+        )}
       </div>
       {isUser && (
         <div className="h-7 w-7 rounded-full bg-muted flex items-center justify-center flex-shrink-0">

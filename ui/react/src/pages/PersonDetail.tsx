@@ -61,6 +61,7 @@ type PersonForm = {
   gender?: string;
   primary_family_relationship?: string;
   email_address?: string;
+  work_email?: string;
   mobile_phone_number?: string;
   home_phone_number?: string;
   work_phone_number?: string;
@@ -91,6 +92,7 @@ export default function PersonDetail() {
         gender: person.gender ?? "",
         primary_family_relationship: person.primary_family_relationship ?? "",
         email_address: person.email_address ?? "",
+        work_email: person.work_email ?? "",
         mobile_phone_number: person.mobile_phone_number ?? "",
         home_phone_number: person.home_phone_number ?? "",
         work_phone_number: person.work_phone_number ?? "",
@@ -244,12 +246,28 @@ export default function PersonDetail() {
                   ))}
                 </select>
               </Field>
-              <Field label="Email" htmlFor="email_address">
+              <Field
+                label="Personal email"
+                htmlFor="email_address"
+                hint="Used to verify the sender on inbound email AND as the personal Google Calendar id Avi reads from."
+              >
                 <input
                   id="email_address"
                   type="email"
                   className="input"
                   {...register("email_address")}
+                />
+              </Field>
+              <Field
+                label="Work email"
+                htmlFor="work_email"
+                hint="Optional second mailbox / calendar (e.g. employer Google Workspace). Avi merges work + personal calendars when checking availability; work events typically show as free/busy only."
+              >
+                <input
+                  id="work_email"
+                  type="email"
+                  className="input"
+                  {...register("work_email")}
                 />
               </Field>
               <Field label="Mobile phone" htmlFor="mobile_phone_number">

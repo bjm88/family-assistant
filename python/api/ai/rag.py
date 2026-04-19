@@ -77,6 +77,20 @@ def build_person_context(
     if age is not None:
         lines.append(f"Age: {age}")
 
+    # Email handles double as Google Calendar ids — surface them so
+    # the LLM can correctly pick a calendar to query and so it can
+    # email the right address. Email addresses themselves are not
+    # treated as sensitive (they're already on lots of business
+    # cards); access to the calendar BEHIND the address is gated
+    # separately by ai.authz.can_see_calendar_details.
+    email_bits: List[str] = []
+    if person.email_address:
+        email_bits.append(f"personal {person.email_address}")
+    if person.work_email:
+        email_bits.append(f"work {person.work_email}")
+    if email_bits:
+        lines.append("Email: " + ", ".join(email_bits))
+
     # Goals (ordered by priority).
     priority_rank = {"urgent": 0, "semi_urgent": 1, "normal": 2, "low": 3}
     goals = sorted(

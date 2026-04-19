@@ -59,7 +59,26 @@ class Person(Base, TimestampMixin):
         ),
     )
 
-    email_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    email_address: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment=(
+            "Personal email address. Doubles as a Google Calendar id "
+            "for the AI assistant — the personal calendar shared with "
+            "Avi is keyed off this address."
+        ),
+    )
+    work_email: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment=(
+            "Work / employer email address. Used by the AI assistant "
+            "as a SECOND Google Calendar id when checking availability "
+            "or listing events for this person — work calendars are "
+            "typically only shared as free/busy, while personal "
+            "calendars are full-detail. Optional."
+        ),
+    )
     mobile_phone_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     home_phone_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     work_phone_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
