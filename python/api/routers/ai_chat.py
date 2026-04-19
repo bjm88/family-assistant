@@ -23,11 +23,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..ai import agent as agent_loop
 from ..ai import ollama
 from ..ai import rag
 from ..ai import schema_catalog
 from ..ai import session as live_session
 from ..ai import sql_tool
+from ..ai import tools as agent_tools
 from ..config import get_settings
 from ..db import SessionLocal, get_db
 
@@ -110,6 +112,14 @@ def _load_assistant(db: Session, family_id: int) -> tuple[str, Optional[str]]:
     assistant = family.assistant
     name = assistant.assistant_name if assistant else "Avi"
     return name, family.family_name
+
+
+def _assistant_id_for(db: Session, family_id: int) -> Optional[int]:
+    """Best-effort lookup of the assistant row (needed for Google tools)."""
+    family = db.get(models.Family, family_id)
+    if family is None or family.assistant is None:
+        return None
+    return family.assistant.assistant_id
 
 
 def _build_rag_block(
@@ -546,25 +556,32 @@ def _execute_planner_queries(
 
 @router.post("/chat")
 async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
-    """Streaming chat endpoint.
+    """Streaming chat endpoint, driven by the AI agent loop.
 
-    When a ``live_session_id`` is provided the server also records the
-    conversation:
+    Each invocation creates one ``agent_tasks`` row + N ``agent_steps``
+    rows so every tool call Avi makes is auditable. The SSE stream
+    emits a mix of three event shapes:
 
-    * the *latest* user message is logged before streaming starts — we
-      never log the whole history the client resent because that would
-      duplicate earlier turns,
-    * the full assistant reply is accumulated from the stream and
-      written to the transcript when the stream finishes (or errors).
+    * ``{"task_id": ...}`` — sent first so the UI can subscribe to the
+      task page or render an in-flight progress card.
+    * ``{"step": {...}}`` — one event per model thought, tool call, and
+      tool result. The UI renders these as inline timeline entries.
+    * ``{"delta": "..."}`` — final natural-language reply (sent in one
+      chunk after the agent loop converges; older clients that just
+      append deltas continue to work unmodified).
+    * ``{"done": true}`` — terminal marker; the UI clears its
+      "streaming" indicator on this.
 
-    Because the streaming generator outlives the request-scoped ``db``
-    dependency, we open a fresh :class:`SessionLocal` inside the
-    generator for the final assistant-message write.
+    When a ``live_session_id`` is provided the server still records the
+    user message (before the agent runs) and the final assistant reply
+    (after) into the live-session transcript, so the History page is
+    unchanged.
     """
     if db.get(models.Family, payload.family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
 
     assistant_name, family_name = _load_assistant(db, payload.family_id)
+    assistant_id = _assistant_id_for(db, payload.family_id)
     rag_block = _build_rag_block(db, payload.family_id, payload.recognized_person_id)
 
     # Optional dynamic-SQL planner. Disabled by default because a
@@ -614,7 +631,26 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
         live_data_block=live_data_block,
     )
 
-    messages = [m.model_dump() for m in payload.messages]
+    # Inject a short tool-use preamble so models that aren't natively
+    # tool-trained still understand the contract. Models that DO have a
+    # native tool template (gemma3, llama3.1+) ignore this gracefully.
+    system = (
+        system
+        + "\n\n--- Tool-use rules ---\n"
+        "You have a small set of tools available (lookup_person, "
+        "sql_query, gmail_send, calendar_list_upcoming). Use them when "
+        "the user asks you to take an action or fetch live data. "
+        "ALWAYS call lookup_person to resolve a household member's email "
+        "before drafting an email to them. After a tool returns, briefly "
+        "confirm what you did (one sentence). Never claim to have sent "
+        "an email unless gmail_send returned ok=true."
+    )
+
+    history = [m.model_dump() for m in payload.messages]
+    latest_user_content = next(
+        (m["content"] for m in reversed(history) if m["role"] == "user"),
+        "",
+    )
 
     # Up-front session bookkeeping: verify the session exists and log
     # the latest user message, so the transcript is correct even if the
@@ -624,63 +660,115 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
         session = db.get(models.LiveSession, payload.live_session_id)
         if session is not None and session.family_id == payload.family_id:
             logged_session_id = session.live_session_id
-            latest_user = next(
-                (m for m in reversed(payload.messages) if m.role == "user"),
-                None,
-            )
-            if latest_user is not None:
+            if latest_user_content:
                 live_session.log_message(
                     db,
                     session,
                     role="user",
-                    content=latest_user.content,
+                    content=latest_user_content,
                     person_id=payload.recognized_person_id,
                     meta={"kind": "chat"},
                 )
                 db.commit()
 
+    # Build the tool registry once per request and inspect which
+    # capabilities are actually live (e.g. is Google connected?). Tools
+    # whose ``requires`` aren't satisfied are simply hidden from the
+    # model so it can't hallucinate calling gmail_send when nobody has
+    # signed in yet.
+    registry = agent_tools.build_default_registry()
+    capabilities = agent_tools.detect_capabilities(db, assistant_id)
+
+    # Create the audit row up-front so the SSE stream can reference its
+    # id immediately. We commit here so external clients (e.g. a future
+    # /tasks/{id}/events SSE consumer that reconnects) can find the row.
+    task_row = agent_loop.create_task(
+        db,
+        family_id=payload.family_id,
+        live_session_id=logged_session_id,
+        person_id=payload.recognized_person_id,
+        kind="chat",
+        input_text=latest_user_content,
+        model=ollama._model(),
+    )
+    db.commit()
+    task_id = task_row.agent_task_id
+
     async def event_stream():
-        # SSE framing — each event is `data: {json}\n\n`. The frontend
-        # parses "delta" (token text) and "done" markers.
-        accumulated: list[str] = []
-        stream_error: Optional[str] = None
+        # SSE framing — each event is `data: {json}\n\n`.
+        # First event tells the UI which task this stream belongs to.
+        yield f"data: {json.dumps({'task_id': task_id})}\n\n"
+
+        accumulated_text = ""
+        terminal_error: Optional[str] = None
+        step_summaries: list[dict] = []  # for live-session transcript
+
         try:
-            async for chunk in ollama.chat_stream(messages, system=system):
-                accumulated.append(chunk)
-                yield f"data: {json.dumps({'delta': chunk})}\n\n"
-        except ollama.OllamaUnavailable as e:
-            stream_error = f"unavailable: {e}"
-            yield f"data: {json.dumps({'error': str(e), 'kind': 'unavailable'})}\n\n"
-        except ollama.OllamaError as e:
-            stream_error = f"error: {e}"
-            yield f"data: {json.dumps({'error': str(e), 'kind': 'error'})}\n\n"
+            async for event in agent_loop.run_agent(
+                task_id=task_id,
+                family_id=payload.family_id,
+                assistant_id=assistant_id,
+                person_id=payload.recognized_person_id,
+                system_prompt=system,
+                history=history,
+                user_message=latest_user_content,
+                registry=registry,
+                capabilities=capabilities,
+            ):
+                if event.type == "step":
+                    step = event.payload.get("step") or {}
+                    step_summaries.append(
+                        {
+                            "step_index": step.get("step_index"),
+                            "step_type": step.get("step_type"),
+                            "tool_name": step.get("tool_name"),
+                            "duration_ms": step.get("duration_ms"),
+                            "error": step.get("error"),
+                        }
+                    )
+                if event.type == "delta":
+                    accumulated_text += event.payload.get("delta", "")
+                if event.type == "task_failed":
+                    terminal_error = event.payload.get("error") or "unknown error"
+                    # Surface the error in the legacy 'error' shape so
+                    # the existing UI banner still lights up.
+                    yield (
+                        "data: "
+                        + json.dumps({"error": terminal_error, "kind": "agent"})
+                        + "\n\n"
+                    )
+                yield event.to_sse()
+        except Exception as exc:  # noqa: BLE001 - never crash the stream
+            logger.exception("Agent stream crashed")
+            terminal_error = str(exc)
+            yield f"data: {json.dumps({'error': str(exc), 'kind': 'error'})}\n\n"
 
         # Log the assistant reply in its own DB session — the request-
         # scoped one was closed the moment the StreamingResponse started.
-        if logged_session_id is not None:
-            final_text = "".join(accumulated).strip()
-            if final_text or stream_error:
-                log_db = SessionLocal()
-                try:
-                    log_session = log_db.get(models.LiveSession, logged_session_id)
-                    if log_session is not None:
-                        live_session.log_message(
-                            log_db,
-                            log_session,
-                            role="assistant",
-                            content=final_text or "(no response)",
-                            meta={
-                                "kind": "chat",
-                                "used_model": ollama._model(),
-                                "error": stream_error,
-                            },
-                        )
-                        log_db.commit()
-                except Exception:  # noqa: BLE001 — logging must never break the stream
-                    logger.exception("Failed to log assistant chat message")
-                    log_db.rollback()
-                finally:
-                    log_db.close()
+        if logged_session_id is not None and (accumulated_text or terminal_error):
+            log_db = SessionLocal()
+            try:
+                log_session = log_db.get(models.LiveSession, logged_session_id)
+                if log_session is not None:
+                    live_session.log_message(
+                        log_db,
+                        log_session,
+                        role="assistant",
+                        content=(accumulated_text or "(no response)").strip(),
+                        meta={
+                            "kind": "chat",
+                            "used_model": ollama._model(),
+                            "agent_task_id": task_id,
+                            "agent_steps": step_summaries,
+                            "error": terminal_error,
+                        },
+                    )
+                    log_db.commit()
+            except Exception:  # noqa: BLE001 — logging must never break the stream
+                logger.exception("Failed to log assistant chat message")
+                log_db.rollback()
+            finally:
+                log_db.close()
 
         yield f"data: {json.dumps({'done': True})}\n\n"
 

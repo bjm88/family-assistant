@@ -8,14 +8,19 @@ import {
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  AlertCircle,
   AlertTriangle,
   ArrowLeft,
   Bot,
   Camera,
   CheckCircle2,
+  Database,
   History,
+  Loader2,
+  Mail,
   Mic,
   MicOff,
+  Search,
   Send,
   Sparkles,
   Square,
@@ -98,12 +103,36 @@ type RecognizeResponse = {
 };
 
 type ChatRole = "user" | "assistant" | "system";
+// One row in the agent's plan/execute/observe transcript. The /chat
+// SSE stream emits these alongside text deltas; the chat bubble
+// renders them as a small inline timeline so the user can see Avi
+// look up the recipient's email, draft the body, send it, etc.
+export type AgentStepView = {
+  agent_step_id: number;
+  step_index: number;
+  step_type:
+    | "thinking"
+    | "tool_call"
+    | "tool_result"
+    | "final"
+    | "error";
+  tool_name?: string | null;
+  tool_input?: Record<string, unknown> | null;
+  tool_output?: unknown;
+  content?: string | null;
+  error?: string | null;
+  model?: string | null;
+  duration_ms?: number | null;
+  created_at?: string | null;
+};
 type ChatMessage = {
   id: string;
   role: ChatRole;
   content: string;
   streaming?: boolean;
   meta?: string;
+  taskId?: number | null;
+  steps?: AgentStepView[];
 };
 
 // How often we snap a webcam frame for face recognition. Slow enough that
@@ -1063,6 +1092,12 @@ function LiveSessionPill({
           >
             <History className="h-3.5 w-3.5" /> Session history
           </Link>
+          <Link
+            to={`/aiassistant/${familyId}/agent-tasks`}
+            className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"
+          >
+            <Sparkles className="h-3.5 w-3.5" /> Agent tasks
+          </Link>
         </div>
       </div>
     </div>
@@ -1775,6 +1810,39 @@ function ChatPanel({
           const line = raw.startsWith("data: ") ? raw.slice(6) : raw;
           try {
             const parsed = JSON.parse(line);
+            // First frame from /chat carries the agent task id so the
+            // bubble can deep-link to /tasks/<id> for full audit.
+            if (typeof parsed.task_id === "number" && !parsed.type) {
+              const taskId = parsed.task_id as number;
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsg.id ? { ...m, taskId } : m
+                )
+              );
+            }
+            // Agent step (thought, tool_call, tool_result, final, error).
+            // The backend already persists these to agent_steps so the
+            // UI list is just a mirror of what's auditable in the DB.
+            if (parsed.type === "step" && parsed.step) {
+              const step = parsed.step as AgentStepView;
+              setMessages((prev) =>
+                prev.map((m) => {
+                  if (m.id !== assistantMsg.id) return m;
+                  const existing = m.steps ?? [];
+                  // Replace by step_index to keep the list compact when
+                  // the same step is re-emitted (rare, but safe).
+                  const filtered = existing.filter(
+                    (s) => s.step_index !== step.step_index
+                  );
+                  return {
+                    ...m,
+                    steps: [...filtered, step].sort(
+                      (a, b) => a.step_index - b.step_index
+                    ),
+                  };
+                })
+              );
+            }
             if (parsed.delta) {
               const delta: string = parsed.delta;
               assistantReply += delta;
@@ -2269,7 +2337,14 @@ function MessageBubble({
             {assistantName} · {message.meta}
           </div>
         )}
-        {message.content || (message.streaming ? "…" : "")}
+        {!isUser && message.steps && message.steps.length > 0 && (
+          <AgentStepsList
+            steps={message.steps}
+            taskId={message.taskId ?? null}
+            streaming={message.streaming}
+          />
+        )}
+        {message.content || (message.streaming && (!message.steps || message.steps.length === 0) ? "…" : "")}
       </div>
       {isUser && (
         <div className="h-7 w-7 rounded-full bg-muted flex items-center justify-center flex-shrink-0">
@@ -2278,4 +2353,213 @@ function MessageBubble({
       )}
     </div>
   );
+}
+
+
+// ---------------------------------------------------------------------------
+// AgentStepsList — inline timeline of plan/execute/observe steps shown
+// inside an assistant bubble whenever the chat turn called any tools.
+// Pairs each tool_call with its tool_result so the eye sees one row per
+// action rather than two.
+// ---------------------------------------------------------------------------
+
+const TOOL_LABEL: Record<string, { label: string; icon: typeof Mail }> = {
+  gmail_send: { label: "Send email", icon: Mail },
+  lookup_person: { label: "Look up person", icon: Search },
+  sql_query: { label: "Query database", icon: Database },
+  calendar_list_upcoming: { label: "List calendar", icon: History },
+};
+
+function AgentStepsList({
+  steps,
+  taskId,
+  streaming,
+}: {
+  steps: AgentStepView[];
+  taskId: number | null;
+  streaming?: boolean;
+}) {
+  // Pair tool_call with the matching tool_result by step_index proximity:
+  // the agent always emits tool_call(s) immediately followed by tool_result(s)
+  // in the same order, so we walk the list and merge them.
+  type Row =
+    | {
+        kind: "tool";
+        callIndex: number;
+        toolName: string;
+        input?: Record<string, unknown> | null;
+        result?: AgentStepView | null;
+      }
+    | { kind: "thinking"; content: string }
+    | { kind: "error"; content: string };
+
+  const rows: Row[] = [];
+  const usedResults = new Set<number>();
+  for (const s of steps) {
+    if (s.step_type === "tool_call") {
+      const result = steps.find(
+        (r) =>
+          r.step_type === "tool_result" &&
+          r.tool_name === s.tool_name &&
+          r.step_index > s.step_index &&
+          !usedResults.has(r.step_index)
+      );
+      if (result) usedResults.add(result.step_index);
+      rows.push({
+        kind: "tool",
+        callIndex: s.step_index,
+        toolName: s.tool_name ?? "tool",
+        input: s.tool_input,
+        result: result ?? null,
+      });
+    } else if (s.step_type === "thinking" && s.content) {
+      rows.push({ kind: "thinking", content: s.content });
+    } else if (s.step_type === "error" && s.error) {
+      rows.push({ kind: "error", content: s.error });
+    }
+    // tool_result rows are absorbed by their pair above; final step
+    // becomes the regular bubble text via the delta channel.
+  }
+
+  if (rows.length === 0) return null;
+
+  const stillRunning = streaming && rows.some((r) => r.kind === "tool" && !r.result);
+
+  return (
+    <div className="mb-2 -mx-1 rounded-lg border border-border bg-muted/40">
+      <div className="flex items-center justify-between px-2 py-1 border-b border-border/60 text-[10px] uppercase tracking-wider text-muted-foreground">
+        <span className="flex items-center gap-1">
+          {stillRunning ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <Sparkles className="h-3 w-3" />
+          )}
+          Agent steps
+        </span>
+        {taskId != null && (
+          <Link
+            to={`agent-tasks/${taskId}`}
+            className="text-primary hover:underline"
+          >
+            Audit ›
+          </Link>
+        )}
+      </div>
+      <ol className="divide-y divide-border/60">
+        {rows.map((row, idx) => (
+          <li key={idx} className="px-2 py-1.5">
+            {row.kind === "tool" && <ToolStepRow row={row} />}
+            {row.kind === "thinking" && (
+              <div className="text-xs text-muted-foreground italic">
+                {row.content}
+              </div>
+            )}
+            {row.kind === "error" && (
+              <div className="text-xs text-rose-600 flex items-start gap-1.5">
+                <AlertCircle className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />
+                {row.content}
+              </div>
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function ToolStepRow({
+  row,
+}: {
+  row: {
+    kind: "tool";
+    callIndex: number;
+    toolName: string;
+    input?: Record<string, unknown> | null;
+    result?: AgentStepView | null;
+  };
+}) {
+  const meta = TOOL_LABEL[row.toolName] ?? { label: row.toolName, icon: Sparkles };
+  const Icon = meta.icon;
+  const result = row.result;
+  const isError = !!result?.error;
+  const isPending = !result;
+
+  return (
+    <div className="flex items-start gap-2">
+      <div
+        className={cn(
+          "h-5 w-5 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5",
+          isError
+            ? "bg-rose-100 text-rose-600"
+            : isPending
+              ? "bg-amber-100 text-amber-600"
+              : "bg-emerald-100 text-emerald-600"
+        )}
+      >
+        {isPending ? (
+          <Loader2 className="h-3 w-3 animate-spin" />
+        ) : isError ? (
+          <AlertCircle className="h-3 w-3" />
+        ) : (
+          <CheckCircle2 className="h-3 w-3" />
+        )}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1.5 text-xs font-medium">
+          <Icon className="h-3.5 w-3.5 text-muted-foreground" />
+          <span>{meta.label}</span>
+          {result?.duration_ms != null && (
+            <span className="text-[10px] text-muted-foreground font-normal">
+              · {Math.max(1, Math.round(result.duration_ms))}ms
+            </span>
+          )}
+        </div>
+        {row.input && Object.keys(row.input).length > 0 && (
+          <div className="text-[11px] text-muted-foreground mt-0.5 truncate">
+            {summariseToolInput(row.toolName, row.input)}
+          </div>
+        )}
+        {result?.content && (
+          <div
+            className={cn(
+              "text-[11px] mt-0.5 truncate",
+              isError ? "text-rose-600" : "text-foreground/80"
+            )}
+          >
+            {result.content}
+          </div>
+        )}
+        {result?.error && (
+          <div className="text-[11px] text-rose-600 mt-0.5">
+            {result.error}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function summariseToolInput(
+  toolName: string,
+  input: Record<string, unknown>
+): string {
+  if (toolName === "gmail_send") {
+    const to = input.to ?? "";
+    const subject = input.subject ?? "";
+    return `to ${to} — “${subject}”`;
+  }
+  if (toolName === "lookup_person") {
+    return `name: ${input.name ?? ""}`;
+  }
+  if (toolName === "sql_query") {
+    const sql = String(input.sql ?? "");
+    return sql.length > 120 ? sql.slice(0, 117) + "…" : sql;
+  }
+  if (toolName === "calendar_list_upcoming") {
+    const hrs = input.hours_ahead ?? 72;
+    return `next ${hrs}h`;
+  }
+  // Fallback: show first 1-2 keys.
+  const entries = Object.entries(input).slice(0, 2);
+  return entries.map(([k, v]) => `${k}: ${String(v).slice(0, 40)}`).join(", ");
 }

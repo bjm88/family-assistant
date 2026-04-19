@@ -15,6 +15,7 @@ queries never need to touch ciphertext.
 from .family import Family
 from .assistant import Assistant
 from .google_oauth_credential import GoogleOAuthCredential
+from .agent_task import AgentTask, AgentStep
 from .person import Person
 from .person_photo import PersonPhoto
 from .face_embedding import FaceEmbedding
@@ -49,6 +50,8 @@ __all__ = [
     "Family",
     "Assistant",
     "GoogleOAuthCredential",
+    "AgentTask",
+    "AgentStep",
     "Person",
     "PersonPhoto",
     "FaceEmbedding",

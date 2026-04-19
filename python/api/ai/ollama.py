@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import AsyncIterator, Dict, Iterable, List, Optional
+import re
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 
 import httpx
 
@@ -249,6 +251,185 @@ async def chat_stream(
         ) from e
 
 
+# ---------------------------------------------------------------------------
+# Tool calling — used by the agent loop (api.ai.agent).
+#
+# Ollama supports a native ``tools`` parameter on /api/chat for models
+# that publish a tool-call template (gemma3, llama3.1+, qwen2.5, …). When
+# the model emits a tool call it shows up as ``message.tool_calls`` in
+# the response. For models that don't support that channel the assistant
+# will instead emit a JSON object inside its prose; :func:`_parse_tool_calls_from_text`
+# tries to recover those so we don't completely lose the tool-call path.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolCall:
+    """Single tool invocation requested by the LLM."""
+
+    name: str
+    arguments: Dict[str, Any]
+
+
+@dataclass
+class ChatWithToolsResult:
+    """Outcome of one round-trip to :func:`chat_with_tools`."""
+
+    content: str  # natural-language portion of the model's reply (often empty when tool_calls are present)
+    tool_calls: List[ToolCall] = field(default_factory=list)
+    model: str = ""
+    raw_message: Dict[str, Any] = field(default_factory=dict)
+
+
+async def chat_with_tools(
+    messages: List[Dict[str, Any]],
+    *,
+    tools: List[Dict[str, Any]],
+    system: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    timeout_seconds: float = 90.0,
+) -> ChatWithToolsResult:
+    """Single non-streaming chat turn with tool-calling enabled.
+
+    ``tools`` follows OpenAI/Ollama function-tool schema:
+    ``[{"type": "function", "function": {"name": ..., "description": ..., "parameters": {...}}}, ...]``.
+
+    The agent loop calls this in a tight loop, appending the model's
+    ``tool_calls`` and our tool results to ``messages`` between turns.
+    Temperature defaults low because tool selection is a structured
+    decision; bump it for the final answer if you want more flair.
+    """
+    target_model = model or _model()
+    ollama_messages: List[Dict[str, Any]] = []
+    if system:
+        ollama_messages.append({"role": "system", "content": system})
+    ollama_messages.extend(messages)
+
+    payload: Dict[str, Any] = {
+        "model": target_model,
+        "messages": ollama_messages,
+        "stream": False,
+        "tools": tools,
+        "options": {"temperature": temperature},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            r = await client.post(f"{_base()}/api/chat", json=payload)
+    except httpx.ConnectError as e:
+        raise OllamaUnavailable(
+            f"Ollama at {_base()} is not responding: {e}"
+        ) from e
+
+    if r.status_code == 404:
+        raise OllamaUnavailable(
+            f"Model '{target_model}' is not pulled. "
+            f"Run `ollama pull {target_model}`."
+        )
+    if r.status_code >= 400:
+        raise OllamaError(
+            f"Ollama returned {r.status_code}: {r.text[:400]}"
+        )
+
+    data = r.json()
+    message = data.get("message") or {}
+    content = (message.get("content") or "").strip()
+
+    # Native tool calls (preferred path when the model template supports it).
+    raw_calls = message.get("tool_calls") or []
+    calls: List[ToolCall] = []
+    for c in raw_calls:
+        fn = (c or {}).get("function") or {}
+        name = fn.get("name") or ""
+        args = fn.get("arguments")
+        # Ollama returns ``arguments`` as either a dict or a JSON string
+        # depending on the model. Normalize to dict.
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args else {}
+            except json.JSONDecodeError:
+                args = {"_raw": args}
+        if not isinstance(args, dict):
+            args = {}
+        if name:
+            calls.append(ToolCall(name=name, arguments=args))
+
+    # Fallback: model didn't use the tool channel but stuffed a JSON
+    # object into the prose. Try to recover. Only used when there were
+    # no native tool_calls.
+    if not calls and content:
+        recovered = _parse_tool_calls_from_text(content, [t["function"]["name"] for t in tools])
+        if recovered:
+            calls = recovered
+            # Strip the JSON tool-call block from the user-visible content.
+            content = ""
+
+    return ChatWithToolsResult(
+        content=content,
+        tool_calls=calls,
+        model=target_model,
+        raw_message=message,
+    )
+
+
+_TOOL_JSON_BLOCK_RE = re.compile(r"\{[^{}]*\"(?:tool|name|function)\"[^{}]*\}", re.DOTALL)
+
+
+def _parse_tool_calls_from_text(
+    text: str, tool_names: List[str]
+) -> List[ToolCall]:
+    """Best-effort recovery of tool calls from prose-only model replies.
+
+    Some local models won't emit ``message.tool_calls`` even when given
+    tools — they instead write something like
+    ``{"tool": "gmail_send", "arguments": {...}}`` inline. We scan for
+    JSON objects, validate the tool name, and reconstruct
+    :class:`ToolCall`s. Returns ``[]`` if nothing parseable is found.
+    """
+    if not text or not tool_names:
+        return []
+    candidates: List[str] = []
+    # Pull every {...} the model may have written; a balanced parser is
+    # overkill — the repair loop below tolerates JSON failures.
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                candidates.append(text[start : i + 1])
+                start = -1
+
+    out: List[ToolCall] = []
+    valid = set(tool_names)
+    for blob in candidates:
+        try:
+            obj = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        # Accept several shapes: {tool, arguments} | {name, arguments} | {function: {...}}
+        name = obj.get("tool") or obj.get("name")
+        args = obj.get("arguments") or obj.get("args") or obj.get("parameters") or {}
+        if not name and isinstance(obj.get("function"), dict):
+            name = obj["function"].get("name")
+            args = obj["function"].get("arguments", args)
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {"_raw": args}
+        if name in valid and isinstance(args, dict):
+            out.append(ToolCall(name=name, arguments=args))
+    return out
+
+
 def system_prompt_for_avi(assistant_name: str, family_name: Optional[str]) -> str:
     """Personality prompt shared by greet + chat endpoints."""
     family_bit = f" the {family_name} family" if family_name else " this family"
@@ -282,9 +463,12 @@ def sync_health() -> Dict[str, object]:
 
 
 __all__ = [
+    "ChatWithToolsResult",
     "OllamaError",
     "OllamaUnavailable",
+    "ToolCall",
     "chat_stream",
+    "chat_with_tools",
     "fast_model",
     "generate",
     "generate_with_fallback",

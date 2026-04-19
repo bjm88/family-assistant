@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import get_settings
 from .routers import (
     addresses,
+    agent_tasks,
     ai_chat,
     ai_face,
     ai_tts,
@@ -112,6 +113,8 @@ def create_app() -> FastAPI:
     app.include_router(ai_chat.router, prefix=AI_PREFIX)
     app.include_router(ai_tts.router, prefix=AI_PREFIX)
     app.include_router(live_sessions.router, prefix=AI_PREFIX)
+    # /api/aiassistant/tasks/* — read-only audit trail for the agent loop.
+    app.include_router(agent_tasks.router, prefix="/api")
 
     @app.get("/api/health", tags=["health"])
     def health() -> dict:

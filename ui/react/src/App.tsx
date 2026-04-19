@@ -16,6 +16,8 @@ import DocumentsPage from "./pages/DocumentsPage";
 import AiAssistantPage from "./pages/AiAssistantPage";
 import AiSessionsListPage from "./pages/AiSessionsListPage";
 import AiSessionDetailPage from "./pages/AiSessionDetailPage";
+import AgentTasksListPage from "./pages/AgentTasksListPage";
+import AgentTaskDetailPage from "./pages/AgentTaskDetailPage";
 
 export default function App() {
   return (
@@ -56,6 +58,14 @@ export default function App() {
       <Route
         path="/aiassistant/:familyId/sessions/:sessionId"
         element={<AiSessionDetailPage />}
+      />
+      <Route
+        path="/aiassistant/:familyId/agent-tasks"
+        element={<AgentTasksListPage />}
+      />
+      <Route
+        path="/aiassistant/:familyId/agent-tasks/:taskId"
+        element={<AgentTaskDetailPage />}
       />
 
       <Route path="*" element={<Navigate to="/admin/families" replace />} />
