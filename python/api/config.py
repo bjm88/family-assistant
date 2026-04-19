@@ -81,6 +81,31 @@ class Settings(BaseSettings):
     # the natural choice when the user has pulled it; falls back to
     # the main model if this one isn't installed in Ollama.
     AI_OLLAMA_FAST_MODEL: str = "gemma4:e2b"
+
+    # ---- Tiered messaging: fast acknowledgement before heavy reply -----
+    # Push-style surfaces (Telegram, SMS) leave the user staring at a
+    # silent chat for the 5-30 s the heavyweight agent needs to respond.
+    # When this flag is on, every inbound that's likely to take a while
+    # gets a quick "I'm looking into that..." ack from the lightweight
+    # model first, then the full answer arrives as a follow-up message
+    # once the agent loop converges. Set false to revert to the original
+    # single-reply behaviour.
+    AI_FAST_ACK_ENABLED: bool = True
+    # Race window. We start the heavy agent immediately and only fire
+    # the fast-model ack if the agent hasn't finished within this many
+    # seconds. Tune to taste: shorter = more acks (chattier UX), longer
+    # = fewer acks (sometimes silent for several seconds).
+    AI_FAST_ACK_AFTER_SECONDS: float = 3.0
+    # Hard ceiling on how long the fast model itself may run before we
+    # give up on the ack and stay silent. Two seconds is plenty for
+    # ``gemma4:e2b`` on Apple Silicon; if it's slower than this the ack
+    # is doing more harm than good.
+    AI_FAST_ACK_TIMEOUT_SECONDS: float = 2.0
+    # Bound on concurrent heavy-agent runs across all messaging
+    # surfaces. Ollama serialises GPU access anyway, so making this
+    # large mostly wastes RAM — but a small pool lets a Telegram
+    # ack fire even while a long-running SMS agent is still mid-flight.
+    AI_BACKGROUND_AGENT_MAX_WORKERS: int = 4
     # Cosine-similarity threshold for a face recognition match. Higher =
     # stricter. 0.40–0.45 is a good default for InsightFace buffalo_l
     # embeddings (ArcFace, 512-dim).

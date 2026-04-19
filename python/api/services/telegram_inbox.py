@@ -60,9 +60,12 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+
 from .. import models, storage
 from ..ai import agent as agent_loop
 from ..ai import authz
+from ..ai import fast_ack
 from ..ai import ollama, prompts, rag, schema_catalog
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
@@ -70,6 +73,7 @@ from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import telegram, twilio_sms
 from ..utils.phone import normalize_phone
+from . import background_agent
 
 
 logger = logging.getLogger(__name__)
@@ -451,38 +455,36 @@ def process_inbound_update(
         or str(inbound.from_user_id or "?"),
     )
     user_message = _format_user_message_for_agent(inbound, person)
+    assistant_id_for_family = _assistant_id_for_family(db, person.family_id)
 
-    # Same contract as SMS / email: every inbound from a registered
-    # family member gets a reply, even if the agent loop blows up.
-    agent_failed = False
-    try:
-        final_text = _run_agent_to_completion(
-            task_id=task.agent_task_id,
-            family_id=person.family_id,
-            assistant_id=_assistant_id_for_family(db, person.family_id),
-            person_id=person.person_id,
-            system_prompt=system_prompt,
-            history=[],
-            user_message=user_message,
-        )
-    except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
-        logger.exception(
-            "Telegram inbox: agent loop crashed for update_id=%s task=%s",
-            inbound.update_id,
-            task.agent_task_id,
-        )
-        agent_failed = True
-        final_text = (
-            "Got your message — Avi here. I hit a snag on my end and "
-            "couldn't finish that just now. I'll look into it."
-        )
+    # ---- Race-and-ack pattern (see api.ai.fast_ack docstring) -------
+    # Kick the heavy agent off on a background thread immediately so
+    # we can either:
+    #   (a) send a single reply if the agent finishes inside the
+    #       AI_FAST_ACK_AFTER_SECONDS window (no ack noise for short
+    #       answers), or
+    #   (b) fire a quick contextual "I'm on it" ack from the fast
+    #       model and follow up with the real answer when the heavy
+    #       agent converges.
+    # Either way the audit row reflects exactly what was sent.
+    final_text, agent_failed, ack_sent_message_id = _run_agent_with_fast_ack(
+        db,
+        inbound=inbound,
+        person=person,
+        task_id=task.agent_task_id,
+        assistant_id=assistant_id_for_family,
+        system_prompt=system_prompt,
+        user_message=user_message,
+        session=session,
+        audit=audit,
+    )
 
     final_text = telegram.truncate_for_telegram(
         final_text or "Got your message — nothing to add right now.",
         max_chars=settings.AI_TELEGRAM_REPLY_MAX_CHARS,
     )
 
-    # ---- Send the reply via the Bot API ----------------------------
+    # ---- Send the (final) reply via the Bot API ---------------------
     try:
         reply_message_id = telegram.send_message(
             bot_token=settings.TELEGRAM_BOT_TOKEN or "",
@@ -513,13 +515,21 @@ def process_inbound_update(
             "telegram_chat_id": inbound.chat_id,
             "telegram_message_id": reply_message_id,
             "in_reply_to": inbound.message_id,
+            # Cross-link to the ack message (if any) so an operator
+            # reading the transcript can see both halves of the
+            # exchange in the right order.
+            "ack_telegram_message_id": ack_sent_message_id,
         },
     )
+    audit.status = "processed_replied"
     if agent_failed:
-        audit.status = "processed_replied"
         audit.status_reason = "Agent loop crashed; sent fallback apology."
+    elif ack_sent_message_id is not None:
+        audit.status_reason = (
+            f"Sent fast-ack (msg={ack_sent_message_id}) then full reply "
+            "after heavy agent converged."
+        )
     else:
-        audit.status = "processed_replied"
         audit.status_reason = None
     audit.reply_telegram_message_id = reply_message_id
     db.commit()
@@ -2311,6 +2321,167 @@ def _assistant_id_for_family(db: Session, family_id: int) -> Optional[int]:
         .limit(1)
     ).scalar_one_or_none()
     return row
+
+
+def _run_agent_with_fast_ack(
+    db: Session,
+    *,
+    inbound: telegram.InboundTelegramMessage,
+    person: models.Person,
+    task_id: int,
+    assistant_id: Optional[int],
+    system_prompt: str,
+    user_message: str,
+    session: models.LiveSession,
+    audit: models.TelegramInboxMessage,
+) -> Tuple[str, bool, Optional[int]]:
+    """Race the heavy agent against the fast-ack threshold.
+
+    Behaviour:
+
+    1. Submits the heavy agent (``_run_agent_to_completion``) to the
+       shared :mod:`api.services.background_agent` thread pool so this
+       caller can race a watchdog against it.
+    2. Waits up to :setting:`AI_FAST_ACK_AFTER_SECONDS`.
+       * If the heavy agent finished in time, returns its text — no
+         ack was needed and none was sent.
+       * Otherwise, asks the lightweight model for a one-sentence
+         contextual ack and sends it as a Telegram reply (threaded
+         under the inbound), then blocks for the heavy agent to
+         finish and returns its text.
+    3. Either way, returns ``(final_text, agent_failed, ack_message_id)``.
+       ``ack_message_id`` is ``None`` when no ack was sent (either the
+       heavy agent won the race or the fast model declined to produce
+       one); otherwise it's the Telegram ``message_id`` of the ack so
+       the caller can cross-link it in the transcript.
+
+    Failure isolation matches the original blocking flow: if the
+    heavy agent crashes we return a fixed apology string and
+    ``agent_failed=True`` so the caller's audit row reflects it. The
+    ack send is best-effort — a Telegram outage during the ack does
+    not abort the heavy reply.
+    """
+    settings = get_settings()
+    family_id = person.family_id
+    person_id = person.person_id
+
+    # ---- Kick off the heavy agent on a background worker -----------
+    def _heavy() -> str:
+        return _run_agent_to_completion(
+            task_id=task_id,
+            family_id=family_id,
+            assistant_id=assistant_id,
+            person_id=person_id,
+            system_prompt=system_prompt,
+            history=[],
+            user_message=user_message,
+        )
+
+    future = background_agent.submit(_heavy)
+
+    # ---- Race ------------------------------------------------------
+    threshold = float(settings.AI_FAST_ACK_AFTER_SECONDS)
+    ack_message_id: Optional[int] = None
+    try:
+        final_text = future.result(timeout=threshold)
+        # Heavy agent won the race — skip the ack entirely. Nothing
+        # to log here; the transcript will record only the final
+        # assistant reply.
+        return final_text, False, None
+    except FuturesTimeoutError:
+        pass
+    except Exception:  # noqa: BLE001 - heavy agent crashed
+        logger.exception(
+            "Telegram inbox: agent loop crashed for update_id=%s task=%s",
+            inbound.update_id,
+            task_id,
+        )
+        return (
+            "Got your message — Avi here. I hit a snag on my end and "
+            "couldn't finish that just now. I'll look into it."
+        ), True, None
+
+    # ---- Heavy agent didn't finish in time — send a contextual ack -
+    if settings.AI_FAST_ACK_ENABLED:
+        ack_text = fast_ack.generate_contextual_ack_sync(
+            surface="telegram",
+            sender_display_name=(
+                inbound.sender_display_name
+                or person.preferred_name
+                or person.first_name
+            ),
+            last_user_message=inbound.body or "",
+        )
+        if ack_text:
+            ack_text = telegram.truncate_for_telegram(
+                ack_text,
+                max_chars=settings.AI_TELEGRAM_REPLY_MAX_CHARS,
+            )
+            try:
+                ack_message_id = telegram.send_message(
+                    bot_token=settings.TELEGRAM_BOT_TOKEN or "",
+                    chat_id=inbound.chat_id,
+                    text=ack_text,
+                    reply_to_message_id=inbound.message_id,
+                )
+                logger.info(
+                    "Telegram inbox: fast-ack sent chat=%s msg=%s "
+                    "(update_id=%s, threshold=%.1fs)",
+                    inbound.chat_id,
+                    ack_message_id,
+                    inbound.update_id,
+                    threshold,
+                )
+                live_session.log_message(
+                    db,
+                    session,
+                    role="assistant",
+                    content=ack_text,
+                    person_id=person_id,
+                    meta={
+                        "kind": "telegram_fast_ack",
+                        "agent_task_id": task_id,
+                        "telegram_chat_id": inbound.chat_id,
+                        "telegram_message_id": ack_message_id,
+                        "in_reply_to": inbound.message_id,
+                    },
+                )
+                # Stamp the audit row mid-flight so an operator who
+                # peeks before the heavy agent finishes can see we
+                # already replied with an ack.
+                audit.status_reason = (
+                    f"Fast-ack sent (msg={ack_message_id}); awaiting "
+                    "heavy agent."
+                )
+                db.commit()
+            except telegram.TelegramSendError as exc:
+                # Don't let an ack-send failure abort the heavy reply.
+                # The user will still get the final answer; we just
+                # missed the latency-hider.
+                logger.warning(
+                    "Telegram inbox: fast-ack send failed for "
+                    "update_id=%s (%s) — continuing without ack",
+                    inbound.update_id,
+                    exc,
+                )
+                ack_message_id = None
+
+    # ---- Block until the heavy agent finishes ----------------------
+    try:
+        final_text = future.result()
+    except Exception:  # noqa: BLE001 - heavy agent crashed post-ack
+        logger.exception(
+            "Telegram inbox: agent loop crashed post-ack for "
+            "update_id=%s task=%s",
+            inbound.update_id,
+            task_id,
+        )
+        return (
+            "Got your message — Avi here. I hit a snag on my end and "
+            "couldn't finish that just now. I'll look into it."
+        ), True, ack_message_id
+
+    return final_text, False, ack_message_id
 
 
 def _run_agent_to_completion(
