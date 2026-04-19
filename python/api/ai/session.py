@@ -177,6 +177,51 @@ def find_or_create_email_session(
     return session, True
 
 
+def find_or_create_sms_session(
+    db: Session,
+    *,
+    family_id: int,
+    counterparty_phone: str,
+) -> Tuple[models.LiveSession, bool]:
+    """Return ``(session, created)`` for an inbound SMS thread.
+
+    Mirrors :func:`find_or_create_email_session` but keys on the
+    counterparty's E.164 phone number rather than a Gmail thread id.
+    SMS conversations are inherently one-on-one: every text from
+    ``+14155551234`` lands in the same session row + transcript so
+    Avi sees the whole back-and-forth on the next turn rather than
+    starting from scratch.
+
+    Like email threads, SMS sessions deliberately skip the live-page
+    idle sweep — a text exchange that takes a week is still one
+    session.
+    """
+    existing = db.execute(
+        select(models.LiveSession)
+        .where(models.LiveSession.family_id == family_id)
+        .where(models.LiveSession.source == "sms")
+        .where(models.LiveSession.external_thread_id == counterparty_phone)
+        .order_by(models.LiveSession.started_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.last_activity_at = _now()
+        if existing.ended_at is not None:
+            existing.ended_at = None
+            existing.end_reason = None
+        return existing, False
+
+    session = models.LiveSession(
+        family_id=family_id,
+        source="sms",
+        external_thread_id=counterparty_phone,
+        start_context=f"sms_thread:{counterparty_phone}",
+    )
+    db.add(session)
+    db.flush()
+    return session, True
+
+
 def touch_session(
     db: Session, session: models.LiveSession
 ) -> None:

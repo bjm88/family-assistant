@@ -432,15 +432,34 @@ def _handle_one_message(
     history: List[dict] = []  # email is one-shot per turn, no in-memory history
 
     # Drive the agent loop synchronously by draining the async generator.
-    final_text = _run_agent_to_completion(
-        task_id=task.agent_task_id,
-        family_id=family_id,
-        assistant_id=assistant_id,
-        person_id=person.person_id,
-        system_prompt=system_prompt,
-        history=history,
-        user_message=user_message,
-    )
+    # Same contract as the SMS / chat paths: every inbound from a
+    # registered family member gets a reply, full stop. If the agent
+    # itself crashes (LLM offline, tool exception, asyncio glitch, …)
+    # we still send a short, honest fallback so the sender knows we
+    # received their email and aren't silently dropping it.
+    agent_failed = False
+    try:
+        final_text = _run_agent_to_completion(
+            task_id=task.agent_task_id,
+            family_id=family_id,
+            assistant_id=assistant_id,
+            person_id=person.person_id,
+            system_prompt=system_prompt,
+            history=history,
+            user_message=user_message,
+        )
+    except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
+        logger.exception(
+            "Email inbox: agent loop crashed for message_id=%s task=%s",
+            msg.message_id,
+            task.agent_task_id,
+        )
+        agent_failed = True
+        final_text = (
+            "Hi — Avi here. I got your message but hit a snag on my end "
+            "and couldn't put together a real answer just now. I'll look "
+            "into it and follow up as soon as I can."
+        )
 
     # ---- Send the reply -----------------------------------------------
     reply_subject = msg.subject or "(no subject)"
@@ -490,7 +509,11 @@ def _handle_one_message(
         **common_audit,
         person_id=person.person_id,
         status="processed_replied",
-        status_reason=None,
+        status_reason=(
+            "Agent loop crashed; sent fallback apology."
+            if agent_failed
+            else None
+        ),
         reply_message_id=reply_id,
         agent_task_id=task.agent_task_id,
         live_session_id=session.live_session_id,

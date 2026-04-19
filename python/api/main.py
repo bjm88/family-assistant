@@ -62,6 +62,7 @@ from .routers import (
     google,
     identity_documents,
     insurance_policies,
+    legal,
     live_sessions,
     media,
     medical_conditions,
@@ -75,6 +76,7 @@ from .routers import (
     residence_photos,
     residences,
     sensitive_identifiers,
+    sms_webhook,
     tasks,
     vehicles,
 )
@@ -174,6 +176,15 @@ def create_app() -> FastAPI:
         app.include_router(r, prefix=ADMIN_PREFIX)
 
     app.include_router(media.router, prefix="/api")
+    # Twilio inbound webhook — public (no admin auth) so Twilio can hit it.
+    # Signature verification (X-Twilio-Signature) is enforced inside the
+    # handler whenever TWILIO_AUTH_TOKEN is configured.
+    app.include_router(sms_webhook.router, prefix="/api")
+    # Public legal pages (Privacy Policy + Terms of Service). Mounted at the
+    # site root (no /api prefix) so the URLs you submit to Twilio look like
+    # ``https://<host>/legal/privacy-policy`` rather than being buried under
+    # /api/*. Twilio's reviewer fetches each URL once during A2P approval.
+    app.include_router(legal.router)
 
     app.include_router(ai_face.router, prefix=AI_PREFIX)
     app.include_router(ai_chat.router, prefix=AI_PREFIX)

@@ -73,6 +73,8 @@ ALLOWED_TABLES: frozenset[str] = frozenset(
         "task_followers",
         "task_comments",
         "task_attachments",
+        "sms_inbox_messages",
+        "sms_inbox_attachments",
     }
 )
 

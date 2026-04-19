@@ -94,13 +94,32 @@ export default function Layout() {
             </NavLink>
           ))}
         </nav>
-        <div className="p-3 border-t border-border">
+        <div className="p-3 border-t border-border space-y-2">
           <NavLink
             to="/admin/families"
-            className="text-xs text-muted-foreground hover:text-foreground"
+            className="text-xs text-muted-foreground hover:text-foreground block"
           >
             ← All families
           </NavLink>
+          <div className="text-[11px] text-muted-foreground/80 flex gap-2">
+            <a
+              href="/legal/privacy-policy.html"
+              target="_blank"
+              rel="noopener"
+              className="hover:text-foreground"
+            >
+              Privacy
+            </a>
+            <span aria-hidden>·</span>
+            <a
+              href="/legal/terms-of-service.html"
+              target="_blank"
+              rel="noopener"
+              className="hover:text-foreground"
+            >
+              Terms
+            </a>
+          </div>
         </div>
       </aside>
       <main className="flex-1 min-w-0">

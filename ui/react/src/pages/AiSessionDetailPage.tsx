@@ -6,6 +6,7 @@ import {
   Clock,
   Info,
   Mail,
+  MessageSquare,
   Square,
   User,
   Users,
@@ -88,20 +89,30 @@ export default function AiSessionDetailPage() {
                       "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-normal",
                       session.source === "email"
                         ? "bg-sky-500/15 text-sky-700 border border-sky-500/30"
+                        : session.source === "sms"
+                        ? "bg-violet-500/15 text-violet-700 border border-violet-500/30"
                         : "bg-muted text-muted-foreground border border-border"
                     )}
                     title={
                       session.source === "email"
                         ? "Started from a Gmail thread"
+                        : session.source === "sms"
+                        ? "Started from a Twilio SMS thread"
                         : "Started from the live camera / chat page"
                     }
                   >
                     {session.source === "email" ? (
                       <Mail className="h-3 w-3" />
+                    ) : session.source === "sms" ? (
+                      <MessageSquare className="h-3 w-3" />
                     ) : (
                       <Video className="h-3 w-3" />
                     )}
-                    {session.source === "email" ? "Email" : "Live"}
+                    {session.source === "email"
+                      ? "Email"
+                      : session.source === "sms"
+                      ? "SMS"
+                      : "Live"}
                   </span>
                 )}
                 <span className="truncate">
@@ -112,6 +123,8 @@ export default function AiSessionDetailPage() {
                         )}`
                       : session?.source === "email"
                       ? "Email thread"
+                      : session?.source === "sms"
+                      ? "SMS thread"
                       : "Conversation transcript"
                     : "Loading…"}
                 </span>

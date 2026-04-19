@@ -143,6 +143,38 @@ class Settings(BaseSettings):
     # spawning dozens of agent runs at once if a flood arrives.
     AI_EMAIL_INBOX_MAX_PER_TICK: int = 5
 
+    # ---- SMS inbox (Twilio) --------------------------------------------
+    # Master switch for the inbound SMS webhook. When OFF the
+    # ``/api/sms/twilio/inbound`` endpoint still exists but returns an
+    # empty TwiML response without invoking the agent loop — useful for
+    # silencing replies while debugging without disconnecting the number
+    # at Twilio.
+    AI_SMS_INBOUND_ENABLED: bool = True
+    # Twilio account / auth credentials. The auth token signs every
+    # webhook so we can verify the request really came from Twilio
+    # (rather than someone hitting the endpoint with a forged form
+    # post). When the token is empty we *log a warning and accept the
+    # request anyway* — that mode is for local-dev only; in production
+    # you must set TWILIO_AUTH_TOKEN.
+    TWILIO_ACCOUNT_SID: Optional[str] = None
+    TWILIO_AUTH_TOKEN: Optional[str] = None
+    # The Twilio phone number Avi sends from. Replies will use this
+    # number even if the inbound came in on a different "To" line, so
+    # only set TWILIO_PRIMARY_PHONE to a number you actually own.
+    TWILIO_PRIMARY_PHONE: Optional[str] = None
+    # Public URL Twilio uses to reach our webhook, e.g.
+    # https://your-tunnel.ngrok.app/api/sms/twilio/inbound — must match
+    # exactly because it is part of the X-Twilio-Signature input. Leave
+    # unset to derive it from the incoming request URL (works in most
+    # cases but breaks if there is a load balancer between Twilio and
+    # us that rewrites the host header).
+    TWILIO_WEBHOOK_PUBLIC_URL: Optional[str] = None
+    # Hard cap on per-message body length when we send a reply. SMS
+    # itself supports up to 1600 chars (= 10 segments) but most users
+    # appreciate brevity over a wall of text — pick a number you'd be
+    # OK reading on a phone screen.
+    AI_SMS_REPLY_MAX_CHARS: int = 480
+
     @property
     def database_url(self) -> str:
         return (

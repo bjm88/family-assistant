@@ -23,7 +23,7 @@ from ._base import OrmModel
 
 LiveSessionMessageRole = Literal["user", "assistant", "system"]
 LiveSessionEndReason = Literal["timeout", "manual", "superseded"]
-LiveSessionSource = Literal["live", "email"]
+LiveSessionSource = Literal["live", "email", "sms"]
 
 
 # ---- nested components -----------------------------------------------------

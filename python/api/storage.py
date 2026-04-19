@@ -241,6 +241,32 @@ def save_task_attachment(
     return str(dest_path.relative_to(root)), size, mime or "application/octet-stream"
 
 
+def save_sms_attachment(
+    family_id: int,
+    sms_inbox_message_id: int,
+    file_bytes: bytes,
+    extension: str,
+) -> Tuple[str, int]:
+    """Persist an MMS media file. Returns ``(relative_path, size_bytes)``.
+
+    Files land under ``family_<id>/sms/<sms_inbox_message_id>/`` so a
+    single ``rm -rf`` of the deleted SMS row's directory cleans up all
+    of its media in one shot. The caller already knows the MIME type
+    (from Twilio's MediaContentType<i>), we only need the extension to
+    keep on-disk filenames human-recognisable.
+    """
+    root = get_settings().storage_root
+    dest_dir = _ensure_dir(
+        root / f"family_{family_id}" / "sms" / str(sms_inbox_message_id)
+    )
+    safe_ext = extension if extension.startswith(".") else f".{extension or 'bin'}"
+    filename = f"{uuid.uuid4().hex}{safe_ext}"
+    dest_path = dest_dir / filename
+    with open(dest_path, "wb") as out:
+        out.write(file_bytes)
+    return str(dest_path.relative_to(root)), len(file_bytes)
+
+
 def absolute_path(relative_path: str) -> Path:
     root = get_settings().storage_root
     p = (root / relative_path).resolve()

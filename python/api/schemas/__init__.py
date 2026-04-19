@@ -60,6 +60,11 @@ from .financial_account import (
     FinancialAccountRead,
 )
 from .document import DocumentRead, DocumentUpdate
+from .sms_inbox import (
+    SmsInboxAttachmentRead,
+    SmsInboxMessageRead,
+    SmsInboxStatus,
+)
 from .task import (
     TaskAttachmentKind,
     TaskAttachmentRead,
@@ -145,6 +150,9 @@ __all__ = [
     "FinancialAccountRead",
     "DocumentRead",
     "DocumentUpdate",
+    "SmsInboxAttachmentRead",
+    "SmsInboxMessageRead",
+    "SmsInboxStatus",
     "TaskAttachmentKind",
     "TaskAttachmentRead",
     "TaskCommentAuthorKind",

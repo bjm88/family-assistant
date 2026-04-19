@@ -50,6 +50,11 @@ from .live_session_message import (
     LIVE_SESSION_MESSAGE_ROLES,
 )
 from .email_inbox_message import EmailInboxMessage, EMAIL_INBOX_STATUSES
+from .sms_inbox_message import (
+    SmsInboxAttachment,
+    SmsInboxMessage,
+    SMS_INBOX_STATUSES,
+)
 from .task import (
     Task,
     TaskAttachment,
@@ -100,6 +105,9 @@ __all__ = [
     "LIVE_SESSION_MESSAGE_ROLES",
     "EmailInboxMessage",
     "EMAIL_INBOX_STATUSES",
+    "SmsInboxMessage",
+    "SmsInboxAttachment",
+    "SMS_INBOX_STATUSES",
     "Task",
     "TaskAttachment",
     "TaskComment",

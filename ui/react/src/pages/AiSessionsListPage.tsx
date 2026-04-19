@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   Clock,
   Mail,
+  MessageSquare,
   MessageSquareText,
   Users,
   Video,
@@ -123,6 +124,8 @@ export default function AiSessionsListPage() {
                             ? s.participants_preview.join(", ")
                             : s.source === "email"
                             ? "Email thread"
+                            : s.source === "sms"
+                            ? "SMS thread"
                             : "No one recognised"}
                         </div>
                       </div>
@@ -141,17 +144,27 @@ export default function AiSessionsListPage() {
                           {s.message_count}{" "}
                           {s.message_count === 1 ? "message" : "messages"}
                         </span>
-                        {s.start_context && s.source !== "email" && (
-                          <span className="text-xs italic">
-                            started via {s.start_context}
-                          </span>
-                        )}
+                        {s.start_context &&
+                          s.source !== "email" &&
+                          s.source !== "sms" && (
+                            <span className="text-xs italic">
+                              started via {s.start_context}
+                            </span>
+                          )}
                         {s.source === "email" && s.start_context && (
                           <span
                             className="text-xs italic truncate max-w-[18rem]"
                             title={s.start_context}
                           >
                             {s.start_context.replace(/^email_thread:?/, "")}
+                          </span>
+                        )}
+                        {s.source === "sms" && s.start_context && (
+                          <span
+                            className="text-xs italic truncate max-w-[18rem]"
+                            title={s.start_context}
+                          >
+                            {s.start_context.replace(/^sms_thread:?/, "")}
                           </span>
                         )}
                       </div>
@@ -184,6 +197,16 @@ function SourceBadge({ source }: { source: LiveSession["source"] }) {
         title="Started from a Gmail thread"
       >
         <Mail className="h-3 w-3" /> via email
+      </span>
+    );
+  }
+  if (source === "sms") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs bg-violet-500/15 text-violet-700 border border-violet-500/30"
+        title="Started from a Twilio SMS thread"
+      >
+        <MessageSquare className="h-3 w-3" /> via SMS
       </span>
     );
   }
