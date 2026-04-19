@@ -37,13 +37,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..crypto import decrypt_str
 from ..integrations import google_oauth
 from ..integrations.gmail import GmailSendError, send_email
 from ..integrations.google_calendar import (
     CalendarError,
     list_upcoming_events,
 )
-from . import sql_tool
+from . import authz, sql_tool
 
 
 logger = logging.getLogger(__name__)
@@ -260,9 +261,19 @@ _SQL_QUERY_SCHEMA: Dict[str, Any] = {
 
 
 async def _handle_sql_query(ctx: ToolContext, sql: str) -> Dict[str, Any]:
+    # Compute the speaker's accessible-subject window once per call so
+    # the SQL sanitiser can redact partially-sensitive columns
+    # (currently ``people.notes``) on the way back. Fully sensitive
+    # tables are blocked at the parser; this handles column-level
+    # cases like notes.
+    scope = authz.build_speaker_scope(ctx.db, speaker_person_id=ctx.person_id)
     try:
         result = sql_tool.run_safe_query(
-            ctx.db, sql, family_id=ctx.family_id, max_rows=50
+            ctx.db,
+            sql,
+            family_id=ctx.family_id,
+            max_rows=50,
+            accessible_subject_ids=scope.can_access_subject_ids,
         )
     except sql_tool.SqlToolError as e:
         raise ToolError(str(e)) from e
@@ -328,6 +339,129 @@ async def _handle_lookup_person(ctx: ToolContext, name: str) -> List[Dict[str, A
             if len(matches) >= 5:
                 break
     return matches
+
+
+# ---- reveal_sensitive_identifier --------------------------------------
+
+
+_REVEAL_SENSITIVE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "person_id": {
+            "type": "integer",
+            "description": (
+                "person_id of the family member whose identifier should "
+                "be revealed. Use lookup_person first if you only know "
+                "their name."
+            ),
+        },
+        "identifier_type": {
+            "type": "string",
+            "description": (
+                "Which identifier to reveal — typically "
+                "'social_security_number'. Other values are stored as-is "
+                "in sensitive_identifiers.identifier_type."
+            ),
+        },
+    },
+    "required": ["person_id", "identifier_type"],
+}
+
+
+async def _handle_reveal_sensitive(
+    ctx: ToolContext, person_id: int, identifier_type: str
+) -> Dict[str, Any]:
+    """Decrypt and return a person's SSN / tax ID — gated by relationship.
+
+    This is the ONLY path that yields a full plaintext SSN. The check
+    matches the user-stated rule: a person can always read their own,
+    a parent can read their direct child's, spouses can read each
+    other's, and everyone else (children, grandparents, siblings,
+    in-laws, anonymous speakers) is denied. Every call — allow or
+    deny — is logged via :mod:`ai.authz` so a future audit can answer
+    "did Avi ever read Sarah's SSN, and who asked?".
+    """
+    if ctx.person_id is None:
+        # An anonymous speaker can never decrypt anything. We refuse
+        # without even leaking which subject was queried.
+        raise ToolError(
+            "I can't reveal sensitive identifiers without first "
+            "knowing who is asking. Please greet me on camera (or "
+            "email me from your registered address) and try again."
+        )
+
+    decision = authz.can_access_sensitive(
+        ctx.db,
+        requestor_person_id=ctx.person_id,
+        subject_person_id=int(person_id),
+        family_id=ctx.family_id,
+    )
+    if not decision.allowed:
+        raise ToolError(
+            "I can't share that — household privacy rules only let a "
+            "person see their own sensitive identifiers, plus those of "
+            "their spouse and direct children. Please ask the person "
+            "themselves (or one of their parents) for it."
+        )
+
+    rows = (
+        ctx.db.query(models.SensitiveIdentifier)
+        .filter(
+            models.SensitiveIdentifier.person_id == int(person_id),
+            models.SensitiveIdentifier.identifier_type == identifier_type,
+        )
+        .all()
+    )
+    if not rows:
+        return {
+            "found": False,
+            "person_id": int(person_id),
+            "identifier_type": identifier_type,
+        }
+
+    # If somehow there are multiple, return them all (e.g. someone has
+    # both an SSN and a historical ITIN under the same type — unlikely
+    # but cheap to support).
+    revealed: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            plaintext = decrypt_str(row.identifier_value_encrypted)
+        except RuntimeError as e:
+            # Likely a key-mismatch (rotated FA_ENCRYPTION_KEY without
+            # re-encrypting). Don't bubble the secret-y exception text
+            # to the model — keep the error generic.
+            logger.error(
+                "Failed to decrypt sensitive_identifier_id=%s: %s",
+                row.sensitive_identifier_id,
+                e,
+            )
+            raise ToolError(
+                "Stored value couldn't be decrypted with the current "
+                "encryption key — flag this to the household admin."
+            ) from e
+        revealed.append(
+            {
+                "sensitive_identifier_id": row.sensitive_identifier_id,
+                "identifier_type": row.identifier_type,
+                "value": plaintext,
+                "last_four": row.identifier_last_four,
+            }
+        )
+
+    logger.info(
+        "[authz] DECRYPT requestor=%s subject=%s identifier_type=%s count=%d",
+        ctx.person_id,
+        int(person_id),
+        identifier_type,
+        len(revealed),
+    )
+    return {
+        "found": True,
+        "person_id": int(person_id),
+        "identifier_type": identifier_type,
+        "results": revealed,
+        "access_label": decision.label,
+    }
 
 
 # ---- gmail.send -------------------------------------------------------
@@ -484,6 +618,31 @@ def build_default_registry() -> ToolRegistry:
             examples=(
                 "What's Sarah's email address?",
                 "Tell me about Ben.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="reveal_sensitive_identifier",
+            label="Reveal a sensitive identifier (SSN, tax ID)",
+            description=(
+                "Decrypt and return a family member's full sensitive "
+                "identifier (typically Social Security Number). The tool "
+                "enforces relationship-based privacy: it ONLY returns a "
+                "value when the speaker is the subject themselves, the "
+                "subject's spouse, or one of the subject's direct "
+                "parents. Children, grandparents, siblings, in-laws, "
+                "and anonymous speakers are refused. Every call is "
+                "audit-logged. Use this only when the user explicitly "
+                "asks for the full number; otherwise stick to the "
+                "*_last_four helper columns."
+            ),
+            parameters=_REVEAL_SENSITIVE_SCHEMA,
+            handler=_handle_reveal_sensitive,
+            timeout_seconds=5.0,
+            examples=(
+                "What's my SSN?",
+                "Read me my daughter's social security number.",
             ),
         )
     )

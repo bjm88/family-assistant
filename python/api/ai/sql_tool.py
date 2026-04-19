@@ -24,12 +24,18 @@ import logging
 import re
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from .authz import (
+    OWNER_COLUMN_BY_TABLE,
+    REDACTED_PLACEHOLDER,
+    SENSITIVE_COLUMNS_BY_TABLE,
+    SENSITIVE_TABLES,
+)
 from .schema_catalog import ALLOWED_TABLES
 
 logger = logging.getLogger(__name__)
@@ -83,6 +89,7 @@ def run_safe_query(
     family_id: int,
     max_rows: int = 200,
     timeout_ms: int = 5_000,
+    accessible_subject_ids: Optional[Iterable[int]] = None,
 ) -> SqlToolResult:
     """Execute ``raw_sql`` after validating it is a read-only SELECT.
 
@@ -91,8 +98,23 @@ def run_safe_query(
     safety checks). It is *not* auto-injected because the LLM may want
     to JOIN or filter via a different column (``person_id``, etc.); we
     leave it to the prompting layer to instruct the LLM to scope.
+
+    ``accessible_subject_ids`` is the set of person ids the speaker is
+    relationship-allowed to read sensitive data for (their own id, plus
+    spouses and direct children — see :mod:`ai.authz`). When supplied,
+    column-level redaction kicks in: for example ``people.notes`` is
+    swapped for the redacted placeholder on any row whose ``person_id``
+    isn't in that set. ``None`` (legacy callers) keeps the original
+    "trusted reader" behaviour.
+
+    Fully-sensitive tables (``sensitive_identifiers``,
+    ``identity_documents``, ``financial_accounts``,
+    ``medical_conditions``, ``medications``, ``physicians``) are
+    rejected by the validator entirely — the model is steered to the
+    purpose-built tools (``reveal_sensitive_identifier`` etc.) that run
+    relationship checks before returning anything.
     """
-    sql = _strip_and_validate(raw_sql)
+    sql, referenced_tables = _strip_and_validate(raw_sql)
 
     wrapped = (
         f"SELECT * FROM ({sql}) AS sandbox_sub LIMIT :__sandbox_limit"
@@ -122,6 +144,14 @@ def run_safe_query(
     columns = list(rows[0].keys()) if rows else []
 
     json_rows = [{k: _jsonable(v) for k, v in r.items()} for r in rows]
+    if accessible_subject_ids is not None:
+        json_rows = _redact_rows_for_speaker(
+            json_rows,
+            referenced_tables=referenced_tables,
+            accessible_subject_ids=frozenset(
+                int(x) for x in accessible_subject_ids if x is not None
+            ),
+        )
     return SqlToolResult(
         sql=sql,
         columns=columns,
@@ -134,7 +164,12 @@ def run_safe_query(
 # ---------- internals ----------------------------------------------------
 
 
-def _strip_and_validate(raw_sql: str) -> str:
+def _strip_and_validate(raw_sql: str) -> tuple[str, frozenset[str]]:
+    """Validate ``raw_sql`` and return ``(clean_sql, referenced_tables)``.
+
+    The set of referenced tables is used by :func:`run_safe_query` for
+    column-level redaction so we don't have to re-parse the SQL.
+    """
     if not raw_sql or not raw_sql.strip():
         raise SqlToolError("Empty query.")
 
@@ -167,7 +202,75 @@ def _strip_and_validate(raw_sql: str) -> str:
             "Query references tables outside the allow-list: " + ", ".join(bad)
         )
 
-    return sql
+    # Relationship-gated tables can't be queried via ad-hoc SQL — even
+    # by a privileged speaker. The agent must use the dedicated tools
+    # (``reveal_sensitive_identifier`` etc.) that perform per-subject
+    # authorization. This is defence-in-depth: the row sanitiser below
+    # would also redact them, but rejecting at the parse layer means a
+    # confused model can't even *learn* whether the table is empty by
+    # observing latency.
+    blocked = sorted(t for t in referenced if t in SENSITIVE_TABLES)
+    if blocked:
+        raise SqlToolError(
+            "These tables can't be queried via sql_query for privacy "
+            "reasons: "
+            + ", ".join(blocked)
+            + ". Use the dedicated tools (e.g. reveal_sensitive_identifier "
+            "for SSN-style identifiers) which run a relationship check "
+            "against the speaker before returning anything."
+        )
+
+    return sql, frozenset(referenced)
+
+
+def _redact_rows_for_speaker(
+    rows: List[Dict[str, Any]],
+    *,
+    referenced_tables: frozenset[str],
+    accessible_subject_ids: frozenset[int],
+) -> List[Dict[str, Any]]:
+    """Apply column-level redaction to a SELECT result.
+
+    Currently only ``people.notes`` is partially-sensitive (other
+    person-scoped tables are blocked outright in ``_strip_and_validate``
+    above). The implementation generalises so adding a new entry to
+    ``SENSITIVE_COLUMNS_BY_TABLE`` is enough to cover it.
+    """
+    sensitive_cols: set[str] = set()
+    for table in referenced_tables:
+        sensitive_cols |= SENSITIVE_COLUMNS_BY_TABLE.get(table, frozenset())
+    if not sensitive_cols:
+        return rows
+
+    owner_candidates = {
+        OWNER_COLUMN_BY_TABLE[t]
+        for t in referenced_tables
+        if t in OWNER_COLUMN_BY_TABLE
+    }
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        owner_id: Optional[int] = None
+        for cand in owner_candidates:
+            v = row.get(cand)
+            if v is not None:
+                try:
+                    owner_id = int(v)
+                except (TypeError, ValueError):
+                    owner_id = None
+                break
+        if owner_id is not None and owner_id in accessible_subject_ids:
+            out.append(dict(row))
+            continue
+        # If we could not determine an owner OR the speaker is not
+        # allowed, we redact the sensitive columns. Erring on the side
+        # of "redact when in doubt" matches the rule the safety
+        # sandbox advertises to the model.
+        red = {}
+        for k, v in row.items():
+            red[k] = REDACTED_PLACEHOLDER if k in sensitive_cols else v
+        out.append(red)
+    return out
 
 
 def _jsonable(value: Any) -> Any:

@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..ai import agent as agent_loop
+from ..ai import authz
 from ..ai import ollama
 from ..ai import prompts
 from ..ai import rag
@@ -130,15 +131,29 @@ def _build_rag_block(
 
     Excludes the schema catalog — that's appended separately by
     :func:`_build_system_prompt` so it can be reused across the planner
-    + main chat call without rebuilding."""
+    + main chat call without rebuilding.
+
+    ``person_id`` here is the *speaker* (the recognized person Avi is
+    talking to). We pass it into the RAG builders as the requestor so
+    sensitive details about other family members are pre-redacted in
+    the static context — the LLM literally never sees the secrets it
+    isn't allowed to share. See :mod:`ai.authz`.
+    """
     family = db.get(models.Family, family_id)
     if family is None:
         return ""
-    parts: List[str] = [rag.build_family_overview(db, family)]
+    parts: List[str] = [
+        rag.build_family_overview(db, family, requestor_person_id=person_id)
+    ]
     if person_id is not None:
         person = db.get(models.Person, person_id)
         if person is not None and person.family_id == family_id:
-            parts.append("Currently talking to:\n" + rag.build_person_context(db, person))
+            parts.append(
+                "Currently talking to:\n"
+                + rag.build_person_context(
+                    db, person, requestor_person_id=person_id
+                )
+            )
     return "\n\n".join(parts).strip()
 
 
@@ -150,6 +165,7 @@ def _build_system_prompt(
     rag_block: str,
     capabilities_block: str = "",
     live_data_block: Optional[str] = None,
+    speaker_person_id: Optional[int] = None,
 ) -> str:
     """Assemble the full system prompt and wrap it in the safety sandbox.
 
@@ -173,6 +189,16 @@ def _build_system_prompt(
     house_context = prompts.render_context_blocks()
     if house_context:
         parts.append("--- House context ---\n" + house_context)
+    # Speaker identity + privacy scope sits BETWEEN the house context
+    # and the household RAG so the LLM reads "who is talking and what
+    # may they see" before it ingests the (already-redacted) family
+    # data block. Without a speaker we still emit the block — it tells
+    # the model to treat the conversation as anonymous and clamp down.
+    parts.append(
+        authz.render_speaker_scope_block(
+            authz.build_speaker_scope(db, speaker_person_id=speaker_person_id)
+        )
+    )
     if rag_block:
         parts.append("--- Known household context ---\n" + rag_block)
     parts.append(
@@ -750,6 +776,7 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
         rag_block=rag_block,
         capabilities_block=capabilities_block,
         live_data_block=live_data_block,
+        speaker_person_id=payload.recognized_person_id,
     )
 
     # Tool-use protocol reminder. Goes after the safety + capabilities

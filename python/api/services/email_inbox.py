@@ -55,6 +55,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..ai import agent as agent_loop
+from ..ai import authz
 from ..ai import ollama, prompts, rag, schema_catalog
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
@@ -626,10 +627,19 @@ def _build_email_system_prompt(
     assistant_name = family.assistant.assistant_name if family and family.assistant else "Avi"
     family_name = family.family_name if family else None
 
+    # Email sender is the speaker for authz purposes — we identified
+    # them by their registered email address, the same role face
+    # recognition plays on the live page. RAG redaction below uses
+    # this so a child sending Avi an email cannot extract a parent's
+    # SSN by typing the question into Gmail instead of speaking it.
     rag_block = ""
     if family is not None:
-        rag_block = rag.build_family_overview(db, family)
-    person_block = "Currently emailing with:\n" + rag.build_person_context(db, person)
+        rag_block = rag.build_family_overview(
+            db, family, requestor_person_id=person.person_id
+        )
+    person_block = "Currently emailing with:\n" + rag.build_person_context(
+        db, person, requestor_person_id=person.person_id
+    )
 
     registry = agent_tools.build_default_registry()
     capabilities = agent_tools.detect_capabilities(db, assistant_id)
@@ -642,6 +652,11 @@ def _build_email_system_prompt(
     house_context = prompts.render_context_blocks()
     if house_context:
         parts.append("--- House context ---\n" + house_context)
+    parts.append(
+        authz.render_speaker_scope_block(
+            authz.build_speaker_scope(db, speaker_person_id=person.person_id)
+        )
+    )
     if rag_block:
         parts.append("--- Known household context ---\n" + rag_block)
     parts.append(person_block)

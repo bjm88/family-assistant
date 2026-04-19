@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from .. import models
+from . import authz
 
 
 def _age_years(dob: Optional[date]) -> Optional[int]:
@@ -30,8 +31,36 @@ def _person_display_name(p: models.Person) -> str:
     return p.preferred_name or p.first_name or f"Person {p.person_id}"
 
 
-def build_person_context(db: Session, person: models.Person) -> str:
-    """Render a person's RAG context as plain text bullets."""
+def build_person_context(
+    db: Session,
+    person: models.Person,
+    *,
+    requestor_person_id: Optional[int] = None,
+) -> str:
+    """Render a person's RAG context as plain text bullets.
+
+    When ``requestor_person_id`` is supplied and the requestor lacks
+    relationship-based access to ``person`` (see :mod:`ai.authz`),
+    sensitive details (free-text notes, medical conditions /
+    medications / physicians, identity-document counts) are redacted
+    from the rendered block. Public details (name, age, role,
+    interests, goals, relationships) are kept so the LLM can still
+    reference the person naturally in conversation.
+
+    When ``requestor_person_id`` is ``None`` we behave as before — the
+    callers that don't care about redaction (greet, followup, where the
+    speaker IS the subject) keep their existing behaviour unchanged.
+    """
+    if requestor_person_id is None:
+        access_allowed = True
+    else:
+        access_allowed = authz.can_access_sensitive(
+            db,
+            requestor_person_id=requestor_person_id,
+            subject_person_id=person.person_id,
+            family_id=person.family_id,
+        ).allowed
+
     lines: List[str] = []
     name = _person_display_name(person)
     full = " ".join(
@@ -78,12 +107,16 @@ def build_person_context(db: Session, person: models.Person) -> str:
             interests = interests[:317] + "…"
         lines.append(f"Interests / hobbies: {interests}")
 
-    # Notes (truncated).
-    if person.notes:
+    # Notes (truncated). Personal notes are gated by relationship —
+    # children and others should not see private notes a parent stored
+    # about themselves or about a sibling.
+    if person.notes and access_allowed:
         note = person.notes.strip().replace("\n", " ")
         if len(note) > 240:
             note = note[:237] + "…"
         lines.append(f"Notes: {note}")
+    elif person.notes and not access_allowed:
+        lines.append(f"Notes: {authz.REDACTED_PLACEHOLDER}")
 
     # Relationships — sibling / parent / spouse count.
     rels = db.execute(
@@ -146,7 +179,12 @@ def build_person_context(db: Session, person: models.Person) -> str:
     return "\n".join(lines)
 
 
-def build_family_overview(db: Session, family: models.Family) -> str:
+def build_family_overview(
+    db: Session,
+    family: models.Family,
+    *,
+    requestor_person_id: Optional[int] = None,
+) -> str:
     """High-level RAG block describing the whole household.
 
     The output is intentionally dense, sectioned, and bulletised so a
@@ -154,7 +192,36 @@ def build_family_overview(db: Session, family: models.Family) -> str:
     the conversation. Sensitive identifiers (full account numbers,
     VINs, plate numbers, SSNs) are *never* surfaced — only their
     last-four helpers, which is what humans actually quote anyway.
+
+    When ``requestor_person_id`` is supplied, per-person sensitive
+    blocks (medical conditions, medications, physicians, identity-doc
+    counts, financial-account last-fours) are also redacted to match
+    the speaker's relationship-based access window. See :mod:`ai.authz`.
+    Without a requestor we fall back to the original "trusted reader"
+    behaviour for backwards compatibility.
     """
+    # Pre-compute who the speaker is allowed to see in detail. When
+    # requestor is None this stays empty and the access lookup short-
+    # circuits below.
+    accessible_subject_ids: set[int] = set()
+    if requestor_person_id is not None and family.people:
+        for p in family.people:
+            decision = authz.can_access_sensitive(
+                db,
+                requestor_person_id=requestor_person_id,
+                subject_person_id=p.person_id,
+                family_id=family.family_id,
+            )
+            if decision.allowed:
+                accessible_subject_ids.add(p.person_id)
+
+    def _can_see(subject_person_id: Optional[int]) -> bool:
+        if requestor_person_id is None:
+            return True
+        if subject_person_id is None:
+            return False
+        return subject_person_id in accessible_subject_ids
+
     # Pre-load the per-person collections we render below in a single
     # round trip per relationship, so the overview stays N+1-free even
     # for big households. Without this we'd issue one ``SELECT FROM
@@ -229,39 +296,54 @@ def build_family_overview(db: Session, family: models.Family) -> str:
             # second section. Closed conditions (with end_date) are
             # left out of the per-person summary; they're available
             # via SQL for follow-up questions about history.
+            #
+            # ALL of these blocks are relationship-gated: only the
+            # speaker themselves, their spouse, and their direct
+            # parents may see another person's medical / physician
+            # data. Anyone else gets a single redacted line so the
+            # LLM still knows the data exists but cannot quote it.
+            person_visible = _can_see(p.person_id)
             active_conditions = [
                 c for c in (p.medical_conditions or []) if c.end_date is None
             ]
-            if active_conditions:
-                lines.append(
-                    "    conditions: "
-                    + "; ".join(
-                        c.condition_name
-                        + (f" ({c.icd10_code})" if c.icd10_code else "")
-                        for c in active_conditions[:6]
-                    )
-                )
             active_meds = [
                 m for m in (p.medications or []) if m.end_date is None
             ]
-            if active_meds:
+            has_any_medical = bool(
+                active_conditions or active_meds or p.physicians
+            )
+            if has_any_medical and not person_visible:
                 lines.append(
-                    "    medications: "
-                    + "; ".join(
-                        (m.brand_name or m.generic_name or m.ndc_number or "?")
-                        + (f" {m.dosage}" if m.dosage else "")
-                        for m in active_meds[:6]
-                    )
+                    f"    medical: {authz.REDACTED_PLACEHOLDER}"
                 )
-            if p.physicians:
-                lines.append(
-                    "    physicians: "
-                    + "; ".join(
-                        doc.physician_name
-                        + (f" ({doc.specialty})" if doc.specialty else "")
-                        for doc in p.physicians[:5]
+            else:
+                if active_conditions:
+                    lines.append(
+                        "    conditions: "
+                        + "; ".join(
+                            c.condition_name
+                            + (f" ({c.icd10_code})" if c.icd10_code else "")
+                            for c in active_conditions[:6]
+                        )
                     )
-                )
+                if active_meds:
+                    lines.append(
+                        "    medications: "
+                        + "; ".join(
+                            (m.brand_name or m.generic_name or m.ndc_number or "?")
+                            + (f" {m.dosage}" if m.dosage else "")
+                            for m in active_meds[:6]
+                        )
+                    )
+                if p.physicians:
+                    lines.append(
+                        "    physicians: "
+                        + "; ".join(
+                            doc.physician_name
+                            + (f" ({doc.specialty})" if doc.specialty else "")
+                            for doc in p.physicians[:5]
+                        )
+                    )
 
     # ---- Pets --------------------------------------------------------
     pets = family.pets or []
@@ -377,11 +459,23 @@ def build_family_overview(db: Session, family: models.Family) -> str:
                 lines.append("    " + " · ".join(extras))
 
     # ---- Financial accounts -----------------------------------------
+    # Each account is gated by its primary holder. If the speaker
+    # cannot access the holder, we still mention "an account exists"
+    # (so the model knows not to claim there are none) but drop the
+    # institution / nickname / last-four.
     accounts = family.financial_accounts or []
     if accounts:
         lines.append("")
         lines.append(f"## Financial accounts ({len(accounts)})")
         for fa in accounts:
+            holder_id = getattr(fa, "primary_holder_person_id", None)
+            holder_visible = _can_see(holder_id)
+            if not holder_visible:
+                lines.append(
+                    f"- {authz.REDACTED_PLACEHOLDER} "
+                    f"[financial_account_id={fa.financial_account_id}]"
+                )
+                continue
             bits = [
                 f"{fa.account_type}",
                 fa.institution_name,
@@ -396,10 +490,13 @@ def build_family_overview(db: Session, family: models.Family) -> str:
             )
 
     # ---- Identity documents (counts only — content is sensitive) -----
+    # Even the *count* is gated: knowing "Sarah has 3 ID documents on
+    # file" gives a stranger a reconnaissance signal, so we suppress
+    # the line entirely for unauthorized speakers.
     id_doc_count_by_person: dict[int, int] = {}
     for p in people:
         n = len(p.identity_documents or [])
-        if n:
+        if n and _can_see(p.person_id):
             id_doc_count_by_person[p.person_id] = n
     if id_doc_count_by_person:
         lines.append("")
