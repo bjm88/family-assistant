@@ -70,3 +70,8 @@ class Family(Base, TimestampMixin):
         cascade="all, delete-orphan",
         order_by="LiveSession.started_at.desc()",
     )
+    tasks: Mapped[List["Task"]] = relationship(  # noqa: F821
+        back_populates="family",
+        cascade="all, delete-orphan",
+        order_by="Task.created_at.desc()",
+    )

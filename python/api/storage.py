@@ -215,6 +215,32 @@ def save_document(
     return str(dest_path.relative_to(root)), size, mime or "application/octet-stream"
 
 
+def save_task_attachment(
+    family_id: int,
+    task_id: int,
+    upload_file: BinaryIO,
+    original_filename: str,
+) -> Tuple[str, int, str]:
+    """Persist a task attachment. Returns ``(relative_path, size, mime)``.
+
+    Files land under ``family_<id>/tasks/task_<id>/`` so a single
+    ``rm -rf`` of a deleted task's directory cleans up all of its
+    attachments at once.
+    """
+    root = get_settings().storage_root
+    dest_dir = _ensure_dir(
+        root / f"family_{family_id}" / "tasks" / f"task_{task_id}"
+    )
+    ext = _ext_from_filename(original_filename)
+    filename = f"{uuid.uuid4().hex}{ext}"
+    dest_path = dest_dir / filename
+    with open(dest_path, "wb") as out:
+        shutil.copyfileobj(upload_file, out)
+    size = dest_path.stat().st_size
+    mime, _ = mimetypes.guess_type(original_filename)
+    return str(dest_path.relative_to(root)), size, mime or "application/octet-stream"
+
+
 def absolute_path(relative_path: str) -> Path:
     root = get_settings().storage_root
     p = (root / relative_path).resolve()

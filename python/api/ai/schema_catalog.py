@@ -69,6 +69,10 @@ ALLOWED_TABLES: frozenset[str] = frozenset(
         "live_sessions",
         "live_session_participants",
         "live_session_messages",
+        "tasks",
+        "task_followers",
+        "task_comments",
+        "task_attachments",
     }
 )
 

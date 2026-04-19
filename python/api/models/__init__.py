@@ -50,6 +50,16 @@ from .live_session_message import (
     LIVE_SESSION_MESSAGE_ROLES,
 )
 from .email_inbox_message import EmailInboxMessage, EMAIL_INBOX_STATUSES
+from .task import (
+    Task,
+    TaskAttachment,
+    TaskComment,
+    TaskFollower,
+    TASK_ATTACHMENT_KINDS,
+    TASK_COMMENT_AUTHOR_KINDS,
+    TASK_PRIORITIES,
+    TASK_STATUSES,
+)
 
 __all__ = [
     "Family",
@@ -90,4 +100,12 @@ __all__ = [
     "LIVE_SESSION_MESSAGE_ROLES",
     "EmailInboxMessage",
     "EMAIL_INBOX_STATUSES",
+    "Task",
+    "TaskAttachment",
+    "TaskComment",
+    "TaskFollower",
+    "TASK_ATTACHMENT_KINDS",
+    "TASK_COMMENT_AUTHOR_KINDS",
+    "TASK_PRIORITIES",
+    "TASK_STATUSES",
 ]

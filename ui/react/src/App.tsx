@@ -13,6 +13,7 @@ import ResidencesPage from "./pages/ResidencesPage";
 import InsurancePoliciesPage from "./pages/InsurancePoliciesPage";
 import FinancialAccountsPage from "./pages/FinancialAccountsPage";
 import DocumentsPage from "./pages/DocumentsPage";
+import TasksPage from "./pages/TasksPage";
 import AiAssistantPage from "./pages/AiAssistantPage";
 import AiSessionsListPage from "./pages/AiSessionsListPage";
 import AiSessionDetailPage from "./pages/AiSessionDetailPage";
@@ -46,6 +47,7 @@ export default function App() {
         <Route path="/admin/families/:familyId/insurance" element={<InsurancePoliciesPage />} />
         <Route path="/admin/families/:familyId/finances" element={<FinancialAccountsPage />} />
         <Route path="/admin/families/:familyId/documents" element={<DocumentsPage />} />
+        <Route path="/admin/families/:familyId/tasks" element={<TasksPage />} />
       </Route>
 
       {/* Live AI assistant (separate top-level namespace so it can evolve

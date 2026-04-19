@@ -8,6 +8,7 @@ import {
   History,
   Home,
   Landmark,
+  ListTodo,
   Network,
   PawPrint,
   Settings,
@@ -30,6 +31,7 @@ const NAV = [
   { to: "insurance", label: "Insurance", icon: ShieldCheck },
   { to: "finances", label: "Finances", icon: Landmark },
   { to: "documents", label: "Documents", icon: FileText },
+  { to: "tasks", label: "Tasks", icon: ListTodo },
   { to: "settings", label: "Family settings", icon: Settings },
 ];
 

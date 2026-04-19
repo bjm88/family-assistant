@@ -75,6 +75,7 @@ from .routers import (
     residence_photos,
     residences,
     sensitive_identifiers,
+    tasks,
     vehicles,
 )
 
@@ -166,6 +167,7 @@ def create_app() -> FastAPI:
         insurance_policies.router,
         financial_accounts.router,
         documents.router,
+        tasks.router,
         google.router,
     ]
     for r in admin_routers:

@@ -1620,6 +1620,624 @@ def _assistant_email(ctx: ToolContext) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Task board tools
+#
+# Avi is the household's "secretary" for the kanban — these handlers
+# let her *create*, *list*, *read*, *update*, *comment on*, and
+# *assign followers to* tasks without the LLM having to write SQL.
+# Tasks are family-shared (no per-person privacy gate beyond the
+# normal family scope) so the parameter shape is intentionally flat.
+#
+# When the LLM creates a task on behalf of a recognised speaker we
+# pass ``ctx.person_id`` as ``created_by`` automatically — the model
+# only needs to supply the title / description / priority. Same for
+# comments: ``author_kind`` defaults to ``'assistant'`` when no
+# ``author_person_id`` is given so Avi-authored notes are properly
+# attributed in the audit trail.
+# ---------------------------------------------------------------------------
+
+
+_TASK_STATUSES_LIST = list(models.TASK_STATUSES)
+_TASK_PRIORITIES_LIST = list(models.TASK_PRIORITIES)
+
+
+def _serialize_task_for_model(t: models.Task) -> Dict[str, Any]:
+    """Compact JSON shape returned to the LLM for a single task.
+
+    Trimmed of the row's full description on list endpoints to keep
+    the context window healthy — the model can call ``task_get`` for
+    full detail when the user asks for it.
+    """
+    return {
+        "task_id": t.task_id,
+        "title": t.title,
+        "status": t.status,
+        "priority": t.priority,
+        "assigned_to_person_id": t.assigned_to_person_id,
+        "created_by_person_id": t.created_by_person_id,
+        "start_date": t.start_date.isoformat() if t.start_date else None,
+        "desired_end_date": (
+            t.desired_end_date.isoformat() if t.desired_end_date else None
+        ),
+        "end_date": t.end_date.isoformat() if t.end_date else None,
+        "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+        "created_at": t.created_at.isoformat(),
+        "updated_at": t.updated_at.isoformat(),
+    }
+
+
+# ---- task_create ------------------------------------------------------
+
+
+_TASK_CREATE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": (
+                "Short headline for the kanban card, e.g. 'Fix the east "
+                "gate latch' or 'Renew Maddie's passport'. Required."
+            ),
+        },
+        "description": {
+            "type": ["string", "null"],
+            "description": (
+                "Longer detail / acceptance criteria / context. Capture "
+                "anything the user said that explains WHAT done looks "
+                "like. Optional."
+            ),
+        },
+        "priority": {
+            "type": "string",
+            "enum": _TASK_PRIORITIES_LIST,
+            "description": (
+                "One of urgent / high / normal / low / future_idea. "
+                "Default to 'normal' unless the speaker tells you "
+                "otherwise. Use 'future_idea' for casual 'someday' "
+                "mentions so they don't pollute the active board."
+            ),
+        },
+        "status": {
+            "type": "string",
+            "enum": _TASK_STATUSES_LIST,
+            "description": (
+                "Initial kanban column. Defaults to 'new'. Set to "
+                "'in_progress' if the user is already mid-task."
+            ),
+        },
+        "assigned_to_person_id": {
+            "type": ["integer", "null"],
+            "description": (
+                "person_id of the owner. Defaults to the SPEAKER's "
+                "person_id when omitted (the asker becomes the owner)."
+            ),
+        },
+        "desired_end_date": {
+            "type": ["string", "null"],
+            "format": "date",
+            "description": (
+                "Soft target the speaker wants the task done by, "
+                "ISO YYYY-MM-DD. Use this when the user says 'by "
+                "Friday', 'next week', etc."
+            ),
+        },
+        "start_date": {
+            "type": ["string", "null"],
+            "format": "date",
+            "description": "When work is intended to begin (ISO date).",
+        },
+        "follower_person_ids": {
+            "type": "array",
+            "items": {"type": "integer"},
+            "description": (
+                "Other household members to loop in as followers. The "
+                "creator + assignee are followers implicitly — only "
+                "include EXTRAS here."
+            ),
+        },
+    },
+    "required": ["title"],
+}
+
+
+async def _handle_task_create(
+    ctx: ToolContext,
+    title: str,
+    description: Optional[str] = None,
+    priority: str = "normal",
+    status: str = "new",
+    assigned_to_person_id: Optional[int] = None,
+    desired_end_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    follower_person_ids: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    cleaned_title = (title or "").strip()
+    if not cleaned_title:
+        raise ToolError("Cannot create a task with an empty title.")
+    if priority not in models.TASK_PRIORITIES:
+        raise ToolError(
+            f"priority must be one of {list(models.TASK_PRIORITIES)}, got {priority!r}"
+        )
+    if status not in models.TASK_STATUSES:
+        raise ToolError(
+            f"status must be one of {list(models.TASK_STATUSES)}, got {status!r}"
+        )
+
+    owner = assigned_to_person_id
+    if owner is None and ctx.person_id is not None:
+        owner = ctx.person_id
+
+    if owner is not None:
+        if (
+            ctx.db.get(models.Person, owner) is None
+            or ctx.db.query(models.Person)
+            .filter(
+                models.Person.person_id == owner,
+                models.Person.family_id == ctx.family_id,
+            )
+            .first()
+            is None
+        ):
+            raise ToolError(
+                f"Assignee person_id={owner} is not a member of this family."
+            )
+
+    def _parse_date(label: str, raw: Optional[str]) -> Optional["date"]:
+        if raw is None:
+            return None
+        try:
+            return datetime.fromisoformat(raw).date()
+        except ValueError as exc:
+            raise ToolError(f"{label} must be ISO YYYY-MM-DD, got {raw!r}") from exc
+
+    from datetime import date  # local to avoid polluting module top-level
+
+    task = models.Task(
+        family_id=ctx.family_id,
+        created_by_person_id=ctx.person_id,
+        assigned_to_person_id=owner,
+        title=cleaned_title,
+        description=description,
+        status=status,
+        priority=priority,
+        start_date=_parse_date("start_date", start_date),
+        desired_end_date=_parse_date("desired_end_date", desired_end_date),
+        completed_at=datetime.now(timezone.utc) if status == "done" else None,
+    )
+    ctx.db.add(task)
+    ctx.db.flush()
+
+    implicit = {p for p in (ctx.person_id, owner) if p is not None}
+    for pid in follower_person_ids or []:
+        if pid in implicit:
+            continue
+        if (
+            ctx.db.query(models.Person)
+            .filter(
+                models.Person.person_id == pid,
+                models.Person.family_id == ctx.family_id,
+            )
+            .first()
+            is None
+        ):
+            raise ToolError(
+                f"Follower person_id={pid} is not a member of this family."
+            )
+        ctx.db.add(
+            models.TaskFollower(
+                task_id=task.task_id,
+                person_id=pid,
+                added_at=datetime.now(timezone.utc),
+            )
+        )
+        implicit.add(pid)
+
+    ctx.db.flush()
+    ctx.db.refresh(task)
+    return {"created": _serialize_task_for_model(task)}
+
+
+# ---- task_list --------------------------------------------------------
+
+
+_TASK_LIST_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "assigned_to_person_id": {
+            "type": ["integer", "null"],
+            "description": (
+                "Filter to tasks owned by this person_id. Use 0 for "
+                "explicitly UNASSIGNED tasks. Omit to see everyone's."
+            ),
+        },
+        "mine_only": {
+            "type": "boolean",
+            "description": (
+                "Shortcut equivalent to assigned_to_person_id=<speaker>. "
+                "Defaults to false. Set true when the user says 'my "
+                "tasks' / 'what's on my plate'."
+            ),
+        },
+        "priority": {
+            "type": ["string", "null"],
+            "enum": _TASK_PRIORITIES_LIST + [None],
+            "description": (
+                "Filter to a single priority bucket. Use repeated calls "
+                "for 'urgent and high' answers."
+            ),
+        },
+        "status": {
+            "type": ["string", "null"],
+            "enum": _TASK_STATUSES_LIST + [None],
+            "description": "Filter to one kanban column.",
+        },
+        "include_done": {
+            "type": "boolean",
+            "description": (
+                "Include status='done' tasks. Defaults to FALSE here so "
+                "list calls focus on active work — set true when "
+                "answering 'what did I close this week?'."
+            ),
+        },
+        "q": {
+            "type": ["string", "null"],
+            "description": "Substring match against title or description.",
+        },
+        "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Max rows to return. Defaults to 15.",
+        },
+    },
+    "required": [],
+}
+
+
+async def _handle_task_list(
+    ctx: ToolContext,
+    assigned_to_person_id: Optional[int] = None,
+    mine_only: bool = False,
+    priority: Optional[str] = None,
+    status: Optional[str] = None,
+    include_done: bool = False,
+    q: Optional[str] = None,
+    limit: int = 15,
+) -> Dict[str, Any]:
+    from sqlalchemy import case, or_, select
+
+    qry = select(models.Task).where(models.Task.family_id == ctx.family_id)
+    if mine_only:
+        if ctx.person_id is None:
+            raise ToolError(
+                "I don't know who's asking yet, so I can't filter to "
+                "'your' tasks. Greet me on camera or email me from a "
+                "registered address and try again."
+            )
+        qry = qry.where(models.Task.assigned_to_person_id == ctx.person_id)
+    elif assigned_to_person_id is not None:
+        if int(assigned_to_person_id) == 0:
+            qry = qry.where(models.Task.assigned_to_person_id.is_(None))
+        else:
+            qry = qry.where(
+                models.Task.assigned_to_person_id == int(assigned_to_person_id)
+            )
+
+    if status is not None:
+        if status not in models.TASK_STATUSES:
+            raise ToolError(
+                f"status must be one of {list(models.TASK_STATUSES)}"
+            )
+        qry = qry.where(models.Task.status == status)
+    elif not include_done:
+        qry = qry.where(models.Task.status != "done")
+
+    if priority is not None:
+        if priority not in models.TASK_PRIORITIES:
+            raise ToolError(
+                f"priority must be one of {list(models.TASK_PRIORITIES)}"
+            )
+        qry = qry.where(models.Task.priority == priority)
+
+    if q:
+        like = f"%{q}%"
+        qry = qry.where(
+            or_(
+                models.Task.title.ilike(like),
+                models.Task.description.ilike(like),
+            )
+        )
+
+    priority_rank = case(
+        (models.Task.priority == "urgent", 0),
+        (models.Task.priority == "high", 1),
+        (models.Task.priority == "normal", 2),
+        (models.Task.priority == "low", 3),
+        (models.Task.priority == "future_idea", 4),
+        else_=5,
+    )
+    status_rank = case(
+        (models.Task.status == "in_progress", 0),
+        (models.Task.status == "finalizing", 1),
+        (models.Task.status == "new", 2),
+        (models.Task.status == "done", 9),
+        else_=5,
+    )
+    qry = qry.order_by(
+        status_rank.asc(),
+        priority_rank.asc(),
+        models.Task.created_at.desc(),
+    ).limit(min(max(int(limit), 1), 50))
+
+    rows = list(ctx.db.execute(qry).scalars())
+    return {
+        "count": len(rows),
+        "tasks": [_serialize_task_for_model(r) for r in rows],
+    }
+
+
+# ---- task_get ---------------------------------------------------------
+
+
+_TASK_GET_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "integer", "description": "tasks.task_id"},
+    },
+    "required": ["task_id"],
+}
+
+
+async def _handle_task_get(ctx: ToolContext, task_id: int) -> Dict[str, Any]:
+    task = ctx.db.get(models.Task, int(task_id))
+    if task is None or task.family_id != ctx.family_id:
+        raise ToolError(f"No task with id={task_id} in this family.")
+    return {
+        **_serialize_task_for_model(task),
+        "description": task.description,
+        "follower_person_ids": [f.person_id for f in task.followers],
+        "comments": [
+            {
+                "task_comment_id": c.task_comment_id,
+                "author_kind": c.author_kind,
+                "author_person_id": c.author_person_id,
+                "body": c.body,
+                "created_at": c.created_at.isoformat(),
+            }
+            for c in task.comments
+        ],
+        "attachment_count": len(task.attachments),
+    }
+
+
+# ---- task_update ------------------------------------------------------
+
+
+_TASK_UPDATE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "integer"},
+        "title": {"type": ["string", "null"]},
+        "description": {"type": ["string", "null"]},
+        "status": {
+            "type": ["string", "null"],
+            "enum": _TASK_STATUSES_LIST + [None],
+        },
+        "priority": {
+            "type": ["string", "null"],
+            "enum": _TASK_PRIORITIES_LIST + [None],
+        },
+        "assigned_to_person_id": {
+            "type": ["integer", "null"],
+            "description": "Set to null to unassign.",
+        },
+        "desired_end_date": {
+            "type": ["string", "null"],
+            "format": "date",
+        },
+        "start_date": {"type": ["string", "null"], "format": "date"},
+        "end_date": {"type": ["string", "null"], "format": "date"},
+    },
+    "required": ["task_id"],
+}
+
+
+async def _handle_task_update(
+    ctx: ToolContext,
+    task_id: int,
+    **fields: Any,
+) -> Dict[str, Any]:
+    task = ctx.db.get(models.Task, int(task_id))
+    if task is None or task.family_id != ctx.family_id:
+        raise ToolError(f"No task with id={task_id} in this family.")
+
+    if "status" in fields and fields["status"] is not None:
+        if fields["status"] not in models.TASK_STATUSES:
+            raise ToolError(
+                f"status must be one of {list(models.TASK_STATUSES)}"
+            )
+        if fields["status"] == "done" and task.completed_at is None:
+            task.completed_at = datetime.now(timezone.utc)
+        elif fields["status"] != "done" and task.completed_at is not None:
+            task.completed_at = None
+
+    if "priority" in fields and fields["priority"] is not None:
+        if fields["priority"] not in models.TASK_PRIORITIES:
+            raise ToolError(
+                f"priority must be one of {list(models.TASK_PRIORITIES)}"
+            )
+
+    if (
+        "assigned_to_person_id" in fields
+        and fields["assigned_to_person_id"] is not None
+        and ctx.db.query(models.Person)
+        .filter(
+            models.Person.person_id == fields["assigned_to_person_id"],
+            models.Person.family_id == ctx.family_id,
+        )
+        .first()
+        is None
+    ):
+        raise ToolError(
+            f"Assignee person_id={fields['assigned_to_person_id']} is not "
+            "a member of this family."
+        )
+
+    for label in ("start_date", "desired_end_date", "end_date"):
+        if label in fields and fields[label] is not None:
+            try:
+                fields[label] = datetime.fromisoformat(fields[label]).date()
+            except ValueError as exc:
+                raise ToolError(
+                    f"{label} must be ISO YYYY-MM-DD, got {fields[label]!r}"
+                ) from exc
+
+    for k, v in fields.items():
+        if hasattr(task, k):
+            setattr(task, k, v)
+
+    ctx.db.flush()
+    ctx.db.refresh(task)
+    return {"updated": _serialize_task_for_model(task)}
+
+
+# ---- task_add_comment -------------------------------------------------
+
+
+_TASK_ADD_COMMENT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "integer"},
+        "body": {
+            "type": "string",
+            "description": (
+                "Comment text. Avi typically writes SHORT auto-notes "
+                "(one or two sentences) — e.g. 'Marking this as done "
+                "per Sarah's request.'"
+            ),
+        },
+        "author_kind": {
+            "type": "string",
+            "enum": list(models.TASK_COMMENT_AUTHOR_KINDS),
+            "description": (
+                "'assistant' (default) when Avi is writing the note "
+                "herself; 'person' when relaying a comment dictated by "
+                "the speaker."
+            ),
+        },
+    },
+    "required": ["task_id", "body"],
+}
+
+
+async def _handle_task_add_comment(
+    ctx: ToolContext,
+    task_id: int,
+    body: str,
+    author_kind: str = "assistant",
+) -> Dict[str, Any]:
+    task = ctx.db.get(models.Task, int(task_id))
+    if task is None or task.family_id != ctx.family_id:
+        raise ToolError(f"No task with id={task_id} in this family.")
+    if author_kind not in models.TASK_COMMENT_AUTHOR_KINDS:
+        raise ToolError(
+            f"author_kind must be one of {list(models.TASK_COMMENT_AUTHOR_KINDS)}"
+        )
+    body = (body or "").strip()
+    if not body:
+        raise ToolError("Comment body cannot be empty.")
+
+    comment = models.TaskComment(
+        task_id=task.task_id,
+        author_person_id=ctx.person_id if author_kind == "person" else None,
+        author_kind=author_kind,
+        body=body,
+        created_at=datetime.now(timezone.utc),
+    )
+    ctx.db.add(comment)
+    ctx.db.flush()
+    ctx.db.refresh(comment)
+    return {
+        "task_comment_id": comment.task_comment_id,
+        "task_id": comment.task_id,
+        "author_kind": comment.author_kind,
+        "author_person_id": comment.author_person_id,
+        "body": comment.body,
+        "created_at": comment.created_at.isoformat(),
+    }
+
+
+# ---- task_add_follower ------------------------------------------------
+
+
+_TASK_ADD_FOLLOWER_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "integer"},
+        "person_id": {
+            "type": "integer",
+            "description": (
+                "person_id of the family member to add as a follower. "
+                "Use lookup_person first if you only have a name."
+            ),
+        },
+    },
+    "required": ["task_id", "person_id"],
+}
+
+
+async def _handle_task_add_follower(
+    ctx: ToolContext, task_id: int, person_id: int
+) -> Dict[str, Any]:
+    task = ctx.db.get(models.Task, int(task_id))
+    if task is None or task.family_id != ctx.family_id:
+        raise ToolError(f"No task with id={task_id} in this family.")
+    if (
+        ctx.db.query(models.Person)
+        .filter(
+            models.Person.person_id == int(person_id),
+            models.Person.family_id == ctx.family_id,
+        )
+        .first()
+        is None
+    ):
+        raise ToolError(
+            f"person_id={person_id} is not a member of this family."
+        )
+
+    existing = (
+        ctx.db.query(models.TaskFollower)
+        .filter(
+            models.TaskFollower.task_id == task.task_id,
+            models.TaskFollower.person_id == int(person_id),
+        )
+        .first()
+    )
+    if existing is not None:
+        return {
+            "task_follower_id": existing.task_follower_id,
+            "task_id": existing.task_id,
+            "person_id": existing.person_id,
+            "already_following": True,
+        }
+
+    follower = models.TaskFollower(
+        task_id=task.task_id,
+        person_id=int(person_id),
+        added_at=datetime.now(timezone.utc),
+    )
+    ctx.db.add(follower)
+    ctx.db.flush()
+    ctx.db.refresh(follower)
+    return {
+        "task_follower_id": follower.task_follower_id,
+        "task_id": follower.task_id,
+        "person_id": follower.person_id,
+        "already_following": False,
+    }
+
+
 def build_default_registry() -> ToolRegistry:
     """Construct the registry the chat agent uses by default."""
     reg = ToolRegistry()
@@ -1836,6 +2454,134 @@ def build_default_registry() -> ToolRegistry:
             examples=(
                 "What's on Ben's calendar this week?",
                 "Show me Sarah's meetings tomorrow.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="task_create",
+            label="Create a household task",
+            description=(
+                "Add a new task to the family kanban board. Use when "
+                "the user says things like 'add a task to…', 'remind "
+                "me to…', 'we should…', or describes work they want "
+                "tracked. The speaker is recorded as the creator "
+                "automatically; if no assignee is supplied the "
+                "speaker also becomes the owner. Default priority is "
+                "'normal'; bump to 'urgent'/'high' only when the user "
+                "is explicit, and use 'future_idea' for casual "
+                "'someday' mentions so they don't pollute the active "
+                "board. After creating a task, briefly confirm what "
+                "was tracked (title + priority + owner) in 1-2 "
+                "sentences."
+            ),
+            parameters=_TASK_CREATE_SCHEMA,
+            handler=_handle_task_create,
+            timeout_seconds=5.0,
+            examples=(
+                "Add a task to fix the east gate latch this weekend.",
+                "Remind me to renew Maddie's passport — high priority.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="task_list",
+            label="List household tasks",
+            description=(
+                "List tasks on the family kanban with filters. Use "
+                "mine_only=true for 'my tasks' / 'what's on my plate', "
+                "priority='urgent'|'high' for 'what's urgent for me?', "
+                "and q='passport' for free-text search. Excludes done "
+                "tasks by default — pass include_done=true when the "
+                "user is asking what they finished. Returns a compact "
+                "list (no descriptions) — call task_get for full "
+                "detail on a specific row."
+            ),
+            parameters=_TASK_LIST_SCHEMA,
+            handler=_handle_task_list,
+            timeout_seconds=5.0,
+            examples=(
+                "What are my high priority tasks?",
+                "What's on the family task board right now?",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="task_get",
+            label="Get full task detail",
+            description=(
+                "Read one task's full detail — description, comments, "
+                "follower list, attachment count. Use after task_list "
+                "when the user wants the specifics of a particular "
+                "task."
+            ),
+            parameters=_TASK_GET_SCHEMA,
+            handler=_handle_task_get,
+            timeout_seconds=4.0,
+            examples=(
+                "Tell me more about the gate task.",
+                "What's the status of the passport renewal?",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="task_update",
+            label="Update a task",
+            description=(
+                "Patch one task — change status (kanban column), "
+                "priority, owner, dates, title, or description. Only "
+                "include the fields you want changed. Setting "
+                "status='done' auto-stamps completed_at; setting it "
+                "back to anything else clears it."
+            ),
+            parameters=_TASK_UPDATE_SCHEMA,
+            handler=_handle_task_update,
+            timeout_seconds=5.0,
+            examples=(
+                "Mark the gate task as done.",
+                "Bump the passport task to urgent.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="task_add_comment",
+            label="Comment on a task",
+            description=(
+                "Append a comment to a task. Defaults to "
+                "author_kind='assistant' so Avi-authored notes "
+                "(status changes, summaries) are clearly attributed. "
+                "Use author_kind='person' when relaying a message "
+                "dictated by the speaker."
+            ),
+            parameters=_TASK_ADD_COMMENT_SCHEMA,
+            handler=_handle_task_add_comment,
+            timeout_seconds=4.0,
+            examples=(
+                "Add a note that I picked up the parts.",
+                "Comment on the passport task: appointment booked for Tuesday.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="task_add_follower",
+            label="Add a follower to a task",
+            description=(
+                "Loop another household member into a task as a "
+                "follower. Idempotent — returns already_following=true "
+                "if the person was already attached. Use lookup_person "
+                "first if you only have a name."
+            ),
+            parameters=_TASK_ADD_FOLLOWER_SCHEMA,
+            handler=_handle_task_add_follower,
+            timeout_seconds=4.0,
+            examples=(
+                "Loop Sarah in on the passport task.",
+                "Add Ben as a follower of the gate task.",
             ),
         )
     )

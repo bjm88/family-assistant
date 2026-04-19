@@ -337,6 +337,74 @@ export interface PetPhoto {
   updated_at: string;
 }
 
+// ============================================================================
+// Family task board (kanban)
+// ============================================================================
+
+export type TaskStatus = "new" | "in_progress" | "finalizing" | "done";
+export type TaskPriority =
+  | "urgent"
+  | "high"
+  | "normal"
+  | "low"
+  | "future_idea";
+export type TaskCommentAuthorKind = "person" | "assistant";
+export type TaskAttachmentKind = "photo" | "pdf" | "document" | "other";
+
+export interface Task {
+  task_id: number;
+  family_id: number;
+  created_by_person_id: number | null;
+  assigned_to_person_id: number | null;
+  title: string;
+  description: string | null;
+  status: TaskStatus;
+  priority: TaskPriority;
+  start_date: string | null;
+  desired_end_date: string | null;
+  end_date: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  follower_count: number;
+  comment_count: number;
+  attachment_count: number;
+}
+
+export interface TaskComment {
+  task_comment_id: number;
+  task_id: number;
+  author_person_id: number | null;
+  author_kind: TaskCommentAuthorKind;
+  body: string;
+  created_at: string;
+}
+
+export interface TaskFollower {
+  task_follower_id: number;
+  task_id: number;
+  person_id: number;
+  added_at: string;
+}
+
+export interface TaskAttachment {
+  task_attachment_id: number;
+  task_id: number;
+  uploaded_by_person_id: number | null;
+  attachment_kind: TaskAttachmentKind;
+  original_file_name: string;
+  mime_type: string | null;
+  file_size_bytes: number | null;
+  caption: string | null;
+  created_at: string;
+}
+
+export interface TaskDetail extends Task {
+  followers: TaskFollower[];
+  comments: TaskComment[];
+  attachments: TaskAttachment[];
+}
+
 export interface DocumentRecord {
   document_id: number;
   family_id: number;

@@ -190,6 +190,52 @@ def build_person_context(
     if siblings:
         lines.append(f"Siblings: {', '.join(siblings)}")
 
+    # Surface the speaker's own open tasks so Avi can volunteer
+    # follow-ups ("you've got 'fix the gate' marked urgent — want to
+    # talk about it?") without an extra tool call. We deliberately
+    # ONLY include tasks owned by THIS person (not the whole family
+    # board) and we cap at the few highest-priority active items so
+    # the prompt stays small. Tasks already in 'done' are skipped —
+    # they're audit history, not action items.
+    task_priority_rank = {
+        "urgent": 0,
+        "high": 1,
+        "normal": 2,
+        "low": 3,
+        "future_idea": 4,
+    }
+    task_status_rank = {
+        "in_progress": 0,
+        "finalizing": 1,
+        "new": 2,
+        "done": 9,
+    }
+    open_tasks = (
+        db.execute(
+            select(models.Task)
+            .where(models.Task.family_id == person.family_id)
+            .where(models.Task.assigned_to_person_id == person.person_id)
+            .where(models.Task.status != "done")
+        )
+        .scalars()
+        .all()
+    )
+    if open_tasks:
+        ranked = sorted(
+            open_tasks,
+            key=lambda t: (
+                task_priority_rank.get(t.priority, 5),
+                task_status_rank.get(t.status, 5),
+                -(int(t.task_id)),
+            ),
+        )
+        lines.append(f"Open tasks ({len(open_tasks)} total, top {min(len(ranked), 5)}):")
+        for t in ranked[:5]:
+            bits = [t.priority.replace("_", "-"), t.status.replace("_", " ")]
+            if t.desired_end_date:
+                bits.append(f"by {t.desired_end_date.isoformat()}")
+            lines.append(f"  - #{t.task_id} {t.title} ({', '.join(bits)})")
+
     return "\n".join(lines)
 
 
