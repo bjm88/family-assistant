@@ -21,10 +21,30 @@ URL organization
 
 from __future__ import annotations
 
+import logging
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
+
+
+# Wire up Python logging the FIRST thing we do, so every ``logger.info``
+# / ``logger.warning`` from our ``api.*`` modules shows up in the terminal
+# alongside uvicorn's access lines. Without this, the root logger sits at
+# WARNING and our diagnostic INFO calls (followup, planner, agent loop)
+# vanish silently. The level is controlled by ``FA_LOG_LEVEL`` so prod
+# can dial it up to WARNING without a redeploy.
+_log_level = os.environ.get("FA_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+# Quiet the noisier libraries so our own messages don't get drowned out.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
 from .routers import (
     addresses,
     agent_tasks,

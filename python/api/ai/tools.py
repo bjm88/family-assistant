@@ -112,6 +112,16 @@ class Tool:
     handler: ToolHandler
     timeout_seconds: float = 15.0
     requires: tuple[str, ...] = field(default_factory=tuple)
+    # Human-friendly title for capability descriptions ("Send email"
+    # rather than "gmail_send"). Falls back to ``name`` when omitted.
+    label: Optional[str] = None
+    # Sample user phrasings the LLM can quote back when asked "what
+    # can you do?". Two-to-three short examples per tool keeps the
+    # system prompt small while still being concrete.
+    examples: tuple[str, ...] = field(default_factory=tuple)
+
+    def display_label(self) -> str:
+        return self.label or self.name
 
     def to_ollama_schema(self) -> Dict[str, Any]:
         """Render the tool in the Ollama / OpenAI ``tools`` shape."""
@@ -442,6 +452,7 @@ def build_default_registry() -> ToolRegistry:
     reg.register(
         Tool(
             name="sql_query",
+            label="Query the family database",
             description=(
                 "Run a single read-only SELECT against the family database. "
                 "Useful for ad-hoc lookups (vehicles, residences, insurance, "
@@ -451,11 +462,17 @@ def build_default_registry() -> ToolRegistry:
             parameters=_SQL_QUERY_SCHEMA,
             handler=_handle_sql_query,
             timeout_seconds=8.0,
+            examples=(
+                "How many cars do we own?",
+                "When does our auto insurance renew?",
+                "Who in the family takes blood pressure medication?",
+            ),
         )
     )
     reg.register(
         Tool(
             name="lookup_person",
+            label="Look up a family member",
             description=(
                 "Find a household member by partial name. Returns person_id, "
                 "names, email, and gender. Use this BEFORE drafting an email "
@@ -464,11 +481,16 @@ def build_default_registry() -> ToolRegistry:
             parameters=_LOOKUP_PERSON_SCHEMA,
             handler=_handle_lookup_person,
             timeout_seconds=4.0,
+            examples=(
+                "What's Sarah's email address?",
+                "Tell me about Ben.",
+            ),
         )
     )
     reg.register(
         Tool(
             name="gmail_send",
+            label="Send an email",
             description=(
                 "Send a plain-text email from the assistant's connected "
                 "Gmail account. Returns the Gmail message_id on success. "
@@ -480,11 +502,16 @@ def build_default_registry() -> ToolRegistry:
             handler=_handle_gmail_send,
             timeout_seconds=20.0,
             requires=("google",),
+            examples=(
+                "Send Mom a note thanking her for dinner.",
+                "Email Ben a one-line summary of tomorrow's calendar.",
+            ),
         )
     )
     reg.register(
         Tool(
             name="calendar_list_upcoming",
+            label="Read the calendar",
             description=(
                 "List events on the assistant's connected Google calendar "
                 "(and any calendars shared with it) for the next N hours. "
@@ -495,9 +522,42 @@ def build_default_registry() -> ToolRegistry:
             handler=_handle_calendar_list,
             timeout_seconds=15.0,
             requires=("google",),
+            examples=(
+                "What's on the calendar this week?",
+                "Are we free Saturday afternoon?",
+            ),
         )
     )
     return reg
+
+
+def describe_capabilities(
+    registry: ToolRegistry, available: set[str]
+) -> str:
+    """Render the registry as a friendly bullet list for the system prompt.
+
+    The model uses this to answer "what can you do?" / "help" with
+    accurate, up-to-date answers instead of making them up. Tools
+    whose capabilities aren't satisfied (e.g. Google not connected)
+    are silently omitted so the model never offers things it can't
+    actually do this turn.
+    """
+    tools_available = registry.for_capabilities(available)
+    if not tools_available:
+        return ""
+    lines: List[str] = ["You currently have these tools:"]
+    for t in tools_available:
+        lines.append(f"- {t.display_label()} ({t.name}) — {t.description}")
+        for ex in t.examples[:2]:
+            lines.append(f'    e.g. "{ex}"')
+    lines.append("")
+    lines.append(
+        "When the user asks 'what can you do?', 'help', or similar, "
+        "summarise these capabilities in 2-4 friendly sentences. Quote "
+        "ONE concrete example per capability so they know how to ask. "
+        "Do not promise capabilities that aren't in the list above."
+    )
+    return "\n".join(lines)
 
 
 def detect_capabilities(db: Session, assistant_id: Optional[int]) -> set[str]:
@@ -526,5 +586,6 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "build_default_registry",
+    "describe_capabilities",
     "detect_capabilities",
 ]

@@ -138,6 +138,14 @@ type ChatMessage = {
 // How often we snap a webcam frame for face recognition. Slow enough that
 // an M-series Mac doesn't spin up the fans; fast enough to feel "live".
 const FACE_RECOG_INTERVAL_MS = 2500;
+
+// After "Hi <name>!" plays we wait this long for the user to react before
+// volunteering a goal-based question. Long enough that a quick "Hi Avi"
+// or "what's the weather?" lands first; short enough that the silence
+// doesn't feel awkward. The clock starts when the greeting is queued
+// for playback (greeting itself takes ~1 s), so the effective gap from
+// "Avi stopped talking" to "Avi asks a follow-up" is ~4-5 s.
+const GREETING_FOLLOWUP_DELAY_MS = 5500;
 // After we greet someone, suppress re-greetings for this long so Avi
 // doesn't loop "Hi Sam!" every time they blink.
 const GREETING_SUPPRESSION_MS = 90_000;
@@ -1628,6 +1636,26 @@ function ChatPanel({
   // the latest closure (audio queue, llmStatus, voiceGender can all
   // change during the session without re-subscribing).
   const triggerGreetRef = useRef<(id: number) => void>(() => undefined);
+
+  // Pending "ask a follow-up question" timer. Set by triggerGreet,
+  // cancelled the moment the user does anything that proves they're
+  // engaged (typing, speaking, sending a message). Held in a ref so
+  // any handler in the component can clear it without re-rendering.
+  const followupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPendingFollowup = useCallback((reason?: string) => {
+    if (followupTimerRef.current != null) {
+      clearTimeout(followupTimerRef.current);
+      followupTimerRef.current = null;
+      if (reason) {
+        console.debug(`[followup] cancelled (${reason})`);
+      }
+    }
+  }, []);
+  // Cancel any pending follow-up when the page unmounts so the
+  // setTimeout callback doesn't fire against a torn-down React tree.
+  useEffect(() => {
+    return () => cancelPendingFollowup("unmount");
+  }, [cancelPendingFollowup]);
   useEffect(() => {
     const handler = (evt: Event) => {
       const detail = (evt as CustomEvent<GreetEventDetail>).detail;
@@ -1645,6 +1673,10 @@ function ChatPanel({
   }, []);
 
   async function triggerGreet(personId: number) {
+    // A fresh face means any pending follow-up from a previous greet
+    // is now stale — drop it before scheduling a new one.
+    cancelPendingFollowup("new greet");
+
     // Phase 1 — instant template greeting. No LLM in this path, so it
     // returns in ~50 ms and we can ship the audio clip immediately.
     const greetingMsg: ChatMessage = {
@@ -1708,10 +1740,25 @@ function ChatPanel({
       return;
     }
 
-    // Phase 2 — LLM-generated follow-up question. Runs in parallel with
-    // the greeting audio so it's usually queued and ready to play the
-    // moment the greeting finishes.
+    // Phase 2 — defer the LLM follow-up question. We give the user a
+    // few seconds of breathing room to ask their own question. If they
+    // type, speak, or send anything, ``cancelPendingFollowup`` is
+    // called from the relevant handler and this timer never fires.
     if (!llmStatus?.available || !llmStatus.model_pulled) {
+      return;
+    }
+    cancelPendingFollowup("rescheduling");
+    followupTimerRef.current = setTimeout(() => {
+      followupTimerRef.current = null;
+      void runFollowup(personId);
+    }, GREETING_FOLLOWUP_DELAY_MS);
+  }
+
+  async function runFollowup(personId: number) {
+    // Sanity: the user might have started something the same tick the
+    // timer fired. The chat-stream guard catches the common case.
+    if (isStreamingRef.current) {
+      console.debug("[followup] suppressed — chat already streaming");
       return;
     }
     const followupMsg: ChatMessage = {
@@ -1760,6 +1807,9 @@ function ChatPanel({
   async function sendUserMessage(text: string) {
     const content = text.trim();
     if (!content || isStreaming) return;
+    // The user just took the floor — drop any pending "ask a follow-up
+    // question" timer so Avi doesn't talk over them.
+    cancelPendingFollowup("user sent message");
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
@@ -2026,6 +2076,12 @@ function ChatPanel({
           interim += r[0].transcript;
         }
       }
+      // Real transcript made it past the echo gate — the user is
+      // talking, so cancel any pending goal-question timer before Avi
+      // tries to talk over them.
+      if (interim || pendingFinal) {
+        cancelPendingFollowup("user speaking");
+      }
       setInput((pendingFinal + " " + interim).trim());
       if (!sawFinal) return;
       if (isStreamingRef.current) return;
@@ -2287,7 +2343,12 @@ function ChatPanel({
             isStreaming ? `${assistantName} is thinking…` : "Ask anything…"
           }
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) => {
+            // Any keystroke (or a speech-driven input update) means the
+            // user is engaged — kill the pending goal-question timer.
+            if (e.target.value) cancelPendingFollowup("user typing");
+            setInput(e.target.value);
+          }}
           disabled={isStreaming}
         />
         <button

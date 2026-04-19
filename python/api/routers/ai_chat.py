@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..ai import agent as agent_loop
 from ..ai import ollama
+from ..ai import prompts
 from ..ai import rag
 from ..ai import schema_catalog
 from ..ai import session as live_session
@@ -147,10 +148,31 @@ def _build_system_prompt(
     assistant_name: str,
     family_name: Optional[str],
     rag_block: str,
+    capabilities_block: str = "",
     live_data_block: Optional[str] = None,
 ) -> str:
-    """Assemble the full system prompt: persona + context + schema."""
+    """Assemble the full system prompt and wrap it in the safety sandbox.
+
+    Section order (top to bottom inside the safety frame):
+
+    1. Persona — who Avi is.
+    2. Capabilities — dynamic list of tools the model can use this
+       turn, with example questions. Lets "what can you do?" produce
+       accurate answers without hard-coding them in code.
+    3. House context — every ``ai_context_*.txt`` at the project root.
+    4. Household RAG context — DB-derived family overview.
+    5. Database schema + (optional) live SQL results.
+
+    The whole stack is then wrapped by :func:`prompts.with_safety` so
+    the unbreakable rules sit OUTSIDE everything below them and can't
+    be overridden by anything appended later in the conversation.
+    """
     parts: List[str] = [ollama.system_prompt_for_avi(assistant_name, family_name)]
+    if capabilities_block:
+        parts.append("--- What you can do ---\n" + capabilities_block)
+    house_context = prompts.render_context_blocks()
+    if house_context:
+        parts.append("--- House context ---\n" + house_context)
     if rag_block:
         parts.append("--- Known household context ---\n" + rag_block)
     parts.append(
@@ -166,7 +188,7 @@ def _build_system_prompt(
     )
     if live_data_block:
         parts.append("--- Live data (just queried for this turn) ---\n" + live_data_block)
-    return "\n\n".join(parts)
+    return prompts.with_safety("\n\n".join(parts))
 
 
 # ---------- Status --------------------------------------------------------
@@ -321,19 +343,45 @@ async def followup(
     assistant_name, family_name = _load_assistant(db, payload.family_id)
     context = rag.build_person_context(db, person)
     goal = rag.pick_goal_for_question(person)
+    has_interests = bool((person.interests_and_activities or "").strip())
+    has_notes = bool((person.notes or "").strip())
 
+    # Tell the model exactly what raw material is in the context block so
+    # it doesn't have to guess. The "anchor" hint nudges it to pick the
+    # most personal thing rather than asking another generic question.
+    available_bits: List[str] = []
     if goal is not None:
-        task = (
-            "Ask ONE short, specific, warmly-phrased follow-up question about "
-            f"their goal: \"{goal.goal_name}\""
-            + (f" — {goal.description}" if goal.description else "")
-            + ". Make it conversational, not templated. Single sentence only."
+        available_bits.append(f"their goal \"{goal.goal_name}\"")
+    if has_interests:
+        available_bits.append("one of their listed interests / hobbies")
+    if has_notes:
+        available_bits.append("something specific from their notes")
+    if not available_bits:
+        # Truly nothing personal known. Ask something gentle, but still
+        # not the same boring sentence every time.
+        anchor_hint = (
+            "We don't have anything specific about them yet — keep the "
+            "question open and inviting (e.g. ask what they've been "
+            "enjoying lately, or what's on their mind today). Vary the "
+            "wording so it doesn't sound templated."
         )
     else:
-        task = (
-            "Ask ONE short, open-ended question about how they're doing today. "
-            "Single sentence only."
+        anchor_hint = (
+            "Anchor the question in ONE specific detail from the context "
+            "above — for example "
+            + ", or ".join(available_bits)
+            + ". Reference the detail concretely (use the actual goal "
+            "name, hobby, or note phrase) so it's clear you remember "
+            "them. Do NOT ask a generic 'how was your day' or 'how are "
+            "you doing today' — those are banned."
         )
+
+    task = (
+        "Ask ONE short, warm, specific follow-up question to keep the "
+        "conversation going. Single sentence only, conversational, no "
+        "preamble.\n\n"
+        + anchor_hint
+    )
 
     prompt = (
         "You just greeted this family member and want to keep the "
@@ -341,10 +389,28 @@ async def followup(
         f"--- Who you are talking to ---\n{context}\n\n"
         f"--- Your task ---\n{task}\n\n"
         "Reply with only the spoken question — no preamble, no quotes, "
-        "no restating their name."
+        "no restating their name, no leading 'Sure!' or 'Great!'."
     )
 
-    system = ollama.system_prompt_for_avi(assistant_name, family_name)
+    logger.info(
+        "[followup] person_id=%s name=%r goal=%r has_interests=%s has_notes=%s",
+        person.person_id,
+        person.preferred_name or person.first_name,
+        goal.goal_name if goal else None,
+        has_interests,
+        has_notes,
+    )
+    # Dump the raw context block so we can verify the goals + interests
+    # actually made it in. Truncated to keep the log readable.
+    _ctx_preview = context.replace("\n", " | ")
+    logger.info(
+        "[followup] context_preview=%s",
+        _ctx_preview[:600] + ("…" if len(_ctx_preview) > 600 else ""),
+    )
+
+    system = prompts.with_safety(
+        ollama.system_prompt_for_avi(assistant_name, family_name)
+    )
 
     # One-sentence follow-up — perfect fit for the lightweight model.
     # The fallback wrapper transparently uses the main chat model if
@@ -368,7 +434,49 @@ async def followup(
     except ollama.OllamaError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    final_question = (question or "How's your day going?").strip()
+    raw_question = (question or "").strip()
+    logger.info(
+        "[followup] model=%s raw_response=%r", followup_model, raw_question
+    )
+
+    # Reject the lazy fallback even if the model actually produced it.
+    # Without this guard a model that lapses into "How's your day going?"
+    # would slip through and look exactly like our hard-coded fallback.
+    GENERIC_PHRASES = (
+        "how's your day",
+        "how is your day",
+        "how are you doing today",
+        "how are you today",
+    )
+    if not raw_question or any(
+        g in raw_question.lower() for g in GENERIC_PHRASES
+    ):
+        # Build a deterministic, personal fallback from the structured
+        # context so we never speak the boring sentence.
+        if goal is not None:
+            final_question = (
+                f"How is it going with your goal to {goal.goal_name}?"
+            )
+        elif has_interests:
+            interest = (person.interests_and_activities or "").strip()
+            # Take the first comma-separated chunk so we name something
+            # specific instead of reading the whole list aloud.
+            first_interest = interest.split(",")[0].strip().rstrip(".")
+            if first_interest:
+                final_question = (
+                    f"Have you done any {first_interest} lately?"
+                )
+            else:
+                final_question = "What have you been up to lately?"
+        else:
+            final_question = "What's been on your mind today?"
+        logger.info(
+            "[followup] substituted_fallback=%r (model produced %r)",
+            final_question,
+            raw_question,
+        )
+    else:
+        final_question = raw_question
 
     # Log into the transcript when we have a session, so the history
     # view can replay the full Avi → human → Avi conversation rhythm.
@@ -481,7 +589,9 @@ async def _plan_queries(
         raw, _ = await ollama.generate_with_fallback(
             prompt,
             primary_model=ollama.fast_model(),
-            system="You return strict JSON. No prose. No markdown fences.",
+            system=prompts.with_safety(
+                "You return strict JSON. No prose. No markdown fences."
+            ),
             temperature=0.1,
             max_tokens=400,
         )
@@ -584,6 +694,16 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
     assistant_id = _assistant_id_for(db, payload.family_id)
     rag_block = _build_rag_block(db, payload.family_id, payload.recognized_person_id)
 
+    # Build the tool registry up-front so the same instance is used to
+    # (a) describe Avi's capabilities to the model in the system prompt
+    # and (b) dispatch real tool calls in the agent loop. Capabilities
+    # are inspected here so a tool whose backing integration is offline
+    # (no Google account connected, etc.) is hidden from the model
+    # entirely — it can't claim to do something it can't do this turn.
+    registry = agent_tools.build_default_registry()
+    capabilities = agent_tools.detect_capabilities(db, assistant_id)
+    capabilities_block = agent_tools.describe_capabilities(registry, capabilities)
+
     # Optional dynamic-SQL planner. Disabled by default because a
     # 26B-parameter local model needs 5-10 s for the extra non-
     # streaming round trip — too slow for conversational use when the
@@ -628,20 +748,21 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
         assistant_name=assistant_name,
         family_name=family_name,
         rag_block=rag_block,
+        capabilities_block=capabilities_block,
         live_data_block=live_data_block,
     )
 
-    # Inject a short tool-use preamble so models that aren't natively
-    # tool-trained still understand the contract. Models that DO have a
-    # native tool template (gemma3, llama3.1+) ignore this gracefully.
+    # Tool-use protocol reminder. Goes after the safety + capabilities
+    # block; safe to keep here because anything appended after
+    # ``with_safety`` is still bracketed by the trailing reinforcer
+    # that ``with_safety`` adds.
     system = (
         system
         + "\n\n--- Tool-use rules ---\n"
-        "You have a small set of tools available (lookup_person, "
-        "sql_query, gmail_send, calendar_list_upcoming). Use them when "
-        "the user asks you to take an action or fetch live data. "
-        "ALWAYS call lookup_person to resolve a household member's email "
-        "before drafting an email to them. After a tool returns, briefly "
+        "Use the tools listed under 'What you can do' when the user "
+        "asks you to take an action or fetch live data. ALWAYS call "
+        "lookup_person to resolve a household member's email before "
+        "drafting an email to them. After a tool returns, briefly "
         "confirm what you did (one sentence). Never claim to have sent "
         "an email unless gmail_send returned ok=true."
     )
@@ -670,14 +791,6 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
                     meta={"kind": "chat"},
                 )
                 db.commit()
-
-    # Build the tool registry once per request and inspect which
-    # capabilities are actually live (e.g. is Google connected?). Tools
-    # whose ``requires`` aren't satisfied are simply hidden from the
-    # model so it can't hallucinate calling gmail_send when nobody has
-    # signed in yet.
-    registry = agent_tools.build_default_registry()
-    capabilities = agent_tools.detect_capabilities(db, assistant_id)
 
     # Create the audit row up-front so the SSE stream can reference its
     # id immediately. We commit here so external clients (e.g. a future

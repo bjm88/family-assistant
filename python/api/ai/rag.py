@@ -67,6 +67,17 @@ def build_person_context(db: Session, person: models.Person) -> str:
             line += f" ({', '.join(extra)})"
             lines.append(line)
 
+    # Interests / hobbies — free-form line the user maintains in the
+    # admin console specifically so Avi has something concrete to riff
+    # on in conversation. Without this the followup-question generator
+    # falls back to a generic "how was your day" because goals alone
+    # often aren't enough material.
+    if person.interests_and_activities:
+        interests = person.interests_and_activities.strip().replace("\n", " ")
+        if len(interests) > 320:
+            interests = interests[:317] + "…"
+        lines.append(f"Interests / hobbies: {interests}")
+
     # Notes (truncated).
     if person.notes:
         note = person.notes.strip().replace("\n", " ")

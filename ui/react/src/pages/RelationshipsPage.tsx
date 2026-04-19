@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Users2, X } from "lucide-react";
 import { api } from "@/lib/api";
@@ -159,7 +159,7 @@ export default function RelationshipsPage() {
     <div>
       <PageHeader
         title="Family tree"
-        description="Pick a focal person to see their parents, spouse, siblings, and children. Click any card to re-center the tree on that person."
+        description="Pick a focal person to see their parents, spouse, siblings, and children. Click a name to re-center the tree, or click the face to open that person's full profile."
       />
 
       <div className="card mb-6">
@@ -196,6 +196,7 @@ export default function RelationshipsPage() {
             hint="Who brought the focus person into the family?"
             people={derived.parents.map((x) => x.person)}
             edges={derived.parents}
+            familyId={familyId}
             onAdd={() => setAddGroup("parent")}
             onSelect={(id) => setFocusId(id)}
             onRemove={(edgeId) => removeEdge.mutate(edgeId)}
@@ -203,7 +204,13 @@ export default function RelationshipsPage() {
 
           <div className="card border-primary/20">
             <div className="card-body flex items-center gap-4">
-              <ProfileAvatar person={focus} size={64} />
+              <Link
+                to={`/admin/families/${familyId}/people/${focus.person_id}`}
+                title="Open profile"
+                className="rounded-full ring-2 ring-transparent hover:ring-primary/40 transition"
+              >
+                <ProfileAvatar person={focus} size={64} />
+              </Link>
               <div className="flex-1">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">
                   Focus
@@ -229,6 +236,7 @@ export default function RelationshipsPage() {
             hint="Marriages / long-term partners. Stored symmetrically in both directions."
             people={derived.spouses.map((x) => x.person)}
             edges={derived.spouses}
+            familyId={familyId}
             onAdd={() => setAddGroup("spouse")}
             onSelect={(id) => setFocusId(id)}
             onRemove={(edgeId) => removeEdge.mutate(edgeId)}
@@ -238,6 +246,7 @@ export default function RelationshipsPage() {
             hint="Computed from shared parents — there's nothing to add here directly."
             people={derived.siblings}
             edges={null}
+            familyId={familyId}
             onSelect={(id) => setFocusId(id)}
           />
           <TreeRow
@@ -245,6 +254,7 @@ export default function RelationshipsPage() {
             hint="Biological, adopted, step — anyone the focus person is a parent to."
             people={derived.children.map((x) => x.person)}
             edges={derived.children}
+            familyId={familyId}
             onAdd={() => setAddGroup("child")}
             onSelect={(id) => setFocusId(id)}
             onRemove={(edgeId) => removeEdge.mutate(edgeId)}
@@ -279,6 +289,7 @@ function TreeRow({
   hint,
   people,
   edges,
+  familyId,
   onAdd,
   onSelect,
   onRemove,
@@ -287,6 +298,7 @@ function TreeRow({
   hint?: string;
   people: Person[];
   edges: { edge: PersonRelationship; person: Person }[] | null;
+  familyId: string | undefined;
   onAdd?: () => void;
   onSelect: (personId: number) => void;
   onRemove?: (edgeId: number) => void;
@@ -323,9 +335,19 @@ function TreeRow({
                   key={p.person_id}
                   className="flex items-center gap-3 border border-border rounded-full pl-1 pr-3 py-1 hover:border-primary/40 hover:bg-primary/5 cursor-pointer transition-colors group"
                   onClick={() => onSelect(p.person_id)}
-                  title="Click to focus on this person"
+                  title="Click name to focus the tree on this person"
                 >
-                  <ProfileAvatar person={p} size={40} />
+                  {/* Avatar drills into the person's full record. The
+                      stopPropagation keeps the surrounding chip's
+                      onSelect (re-focus) from also firing. */}
+                  <Link
+                    to={`/admin/families/${familyId}/people/${p.person_id}`}
+                    onClick={(e) => e.stopPropagation()}
+                    title="Open profile"
+                    className="rounded-full ring-2 ring-transparent hover:ring-primary/40 transition"
+                  >
+                    <ProfileAvatar person={p} size={40} />
+                  </Link>
                   <div className="pr-1">
                     <div className="text-sm font-medium leading-tight">
                       {p.preferred_name || p.first_name} {p.last_name}
