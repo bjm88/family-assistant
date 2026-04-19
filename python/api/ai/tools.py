@@ -472,6 +472,330 @@ async def _handle_reveal_sensitive(
     }
 
 
+# ---- reveal_secret ----------------------------------------------------
+#
+# Umbrella decrypt-and-return tool for every other Fernet-encrypted
+# family identifier: vehicle VIN / license plate, identity-document
+# number (driver's licence, passport), bank account & routing numbers,
+# insurance policy number. Same household-privacy matrix as
+# ``reveal_sensitive_identifier``: self / spouse / direct parent of the
+# subject ALLOW, everyone else DENY.
+#
+# We resolve a "subject person" per category so the same authz check
+# can be applied uniformly:
+#
+#   vehicle_vin / vehicle_license_plate → vehicles.primary_driver_person_id
+#                                         (NULL → household-shared,
+#                                          allowed for any identified
+#                                          family member of same family)
+#   identity_document_number            → identity_documents.person_id
+#   financial_account_number /          → financial_accounts.primary_holder_person_id
+#   financial_routing_number
+#   insurance_policy_number             → any covered person via
+#                                         insurance_policy_people
+#                                         (allowed if speaker can access
+#                                         ANY of them, which means a
+#                                         covered person, their spouse,
+#                                         or their parent)
+#
+# Every call — allow or deny — is audit-logged through ai.authz so
+# ``rg "[authz]"`` can answer "did Avi ever read the truck's full VIN,
+# and who asked?".
+
+
+_REVEAL_SECRET_CATEGORIES = (
+    "vehicle_vin",
+    "vehicle_license_plate",
+    "identity_document_number",
+    "financial_account_number",
+    "financial_routing_number",
+    "insurance_policy_number",
+)
+
+
+_REVEAL_SECRET_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "category": {
+            "type": "string",
+            "enum": list(_REVEAL_SECRET_CATEGORIES),
+            "description": (
+                "Which encrypted field to decrypt. Pick one of: "
+                "vehicle_vin (full 17-char VIN), "
+                "vehicle_license_plate (full plate), "
+                "identity_document_number (driver's license / "
+                "passport / state ID number), "
+                "financial_account_number (bank or brokerage account "
+                "number), financial_routing_number (ABA routing "
+                "number on a checking/savings account), "
+                "insurance_policy_number (full policy number)."
+            ),
+        },
+        "record_id": {
+            "type": "integer",
+            "description": (
+                "Primary-key id of the row to decrypt. The id "
+                "interpretation depends on category: vehicle_id for "
+                "the two vehicle_* categories, identity_document_id "
+                "for identity_document_number, financial_account_id "
+                "for the two financial_* categories, "
+                "insurance_policy_id for insurance_policy_number. "
+                "Use sql_query to find the id first if you only have "
+                "the make/model, the institution, etc."
+            ),
+        },
+    },
+    "required": ["category", "record_id"],
+}
+
+
+def _resolve_secret_subject(
+    db: Session, *, category: str, record_id: int
+) -> tuple[Optional[object], List[int], Optional[int], Optional[bytes], Optional[str]]:
+    """Look up the row + return (row, candidate_subject_ids, family_id, ciphertext, label).
+
+    ``candidate_subject_ids`` is the list of person_ids the household
+    privacy gate runs against. The speaker passes the gate if they can
+    access AT LEAST ONE of them (that's how household-shared assets
+    like a family truck or a joint policy work — every covered person
+    is a valid "owner" for authz purposes).
+
+    An empty list means "household-shared, no specific owner" and the
+    caller falls back to a same-family check.
+
+    Returns ``(None, [], None, None, None)`` if no row exists for that
+    id.
+    """
+    if category in ("vehicle_vin", "vehicle_license_plate"):
+        row = db.get(models.Vehicle, int(record_id))
+        if row is None:
+            return None, [], None, None, None
+        ciphertext = (
+            row.vehicle_identification_number_encrypted
+            if category == "vehicle_vin"
+            else row.license_plate_number_encrypted
+        )
+        label = "VIN" if category == "vehicle_vin" else "license plate"
+        owners = (
+            [int(row.primary_driver_person_id)]
+            if row.primary_driver_person_id is not None
+            else []
+        )
+        return row, owners, int(row.family_id), ciphertext, label
+
+    if category == "identity_document_number":
+        row = db.get(models.IdentityDocument, int(record_id))
+        if row is None:
+            return None, [], None, None, None
+        # IdentityDocument doesn't carry family_id directly — pull it
+        # from the owning person.
+        owner_person = db.get(models.Person, int(row.person_id))
+        family_id = owner_person.family_id if owner_person else None
+        return (
+            row,
+            [int(row.person_id)],
+            family_id,
+            row.document_number_encrypted,
+            f"{row.document_type} number",
+        )
+
+    if category in ("financial_account_number", "financial_routing_number"):
+        row = db.get(models.FinancialAccount, int(record_id))
+        if row is None:
+            return None, [], None, None, None
+        ciphertext = (
+            row.account_number_encrypted
+            if category == "financial_account_number"
+            else row.routing_number_encrypted
+        )
+        label = (
+            "account number"
+            if category == "financial_account_number"
+            else "routing number"
+        )
+        owners = (
+            [int(row.primary_holder_person_id)]
+            if row.primary_holder_person_id is not None
+            else []
+        )
+        return row, owners, int(row.family_id), ciphertext, label
+
+    if category == "insurance_policy_number":
+        row = db.get(models.InsurancePolicy, int(record_id))
+        if row is None:
+            return None, [], None, None, None
+        covered_ids = [
+            int(p.person_id)
+            for p in db.query(models.InsurancePolicyPerson)
+            .filter(models.InsurancePolicyPerson.insurance_policy_id == int(record_id))
+            .all()
+        ]
+        return (
+            row,
+            covered_ids,
+            int(row.family_id),
+            row.policy_number_encrypted,
+            "policy number",
+        )
+
+    raise ToolError(f"Unknown reveal_secret category: {category!r}")
+
+
+async def _handle_reveal_secret(
+    ctx: ToolContext, category: str, record_id: int
+) -> Dict[str, Any]:
+    """Decrypt one Fernet-encrypted family identifier — gated by relationship.
+
+    Mirrors :func:`_handle_reveal_sensitive` but for the wider set of
+    encrypted family identifiers (vehicle VIN / plate, identity-doc
+    number, bank account & routing numbers, insurance policy number).
+    The privacy matrix is identical: a person can always read their
+    own, a direct parent can read a direct child's, spouses can read
+    each other's, everyone else (children → parents, siblings,
+    grandparents, in-laws, anonymous speakers) is denied.
+    """
+    if category not in _REVEAL_SECRET_CATEGORIES:
+        raise ToolError(
+            f"Unknown category {category!r}. Allowed: "
+            + ", ".join(_REVEAL_SECRET_CATEGORIES)
+            + "."
+        )
+
+    if ctx.person_id is None:
+        raise ToolError(
+            "I can't reveal that without first knowing who is asking. "
+            "Please greet me on camera (or email me from your "
+            "registered address) and try again."
+        )
+
+    row, candidate_subject_ids, family_id, ciphertext, label = (
+        _resolve_secret_subject(
+            ctx.db, category=category, record_id=int(record_id)
+        )
+    )
+    if row is None:
+        return {
+            "found": False,
+            "category": category,
+            "record_id": int(record_id),
+        }
+
+    # Cross-family belt-and-suspenders. The speaker's family_id (from
+    # ToolContext) must match the row's family — refuse otherwise so
+    # one household can't read another's secrets even if a hallucinated
+    # record_id happens to land on a valid row.
+    if (
+        ctx.family_id is not None
+        and family_id is not None
+        and int(ctx.family_id) != int(family_id)
+    ):
+        logger.info(
+            "[authz] DENY  scope=secret requestor=%s category=%s "
+            "record_id=%s reason=cross_family",
+            ctx.person_id,
+            category,
+            int(record_id),
+        )
+        raise ToolError(
+            "That record belongs to a different household — I can't "
+            "reveal it."
+        )
+
+    decision_label: Optional[str] = None
+    allowed = False
+
+    if candidate_subject_ids:
+        # Standard subject-based check. Speaker passes if they can
+        # access ANY one of the candidate subjects (covers joint
+        # accounts and shared insurance policies).
+        for subject_id in candidate_subject_ids:
+            decision = authz.can_access_sensitive(
+                ctx.db,
+                requestor_person_id=ctx.person_id,
+                subject_person_id=int(subject_id),
+                family_id=ctx.family_id,
+            )
+            if decision.allowed:
+                allowed = True
+                decision_label = decision.label
+                break
+    else:
+        # Household-shared asset (e.g. a family vehicle with no
+        # primary_driver assigned). Allow any identified family member
+        # of the same household to read it. We still audit-log so the
+        # decision is recoverable.
+        speaker = ctx.db.get(models.Person, int(ctx.person_id))
+        if (
+            speaker is not None
+            and family_id is not None
+            and int(speaker.family_id) == int(family_id)
+        ):
+            allowed = True
+            decision_label = "household_shared"
+        logger.info(
+            "[authz] %s scope=secret requestor=%s category=%s record_id=%s "
+            "reason=%s",
+            "ALLOW" if allowed else "DENY ",
+            ctx.person_id,
+            category,
+            int(record_id),
+            decision_label or "unauthorized",
+        )
+
+    if not allowed:
+        raise ToolError(
+            "I can't share that — household privacy rules only let a "
+            "person see their own sensitive details, plus those of "
+            "their spouse and direct children. Please ask the person "
+            "themselves (or one of their parents) for it."
+        )
+
+    if not ciphertext:
+        return {
+            "found": True,
+            "category": category,
+            "record_id": int(record_id),
+            "value": None,
+            "note": (
+                "The row exists but no encrypted value is stored for "
+                "this field — the household never recorded it."
+            ),
+            "access_label": decision_label,
+        }
+
+    try:
+        plaintext = decrypt_str(ciphertext)
+    except RuntimeError as e:
+        logger.error(
+            "Failed to decrypt %s record_id=%s: %s",
+            category,
+            int(record_id),
+            e,
+        )
+        raise ToolError(
+            "Stored value couldn't be decrypted with the current "
+            "encryption key — flag this to the household admin."
+        ) from e
+
+    logger.info(
+        "[authz] DECRYPT scope=secret requestor=%s category=%s "
+        "record_id=%s subject_candidates=%s",
+        ctx.person_id,
+        category,
+        int(record_id),
+        candidate_subject_ids or "household_shared",
+    )
+
+    return {
+        "found": True,
+        "category": category,
+        "record_id": int(record_id),
+        "label": label,
+        "value": plaintext,
+        "access_label": decision_label,
+    }
+
+
 # ---- gmail.send -------------------------------------------------------
 
 
@@ -1359,6 +1683,40 @@ def build_default_registry() -> ToolRegistry:
             examples=(
                 "What's my SSN?",
                 "Read me my daughter's social security number.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="reveal_secret",
+            label="Reveal an encrypted family identifier (VIN, plate, account #, policy #, ID #)",
+            description=(
+                "Decrypt and return one Fernet-encrypted family "
+                "identifier: a vehicle's full VIN or license plate, "
+                "an identity-document number (driver's licence, "
+                "passport, state ID), a bank account or routing "
+                "number, or an insurance policy number. Enforces the "
+                "same household privacy matrix as "
+                "reveal_sensitive_identifier — it ONLY returns a "
+                "value when the speaker is the subject themselves, "
+                "the subject's spouse, or one of the subject's direct "
+                "parents (so a child cannot read a parent's data, "
+                "and a sibling cannot read a sibling's). For shared "
+                "household assets like a vehicle with no primary "
+                "driver, any identified family member of the same "
+                "household may read it. Every call is audit-logged. "
+                "Use this whenever the user explicitly asks for the "
+                "FULL value of one of these fields — for everyday "
+                "questions stick to the *_last_four helper columns "
+                "you can already see via sql_query."
+            ),
+            parameters=_REVEAL_SECRET_SCHEMA,
+            handler=_handle_reveal_secret,
+            timeout_seconds=5.0,
+            examples=(
+                "What's the VIN on my truck?",
+                "Read me my driver's license number.",
+                "Tell me the policy number on our auto insurance.",
             ),
         )
     )
