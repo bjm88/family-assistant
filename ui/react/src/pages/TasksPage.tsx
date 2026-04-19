@@ -8,12 +8,14 @@ import {
   Clock,
   Download,
   Flag,
+  GripVertical,
   ListTodo,
   Loader2,
   MessageSquare,
   Paperclip,
   Plus,
   Trash2,
+  Undo2,
   UploadCloud,
   Users,
   X,
@@ -33,6 +35,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useToast } from "@/components/Toast";
 import { cn } from "@/lib/cn";
 
@@ -155,6 +158,12 @@ export default function TasksPage() {
 
   const [createOpen, setCreateOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<number | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<Task | null>(null);
+
+  // Drag-and-drop state. ``draggingId`` drives the source-card
+  // opacity; ``dropTarget`` highlights the column the cursor is over.
+  const [draggingId, setDraggingId] = useState<number | null>(null);
+  const [dropTarget, setDropTarget] = useState<TaskStatus | null>(null);
 
   // Filters
   const [filterPerson, setFilterPerson] = useState<string>("all"); // 'all' | 'unassigned' | person_id
@@ -172,8 +181,9 @@ export default function TasksPage() {
     [people],
   );
 
+  const tasksKey = ["tasks", familyId] as const;
   const { data: tasks, isLoading } = useQuery<Task[]>({
-    queryKey: ["tasks", familyId],
+    queryKey: tasksKey,
     queryFn: () => api.get<Task[]>(`/api/tasks?family_id=${familyId}`),
   });
 
@@ -210,14 +220,68 @@ export default function TasksPage() {
     return out;
   }, [filtered]);
 
+  // Optimistic status update — used by both drag/drop and the one-click
+  // "complete" button. We patch the cached tasks list immediately so the
+  // card visually moves columns the instant the user lets go (or clicks),
+  // then roll back on error. The eventual ``invalidateQueries`` in
+  // ``onSettled`` re-syncs from the server (refresh counters, completed_at,
+  // etc.) without a visible flicker.
   const updateStatus = useMutation({
-    mutationFn: ({ task_id, status }: { task_id: number; status: TaskStatus }) =>
-      api.patch<Task>(`/api/tasks/${task_id}`, { status }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["tasks", familyId] });
+    mutationFn: ({
+      task_id,
+      status,
+    }: {
+      task_id: number;
+      status: TaskStatus;
+    }) => api.patch<Task>(`/api/tasks/${task_id}`, { status }),
+    onMutate: async ({ task_id, status }) => {
+      await qc.cancelQueries({ queryKey: tasksKey });
+      const previous = qc.getQueryData<Task[]>(tasksKey);
+      qc.setQueryData<Task[]>(tasksKey, (old) =>
+        (old ?? []).map((t) =>
+          t.task_id === task_id ? { ...t, status } : t,
+        ),
+      );
+      return { previous };
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error, _vars, ctx) => {
+      if (ctx?.previous) qc.setQueryData(tasksKey, ctx.previous);
+      toast.error(err.message);
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: tasksKey }),
   });
+
+  // Page-level delete mutation so we can remove a task from the kanban
+  // card itself (not just the detail modal). Same optimistic-then-roll-back
+  // pattern as the status update — the card vanishes the moment the user
+  // confirms.
+  const deleteTask = useMutation({
+    mutationFn: (task_id: number) => api.del(`/api/tasks/${task_id}`),
+    onMutate: async (task_id) => {
+      await qc.cancelQueries({ queryKey: tasksKey });
+      const previous = qc.getQueryData<Task[]>(tasksKey);
+      qc.setQueryData<Task[]>(tasksKey, (old) =>
+        (old ?? []).filter((t) => t.task_id !== task_id),
+      );
+      return { previous };
+    },
+    onError: (err: Error, _vars, ctx) => {
+      if (ctx?.previous) qc.setQueryData(tasksKey, ctx.previous);
+      toast.error(err.message);
+    },
+    onSuccess: () => toast.success("Task deleted."),
+    onSettled: () => qc.invalidateQueries({ queryKey: tasksKey }),
+  });
+
+  // Called when a card is dropped on a column header / body.
+  const handleDrop = (status: TaskStatus) => {
+    if (draggingId === null) return;
+    const dragged = (tasks ?? []).find((t) => t.task_id === draggingId);
+    setDraggingId(null);
+    setDropTarget(null);
+    if (!dragged || dragged.status === status) return;
+    updateStatus.mutate({ task_id: dragged.task_id, status });
+  };
 
   const totalCount = tasks?.length ?? 0;
   const visibleCount = filtered.length;
@@ -226,7 +290,7 @@ export default function TasksPage() {
     <div>
       <PageHeader
         title="Tasks"
-        description="Household kanban — Avi can create, list, and update tasks for you. Drag/click a card to change its status."
+        description="Household kanban — drag any card between columns, click ✓ to complete, or 🗑 to delete. Avi can also create, update, and complete tasks for you."
         actions={
           <button className="btn-primary" onClick={() => setCreateOpen(true)}>
             <Plus className="h-4 w-4" /> New task
@@ -310,10 +374,25 @@ export default function TasksPage() {
               spec={col}
               tasks={grouped[col.status]}
               peopleById={peopleById}
+              isDropTarget={dropTarget === col.status}
+              draggingId={draggingId}
+              onDragEnter={() => {
+                if (draggingId !== null) setDropTarget(col.status);
+              }}
+              onDragLeave={() => {
+                if (dropTarget === col.status) setDropTarget(null);
+              }}
+              onDrop={() => handleDrop(col.status)}
               onOpen={setActiveTaskId}
               onAdvance={(task, next) =>
                 updateStatus.mutate({ task_id: task.task_id, status: next })
               }
+              onDelete={(task) => setConfirmDelete(task)}
+              onDragStart={(id) => setDraggingId(id)}
+              onDragEnd={() => {
+                setDraggingId(null);
+                setDropTarget(null);
+              }}
             />
           ))}
         </div>
@@ -325,7 +404,7 @@ export default function TasksPage() {
           people={people ?? []}
           onClose={() => setCreateOpen(false)}
           onCreated={(newTask) => {
-            qc.invalidateQueries({ queryKey: ["tasks", familyId] });
+            qc.invalidateQueries({ queryKey: tasksKey });
             setCreateOpen(false);
             setActiveTaskId(newTask.task_id);
           }}
@@ -341,6 +420,32 @@ export default function TasksPage() {
           onClose={() => setActiveTaskId(null)}
         />
       )}
+
+      <ConfirmDialog
+        open={confirmDelete !== null}
+        destructive
+        title="Delete this task?"
+        message={
+          confirmDelete ? (
+            <div className="space-y-2">
+              <p>
+                <span className="font-medium">{confirmDelete.title}</span> will
+                be permanently deleted, along with all of its comments,
+                followers, and attachments. This cannot be undone.
+              </p>
+            </div>
+          ) : null
+        }
+        confirmLabel="Delete task"
+        busy={deleteTask.isPending}
+        onCancel={() => setConfirmDelete(null)}
+        onConfirm={() => {
+          if (!confirmDelete) return;
+          deleteTask.mutate(confirmDelete.task_id, {
+            onSettled: () => setConfirmDelete(null),
+          });
+        }}
+      />
     </div>
   );
 }
@@ -349,22 +454,80 @@ export default function TasksPage() {
 // Kanban column + card
 // ---------------------------------------------------------------------------
 
+interface KanbanColumnProps {
+  spec: ColumnSpec;
+  tasks: Task[];
+  peopleById: Map<number, Person>;
+  isDropTarget: boolean;
+  draggingId: number | null;
+  onOpen: (id: number) => void;
+  onAdvance: (task: Task, next: TaskStatus) => void;
+  onDelete: (task: Task) => void;
+  onDragStart: (id: number) => void;
+  onDragEnd: () => void;
+  onDragEnter: () => void;
+  onDragLeave: () => void;
+  onDrop: () => void;
+}
+
 function KanbanColumn({
   spec,
   tasks,
   peopleById,
+  isDropTarget,
+  draggingId,
   onOpen,
   onAdvance,
-}: {
-  spec: ColumnSpec;
-  tasks: Task[];
-  peopleById: Map<number, Person>;
-  onOpen: (id: number) => void;
-  onAdvance: (task: Task, next: TaskStatus) => void;
-}) {
+  onDelete,
+  onDragStart,
+  onDragEnd,
+  onDragEnter,
+  onDragLeave,
+  onDrop,
+}: KanbanColumnProps) {
   const Icon = spec.icon;
+
+  // ``dragenter`` / ``dragleave`` fire for every nested element the cursor
+  // crosses, which would make our highlight flicker. Counting enter / leave
+  // events on a ref keeps us "hovered" until the cursor actually leaves
+  // the column outline.
+  const dragCounter = useRef(0);
+
+  const handleDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
+    if (draggingId === null) return;
+    e.preventDefault();
+    dragCounter.current += 1;
+    if (dragCounter.current === 1) onDragEnter();
+  };
+  const handleDragLeave = () => {
+    if (draggingId === null) return;
+    dragCounter.current = Math.max(0, dragCounter.current - 1);
+    if (dragCounter.current === 0) onDragLeave();
+  };
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    if (draggingId === null) return;
+    // Required for a drop to be allowed; without preventDefault the
+    // browser treats the column as a non-target and drop never fires.
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+  };
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    dragCounter.current = 0;
+    onDrop();
+  };
+
   return (
-    <div className="card flex flex-col">
+    <div
+      className={cn(
+        "card flex flex-col transition-all",
+        isDropTarget && "ring-2 ring-primary ring-offset-2 bg-primary/5",
+      )}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+    >
       <div className="card-header">
         <div className="flex items-center gap-2 min-w-0">
           <Icon
@@ -382,8 +545,15 @@ function KanbanColumn({
       </div>
       <div className="card-body flex-1 space-y-2 min-h-[120px]">
         {tasks.length === 0 ? (
-          <div className="text-xs text-muted-foreground italic text-center py-6">
-            {spec.hint}
+          <div
+            className={cn(
+              "text-xs italic text-center py-6 rounded-md border-2 border-dashed transition-colors",
+              isDropTarget
+                ? "border-primary text-primary bg-primary/5"
+                : "border-transparent text-muted-foreground",
+            )}
+          >
+            {isDropTarget ? `Drop to mark “${spec.label}”` : spec.hint}
           </div>
         ) : (
           tasks.map((t) => (
@@ -391,8 +561,12 @@ function KanbanColumn({
               key={t.task_id}
               task={t}
               peopleById={peopleById}
+              isDragging={draggingId === t.task_id}
               onOpen={() => onOpen(t.task_id)}
               onAdvance={(next) => onAdvance(t, next)}
+              onDelete={() => onDelete(t)}
+              onDragStart={() => onDragStart(t.task_id)}
+              onDragEnd={onDragEnd}
             />
           ))
         )}
@@ -404,38 +578,79 @@ function KanbanColumn({
 function KanbanCard({
   task,
   peopleById,
+  isDragging,
   onOpen,
   onAdvance,
+  onDelete,
+  onDragStart,
+  onDragEnd,
 }: {
   task: Task;
   peopleById: Map<number, Person>;
+  isDragging: boolean;
   onOpen: () => void;
   onAdvance: (next: TaskStatus) => void;
+  onDelete: () => void;
+  onDragStart: () => void;
+  onDragEnd: () => void;
 }) {
   const meta = PRIORITY_META[task.priority];
   const due = formatDate(task.desired_end_date) ?? formatDate(task.end_date);
+  const isDone = task.status === "done";
+
+  const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
+    // Carry the id through the DataTransfer too so external drop targets
+    // (or future debugging) can read it; the actual logic uses the
+    // ``draggingId`` state on the page so this is belt-and-suspenders.
+    e.dataTransfer.setData("text/plain", String(task.task_id));
+    e.dataTransfer.effectAllowed = "move";
+    onDragStart();
+  };
 
   return (
     <div
-      className="rounded-md border border-border bg-white p-3 hover:shadow-md transition-shadow cursor-pointer group"
+      draggable
+      onDragStart={handleDragStart}
+      onDragEnd={onDragEnd}
+      className={cn(
+        "rounded-md border border-border bg-white p-3 transition-all cursor-grab active:cursor-grabbing group select-none",
+        "hover:shadow-md hover:border-primary/40",
+        isDragging && "opacity-40 shadow-lg ring-2 ring-primary",
+      )}
       onClick={onOpen}
+      title="Click to open · drag to move"
     >
       <div className="flex items-start justify-between gap-2">
-        <div className="font-medium text-sm leading-snug truncate-2-lines">
-          {task.title}
+        <div className="flex items-start gap-1.5 min-w-0 flex-1">
+          <GripVertical
+            className="h-4 w-4 text-muted-foreground/40 shrink-0 mt-0.5 group-hover:text-muted-foreground"
+            aria-hidden
+          />
+          <div
+            className={cn(
+              "font-medium text-sm leading-snug truncate-2-lines",
+              isDone && "line-through text-muted-foreground",
+            )}
+          >
+            {task.title}
+          </div>
         </div>
         <span className={cn("badge shrink-0", meta.badgeClass)}>
           <Flag className="h-3 w-3 mr-1" />
           {meta.label}
         </span>
       </div>
+
       <div className="mt-2 text-xs text-muted-foreground flex items-center justify-between gap-2">
         <span className="truncate">
           {personLabel(peopleById, task.assigned_to_person_id)}
         </span>
         {due && <span className="shrink-0">due {due}</span>}
       </div>
-      {(task.comment_count > 0 || task.attachment_count > 0 || task.follower_count > 0) && (
+
+      {(task.comment_count > 0 ||
+        task.attachment_count > 0 ||
+        task.follower_count > 0) && (
         <div className="mt-2 text-xs text-muted-foreground flex items-center gap-3">
           {task.comment_count > 0 && (
             <span className="inline-flex items-center gap-1">
@@ -457,20 +672,43 @@ function KanbanCard({
           )}
         </div>
       )}
+
+      {/* Hover toolbar: Complete + Delete. Stops click from bubbling
+          so it doesn't open the detail modal. */}
       <div
-        className="mt-2 hidden group-hover:flex items-center gap-1 text-xs"
+        className="mt-2 flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
         onClick={(e) => e.stopPropagation()}
       >
-        {STATUS_OPTIONS.filter((s) => s !== task.status).map((s) => (
+        {isDone ? (
           <button
-            key={s}
-            className="px-2 py-0.5 rounded border border-border text-muted-foreground hover:bg-muted hover:text-foreground"
-            onClick={() => onAdvance(s)}
-            title={`Move to ${s.replace("_", " ")}`}
+            type="button"
+            className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border text-muted-foreground hover:bg-muted hover:text-foreground"
+            onClick={() => onAdvance("in_progress")}
+            title="Reopen this task (move to In progress)"
           >
-            → {s.replace("_", " ")}
+            <Undo2 className="h-3.5 w-3.5" />
+            Reopen
           </button>
-        ))}
+        ) : (
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+            onClick={() => onAdvance("done")}
+            title="Mark this task done"
+          >
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            Complete
+          </button>
+        )}
+        <button
+          type="button"
+          className="inline-flex items-center justify-center h-7 w-7 rounded border border-border text-muted-foreground hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
+          onClick={onDelete}
+          title="Delete this task"
+          aria-label="Delete task"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
       </div>
     </div>
   );
@@ -733,6 +971,7 @@ function TaskDetailModal({
 
   const [commentDraft, setCommentDraft] = useState("");
   const [followerToAdd, setFollowerToAdd] = useState<string>("");
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
 
   return (
     <Modal
@@ -744,17 +983,26 @@ function TaskDetailModal({
         <div className="flex w-full justify-between">
           <button
             className="btn-secondary text-destructive"
-            onClick={() => {
-              if (confirm("Delete this task? This cannot be undone.")) {
-                deleteTask.mutate();
-              }
-            }}
+            onClick={() => setConfirmingDelete(true)}
           >
             <Trash2 className="h-4 w-4" /> Delete
           </button>
-          <button className="btn-primary" onClick={onClose}>
-            Done
-          </button>
+          <div className="flex items-center gap-2">
+            {t && t.status !== "done" && (
+              <button
+                className="btn-secondary"
+                onClick={() => patchTask.mutate({ status: "done" })}
+                disabled={patchTask.isPending}
+                title="Mark this task done"
+              >
+                <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                Mark done
+              </button>
+            )}
+            <button className="btn-primary" onClick={onClose}>
+              Done
+            </button>
+          </div>
         </div>
       }
     >
@@ -1027,6 +1275,31 @@ function TaskDetailModal({
           </section>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmingDelete}
+        destructive
+        title="Delete this task?"
+        message={
+          t ? (
+            <p>
+              <span className="font-medium">{t.title}</span> will be
+              permanently deleted, along with all of its comments,
+              followers, and attachments. This cannot be undone.
+            </p>
+          ) : (
+            "This task will be permanently deleted."
+          )
+        }
+        confirmLabel="Delete task"
+        busy={deleteTask.isPending}
+        onCancel={() => setConfirmingDelete(false)}
+        onConfirm={() =>
+          deleteTask.mutate(undefined, {
+            onSettled: () => setConfirmingDelete(false),
+          })
+        }
+      />
     </Modal>
   );
 }
