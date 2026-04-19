@@ -128,6 +128,21 @@ class Settings(BaseSettings):
     # underlying sandboxed sql_tool are always available either way.
     AI_RAG_PLANNER_ENABLED: bool = False
 
+    # ---- Email inbox poller --------------------------------------------
+    # When ON, a background coroutine polls every connected assistant's
+    # Gmail inbox for unread messages from REGISTERED family members and
+    # replies via the agent loop. Set OFF to disable Avi's email
+    # autopilot entirely (the OAuth connection itself remains intact).
+    AI_EMAIL_INBOX_ENABLED: bool = True
+    # Polling cadence in seconds. Gmail's per-user quota is generous so
+    # 30-60 s feels responsive without being noisy. Set very high (e.g.
+    # 3600) to effectively disable while keeping the option to bump it
+    # down without a restart in the future.
+    AI_EMAIL_INBOX_POLL_SECONDS: int = 60
+    # Max unread messages fetched per poll cycle. Keeps a backlog from
+    # spawning dozens of agent runs at once if a flood arrives.
+    AI_EMAIL_INBOX_MAX_PER_TICK: int = 5
+
     @property
     def database_url(self) -> str:
         return (

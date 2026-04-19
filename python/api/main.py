@@ -21,13 +21,16 @@ URL organization
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
+from .services import email_inbox
 
 
 # Wire up Python logging the FIRST thing we do, so every ``logger.info``
@@ -80,6 +83,46 @@ ADMIN_PREFIX = "/api/admin"
 AI_PREFIX = "/api/aiassistant"
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Start + cleanly stop the long-lived background services.
+
+    Currently runs the email-inbox poller (Avi auto-replies to mail
+    from registered family members). Add more services here as they
+    arrive — every one should accept a stop event so shutdown is
+    deterministic instead of hanging on a sleep.
+    """
+    settings = get_settings()
+    stop_event = asyncio.Event()
+    background_tasks: list[asyncio.Task] = []
+
+    if settings.AI_EMAIL_INBOX_ENABLED:
+        background_tasks.append(
+            asyncio.create_task(
+                email_inbox.run_email_inbox_loop(stop_event),
+                name="email_inbox_poller",
+            )
+        )
+    else:
+        logging.getLogger(__name__).info(
+            "Email inbox poller disabled via AI_EMAIL_INBOX_ENABLED=false"
+        )
+
+    try:
+        yield
+    finally:
+        stop_event.set()
+        for task in background_tasks:
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+            except Exception:  # noqa: BLE001 - shutdown is best-effort
+                logging.getLogger(__name__).exception(
+                    "Background task %s raised on shutdown", task.get_name()
+                )
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
@@ -91,6 +134,7 @@ def create_app() -> FastAPI:
             "the live AI endpoints (face recognition, chat, greet) backed by "
             "local Ollama + InsightFace."
         ),
+        lifespan=_lifespan,
     )
 
     app.add_middleware(

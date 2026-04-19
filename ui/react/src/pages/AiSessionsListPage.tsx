@@ -1,6 +1,13 @@
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, Clock, MessageSquareText, Users } from "lucide-react";
+import {
+  ArrowLeft,
+  Clock,
+  Mail,
+  MessageSquareText,
+  Users,
+  Video,
+} from "lucide-react";
 
 import { api } from "@/lib/api";
 import type { Family, LiveSession } from "@/lib/types";
@@ -110,9 +117,12 @@ export default function AiSessionsListPage() {
                           />
                           {s.is_active ? "Active" : s.end_reason ?? "Ended"}
                         </span>
+                        <SourceBadge source={s.source} />
                         <div className="font-medium truncate">
                           {s.participants_preview.length > 0
                             ? s.participants_preview.join(", ")
+                            : s.source === "email"
+                            ? "Email thread"
                             : "No one recognised"}
                         </div>
                       </div>
@@ -131,9 +141,17 @@ export default function AiSessionsListPage() {
                           {s.message_count}{" "}
                           {s.message_count === 1 ? "message" : "messages"}
                         </span>
-                        {s.start_context && (
+                        {s.start_context && s.source !== "email" && (
                           <span className="text-xs italic">
                             started via {s.start_context}
+                          </span>
+                        )}
+                        {s.source === "email" && s.start_context && (
+                          <span
+                            className="text-xs italic truncate max-w-[18rem]"
+                            title={s.start_context}
+                          >
+                            {s.start_context.replace(/^email_thread:?/, "")}
                           </span>
                         )}
                       </div>
@@ -155,6 +173,27 @@ export default function AiSessionsListPage() {
         )}
       </main>
     </div>
+  );
+}
+
+function SourceBadge({ source }: { source: LiveSession["source"] }) {
+  if (source === "email") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs bg-sky-500/15 text-sky-700 border border-sky-500/30"
+        title="Started from a Gmail thread"
+      >
+        <Mail className="h-3 w-3" /> via email
+      </span>
+    );
+  }
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs bg-muted text-muted-foreground border border-border"
+      title="Started from the live camera / chat page"
+    >
+      <Video className="h-3 w-3" /> live
+    </span>
   );
 }
 

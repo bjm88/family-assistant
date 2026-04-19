@@ -572,8 +572,10 @@ def detect_capabilities(db: Session, assistant_id: Optional[int]) -> set[str]:
         row = google_oauth.load_credentials_row(db, assistant_id)
         if row is not None:
             scopes = set((row.scopes or "").split())
-            if any(s.endswith("/gmail.send") for s in scopes) or any(
-                s.endswith("/calendar.readonly") for s in scopes
+            if (
+                any(s.endswith("/gmail.send") for s in scopes)
+                or any(s.endswith("/gmail.modify") for s in scopes)
+                or any(s.endswith("/calendar.readonly") for s in scopes)
             ):
                 caps.add("google")
     return caps

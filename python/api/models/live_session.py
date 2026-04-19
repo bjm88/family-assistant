@@ -23,7 +23,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..db import Base
@@ -39,16 +48,38 @@ LIVE_SESSION_END_REASONS: tuple[str, ...] = (
     "superseded",
 )
 
+# Where this session originated. Drives badging in the history UI and
+# the "should the email poller reopen this thread?" lookup.
+LIVE_SESSION_SOURCES: tuple[str, ...] = ("live", "email")
+
 
 class LiveSession(Base, TimestampMixin):
     __tablename__ = "live_sessions"
-    __table_args__ = {
-        "comment": (
-            "One row per continuous AI-assistant interaction with a "
-            "family. Messages and participants hang off this row so the "
-            "history view can replay the whole conversation."
-        )
-    }
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('live', 'email')",
+            name="ck_live_sessions_source",
+        ),
+        # Partial unique index — only enforce uniqueness on rows that
+        # actually have an external thread id, so live (non-email)
+        # sessions don't collide on a shared NULL.
+        Index(
+            "uq_live_sessions_external_thread",
+            "family_id",
+            "external_thread_id",
+            unique=True,
+            postgresql_where=text("external_thread_id IS NOT NULL"),
+        ),
+        {
+            "comment": (
+                "One row per continuous AI-assistant interaction with a "
+                "family. Messages and participants hang off this row so "
+                "the history view can replay the whole conversation. "
+                "``source`` distinguishes live (camera/chat) sessions "
+                "from email-thread sessions opened by the inbox poller."
+            )
+        },
+    )
 
     live_session_id: Mapped[int] = mapped_column(
         primary_key=True, autoincrement=True
@@ -97,6 +128,30 @@ class LiveSession(Base, TimestampMixin):
             "One of 'timeout' (idle sweep), 'manual' (closed from UI), "
             "'superseded' (a newer session took over), or NULL while "
             "still active."
+        ),
+    )
+    source: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default="live",
+        default="live",
+        comment=(
+            "Which surface opened this session. 'live' = camera or "
+            "in-page chat, 'email' = a Gmail thread routed through the "
+            "email-inbox poller. The UI uses this to badge rows and "
+            "the poller uses it (with external_thread_id) to find the "
+            "running session for an ongoing email thread."
+        ),
+    )
+    external_thread_id: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment=(
+            "Opaque foreign id for the conversation upstream. For "
+            "source='email' this is the Gmail thread_id, which lets "
+            "the poller reuse one session row per multi-turn email "
+            "thread instead of opening a fresh session every reply. "
+            "NULL for source='live'."
         ),
     )
 

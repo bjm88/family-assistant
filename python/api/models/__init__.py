@@ -39,12 +39,17 @@ from .insurance_policy import (
 )
 from .financial_account import FinancialAccount
 from .document import Document
-from .live_session import LiveSession, LIVE_SESSION_END_REASONS
+from .live_session import (
+    LiveSession,
+    LIVE_SESSION_END_REASONS,
+    LIVE_SESSION_SOURCES,
+)
 from .live_session_participant import LiveSessionParticipant
 from .live_session_message import (
     LiveSessionMessage,
     LIVE_SESSION_MESSAGE_ROLES,
 )
+from .email_inbox_message import EmailInboxMessage, EMAIL_INBOX_STATUSES
 
 __all__ = [
     "Family",
@@ -79,7 +84,10 @@ __all__ = [
     "Document",
     "LiveSession",
     "LIVE_SESSION_END_REASONS",
+    "LIVE_SESSION_SOURCES",
     "LiveSessionParticipant",
     "LiveSessionMessage",
     "LIVE_SESSION_MESSAGE_ROLES",
+    "EmailInboxMessage",
+    "EMAIL_INBOX_STATUSES",
 ]

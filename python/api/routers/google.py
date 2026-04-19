@@ -52,6 +52,9 @@ class GoogleStatus(BaseModel):
     scopes: list[str] = Field(default_factory=list)
     token_expires_at: Optional[str] = None
     can_send_email: bool = False
+    # Implies inbox read + mark-as-read; the email-inbox poller refuses
+    # to start unless this is True for the assistant.
+    can_read_inbox: bool = False
     can_read_calendar: bool = False
     email_matches_assistant: Optional[bool] = None
     oauth_configured: bool = False
@@ -81,7 +84,17 @@ def _status_for(
         token_expires_at=(
             row.token_expires_at.isoformat() if row.token_expires_at else None
         ),
-        can_send_email=any(s.endswith("/gmail.send") for s in scopes),
+        # gmail.modify is a superset that includes send + read, so we
+        # treat either as evidence Avi can send. The inbox poller needs
+        # the modify scope specifically.
+        can_send_email=any(
+            s.endswith("/gmail.send") or s.endswith("/gmail.modify")
+            for s in scopes
+        ),
+        can_read_inbox=any(
+            s.endswith("/gmail.modify") or s.endswith("/gmail.readonly")
+            for s in scopes
+        ),
         can_read_calendar=any(
             s.endswith("/calendar.readonly") or s.endswith("/calendar")
             for s in scopes

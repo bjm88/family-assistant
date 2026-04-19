@@ -74,7 +74,13 @@ DEFAULT_SCOPES: tuple[str, ...] = (
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/gmail.send",
+    # gmail.modify is a superset of gmail.send + gmail.readonly:
+    # it lets Avi list inbox messages, fetch their bodies, send
+    # replies, and mark threads as read so we don't reprocess them.
+    # Existing connections still work because Google honours the
+    # already-granted scope set; only NEW connects request the
+    # extra capability.
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar.readonly",
 )
 

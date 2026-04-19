@@ -23,6 +23,7 @@ from ._base import OrmModel
 
 LiveSessionMessageRole = Literal["user", "assistant", "system"]
 LiveSessionEndReason = Literal["timeout", "manual", "superseded"]
+LiveSessionSource = Literal["live", "email"]
 
 
 # ---- nested components -----------------------------------------------------
@@ -59,6 +60,9 @@ class LiveSessionRead(OrmModel):
     last_activity_at: datetime
     start_context: Optional[str]
     end_reason: Optional[LiveSessionEndReason]
+    source: LiveSessionSource = "live"
+    # Gmail thread id for source='email' sessions; NULL for 'live'.
+    external_thread_id: Optional[str] = None
     is_active: bool
     participant_count: int
     message_count: int

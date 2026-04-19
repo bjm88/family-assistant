@@ -5,9 +5,11 @@ import {
   Bot,
   Clock,
   Info,
+  Mail,
   Square,
   User,
   Users,
+  Video,
 } from "lucide-react";
 
 import { api } from "@/lib/api";
@@ -79,14 +81,40 @@ export default function AiSessionDetailPage() {
               <div className="text-xs text-muted-foreground uppercase tracking-wide truncate">
                 {family?.family_name ?? "—"} · Session #{sessionId}
               </div>
-              <div className="font-semibold text-lg truncate">
-                {session
-                  ? session.participants_preview.length > 0
-                    ? `Conversation with ${session.participants_preview.join(
-                        ", "
-                      )}`
-                    : "Conversation transcript"
-                  : "Loading…"}
+              <div className="font-semibold text-lg truncate flex items-center gap-2">
+                {session && (
+                  <span
+                    className={cn(
+                      "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-normal",
+                      session.source === "email"
+                        ? "bg-sky-500/15 text-sky-700 border border-sky-500/30"
+                        : "bg-muted text-muted-foreground border border-border"
+                    )}
+                    title={
+                      session.source === "email"
+                        ? "Started from a Gmail thread"
+                        : "Started from the live camera / chat page"
+                    }
+                  >
+                    {session.source === "email" ? (
+                      <Mail className="h-3 w-3" />
+                    ) : (
+                      <Video className="h-3 w-3" />
+                    )}
+                    {session.source === "email" ? "Email" : "Live"}
+                  </span>
+                )}
+                <span className="truncate">
+                  {session
+                    ? session.participants_preview.length > 0
+                      ? `Conversation with ${session.participants_preview.join(
+                          ", "
+                        )}`
+                      : session?.source === "email"
+                      ? "Email thread"
+                      : "Conversation transcript"
+                    : "Loading…"}
+                </span>
               </div>
             </div>
           </div>

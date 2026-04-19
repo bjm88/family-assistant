@@ -100,7 +100,11 @@ def ensure_active_session(
     *,
     start_context: Optional[str] = None,
 ) -> Tuple[models.LiveSession, bool]:
-    """Return ``(session, created)`` for the family's active session.
+    """Return ``(session, created)`` for the family's active live session.
+
+    "Live" means ``source='live'`` — we deliberately ignore email-thread
+    sessions here so a long-running email conversation doesn't get
+    mistaken for an active in-room interaction.
 
     Sweeps idle sessions first so we never accidentally reuse one that
     has expired by a few seconds. If an active session exists we return
@@ -111,13 +115,62 @@ def ensure_active_session(
     """
     close_stale_sessions(db, family_id=family_id)
     existing = get_active_session(db, family_id)
-    if existing is not None:
+    # Only reuse a session when it's a live one — email threads have
+    # their own lookup path keyed on the thread id.
+    if existing is not None and existing.source == "live":
         existing.last_activity_at = _now()
         return existing, False
 
     session = models.LiveSession(
         family_id=family_id,
         start_context=start_context,
+        source="live",
+    )
+    db.add(session)
+    db.flush()
+    return session, True
+
+
+def find_or_create_email_session(
+    db: Session,
+    *,
+    family_id: int,
+    external_thread_id: str,
+    subject: Optional[str] = None,
+) -> Tuple[models.LiveSession, bool]:
+    """Return ``(session, created)`` for a Gmail thread.
+
+    Looks up the existing email-source session for the thread first
+    (so a multi-message conversation accretes into a single transcript)
+    and creates a new one when none exists. Email threads do NOT
+    auto-close after 30 minutes the way live sessions do — a back and
+    forth that takes a week is still one session — so we skip the idle
+    sweep entirely on this path.
+    """
+    existing = db.execute(
+        select(models.LiveSession)
+        .where(models.LiveSession.family_id == family_id)
+        .where(models.LiveSession.source == "email")
+        .where(models.LiveSession.external_thread_id == external_thread_id)
+        .order_by(models.LiveSession.started_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.last_activity_at = _now()
+        # If the user re-opens an old, ended thread, reactivate it so
+        # the new reply doesn't look orphaned in the history view.
+        if existing.ended_at is not None:
+            existing.ended_at = None
+            existing.end_reason = None
+        return existing, False
+
+    session = models.LiveSession(
+        family_id=family_id,
+        source="email",
+        external_thread_id=external_thread_id,
+        start_context=(
+            f"email_thread:{subject[:80]}" if subject else "email_thread"
+        ),
     )
     db.add(session)
     db.flush()
@@ -280,6 +333,8 @@ def session_header_dict(
         "last_activity_at": session.last_activity_at,
         "start_context": session.start_context,
         "end_reason": session.end_reason,
+        "source": session.source,
+        "external_thread_id": session.external_thread_id,
         "is_active": session.ended_at is None,
         "participant_count": len(parts),
         "message_count": len(msgs),

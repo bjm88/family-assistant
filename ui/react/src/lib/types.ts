@@ -56,6 +56,7 @@ export interface AvatarLandmarks {
 
 export type LiveSessionMessageRole = "user" | "assistant" | "system";
 export type LiveSessionEndReason = "timeout" | "manual" | "superseded";
+export type LiveSessionSource = "live" | "email";
 
 export interface LiveSessionParticipant {
   live_session_participant_id: number;
@@ -85,6 +86,8 @@ export interface LiveSession {
   last_activity_at: string;
   start_context: string | null;
   end_reason: LiveSessionEndReason | null;
+  source: LiveSessionSource;
+  external_thread_id: string | null;
   is_active: boolean;
   participant_count: number;
   message_count: number;

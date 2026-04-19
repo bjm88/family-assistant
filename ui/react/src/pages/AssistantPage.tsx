@@ -30,6 +30,7 @@ type GoogleStatus = {
   scopes: string[];
   token_expires_at: string | null;
   can_send_email: boolean;
+  can_read_inbox: boolean;
   can_read_calendar: boolean;
   email_matches_assistant: boolean | null;
   oauth_configured: boolean;
@@ -554,6 +555,16 @@ function GoogleAccountSection({
                 label="Can send email"
                 value={status.can_send_email ? "yes" : "no"}
                 ok={status.can_send_email}
+              />
+              <KV
+                label="Can read inbox & auto-reply"
+                value={status.can_read_inbox ? "yes" : "no"}
+                ok={status.can_read_inbox}
+                hint={
+                  status.can_read_inbox
+                    ? "Avi polls the inbox every minute and replies to mail from registered family members."
+                    : "Reconnect Google to grant the gmail.modify scope. Until then, Avi only sends outbound mail and ignores incoming messages."
+                }
               />
               <KV
                 label="Can read calendar"
