@@ -46,115 +46,291 @@ The project has three cooperating layers:
 
 ## Architecture Diagram
 
+The system has **four ways family members reach Avi** (live page, SMS,
+Telegram, email), all converging on one shared agent loop with a tool
+registry. Everything model-side runs locally; the only outbound traffic
+is to opt-in cloud APIs (Twilio, Google, Gemini, Telegram Bot API).
+
 ```mermaid
 flowchart LR
-    subgraph Browser["🖥️  Browser"]
+    %% ─── Inbound surfaces ────────────────────────────────────────
+    subgraph Inbound["📥  Inbound surfaces"]
         direction TB
-        AdminUI["Admin Console<br/>/admin/families/...<br/>React + Vite + Tailwind"]
-        LiveUI["Live AI Assistant<br/>/aiassistant/:id<br/>Webcam · Mic · Chat"]
+        AdminUI["Admin Console<br/>/admin/...<br/>React + Vite + Tailwind"]
+        LiveUI["Live AI page<br/>/aiassistant/:id<br/>Webcam · Mic · Chat (SSE)<br/>Live2D Avi character"]
+        SMSIn["SMS<br/>(Twilio webhook)"]
+        TelegramIn["Telegram chat<br/>(BotFather long-poll)"]
+        EmailIn["Gmail thread<br/>(60s poll, OAuth)"]
+        Doorbell["Doorbird gate<br/>(intercom + face)"]
     end
 
-    subgraph API["⚙️  FastAPI Backend  (python/api/)"]
+    %% ─── FastAPI ─────────────────────────────────────────────────
+    subgraph API["⚙️  FastAPI backend  (python/api/)"]
         direction TB
-        AdminRouters["/api/admin/*<br/>families · people · relationships<br/>goals · pets · residences · vehicles<br/>insurance · finances · documents<br/>identity · assistants"]
-        MediaRouter["/api/media/*<br/>static file proxy"]
-        AIRouters["/api/aiassistant/*<br/>face/enroll · face/recognize<br/>greet · followup · chat (SSE)<br/>tts (audio/wav)"]
 
-        subgraph AIModules["AI subsystem (python/api/ai/)"]
+        AdminRouters["/api/admin/*<br/>families · people · relationships<br/>goals · medical · pets · residences<br/>vehicles · insurance · finances · documents<br/>identity · sensitive identifiers · assistants<br/>tasks · google OAuth · status"]
+        AIRouters["/api/aiassistant/*<br/>face/enroll · face/recognize<br/>chat (SSE) · tts (wav)<br/>sessions · agent_tasks · status"]
+        MediaRouter["/api/media/*<br/>static file proxy"]
+        SmsHook["/api/sms/twilio/inbound<br/>signature-verified webhook"]
+        Legal["/legal/*<br/>privacy · terms (public)"]
+
+        subgraph BgSvc["Lifespan background services (services/)"]
             direction TB
-            FaceSvc["face.py<br/>InsightFace buffalo_l<br/>CoreML / CPU providers"]
-            OllamaSvc["ollama.py<br/>HTTP client · streaming chat"]
-            RAG["rag.py<br/>person + goals + tree<br/>→ prompt context"]
-            TTSSvc["tts.py<br/>Kokoro-82M · ONNX Runtime<br/>voice by gender · disk cache"]
+            EmailLoop["email_inbox.py<br/>Gmail long-poll<br/>(asyncio task)"]
+            TelegramLoop["telegram_inbox.py<br/>getUpdates long-poll<br/>(asyncio task)"]
+            BgPool["background_agent.py<br/>shared ThreadPoolExecutor<br/>(heavy agent runs)"]
         end
 
-        Crypto["crypto.py<br/>Fernet envelope"]
+        subgraph AIModules["AI subsystem (ai/)"]
+            direction TB
+            Agent["agent.py<br/>plan/execute/observe loop<br/>SSE event stream"]
+            Tools["tools.py · sql_tool.py<br/>16 callable tools<br/>(SQL · calendar · email · tasks · ...)"]
+            Authz["authz.py<br/>per-speaker scope filter<br/>parent/spouse/self/etc."]
+            FastAck["fast_ack.py<br/>gemma4:e2b 1-sentence ack<br/>sync + async entry points<br/>(/api/chat · think:false)"]
+            OllamaCli["ollama.py<br/>generate · chat · stream"]
+            RAG["rag.py · prompts.py<br/>· schema_catalog.py<br/>(builds system prompt)"]
+            FaceSvc["face.py · enrollment.py<br/>InsightFace buffalo_l<br/>CoreML / CPU"]
+            TTSSvc["tts.py<br/>Kokoro-82M ONNX<br/>voice by gender · disk cache"]
+            LiveSess["session.py<br/>per-surface LiveSession<br/>(live · sms · telegram · email)"]
+        end
+
+        Crypto["crypto.py<br/>Fernet envelope<br/>(SSN · accts · VINs · ...)"]
         Storage["storage.py<br/>resources/family/..."]
-        Gemini["integrations/gemini.py<br/>avatar generation<br/>(optional, one-shot)"]
+
+        subgraph Integrations["integrations/"]
+            direction TB
+            TwilioInt["twilio_sms.py<br/>send + signature verify"]
+            TelegramInt["telegram.py<br/>Bot API client"]
+            GmailInt["gmail.py<br/>list · get · send"]
+            CalInt["google_calendar.py<br/>upcoming · busy · free slots"]
+            OAuthInt["google_oauth.py<br/>token mint + refresh"]
+            GeminiInt["gemini.py<br/>avatar image gen"]
+            DoorInt["doorbird_gate.py<br/>open · ring (planned)"]
+        end
     end
 
+    %% ─── Local model daemons ─────────────────────────────────────
     subgraph LocalAI["🧠  Local AI daemons"]
         direction TB
-        Ollama["Ollama<br/>gemma4 / gemma3<br/>localhost:11434"]
-        Insight["InsightFace<br/>ArcFace 512-d embeddings<br/>onnxruntime · CoreML"]
+        OllamaHeavy["Ollama heavy<br/>gemma4:26b<br/>localhost:11434"]
+        OllamaFast["Ollama fast<br/>gemma4:e2b<br/>(same daemon)"]
+        Insight["InsightFace<br/>ArcFace 512-d<br/>onnxruntime · CoreML"]
+        Kokoro["Kokoro-82M<br/>ONNX TTS<br/>~330 MB weights"]
     end
 
+    %% ─── Persistence ─────────────────────────────────────────────
     subgraph Data["💾  Persistence"]
         direction TB
-        PG[("PostgreSQL<br/>family_assistant db<br/>Alembic-managed")]
-        FS[("Filesystem<br/>resources/family/<br/>photos · docs · avatars")]
+        PG[("PostgreSQL · ~40 tables<br/>+ llm_schema_catalog view<br/>Alembic-managed")]
+        FS[("Filesystem<br/>resources/family/<br/>photos · docs · attachments<br/>tts_cache · models")]
     end
 
-    subgraph External["☁️  External (optional)"]
-        GeminiAPI["Google Gemini API<br/>avatar image gen"]
+    %% ─── External (optional) ─────────────────────────────────────
+    subgraph External["☁️  External APIs (opt-in only)"]
+        direction TB
+        TwilioCloud["Twilio<br/>SMS in/out · signed webhooks"]
+        TelegramCloud["Telegram Bot API<br/>getUpdates · sendMessage"]
+        GoogleCloud["Google APIs<br/>Gmail · Calendar · OAuth2"]
+        GeminiCloud["Google Gemini<br/>avatar image gen<br/>(one-shot)"]
+        DoorCloud["Doorbird LAN device<br/>(local IP, not cloud)"]
     end
 
-    AdminUI -->|fetch<br/>resolveApiPath| AdminRouters
+    %% ─── Browser → API ───────────────────────────────────────────
+    AdminUI -->|REST + multipart| AdminRouters
     AdminUI --> MediaRouter
-    LiveUI -->|multipart frame<br/>every 2.5s| AIRouters
+    LiveUI -->|multipart frame ~2.5s| AIRouters
     LiveUI -->|SSE stream| AIRouters
     LiveUI --> MediaRouter
 
+    %% ─── Inbound surfaces → API ──────────────────────────────────
+    SMSIn --> TwilioCloud
+    TwilioCloud -->|X-Twilio-Signature| SmsHook
+    TelegramIn --> TelegramCloud
+    TelegramCloud -.->|long-poll| TelegramLoop
+    EmailIn --> GoogleCloud
+    GoogleCloud -.->|polled| EmailLoop
+    Doorbell -.->|HTTP/RTSP| DoorInt
+
+    %% ─── API → DB / agent ────────────────────────────────────────
     AdminRouters --> PG
     AdminRouters --> Crypto
     AdminRouters --> Storage
-    AdminRouters -.->|assistant<br/>avatar| Gemini
+    AdminRouters --> OAuthInt
+    SmsHook --> Agent
+    TelegramLoop --> Agent
+    EmailLoop --> Agent
+    AIRouters --> Agent
     AIRouters --> FaceSvc
-    AIRouters --> OllamaSvc
-    AIRouters --> RAG
-    RAG --> PG
+    AIRouters --> TTSSvc
 
+    Agent --> Tools
+    Agent --> Authz
+    Agent --> RAG
+    Agent --> OllamaCli
+    Agent -.->|race 3s| FastAck
+    Agent -->|submit| BgPool
+    FastAck --> OllamaCli
+    Tools --> Authz
+    Tools --> Crypto
+    Tools --> PG
+    Tools --> GmailInt
+    Tools --> CalInt
+    Tools --> TelegramInt
+    Tools --> TwilioInt
+
+    OAuthInt --> GoogleCloud
+    GmailInt --> GoogleCloud
+    CalInt --> GoogleCloud
+    TelegramInt --> TelegramCloud
+    TwilioInt --> TwilioCloud
+    GeminiInt --> GeminiCloud
+    DoorInt --> DoorCloud
+
+    OllamaCli --> OllamaHeavy
+    OllamaCli --> OllamaFast
     FaceSvc --> Insight
     FaceSvc --> PG
     FaceSvc --> Storage
-    OllamaSvc --> Ollama
+    TTSSvc --> Kokoro
+    LiveSess --> PG
     Storage --> FS
     MediaRouter --> FS
-    Gemini --> GeminiAPI
+    AdminRouters -.->|assistant avatar| GeminiInt
 
-    classDef browser fill:#eef2ff,stroke:#6366f1,color:#1e1b4b
+    classDef inbound fill:#eef2ff,stroke:#6366f1,color:#1e1b4b
     classDef api fill:#f0fdf4,stroke:#16a34a,color:#14532d
     classDef localai fill:#fdf4ff,stroke:#a21caf,color:#581c87
     classDef data fill:#fff7ed,stroke:#d97706,color:#7c2d12
     classDef ext fill:#f5f5f5,stroke:#6b7280,color:#111827,stroke-dasharray: 3 3
-    class Browser,AdminUI,LiveUI browser
-    class API,AdminRouters,MediaRouter,AIRouters,FaceSvc,OllamaSvc,RAG,Crypto,Storage,Gemini api
-    class LocalAI,Ollama,Insight localai
+    class Inbound,AdminUI,LiveUI,SMSIn,TelegramIn,EmailIn,Doorbell inbound
+    class API,AdminRouters,MediaRouter,AIRouters,SmsHook,Legal,BgSvc,EmailLoop,TelegramLoop,BgPool,AIModules,Agent,Tools,Authz,FastAck,OllamaCli,RAG,FaceSvc,TTSSvc,LiveSess,Crypto,Storage,Integrations,TwilioInt,TelegramInt,GmailInt,CalInt,OAuthInt,GeminiInt,DoorInt api
+    class LocalAI,OllamaHeavy,OllamaFast,Insight,Kokoro localai
     class Data,PG,FS data
-    class External,GeminiAPI ext
+    class External,TwilioCloud,TelegramCloud,GoogleCloud,GeminiCloud,DoorCloud ext
 ```
+
+### Inbound surface matrix
+
+| Surface | Trigger | Identity gate | Response path | Session row |
+|---|---|---|---|---|
+| **Live page** | `/api/aiassistant/chat` (SSE) or face match | family-scoped (single-machine trust) | streaming SSE deltas (+ optional fast-ack placeholder) | `live_sessions(source='live')`, idle 30 min |
+| **SMS** | Twilio inbound webhook (signed) | `from` matches `people.mobile_phone_number` (E.164) | TwiML reply via Twilio | `live_sessions(source='sms', external_thread_id=<E.164>)`, never auto-closed |
+| **Telegram** | bot long-poll, 25 s window | `message.from.id` ↔ `people.telegram_user_id` (or `@username`); unknowns get a one-tap "Share contact" prompt + SMS-2FA bind | `sendMessage` (+ optional fast-ack pre-message) | `live_sessions(source='telegram', external_thread_id=<chat_id>)` |
+| **Email** | Gmail unread poll, 60 s | `From:` matches `people.email_address` | `users.messages.send` reply, threaded | `live_sessions(source='email', external_thread_id=<thread_id>)` |
+| **Doorbird gate** | scaffold only (planned) | LAN device, no auth surface yet | open / ring | n/a |
 
 ### Request flow — "Avi, say hi to whoever walks in"
 
 ```mermaid
 sequenceDiagram
-    participant UI as "Live AI Page (browser)"
+    participant UI as "Live AI page (browser)"
     participant Face as "/api/aiassistant/face"
     participant Insight as "InsightFace (CoreML)"
-    participant Chat as "/api/aiassistant/greet"
-    participant RAG as "rag.py"
+    participant Chat as "/api/aiassistant/chat (SSE)"
+    participant Agent as "ai/agent.py"
+    participant Tools as "ai/tools.py"
     participant PG as Postgres
-    participant Ollama as "Ollama · gemma4"
+    participant Ollama as "Ollama · gemma4:26b"
+    participant TTS as "ai/tts.py · Kokoro"
 
     loop every 2.5s while camera on
-        UI->>Face: POST /recognize<br/>(JPEG frame, family_id)
+        UI->>Face: POST /recognize (JPEG, family_id)
         Face->>Insight: extract_embedding()
         Insight-->>Face: 512-d vector
-        Face->>PG: SELECT face_embeddings<br/>WHERE family_id=?
-        Face->>Face: cosine match vs gallery
+        Face->>PG: SELECT face_embeddings WHERE family_id=?
         Face-->>UI: {matched, person_id, similarity}
     end
 
     alt new person recognized
-        UI->>Chat: POST /greet<br/>{family_id, person_id}
-        Chat->>RAG: build_person_context()
-        RAG->>PG: SELECT person + goals + relationships
-        RAG-->>Chat: text block
-        Chat->>Ollama: generate(prompt + RAG)
-        Ollama-->>Chat: "Hi Sam! How's your<br/>gymnastics meet tomorrow?"
-        Chat-->>UI: greeting JSON
-        UI->>UI: append assistant<br/>bubble to chat
+        UI->>Chat: POST /chat {greet, person_id}
+        Chat->>Agent: run_agent()
+        Agent->>PG: build RAG (person + goals + tree)
+        Agent->>Ollama: generate(system + history)
+        Ollama-->>Agent: tool_call(calendar_list_for_person)
+        Agent->>Tools: dispatch
+        Tools->>PG: scope check (authz)
+        Tools-->>Agent: tool_result
+        Agent->>Ollama: continue with tool_result
+        Ollama-->>Agent: final reply
+        Agent-->>Chat: SSE deltas → "Hi Sam! Big game tomorrow?"
+        Chat-->>UI: streamed bubble
+        UI->>TTS: POST /tts (text)
+        TTS-->>UI: WAV (cached or fresh)
+        UI->>UI: Live2D lip-sync to playback
     end
+```
+
+### Request flow — "Telegram message lands"
+
+```mermaid
+sequenceDiagram
+    participant TG as Telegram cloud
+    participant Loop as telegram_inbox loop
+    participant Agent as agent.py
+    participant Pool as background_agent pool
+    participant Fast as fast_ack.py · gemma4:e2b
+    participant Heavy as Ollama · gemma4:26b
+    participant Bot as integrations/telegram.py
+
+    TG-->>Loop: getUpdates (25 s long-poll)
+    Loop->>Loop: dedup + person lookup<br/>(telegram_user_id → people)
+    Loop->>Agent: process_inbound_update
+    Agent->>Pool: submit heavy run
+    Pool->>Heavy: generate (with tools)
+    par 3-second race
+        Loop->>Loop: future.result(timeout=3.0)
+    and
+        Heavy-->>Pool: streaming tokens
+    end
+    alt Heavy didn't finish in 3 s
+        Loop->>Fast: contextual ack ("Looking up Sara's calendar...")
+        Fast->>Heavy: (e2b) /api/chat think:false
+        Fast-->>Loop: 1 sentence
+        Loop->>Bot: sendMessage (ack)
+        Bot-->>TG: msg #1
+    end
+    Heavy-->>Pool: final text
+    Loop->>Bot: sendMessage (full reply)
+    Bot-->>TG: msg #2 (threaded under inbound)
+```
+
+### Request flow — "Live chat with fast-ack placeholder"
+
+```mermaid
+sequenceDiagram
+    participant UI as "Live AI page (browser)"
+    participant Chat as "/api/aiassistant/chat (SSE)"
+    participant Agent as "ai/agent.py"
+    participant Watch as "fast-ack watchdog<br/>(asyncio task)"
+    participant Fast as "fast_ack.py · gemma4:e2b"
+    participant Heavy as "Ollama · gemma4:26b"
+    participant PG as Postgres
+
+    UI->>Chat: POST /chat (history, person_id, session_id)
+    Chat->>PG: log user message + create agent_task row
+    Chat-->>UI: data: {task_id}
+    par
+        Chat->>Agent: run_agent (producer task)
+        Agent->>Heavy: generate / tool_call / generate ...
+        Agent-->>Chat: step events (tool_call, tool_result, …)
+        Chat-->>UI: data: {type:"step", step:{…}}
+    and 3-second race
+        Watch->>Watch: wait first_delta_seen, timeout=3s
+    end
+    alt No delta after 3s
+        Watch->>Fast: contextual ack (async)
+        Fast->>Heavy: (e2b) /api/chat think:false
+        Fast-->>Watch: 1 sentence
+        Watch-->>Chat: queue ("fast_ack", text)
+        Chat-->>UI: data: {type:"fast_ack", text:"Looking up Sara's calendar."}
+        UI->>UI: render italic placeholder in assistant bubble
+    end
+    Heavy-->>Agent: final text
+    Agent-->>Chat: delta event (full reply)
+    Chat-->>UI: data: {delta:"Sara's piano lesson is at 4pm…"}
+    UI->>UI: replace placeholder with streamed reply
+    Chat->>PG: log fast_ack (if any) + final reply to live_session_messages
+    Chat-->>UI: data: {done:true}
 ```
 
 ## Key Technologies
@@ -163,16 +339,36 @@ sequenceDiagram
 
 | Category | Package | Why |
 |---|---|---|
-| Web framework | **FastAPI** · `uvicorn[standard]` | Async HTTP, automatic OpenAPI, SSE streaming |
-| ORM + migrations | **SQLAlchemy 2.0** · **Alembic** | Typed mapped classes, first-class `COMMENT ON` support |
+| Web framework | **FastAPI** · `uvicorn[standard]` | Async HTTP, automatic OpenAPI, SSE streaming, lifespan-managed background tasks |
+| ORM + migrations | **SQLAlchemy 2.0** · **Alembic** | Typed mapped classes, first-class `COMMENT ON` support, forward-only revisions |
 | Database driver | `psycopg2-binary` | Postgres |
 | Validation | **Pydantic v2** · `pydantic-settings` | Request/response schemas + `.env` loading |
 | Encryption | `cryptography` (Fernet) | AES-128-CBC + HMAC-SHA256 for sensitive columns |
 | File uploads | `python-multipart` · Pillow | Photo + document ingest |
+| HTTP client | **`httpx`** | Streaming Ollama, Gmail, Calendar, Twilio, Telegram, Doorbird |
 | Face recognition | **InsightFace** · `onnxruntime` · OpenCV | ArcFace 512-d embeddings, CoreML provider on Apple Silicon |
-| Local LLM client | `httpx` | Streaming Ollama HTTP client |
-| Text-to-speech | **kokoro-onnx** · `soundfile` · `espeakng-loader` | Kokoro-82M neural voices, 24 kHz mono WAV, ONNX Runtime (~300 MB weights) |
+| Text-to-speech | **kokoro-onnx** · `soundfile` · `espeakng-loader` | Kokoro-82M neural voices, 24 kHz mono WAV, ONNX Runtime (~330 MB weights) |
+| Concurrency | `asyncio` · `concurrent.futures.ThreadPoolExecutor` | Long-poll inbox loops on the event loop, heavy agent runs on a bounded background pool |
 | Image gen (optional) | `google-genai` | Avatar generation for Avi's profile image |
+| Google APIs | `google-auth` · `google-auth-oauthlib` · raw REST via `httpx` | Gmail send/list/get + Calendar free/busy + OAuth refresh |
+| SMS | Twilio REST + signed webhooks (validated in-process) | Two-way SMS as a chat surface, plus the second factor for Telegram contact verification |
+| Telegram | Bot API over `httpx` (no python-telegram-bot dep) | `getUpdates` long-poll, `sendMessage`, `request_contact`, file download |
+| Door / gate | local `httpx` calls to a Doorbird IP | Open-gate intent (scaffold) |
+
+### AI / agent layer
+
+| Category | Component | Why |
+|---|---|---|
+| Heavy chat model | **`gemma4:26b`** via Ollama | Tool-using agent, multi-turn reasoning. Default for every surface. |
+| Fast model | **`gemma4:e2b`** via Ollama (`/api/chat`, `think: false`) | 1-sentence contextual acknowledgments inside the 3-second race window so push surfaces never sit silent. |
+| Agent loop | `ai/agent.py` | Plan/execute/observe loop, async generator that yields `task_started · step · delta · task_completed · task_failed` events to the SSE channel and writes one `agent_steps` row per emission. |
+| Tool registry | `ai/tools.py` | 16 callable tools: `sql_query`, `lookup_person`, `reveal_sensitive_identifier`, `reveal_secret`, `gmail_send`, `calendar_list_upcoming`, `calendar_check_availability`, `calendar_find_free_slots`, `calendar_list_for_person`, `task_create / list / get / update / add_comment / add_follower`, `telegram_invite`. Each is a `Tool(name, description, parameters, handler, timeout, requires)`. |
+| SQL sandbox | `ai/sql_tool.py` | Read-only Postgres role + statement-level guard; the model can write SELECTs against `llm_schema_catalog` without touching ciphertext. |
+| Authz scope | `ai/authz.py` | Per-speaker access policy (self / spouse / parent / child / unauthorized) injected into every system prompt and re-checked inside sensitive tools. |
+| RAG context | `ai/rag.py` · `ai/prompts.py` · `ai/schema_catalog.py` | Builds the household overview (people, goals, vehicles, residences, accounts) and the dynamic schema dump that lets the model write SQL on the fly. |
+| Fast-ack | `ai/fast_ack.py` + `services/background_agent.py` | Surface-agnostic latency hider. Telegram + SMS submit the heavy run to a shared `ThreadPoolExecutor` and call `generate_contextual_ack_sync`; the live `/chat` SSE handler races the agent on the event loop with `generate_contextual_ack_async`. Either way, if the heavy model hasn't started replying after `AI_FAST_ACK_AFTER_SECONDS` (default 3 s), `gemma4:e2b` mints a one-sentence ack ("Looking up Sara's calendar.") that's delivered as a Telegram pre-message / SMS pre-message / SSE `fast_ack` event before the real reply. |
+| Inbox pollers | `services/email_inbox.py` · `services/telegram_inbox.py` | Long-poll loops started from FastAPI's `lifespan`. Each maintains its own dedup, audit-row writes, and per-thread `LiveSession`. |
+| SMS surface | `routers/sms_webhook.py` · `services/sms_inbox.py` | Twilio inbound webhook (signature verified) → person lookup → agent loop → TwiML reply. |
 
 ### Frontend avatar rendering
 
@@ -198,7 +394,7 @@ sequenceDiagram
 
 | | |
 |---|---|
-| **Ollama** | Serves the chat LLM on `localhost:11434`. Default model is `gemma4`; any Ollama-compatible model works via `AI_OLLAMA_MODEL`. |
+| **Ollama** | Serves both LLMs on `localhost:11434`. Heavy model `AI_OLLAMA_MODEL` (default `gemma4:26b`) drives the agent; lightweight `AI_OLLAMA_FAST_MODEL` (default `gemma4:e2b`) generates fast acks and other structured one-shots. Ollama serializes per-loaded-model unless `OLLAMA_NUM_PARALLEL>1`; idle models unload after 5 min by default (`keep_alive`). |
 | **InsightFace (buffalo_l)** | Face detection + 512-d ArcFace embeddings. First run downloads ~300 MB into `~/.insightface/`. Uses CoreML provider when `AI_MAC_STUDIO_OPTIMIZED=true` (default). |
 | **Kokoro-82M (kokoro-onnx)** | Neural text-to-speech for Avi's spoken greetings + follow-up questions. Weights (~330 MB total: `kokoro-v1.0.onnx` + `voices-v1.0.bin`) are lazy-downloaded on first `/api/aiassistant/tts` call into `resources/models/kokoro/`. Cached synthesis results live in `resources/family/tts_cache/` so repeat phrases return in ~8 ms. Voice is picked from the assistant's `gender` (female → `af_bella`, male → `am_adam`) or forced via `AI_TTS_VOICE`. |
 
@@ -618,12 +814,34 @@ read `llm_schema_catalog` and see things like:
 - `vehicles.registration_expiration_date` — "Used by Avi to proactively
   warn …".
 
-Tables today: `families`, `people`, `person_photos`,
-`person_relationships`, `goals`, `pets`, `pet_photos`, `residences`,
-`residence_photos`, `addresses`, `identity_documents`,
-`sensitive_identifiers`, `vehicles`, `insurance_policies`,
-`insurance_policy_people`, `insurance_policy_vehicles`,
-`financial_accounts`, `documents`, `assistants`, `face_embeddings`.
+For a complete table-by-table walkthrough — including the AI surfaces
+(`live_sessions`, `agent_tasks`, the inbox-message audit tables, the
+Telegram invite + verification tables, etc.) and an ER-style diagram of
+how the pieces hang together — see **[`docs/DATA_MODEL.md`](docs/DATA_MODEL.md)**.
+
+Tables today, grouped by domain:
+
+- **Family core** — `families`, `assistants`, `people`,
+  `person_relationships`, `person_photos`, `face_embeddings`, `goals`.
+- **Health** — `medical_conditions`, `medications`, `physicians`.
+- **Household assets** — `pets`, `pet_photos`, `residences`,
+  `residence_photos`, `addresses`, `vehicles`, `insurance_policies`,
+  `insurance_policy_people`, `insurance_policy_vehicles`,
+  `financial_accounts`, `documents`.
+- **Identity (encrypted)** — `identity_documents`,
+  `sensitive_identifiers`.
+- **AI conversation surfaces** — `live_sessions`,
+  `live_session_participants`, `live_session_messages`.
+- **Inbox audit** — `email_inbox_messages`, `sms_inbox_messages`,
+  `sms_inbox_attachments`, `telegram_inbox_messages`,
+  `telegram_inbox_attachments`.
+- **Telegram onboarding** — `telegram_invites` (deep-link claims),
+  `telegram_contact_verifications` (SMS-2FA for contact-share linking).
+- **Tasks (kanban)** — `tasks`, `task_comments`, `task_followers`,
+  `task_attachments`.
+- **Agent audit** — `agent_tasks`, `agent_steps`.
+- **External-service credentials** — `google_oauth_credentials`
+  (Fernet-encrypted refresh tokens for Gmail + Calendar).
 
 ## Encryption of sensitive columns
 
@@ -643,38 +861,68 @@ Tables today: `families`, `people`, `person_photos`,
 
 ```
 family-assistant/
-├── python/api/              FastAPI backend
-│   ├── main.py              route mounting (/api/admin, /api/aiassistant, /api/media)
-│   ├── config.py            pydantic-settings (DB, Fernet, Ollama, face thresholds)
-│   ├── db.py                SQLAlchemy 2.0 engine + session
-│   ├── crypto.py            Fernet helpers
-│   ├── storage.py           filesystem uploads under resources/family/<family_id>/...
-│   ├── models/              one ORM class per table, with comment= on every column
-│   ├── schemas/             Pydantic request/response shapes (never expose ciphertext)
-│   ├── routers/             one FastAPI router per resource (full CRUD)
+├── python/api/                    FastAPI backend
+│   ├── main.py                    route mounting + lifespan (email + telegram pollers)
+│   ├── config.py                  pydantic-settings (DB, Fernet, Ollama, Twilio, Telegram, face/TTS, fast-ack)
+│   ├── db.py                      SQLAlchemy 2.0 engine + session
+│   ├── crypto.py                  Fernet helpers
+│   ├── storage.py                 filesystem uploads under resources/family/<family_id>/...
+│   ├── utils/                     phone normalisation, etc.
+│   ├── models/                    one ORM class per table, every column has comment=
+│   ├── schemas/                   Pydantic request/response shapes (never expose ciphertext)
+│   ├── routers/                   one FastAPI router per resource
+│   │   ├── families · people · person_photos · person_relationships
+│   │   ├── goals · medical_conditions · medications · physicians
+│   │   ├── pets · pet_photos · residences · residence_photos · addresses
+│   │   ├── vehicles · insurance_policies · financial_accounts · documents
+│   │   ├── identity_documents · sensitive_identifiers · assistants
+│   │   ├── tasks · google · status · legal · media
+│   │   ├── ai_chat · ai_face · ai_tts · live_sessions · agent_tasks
+│   │   └── sms_webhook            (public Twilio inbound)
 │   ├── ai/
-│   │   ├── face.py          InsightFace wrapper, embedding cache, cosine match
-│   │   ├── ollama.py        httpx client, generate + streaming chat
-│   │   └── rag.py           person/family context builder
+│   │   ├── agent.py               plan/execute/observe loop, SSE event stream
+│   │   ├── tools.py               16 callable tools (SQL, calendar, email, tasks, ...)
+│   │   ├── sql_tool.py            sandboxed read-only SQL
+│   │   ├── authz.py               per-speaker scope + sensitive-tool guard
+│   │   ├── ollama.py              httpx client (heavy + fast model)
+│   │   ├── fast_ack.py            gemma4:e2b 1-sentence ack via /api/chat (sync + async entry points)
+│   │   ├── prompts.py · rag.py · schema_catalog.py    system-prompt + RAG builders
+│   │   ├── session.py             find_or_create per-surface LiveSession
+│   │   ├── face.py · enrollment.py InsightFace wrapper, embedding cache, cosine match
+│   │   └── tts.py                 Kokoro-82M ONNX, voice by gender, disk cache
+│   ├── services/
+│   │   ├── email_inbox.py         Gmail long-poll loop (lifespan task)
+│   │   ├── telegram_inbox.py      Telegram getUpdates loop + per-update agent dispatch
+│   │   ├── sms_inbox.py           inbound SMS pipeline (called by sms_webhook router)
+│   │   ├── background_agent.py    shared ThreadPoolExecutor for fast-ack race
+│   │   └── system_status.py       /api/aiassistant/status payload builder
 │   ├── integrations/
-│   │   └── gemini.py        optional avatar image generation
-│   └── migrations/          Alembic revisions
-├── ui/react/                Vite + React + TS admin console + AI page
+│   │   ├── gmail.py · google_calendar.py · google_oauth.py    Google APIs
+│   │   ├── telegram.py            Bot API client (sendMessage, getUpdates, files)
+│   │   ├── twilio_sms.py          Twilio REST + signature verification
+│   │   ├── doorbird_gate.py       LAN gate intent (scaffold)
+│   │   └── gemini.py              optional avatar image generation
+│   └── migrations/                Alembic revisions
+├── ui/react/                      Vite + React + TS admin console + AI page
 │   └── src/
-│       ├── App.tsx          route tree (/admin/..., /aiassistant/:id)
-│       ├── lib/api.ts       fetch wrapper + resolveApiPath rewriting
-│       ├── components/      Layout, Modal, PageHeader, Toast, etc.
+│       ├── App.tsx                route tree (/admin/..., /aiassistant/:id)
+│       ├── lib/api.ts             fetch wrapper + resolveApiPath rewriting
+│       ├── components/            Layout, Modal, PageHeader, Toast, Live2D bits, etc.
 │       └── pages/
 │           ├── FamiliesList, FamilyDashboard, FamilySettings
 │           ├── PeoplePage, PersonDetail, RelationshipsPage
+│           ├── MedicalPage, MedicationsPage, PhysiciansPage
 │           ├── PetsPage, ResidencesPage, VehiclesPage
 │           ├── InsurancePoliciesPage, FinancialAccountsPage, DocumentsPage
-│           ├── AssistantPage              (admin Avi config)
-│           └── AiAssistantPage            (live /aiassistant/:familyId)
-├── resources/family/        uploaded photos + documents (gitignored, private)
-├── alembic.ini              migration config
-├── pyproject.toml           Python deps, managed by uv
-└── .env                     DB + Fernet + Ollama secrets (gitignored)
+│           ├── TasksPage, AgentTasksPage   (kanban + agent run audit)
+│           ├── AssistantPage               (admin Avi config + Google OAuth)
+│           └── AiAssistantPage             (live /aiassistant/:familyId)
+├── docs/                          long-form docs (DATA_MODEL.md, ...)
+├── resources/family/              uploaded photos + documents + tts_cache (gitignored)
+├── resources/models/              Kokoro ONNX weights (gitignored)
+├── alembic.ini                    migration config
+├── pyproject.toml                 Python deps, managed by uv
+└── .env                           DB + Fernet + Ollama + Twilio + Telegram + Google secrets (gitignored)
 ```
 
 ## Common operations

@@ -134,6 +134,13 @@ type ChatMessage = {
   meta?: string;
   taskId?: number | null;
   steps?: AgentStepView[];
+  // Fast-ack from the lightweight model. Populated by the SSE
+  // `fast_ack` event when the heavy agent hasn't started streaming
+  // text within AI_FAST_ACK_AFTER_SECONDS. Rendered as a transient
+  // placeholder bubble so the user sees Avi acknowledge them within
+  // ~1s instead of staring at "thinking…" for 10-30s. Replaced by
+  // the real reply the moment `content` starts populating.
+  fastAck?: string | null;
 };
 
 // How often we snap a webcam frame for face recognition. Slow enough that
@@ -772,7 +779,7 @@ export default function AiAssistantPage() {
             onLive2DStateChange={onLive2DStateChange}
             animationMode={animationMode}
           />
-          <LiveCameraPanel familyId={familyId} />
+          <LiveCameraPanel familyId={familyId} liveSessionId={liveSessionId} />
         </div>
         <ChatPanel
           familyId={familyId}
@@ -1369,7 +1376,18 @@ function Badge({
 // Live camera + face recognition loop
 // ============================================================================
 
-function LiveCameraPanel({ familyId }: { familyId: number }) {
+function LiveCameraPanel({
+  familyId,
+  liveSessionId,
+}: {
+  familyId: number;
+  // Threaded down so the recognition loop can flush its per-person
+  // greet-suppression map whenever a new session begins (after End &
+  // reset, the 30-min idle sweep, etc.). Without this the client's
+  // 90-second suppression silently swallows the first greet attempt
+  // of every fresh session, leaving the user staring at a quiet page.
+  liveSessionId: number | null;
+}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [cameraOn, setCameraOn] = useState(true);
@@ -1485,6 +1503,7 @@ function LiveCameraPanel({ familyId }: { familyId: number }) {
 
       <FaceRecognitionLoop
         familyId={familyId}
+        liveSessionId={liveSessionId}
         videoRef={videoRef}
         canvasRef={canvasRef}
         cameraOn={cameraOn && !cameraError}
@@ -1504,18 +1523,46 @@ function LiveCameraPanel({ familyId }: { familyId: number }) {
  */
 function FaceRecognitionLoop({
   familyId,
+  liveSessionId,
   videoRef,
   canvasRef,
   cameraOn,
   onRecognize,
 }: {
   familyId: number;
+  // Triggers a suppression-map flush + immediate recognition tick
+  // whenever it changes — see the effect below for the rationale.
+  liveSessionId: number | null;
   videoRef: React.RefObject<HTMLVideoElement>;
   canvasRef: React.RefObject<HTMLCanvasElement>;
   cameraOn: boolean;
   onRecognize: (r: RecognizeResponse) => void;
 }) {
+  // Per-person "we already said hi to them within the last 90s"
+  // suppression. Stops a continuously-detected face from spamming
+  // /greet on every recognition tick (every 2.5s).
+  //
+  // CRITICAL: this map is reset whenever the session id changes so
+  // a fresh session re-greets everyone. The backend already enforces
+  // "greet once per session" via greeted_already, but the client
+  // suppression sits *in front* of that check — without the reset,
+  // the client never even calls /greet for the new session, so the
+  // server never gets a chance to say "yes, this is a new session,
+  // greet them again". That's why "End & reset" used to leave the
+  // page silent until the suppression naturally aged out 90s later.
   const lastGreetedRef = useRef<Map<number, number>>(new Map());
+
+  useEffect(() => {
+    // Clear the per-person greet suppression so the new session can
+    // greet everyone again from scratch. The recognition effect
+    // below also has `liveSessionId` in its dep array, so it tears
+    // down + restarts in the same render — that fresh start fires
+    // an immediate `void tick()` against the just-cleared map and
+    // the user gets greeted within milliseconds of End & reset
+    // (or any session rollover) rather than waiting for the next
+    // scheduled interval.
+    lastGreetedRef.current.clear();
+  }, [liveSessionId]);
 
   useEffect(() => {
     if (!cameraOn) return;
@@ -1578,7 +1625,11 @@ function FaceRecognitionLoop({
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [cameraOn, familyId, videoRef, canvasRef, onRecognize]);
+    // `liveSessionId` is in the dep array so a session rollover
+    // (End & reset, idle sweep, etc.) tears the loop down and
+    // restarts it with a fresh closure — guaranteeing an immediate
+    // recognition tick that uses the just-cleared suppression map.
+  }, [cameraOn, familyId, liveSessionId, videoRef, canvasRef, onRecognize]);
 
   return null;
 }
@@ -1962,6 +2013,21 @@ function ChatPanel({
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === assistantMsg.id ? { ...m, taskId } : m
+                )
+              );
+            }
+            // Fast-ack from the lightweight model. At most one per
+            // turn, fired by the backend race-and-ack watchdog when
+            // the heavy agent hasn't streamed any text yet by the
+            // configured threshold (default 3s). We surface it as a
+            // placeholder inside the in-flight assistant bubble so
+            // the user sees Avi react quickly; the bubble's real
+            // content takes over when the heavy reply lands.
+            if (parsed.type === "fast_ack" && typeof parsed.text === "string") {
+              const ackText = parsed.text as string;
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsg.id ? { ...m, fastAck: ackText } : m
                 )
               );
             }
@@ -2469,6 +2535,25 @@ function ChatPanel({
   );
 }
 
+// Three dots that gently bounce while Avi is composing a reply.
+// CSS-only (see `.chat-typing-dots` in src/index.css). Inherits
+// `currentColor` so the same component looks right in both the
+// muted-foreground placeholder text AND a dimmer variant if we
+// ever drop it into a different bubble background.
+function TypingDots({ className }: { className?: string }) {
+  return (
+    <span
+      className={cn("chat-typing-dots", className)}
+      role="status"
+      aria-label="Avi is typing"
+    >
+      <span />
+      <span />
+      <span />
+    </span>
+  );
+}
+
 function MessageBubble({
   message,
   assistantName,
@@ -2520,11 +2605,29 @@ function MessageBubble({
             streaming={message.streaming}
           />
         )}
-        {message.content ||
-          (message.streaming &&
-          (!message.steps || message.steps.length === 0)
-            ? "…"
-            : "")}
+        {/*
+         * Render priority for an in-flight assistant bubble:
+         *   1. Real `content` once the heavy reply starts streaming.
+         *   2. Otherwise the fast-ack placeholder + animated dots
+         *      so the user sees both the contextual hint AND that
+         *      Avi is still composing the full reply.
+         *   3. Otherwise just the animated dots (covers the gap
+         *      before any tool steps or ack arrive).
+         *   4. Nothing if the bubble is settled and content-less
+         *      (e.g. greet skipped).
+         */}
+        {message.content ? (
+          message.content
+        ) : !isUser && message.streaming && message.fastAck ? (
+          <span className="flex items-center gap-2 italic text-muted-foreground">
+            <span>{message.fastAck}</span>
+            <TypingDots />
+          </span>
+        ) : message.streaming ? (
+          <TypingDots />
+        ) : (
+          ""
+        )}
         {isSpeakingThis && !isUser && onSkipSpeech && (
           <div className="mt-1.5 flex justify-end">
             <button

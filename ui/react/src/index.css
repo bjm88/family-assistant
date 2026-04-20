@@ -52,6 +52,34 @@ body {
 .animate-avi-wave    { animation: avi-wave 700ms ease-in-out 4; transform-origin: 80% 90%; }
 .animate-avi-echo    { animation: avi-echo 1.8s ease-out infinite; }
 
+/* ---- Chat "typing" indicator ----------------------------------- */
+/* Three dots that gently bounce while Avi is composing a reply.
+   Used inside the in-flight assistant bubble in place of the old
+   static "…" so the user can see at a glance whether the system
+   is alive vs hung. CSS-only — no GIF asset to ship.            */
+@keyframes chat-typing-bounce {
+  0%, 80%, 100% { transform: translateY(0);    opacity: 0.4; }
+  40%           { transform: translateY(-3px); opacity: 1;   }
+}
+
+.chat-typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+}
+.chat-typing-dots > span {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: currentColor;
+  animation: chat-typing-bounce 1.2s infinite ease-in-out both;
+}
+.chat-typing-dots > span:nth-child(1) { animation-delay: -0.32s; }
+.chat-typing-dots > span:nth-child(2) { animation-delay: -0.16s; }
+.chat-typing-dots > span:nth-child(3) { animation-delay:  0s;    }
+
 @layer components {
   .btn {
     @apply inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-50 disabled:pointer-events-none;

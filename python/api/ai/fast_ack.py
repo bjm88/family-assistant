@@ -107,6 +107,24 @@ _SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 
 
+def _build_user_prompt(
+    *,
+    surface: str,
+    sender_display_name: Optional[str],
+    last_user_message: str,
+) -> str:
+    """Format the per-call user message for the fast model."""
+    sender_hint = sender_display_name or "the user"
+    return (
+        f"Surface: {surface}\n"
+        f"Sender: {sender_hint}\n"
+        f"Their message:\n"
+        f"{last_user_message.strip()}\n"
+        "\n"
+        "Now reply with the one-sentence acknowledgement (no quotes)."
+    )
+
+
 def generate_contextual_ack_sync(
     *,
     surface: str,
@@ -146,6 +164,13 @@ def generate_contextual_ack_sync(
         The actual inbound text we're acknowledging.
     timeout_seconds
         Override the default from settings. Mostly useful in tests.
+
+    See also
+    --------
+    :func:`generate_contextual_ack_async` — the async-native sibling
+    used by callers that already live on an event loop (e.g. the live
+    chat SSE endpoint). They share the prompt + timeout + cleanup
+    logic so behaviour stays identical across surfaces.
     """
     settings = get_settings()
     if not settings.AI_FAST_ACK_ENABLED:
@@ -158,15 +183,10 @@ def generate_contextual_ack_sync(
         if timeout_seconds is not None
         else settings.AI_FAST_ACK_TIMEOUT_SECONDS
     )
-
-    sender_hint = sender_display_name or "the user"
-    user_prompt = (
-        f"Surface: {surface}\n"
-        f"Sender: {sender_hint}\n"
-        f"Their message:\n"
-        f"{last_user_message.strip()}\n"
-        "\n"
-        "Now reply with the one-sentence acknowledgement (no quotes)."
+    user_prompt = _build_user_prompt(
+        surface=surface,
+        sender_display_name=sender_display_name,
+        last_user_message=last_user_message,
     )
 
     async def _call() -> str:
@@ -192,6 +212,72 @@ def generate_contextual_ack_sync(
     except OllamaUnavailable as exc:
         # Fast model isn't pulled, or Ollama itself is down. Expected
         # in dev / fresh installs; never bubble up.
+        logger.debug("fast_ack: %s — skipping ack", exc)
+        return None
+    except OllamaError as exc:
+        logger.warning("fast_ack: Ollama error %s — skipping ack", exc)
+        return None
+    except Exception:  # noqa: BLE001 - last-resort safety
+        logger.exception("fast_ack: unexpected error — skipping ack")
+        return None
+
+    return _clean_ack_text(text)
+
+
+async def generate_contextual_ack_async(
+    *,
+    surface: str,
+    sender_display_name: Optional[str],
+    last_user_message: str,
+    timeout_seconds: Optional[float] = None,
+) -> Optional[str]:
+    """Async-native counterpart of :func:`generate_contextual_ack_sync`.
+
+    Use this from anywhere already on an event loop (e.g. the live
+    chat SSE endpoint, where racing the heavy agent is best expressed
+    with ``asyncio.create_task`` + ``asyncio.Event``). Shares the
+    prompt, model selection, timeout cap, error handling, and output
+    cleaning with the sync sibling so a given inbound produces the
+    same ack regardless of which surface fired it.
+
+    Returns ``None`` under exactly the same conditions as the sync
+    version.
+    """
+    settings = get_settings()
+    if not settings.AI_FAST_ACK_ENABLED:
+        return None
+    if not last_user_message or not last_user_message.strip():
+        return None
+
+    cap = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else settings.AI_FAST_ACK_TIMEOUT_SECONDS
+    )
+    user_prompt = _build_user_prompt(
+        surface=surface,
+        sender_display_name=sender_display_name,
+        last_user_message=last_user_message,
+    )
+
+    try:
+        text = await asyncio.wait_for(
+            _chat_oneshot(
+                system=_SYSTEM_PROMPT,
+                user=user_prompt,
+                model=fast_model(),
+                temperature=0.4,
+                max_tokens=80,
+            ),
+            timeout=cap,
+        )
+    except asyncio.TimeoutError:
+        logger.debug(
+            "fast_ack: e2b call exceeded %.1fs timeout — skipping ack",
+            cap,
+        )
+        return None
+    except OllamaUnavailable as exc:
         logger.debug("fast_ack: %s — skipping ack", exc)
         return None
     except OllamaError as exc:
@@ -300,4 +386,7 @@ def _clean_ack_text(raw: Optional[str]) -> Optional[str]:
     return text
 
 
-__all__ = ["generate_contextual_ack_sync"]
+__all__ = [
+    "generate_contextual_ack_sync",
+    "generate_contextual_ack_async",
+]

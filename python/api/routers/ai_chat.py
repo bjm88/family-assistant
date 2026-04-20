@@ -13,9 +13,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -25,6 +26,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..ai import agent as agent_loop
 from ..ai import authz
+from ..ai import fast_ack
 from ..ai import ollama
 from ..ai import prompts
 from ..ai import rag
@@ -696,10 +698,16 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
 
     Each invocation creates one ``agent_tasks`` row + N ``agent_steps``
     rows so every tool call Avi makes is auditable. The SSE stream
-    emits a mix of three event shapes:
+    emits a mix of these event shapes:
 
     * ``{"task_id": ...}`` — sent first so the UI can subscribe to the
       task page or render an in-flight progress card.
+    * ``{"type": "fast_ack", "text": ...}`` — *optional, at most one
+      per turn.* Sent if the heavy agent hasn't started streaming text
+      within :setting:`AI_FAST_ACK_AFTER_SECONDS`. The UI shows it as
+      a transient placeholder bubble that's replaced when the real
+      reply arrives. Mirrors the Telegram / SMS fast-ack pattern so
+      every surface behaves the same way.
     * ``{"step": {...}}`` — one event per model thought, tool call, and
       tool result. The UI renders these as inline timeline entries.
     * ``{"delta": "..."}`` — final natural-language reply (sent in one
@@ -711,7 +719,9 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
     When a ``live_session_id`` is provided the server still records the
     user message (before the agent runs) and the final assistant reply
     (after) into the live-session transcript, so the History page is
-    unchanged.
+    unchanged. The fast-ack, when emitted, is also logged with
+    ``meta.kind="live_fast_ack"`` so the History view can replay it
+    in order.
     """
     if db.get(models.Family, payload.family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
@@ -834,6 +844,19 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
     db.commit()
     task_id = task_row.agent_task_id
 
+    # Best display-name for the speaker so the fast-ack prompt can
+    # personalise (*"Looking up your calendar..."*) when known. None
+    # is fine — the fast-ack module falls back to "the user".
+    sender_display_name: Optional[str] = None
+    if payload.recognized_person_id is not None:
+        speaker = db.get(models.Person, payload.recognized_person_id)
+        if speaker is not None and speaker.family_id == payload.family_id:
+            sender_display_name = (
+                speaker.preferred_name or speaker.first_name
+            )
+
+    settings = get_settings()
+
     async def event_stream():
         # SSE framing — each event is `data: {json}\n\n`.
         # First event tells the UI which task this stream belongs to.
@@ -843,18 +866,134 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
         terminal_error: Optional[str] = None
         step_summaries: list[dict] = []  # for live-session transcript
 
+        # Fast-ack race state. ``first_delta_seen`` short-circuits the
+        # ack path the moment the heavy model starts streaming text —
+        # no point announcing work that's already arriving. The ack,
+        # when minted, lands here so the post-stream session-log step
+        # can persist it alongside the final reply.
+        first_delta_seen = asyncio.Event()
+        agent_finished = asyncio.Event()
+        emitted_fast_ack: Optional[str] = None
+
+        # Pump agent events through a queue so the watchdog can
+        # interleave a `fast_ack` event between two heavy-model events
+        # without blocking on the next ``__anext__`` call.
+        queue: asyncio.Queue[Tuple[str, Any]] = asyncio.Queue()
+
+        async def _producer() -> None:
+            try:
+                async for event in agent_loop.run_agent(
+                    task_id=task_id,
+                    family_id=payload.family_id,
+                    assistant_id=assistant_id,
+                    person_id=payload.recognized_person_id,
+                    system_prompt=system,
+                    history=history,
+                    user_message=latest_user_content,
+                    registry=registry,
+                    capabilities=capabilities,
+                ):
+                    await queue.put(("event", event))
+            except Exception as exc:  # noqa: BLE001 - never crash the stream
+                logger.exception("Agent stream crashed")
+                await queue.put(("crash", exc))
+            finally:
+                agent_finished.set()
+                await queue.put(("done", None))
+
+        async def _ack_watchdog() -> None:
+            """Live-chat fast-ack: race the e2b call against the heavy agent.
+
+            Differs from the Telegram / SMS path in *when* the fast
+            model is invoked. Telegram waits
+            ``AI_FAST_ACK_AFTER_SECONDS`` before even starting the
+            ack call so simple replies don't trigger two outbound
+            messages on every turn. That works there because the ack
+            is a separate Telegram message — chatty is bad UX.
+
+            On the live page, the ack lives *inside* the same
+            assistant bubble (rendered as a placeholder, replaced the
+            moment the real reply arrives), so there's no spam cost
+            and we want it to land as soon as humanly possible. We
+            therefore fire the e2b call *immediately*, in parallel
+            with the heavy agent, and emit only if the fast model
+            wins the race.
+
+            This also dodges a real serialisation issue we hit in the
+            previous design: if Ollama queues the e2b request behind
+            the in-flight 26b request, by the time the ack came back
+            the heavy delta had already arrived and we'd silently
+            drop it — exactly the symptom of "live chat doesn't show
+            a quick response".
+
+            Telegram and SMS keep the 3s threshold via
+            ``generate_contextual_ack_sync``; nothing here changes
+            their behaviour.
+            """
+            try:
+                ack_text = await fast_ack.generate_contextual_ack_async(
+                    surface="chat",
+                    sender_display_name=sender_display_name,
+                    last_user_message=latest_user_content,
+                )
+            except Exception:  # noqa: BLE001 - ack must never crash chat
+                logger.exception(
+                    "Live chat fast-ack call crashed for task=%s", task_id
+                )
+                return
+            if not ack_text:
+                logger.info(
+                    "Live chat fast-ack returned no text for task=%s "
+                    "(model not pulled, timeout, or feature off)",
+                    task_id,
+                )
+                return
+            if first_delta_seen.is_set() or agent_finished.is_set():
+                # Heavy reply already landed — emitting now would
+                # just flicker. Log so we can see when this happens.
+                logger.info(
+                    "Live chat fast-ack ready but heavy agent already "
+                    "finished for task=%s — dropping ack to avoid flicker",
+                    task_id,
+                )
+                return
+            await queue.put(("fast_ack", ack_text))
+
+        producer_task = asyncio.create_task(_producer())
+        watchdog_task: Optional[asyncio.Task] = None
+        if settings.AI_FAST_ACK_ENABLED and latest_user_content:
+            watchdog_task = asyncio.create_task(_ack_watchdog())
+
         try:
-            async for event in agent_loop.run_agent(
-                task_id=task_id,
-                family_id=payload.family_id,
-                assistant_id=assistant_id,
-                person_id=payload.recognized_person_id,
-                system_prompt=system,
-                history=history,
-                user_message=latest_user_content,
-                registry=registry,
-                capabilities=capabilities,
-            ):
+            while True:
+                kind, item = await queue.get()
+                if kind == "done":
+                    break
+                if kind == "fast_ack":
+                    emitted_fast_ack = item
+                    yield (
+                        "data: "
+                        + json.dumps({"type": "fast_ack", "text": item})
+                        + "\n\n"
+                    )
+                    logger.info(
+                        "Live chat: fast-ack emitted for task=%s text=%r",
+                        task_id,
+                        item,
+                    )
+                    continue
+                if kind == "crash":
+                    terminal_error = str(item)
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {"error": terminal_error, "kind": "error"}
+                        )
+                        + "\n\n"
+                    )
+                    continue
+                # kind == "event" — an AgentEvent from the loop.
+                event = item
                 if event.type == "step":
                     step = event.payload.get("step") or {}
                     step_summaries.append(
@@ -868,28 +1007,63 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
                     )
                 if event.type == "delta":
                     accumulated_text += event.payload.get("delta", "")
+                    first_delta_seen.set()
                 if event.type == "task_failed":
-                    terminal_error = event.payload.get("error") or "unknown error"
+                    terminal_error = (
+                        event.payload.get("error") or "unknown error"
+                    )
                     # Surface the error in the legacy 'error' shape so
                     # the existing UI banner still lights up.
                     yield (
                         "data: "
-                        + json.dumps({"error": terminal_error, "kind": "agent"})
+                        + json.dumps(
+                            {"error": terminal_error, "kind": "agent"}
+                        )
                         + "\n\n"
                     )
                 yield event.to_sse()
-        except Exception as exc:  # noqa: BLE001 - never crash the stream
-            logger.exception("Agent stream crashed")
-            terminal_error = str(exc)
-            yield f"data: {json.dumps({'error': str(exc), 'kind': 'error'})}\n\n"
+        finally:
+            # The producer normally completes on its own; we only need
+            # to cancel the watchdog if the agent finished before its
+            # threshold fired (otherwise it's a harmless no-op task
+            # waiting on ``first_delta_seen``).
+            if watchdog_task is not None and not watchdog_task.done():
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            if not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
 
-        # Log the assistant reply in its own DB session — the request-
-        # scoped one was closed the moment the StreamingResponse started.
-        if logged_session_id is not None and (accumulated_text or terminal_error):
+        # Log the fast-ack + assistant reply in their own DB session —
+        # the request-scoped one was closed the moment the
+        # StreamingResponse started. Two rows so the History view can
+        # replay the same Avi-said-X / Avi-said-Y rhythm the user saw.
+        if logged_session_id is not None and (
+            accumulated_text or terminal_error or emitted_fast_ack
+        ):
             log_db = SessionLocal()
             try:
                 log_session = log_db.get(models.LiveSession, logged_session_id)
                 if log_session is not None:
+                    if emitted_fast_ack:
+                        live_session.log_message(
+                            log_db,
+                            log_session,
+                            role="assistant",
+                            content=emitted_fast_ack,
+                            person_id=payload.recognized_person_id,
+                            meta={
+                                "kind": "live_fast_ack",
+                                "agent_task_id": task_id,
+                                "used_model": ollama.fast_model(),
+                            },
+                        )
                     live_session.log_message(
                         log_db,
                         log_session,
@@ -901,6 +1075,7 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
                             "agent_task_id": task_id,
                             "agent_steps": step_summaries,
                             "error": terminal_error,
+                            "had_fast_ack": bool(emitted_fast_ack),
                         },
                     )
                     log_db.commit()
