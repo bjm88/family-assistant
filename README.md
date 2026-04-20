@@ -81,6 +81,8 @@ flowchart TB
         RAG["RAG context"]
         Face["Face recognition"]
         Voice["Voice (TTS)"]
+        Tasks["Task Mgmt"]
+        Cron["Cron Scheduling"]
     end
 
     %% ─── Integrations ───────────────────────────────────────────
@@ -88,9 +90,9 @@ flowchart TB
         direction LR
         Gmail["Gmail"]
         GCal["Google Calendar"]
+        Gemini["Gemini /<br/>Web Search"]
     end
 
-    Tasks["Task manager"]
     DB[("Database")]
 
     %% ─── Wiring ─────────────────────────────────────────────────
@@ -118,10 +120,12 @@ flowchart TB
     Agent --> Tasks
     Agent --> Gmail
     Agent --> GCal
+    Agent --> Gemini
     Agent --> DB
 
-    RAG --> DB
+    Cron --> Agent
     Tasks --> DB
+    RAG --> DB
 
     classDef inbound fill:#eef2ff,stroke:#6366f1,color:#1e1b4b,stroke-width:2px
     classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
@@ -130,10 +134,10 @@ flowchart TB
     classDef integ fill:#ecfeff,stroke:#0891b2,color:#164e63,stroke-width:2px
     classDef data fill:#fff7ed,stroke:#d97706,color:#7c2d12,stroke-width:2px
     class Web,SMS,Email,Telegram inbound
-    class Hub,Agent,Tasks core
+    class Hub,Agent core
     class AdminUI,CRUD admin
-    class LLM,RAG,Face,Voice ai
-    class Gmail,GCal integ
+    class LLM,RAG,Face,Voice,Tasks,Cron ai
+    class Gmail,GCal,Gemini integ
     class DB data
 ```
 
@@ -173,7 +177,7 @@ sequenceDiagram
     loop every 250ms while camera on
         UI->>MP: detectForVideo(<video>)
         MP-->>UI: bboxes + scores
-        Note over UI: IoU tracker updates;<br/>backend stays idle
+        Note over UI: IoU tracker updates; backend stays idle
     end
 
     alt new face track born
