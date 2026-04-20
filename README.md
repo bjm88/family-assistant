@@ -54,26 +54,35 @@ locally on the box; the only outbound traffic is to opt-in cloud APIs.
 
 ```mermaid
 flowchart TB
-    %% ─── Inbound channels ───────────────────────────────────────
+    %% ─── Inbound channels (one row via direction LR) ────────────
     subgraph Inbound["Inbound channels"]
         direction LR
         Web["Web chat"]
         SMS["SMS"]
         Email["Email"]
-        TG["Telegram"]
-        Gate["Doorbird gate"]
+        Telegram["Telegram"]
     end
 
     %% ─── Core ───────────────────────────────────────────────────
     Hub["Messaging service"]
+    AdminUI["Admin UI"]
+    CRUD["CRUD API"]
     Agent["Agent AI manager"]
 
     %% ─── AI capabilities ────────────────────────────────────────
     subgraph AI["AI capabilities"]
         direction LR
         LLM["LLM<br/>(Ollama)"]
+        RAG["RAG context"]
         Face["Face recognition"]
         Voice["Voice (TTS)"]
+    end
+
+    %% ─── Integrations ───────────────────────────────────────────
+    subgraph Integrations["Integrations"]
+        direction LR
+        Gmail["Gmail"]
+        GCal["Google Calendar"]
     end
 
     Tasks["Task manager"]
@@ -83,27 +92,43 @@ flowchart TB
     Web --> Hub
     SMS --> Hub
     Email --> Hub
-    TG --> Hub
-    Gate --> Hub
+    Telegram --> Hub
+
+    %% Invisible links to coax Mermaid into aligning the admin
+    %% pipeline (right column) next to the messaging pipeline
+    %% (left column) instead of stacking them.
+    Hub ~~~ AdminUI
+    Agent ~~~ CRUD
 
     Hub --> Agent
     Hub --> DB
 
+    AdminUI --> CRUD
+    CRUD --> DB
+
     Agent --> LLM
+    Agent --> RAG
     Agent --> Face
     Agent --> Voice
     Agent --> Tasks
+    Agent --> Gmail
+    Agent --> GCal
     Agent --> DB
 
+    RAG --> DB
     Tasks --> DB
 
     classDef inbound fill:#eef2ff,stroke:#6366f1,color:#1e1b4b,stroke-width:2px
     classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+    classDef admin fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px
     classDef ai fill:#fdf4ff,stroke:#a21caf,color:#581c87,stroke-width:2px
+    classDef integ fill:#ecfeff,stroke:#0891b2,color:#164e63,stroke-width:2px
     classDef data fill:#fff7ed,stroke:#d97706,color:#7c2d12,stroke-width:2px
-    class Web,SMS,Email,TG,Gate inbound
+    class Web,SMS,Email,Telegram inbound
     class Hub,Agent,Tasks core
-    class LLM,Face,Voice ai
+    class AdminUI,CRUD admin
+    class LLM,RAG,Face,Voice ai
+    class Gmail,GCal integ
     class DB data
 ```
 
