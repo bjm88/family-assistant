@@ -46,167 +46,65 @@ The project has three cooperating layers:
 
 ## Architecture Diagram
 
-The system has **four ways family members reach Avi** (live page, SMS,
-Telegram, email), all converging on one shared agent loop with a tool
-registry. Everything model-side runs locally; the only outbound traffic
-is to opt-in cloud APIs (Twilio, Google, Gemini, Telegram Bot API).
+A bird's-eye view. Every family member — whether they're standing in
+front of the camera, texting, emailing, or chatting on Telegram —
+lands on the same **messaging service**, which hands the conversation
+to the **agent AI** to plan, call tools, and reply. Models all run
+locally on the box; the only outbound traffic is to opt-in cloud APIs.
 
 ```mermaid
-flowchart LR
-    %% ─── Inbound surfaces ────────────────────────────────────────
-    subgraph Inbound["📥  Inbound surfaces"]
-        direction TB
-        AdminUI["Admin Console<br/>/admin/...<br/>React + Vite + Tailwind"]
-        LiveUI["Live AI page<br/>/aiassistant/:id<br/>Webcam · Mic · Chat (SSE)<br/>Live2D Avi character"]
-        SMSIn["SMS<br/>(Twilio webhook)"]
-        TelegramIn["Telegram chat<br/>(BotFather long-poll)"]
-        EmailIn["Gmail thread<br/>(60s poll, OAuth)"]
-        Doorbell["Doorbird gate<br/>(intercom + face)"]
+flowchart TB
+    %% ─── Inbound channels ───────────────────────────────────────
+    subgraph Inbound["Inbound channels"]
+        direction LR
+        Web["Web chat"]
+        SMS["SMS"]
+        Email["Email"]
+        TG["Telegram"]
+        Gate["Doorbird gate"]
     end
 
-    %% ─── FastAPI ─────────────────────────────────────────────────
-    subgraph API["⚙️  FastAPI backend  (python/api/)"]
-        direction TB
+    %% ─── Core ───────────────────────────────────────────────────
+    Hub["Messaging service"]
+    Agent["Agent AI manager"]
 
-        AdminRouters["/api/admin/*<br/>families · people · relationships<br/>goals · medical · pets · residences<br/>vehicles · insurance · finances · documents<br/>identity · sensitive identifiers · assistants<br/>tasks · google OAuth · status"]
-        AIRouters["/api/aiassistant/*<br/>face/enroll · face/recognize<br/>chat (SSE) · tts (wav)<br/>sessions · agent_tasks · status"]
-        MediaRouter["/api/media/*<br/>static file proxy"]
-        SmsHook["/api/sms/twilio/inbound<br/>signature-verified webhook"]
-        Legal["/legal/*<br/>privacy · terms (public)"]
-
-        subgraph BgSvc["Lifespan background services (services/)"]
-            direction TB
-            EmailLoop["email_inbox.py<br/>Gmail long-poll<br/>(asyncio task)"]
-            TelegramLoop["telegram_inbox.py<br/>getUpdates long-poll<br/>(asyncio task)"]
-            BgPool["background_agent.py<br/>shared ThreadPoolExecutor<br/>(heavy agent runs)"]
-        end
-
-        subgraph AIModules["AI subsystem (ai/)"]
-            direction TB
-            Agent["agent.py<br/>plan/execute/observe loop<br/>SSE event stream"]
-            Tools["tools.py · sql_tool.py<br/>16 callable tools<br/>(SQL · calendar · email · tasks · ...)"]
-            Authz["authz.py<br/>per-speaker scope filter<br/>parent/spouse/self/etc."]
-            FastAck["fast_ack.py<br/>gemma4:e2b 1-sentence ack<br/>sync + async entry points<br/>(/api/chat · think:false)"]
-            OllamaCli["ollama.py<br/>generate · chat · stream"]
-            RAG["rag.py · prompts.py<br/>· schema_catalog.py<br/>(builds system prompt)"]
-            FaceSvc["face.py · enrollment.py<br/>InsightFace buffalo_l<br/>CoreML / CPU"]
-            TTSSvc["tts.py<br/>Kokoro-82M ONNX<br/>voice by gender · disk cache"]
-            LiveSess["session.py<br/>per-surface LiveSession<br/>(live · sms · telegram · email)"]
-        end
-
-        Crypto["crypto.py<br/>Fernet envelope<br/>(SSN · accts · VINs · ...)"]
-        Storage["storage.py<br/>resources/family/..."]
-
-        subgraph Integrations["integrations/"]
-            direction TB
-            TwilioInt["twilio_sms.py<br/>send + signature verify"]
-            TelegramInt["telegram.py<br/>Bot API client"]
-            GmailInt["gmail.py<br/>list · get · send"]
-            CalInt["google_calendar.py<br/>upcoming · busy · free slots"]
-            OAuthInt["google_oauth.py<br/>token mint + refresh"]
-            GeminiInt["gemini.py<br/>avatar image gen"]
-            DoorInt["doorbird_gate.py<br/>open · ring (planned)"]
-        end
+    %% ─── AI capabilities ────────────────────────────────────────
+    subgraph AI["AI capabilities"]
+        direction LR
+        LLM["LLM<br/>(Ollama)"]
+        Face["Face recognition"]
+        Voice["Voice (TTS)"]
     end
 
-    %% ─── Local model daemons ─────────────────────────────────────
-    subgraph LocalAI["🧠  Local AI daemons"]
-        direction TB
-        OllamaHeavy["Ollama heavy<br/>gemma4:26b<br/>localhost:11434"]
-        OllamaFast["Ollama fast<br/>gemma4:e2b<br/>(same daemon)"]
-        Insight["InsightFace<br/>ArcFace 512-d<br/>onnxruntime · CoreML"]
-        Kokoro["Kokoro-82M<br/>ONNX TTS<br/>~330 MB weights"]
-    end
+    Tasks["Task manager"]
+    DB[("Database")]
 
-    %% ─── Persistence ─────────────────────────────────────────────
-    subgraph Data["💾  Persistence"]
-        direction TB
-        PG[("PostgreSQL · ~40 tables<br/>+ llm_schema_catalog view<br/>Alembic-managed")]
-        FS[("Filesystem<br/>resources/family/<br/>photos · docs · attachments<br/>tts_cache · models")]
-    end
+    %% ─── Wiring ─────────────────────────────────────────────────
+    Web --> Hub
+    SMS --> Hub
+    Email --> Hub
+    TG --> Hub
+    Gate --> Hub
 
-    %% ─── External (optional) ─────────────────────────────────────
-    subgraph External["☁️  External APIs (opt-in only)"]
-        direction TB
-        TwilioCloud["Twilio<br/>SMS in/out · signed webhooks"]
-        TelegramCloud["Telegram Bot API<br/>getUpdates · sendMessage"]
-        GoogleCloud["Google APIs<br/>Gmail · Calendar · OAuth2"]
-        GeminiCloud["Google Gemini<br/>avatar image gen<br/>(one-shot)"]
-        DoorCloud["Doorbird LAN device<br/>(local IP, not cloud)"]
-    end
+    Hub --> Agent
+    Hub --> DB
 
-    %% ─── Browser → API ───────────────────────────────────────────
-    AdminUI -->|REST + multipart| AdminRouters
-    AdminUI --> MediaRouter
-    LiveUI -->|multipart frame ~2.5s| AIRouters
-    LiveUI -->|SSE stream| AIRouters
-    LiveUI --> MediaRouter
+    Agent --> LLM
+    Agent --> Face
+    Agent --> Voice
+    Agent --> Tasks
+    Agent --> DB
 
-    %% ─── Inbound surfaces → API ──────────────────────────────────
-    SMSIn --> TwilioCloud
-    TwilioCloud -->|X-Twilio-Signature| SmsHook
-    TelegramIn --> TelegramCloud
-    TelegramCloud -.->|long-poll| TelegramLoop
-    EmailIn --> GoogleCloud
-    GoogleCloud -.->|polled| EmailLoop
-    Doorbell -.->|HTTP/RTSP| DoorInt
+    Tasks --> DB
 
-    %% ─── API → DB / agent ────────────────────────────────────────
-    AdminRouters --> PG
-    AdminRouters --> Crypto
-    AdminRouters --> Storage
-    AdminRouters --> OAuthInt
-    SmsHook --> Agent
-    TelegramLoop --> Agent
-    EmailLoop --> Agent
-    AIRouters --> Agent
-    AIRouters --> FaceSvc
-    AIRouters --> TTSSvc
-
-    Agent --> Tools
-    Agent --> Authz
-    Agent --> RAG
-    Agent --> OllamaCli
-    Agent -.->|race 3s| FastAck
-    Agent -->|submit| BgPool
-    FastAck --> OllamaCli
-    Tools --> Authz
-    Tools --> Crypto
-    Tools --> PG
-    Tools --> GmailInt
-    Tools --> CalInt
-    Tools --> TelegramInt
-    Tools --> TwilioInt
-
-    OAuthInt --> GoogleCloud
-    GmailInt --> GoogleCloud
-    CalInt --> GoogleCloud
-    TelegramInt --> TelegramCloud
-    TwilioInt --> TwilioCloud
-    GeminiInt --> GeminiCloud
-    DoorInt --> DoorCloud
-
-    OllamaCli --> OllamaHeavy
-    OllamaCli --> OllamaFast
-    FaceSvc --> Insight
-    FaceSvc --> PG
-    FaceSvc --> Storage
-    TTSSvc --> Kokoro
-    LiveSess --> PG
-    Storage --> FS
-    MediaRouter --> FS
-    AdminRouters -.->|assistant avatar| GeminiInt
-
-    classDef inbound fill:#eef2ff,stroke:#6366f1,color:#1e1b4b
-    classDef api fill:#f0fdf4,stroke:#16a34a,color:#14532d
-    classDef localai fill:#fdf4ff,stroke:#a21caf,color:#581c87
-    classDef data fill:#fff7ed,stroke:#d97706,color:#7c2d12
-    classDef ext fill:#f5f5f5,stroke:#6b7280,color:#111827,stroke-dasharray: 3 3
-    class Inbound,AdminUI,LiveUI,SMSIn,TelegramIn,EmailIn,Doorbell inbound
-    class API,AdminRouters,MediaRouter,AIRouters,SmsHook,Legal,BgSvc,EmailLoop,TelegramLoop,BgPool,AIModules,Agent,Tools,Authz,FastAck,OllamaCli,RAG,FaceSvc,TTSSvc,LiveSess,Crypto,Storage,Integrations,TwilioInt,TelegramInt,GmailInt,CalInt,OAuthInt,GeminiInt,DoorInt api
-    class LocalAI,OllamaHeavy,OllamaFast,Insight,Kokoro localai
-    class Data,PG,FS data
-    class External,TwilioCloud,TelegramCloud,GoogleCloud,GeminiCloud,DoorCloud ext
+    classDef inbound fill:#eef2ff,stroke:#6366f1,color:#1e1b4b,stroke-width:2px
+    classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+    classDef ai fill:#fdf4ff,stroke:#a21caf,color:#581c87,stroke-width:2px
+    classDef data fill:#fff7ed,stroke:#d97706,color:#7c2d12,stroke-width:2px
+    class Web,SMS,Email,TG,Gate inbound
+    class Hub,Agent,Tasks core
+    class LLM,Face,Voice ai
+    class DB data
 ```
 
 ### Inbound surface matrix
@@ -258,79 +156,6 @@ sequenceDiagram
         TTS-->>UI: WAV (cached or fresh)
         UI->>UI: Live2D lip-sync to playback
     end
-```
-
-### Request flow — "Telegram message lands"
-
-```mermaid
-sequenceDiagram
-    participant TG as Telegram cloud
-    participant Loop as telegram_inbox loop
-    participant Agent as agent.py
-    participant Pool as background_agent pool
-    participant Fast as fast_ack.py · gemma4:e2b
-    participant Heavy as Ollama · gemma4:26b
-    participant Bot as integrations/telegram.py
-
-    TG-->>Loop: getUpdates (25 s long-poll)
-    Loop->>Loop: dedup + person lookup<br/>(telegram_user_id → people)
-    Loop->>Agent: process_inbound_update
-    Agent->>Pool: submit heavy run
-    Pool->>Heavy: generate (with tools)
-    par 3-second race
-        Loop->>Loop: future.result(timeout=3.0)
-    and
-        Heavy-->>Pool: streaming tokens
-    end
-    alt Heavy didn't finish in 3 s
-        Loop->>Fast: contextual ack ("Looking up Sara's calendar...")
-        Fast->>Heavy: (e2b) /api/chat think:false
-        Fast-->>Loop: 1 sentence
-        Loop->>Bot: sendMessage (ack)
-        Bot-->>TG: msg #1
-    end
-    Heavy-->>Pool: final text
-    Loop->>Bot: sendMessage (full reply)
-    Bot-->>TG: msg #2 (threaded under inbound)
-```
-
-### Request flow — "Live chat with fast-ack placeholder"
-
-```mermaid
-sequenceDiagram
-    participant UI as "Live AI page (browser)"
-    participant Chat as "/api/aiassistant/chat (SSE)"
-    participant Agent as "ai/agent.py"
-    participant Watch as "fast-ack watchdog<br/>(asyncio task)"
-    participant Fast as "fast_ack.py · gemma4:e2b"
-    participant Heavy as "Ollama · gemma4:26b"
-    participant PG as Postgres
-
-    UI->>Chat: POST /chat (history, person_id, session_id)
-    Chat->>PG: log user message + create agent_task row
-    Chat-->>UI: data: {task_id}
-    par
-        Chat->>Agent: run_agent (producer task)
-        Agent->>Heavy: generate / tool_call / generate ...
-        Agent-->>Chat: step events (tool_call, tool_result, …)
-        Chat-->>UI: data: {type:"step", step:{…}}
-    and 3-second race
-        Watch->>Watch: wait first_delta_seen, timeout=3s
-    end
-    alt No delta after 3s
-        Watch->>Fast: contextual ack (async)
-        Fast->>Heavy: (e2b) /api/chat think:false
-        Fast-->>Watch: 1 sentence
-        Watch-->>Chat: queue ("fast_ack", text)
-        Chat-->>UI: data: {type:"fast_ack", text:"Looking up Sara's calendar."}
-        UI->>UI: render italic placeholder in assistant bubble
-    end
-    Heavy-->>Agent: final text
-    Agent-->>Chat: delta event (full reply)
-    Chat-->>UI: data: {delta:"Sara's piano lesson is at 4pm…"}
-    UI->>UI: replace placeholder with streamed reply
-    Chat->>PG: log fast_ack (if any) + final reply to live_session_messages
-    Chat-->>UI: data: {done:true}
 ```
 
 ## Key Technologies

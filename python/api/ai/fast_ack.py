@@ -326,6 +326,11 @@ async def _chat_oneshot(
         ],
         "stream": False,
         "think": False,
+        # Pin the fast model in Ollama's memory for an hour so the
+        # next ack call doesn't pay the cold-load cost. Combined
+        # with the lifespan warmup this means even the very first
+        # ack of the day lands within ~500 ms instead of 3–4 s.
+        "keep_alive": "1h",
         "options": {
             "num_predict": max_tokens,
             "temperature": temperature,
@@ -386,7 +391,81 @@ def _clean_ack_text(raw: Optional[str]) -> Optional[str]:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Instant heuristic ack — no LLM, returns in microseconds
+# ---------------------------------------------------------------------------
+
+
+# Verb buckets keyed by leading-token / keyword. Order matters: the
+# first matching bucket wins, so put the more specific actions
+# (drafting, scheduling) before the generic lookup catch-all.
+#
+# The strings are deliberately neutral and surface-agnostic so this
+# helper can stand in for the real e2b ack on any channel where we
+# need *something* visible within milliseconds.
+_HEURISTIC_BUCKETS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("send ", "email ", "draft ", "write ", "reply ", "respond ",
+         "compose ", "message "),
+        "Drafting that message.",
+    ),
+    (
+        ("schedule ", "book ", "add ", "remind ", "create ", "set up ",
+         "setup ", "plan "),
+        "Setting that up.",
+    ),
+    (
+        ("text ", "sms "),
+        "Drafting that text.",
+    ),
+    (
+        ("call ", "phone "),
+        "Pulling that contact up.",
+    ),
+    (
+        ("delete ", "remove ", "cancel ", "clear "),
+        "Working on that update.",
+    ),
+    (
+        ("update ", "change ", "edit ", "rename ", "fix "),
+        "Working on that change.",
+    ),
+    (
+        ("list ", "show ", "find ", "search ", "look ", "get ", "give me ",
+         "fetch ", "pull ", "what ", "who ", "where ", "when ", "how ",
+         "which ", "tell me", "do we have"),
+        "Looking that up.",
+    ),
+)
+
+
+def heuristic_ack(last_user_message: Optional[str]) -> str:
+    """Pick a generic but vaguely-relevant ack string in microseconds.
+
+    Used as the *instant* placeholder in front of the e2b call: even
+    if Ollama is loaded down with the heavy 26b request and the
+    contextual ack takes 3–4 s to come back, the user sees an
+    immediately-relevant verb inside the assistant bubble within
+    milliseconds. The contextual e2b ack replaces this when it
+    lands; if the heavy reply wins the race the heuristic stays
+    visible until the real content streams in.
+
+    The match is case-insensitive on the leading 60 chars of the
+    message so polite preambles ("hey, can you ...") still bucket
+    correctly. Falls back to the safe generic when nothing matches.
+    """
+    head = (last_user_message or "").strip().lower()[:120]
+    if not head:
+        return "Working on it."
+    for keywords, ack in _HEURISTIC_BUCKETS:
+        for kw in keywords:
+            if kw in head:
+                return ack
+    return "Working on it."
+
+
 __all__ = [
     "generate_contextual_ack_sync",
     "generate_contextual_ack_async",
+    "heuristic_ack",
 ]

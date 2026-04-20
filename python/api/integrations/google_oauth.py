@@ -28,12 +28,26 @@ We request the *minimum useful* scope set on first connect:
   the user just authorised (returned as ``id_token`` claims).
 * ``https://www.googleapis.com/auth/gmail.send`` — outbound mail only,
   no inbox read.
-* ``https://www.googleapis.com/auth/calendar.readonly`` — covers
-  reading the assistant's own calendar plus any calendars shared *with*
-  it (free/busy and event lookups).
+* ``https://www.googleapis.com/auth/calendar.events`` — read AND
+  write events on the assistant's own calendar plus any calendars
+  shared *with* it (free/busy lookups, event listings, AND inserting
+  new events / holds when the household member has flipped on
+  ``people.ai_can_write_calendar`` in their profile).
 
 Add more scopes by overriding :data:`DEFAULT_SCOPES`; existing
 credentials keep working as long as the new scope set is a superset.
+
+Re-consent note
+---------------
+Households connected before the ``calendar.readonly →
+calendar.events`` upgrade still hold the older read-only token.
+Calendar reads keep working unchanged, but write tools (e.g.
+``calendar_create_event``) will return a Google 403 with
+``insufficient_scope``. The integration layer detects that and
+surfaces a "disconnect + reconnect Google in /aiassistant settings
+to grant write access" message — there's no automatic upgrade path
+because Google's incremental-auth flow still requires the user to
+click through the consent screen.
 """
 
 from __future__ import annotations
@@ -81,7 +95,15 @@ DEFAULT_SCOPES: tuple[str, ...] = (
     # already-granted scope set; only NEW connects request the
     # extra capability.
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar.readonly",
+    # calendar.events is a superset of calendar.readonly: it lets
+    # Avi list / read events across every calendar the user has
+    # shared with the assistant AND insert new events on calendars
+    # the user has shared with edit permission. Required by the
+    # calendar_create_event tool. Existing households with the
+    # older read-only token must disconnect + reconnect on the
+    # AI Assistant settings page to gain the write capability;
+    # see the module docstring for why.
+    "https://www.googleapis.com/auth/calendar.events",
 )
 
 

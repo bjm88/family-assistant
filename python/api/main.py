@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .ai import ollama as ai_ollama
 from .config import get_settings
 from .services import email_inbox, telegram_inbox
 
@@ -123,6 +124,27 @@ async def _lifespan(app: FastAPI):
         logging.getLogger(__name__).info(
             "Telegram inbox loop disabled via AI_TELEGRAM_INBOUND_ENABLED=false"
         )
+
+    # Pre-warm both Ollama models so the first chat doesn't pay the
+    # 1–10 s cold-load cost. The fast (e2b) ack model is the more
+    # critical one — its whole job is to land inside a few seconds,
+    # so a cold start blows the AI_FAST_ACK_TIMEOUT_SECONDS budget
+    # and the user never sees the contextual placeholder. We pin
+    # both models for an hour via the warmup helper's keep_alive.
+    #
+    # The warmup is fired-and-forgotten on a background task so a
+    # missing / unpulled model (or a down Ollama) never blocks
+    # FastAPI startup. Both functions log their own outcome.
+    async def _ollama_warmup() -> None:
+        await asyncio.gather(
+            ai_ollama.warmup_model(ai_ollama._model()),
+            ai_ollama.warmup_model(ai_ollama.fast_model()),
+            return_exceptions=True,
+        )
+
+    background_tasks.append(
+        asyncio.create_task(_ollama_warmup(), name="ollama_warmup")
+    )
 
     try:
         yield

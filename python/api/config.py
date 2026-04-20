@@ -97,10 +97,15 @@ class Settings(BaseSettings):
     # = fewer acks (sometimes silent for several seconds).
     AI_FAST_ACK_AFTER_SECONDS: float = 3.0
     # Hard ceiling on how long the fast model itself may run before we
-    # give up on the ack and stay silent. Two seconds is plenty for
-    # ``gemma4:e2b`` on Apple Silicon; if it's slower than this the ack
-    # is doing more harm than good.
-    AI_FAST_ACK_TIMEOUT_SECONDS: float = 2.0
+    # give up on the ack and stay silent. ``gemma4:e2b`` warm runs in
+    # ~300–700 ms on Apple Silicon, but a cold load (first request
+    # of the day, or after Ollama unloads it) can take 3–4 s before
+    # the first token. Six seconds gives the cold path enough room
+    # without letting a truly stuck call drag the user-visible
+    # latency past the heavy reply itself. The lifespan warmup
+    # (`api.ai.ollama.warmup_model`) plus `keep_alive=1h` on every
+    # ack call keep the model warm so this cap rarely matters.
+    AI_FAST_ACK_TIMEOUT_SECONDS: float = 6.0
     # Bound on concurrent heavy-agent runs across all messaging
     # surfaces. Ollama serialises GPU access anyway, so making this
     # large mostly wastes RAM — but a small pool lets a Telegram

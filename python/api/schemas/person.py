@@ -35,6 +35,17 @@ class PersonBase(BaseModel):
     )
     interests_and_activities: Optional[str] = None
     notes: Optional[str] = None
+    ai_can_write_calendar: Optional[bool] = Field(
+        default=False,
+        description=(
+            "Per-person consent: when true, the AI assistant may add "
+            "events (holds, reminders, blocks) to this person's "
+            "personal Google calendar via the calendar_create_event "
+            "tool. The Google calendar ALSO has to be shared with "
+            "the assistant's Google account with edit permission — "
+            "this flag is the in-app consent half of that pair."
+        ),
+    )
 
 
 class PersonCreate(PersonBase):
@@ -58,6 +69,7 @@ class PersonUpdate(BaseModel):
     telegram_username: Optional[str] = Field(None, max_length=64)
     interests_and_activities: Optional[str] = None
     notes: Optional[str] = None
+    ai_can_write_calendar: Optional[bool] = None
 
 
 class PersonRead(OrmModel):
@@ -80,6 +92,7 @@ class PersonRead(OrmModel):
     profile_photo_path: Optional[str]
     interests_and_activities: Optional[str]
     notes: Optional[str]
+    ai_can_write_calendar: bool
     created_at: datetime
     updated_at: datetime
 

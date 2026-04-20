@@ -32,7 +32,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -45,8 +45,10 @@ from ..integrations.gmail import GmailSendError, send_email
 from ..integrations.google_calendar import (
     CalendarError,
     CalendarNotShared,
+    CalendarReadOnly,
     PerCalendarBusy,
     busy_for_calendars,
+    create_event as gcal_create_event,
     events_for_calendar,
     find_free_slots,
     list_upcoming_events,
@@ -1399,6 +1401,237 @@ async def _handle_calendar_find_free_slots(
         "working_hours_only": working_hours_only,
         "slots": slots,
         "summary": summary,
+    }
+
+
+# ---- calendar.create_event --------------------------------------------
+
+
+_CALENDAR_CREATE_EVENT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary": {
+            "type": "string",
+            "description": (
+                "Short event title shown on the calendar (e.g. "
+                "'Hold', 'Dentist', 'Block — focus time'). Required."
+            ),
+        },
+        "start": {
+            "type": "string",
+            "description": (
+                "ISO 8601 start time WITH timezone offset (e.g. "
+                "2026-04-21T14:00:00-04:00). The user almost always "
+                "speaks in their local time — translate phrases like "
+                "'next Tuesday at 2pm' into the offset that matches "
+                "where the household lives."
+            ),
+        },
+        "end": {
+            "type": "string",
+            "description": (
+                "Optional ISO 8601 end time. If omitted, the event "
+                "is created with a 60-minute duration starting at "
+                "'start'. Must be strictly after start when supplied."
+            ),
+        },
+        "person": {
+            "type": "string",
+            "description": (
+                "Optional household member whose calendar gets the "
+                "event. Defaults to the speaker themselves — the "
+                "primary use case is 'add a hold on MY calendar'. "
+                "Only the speaker may write to their own calendar; "
+                "writes on someone else's calendar are refused even "
+                "when the relationship would normally allow it."
+            ),
+        },
+        "description": {
+            "type": "string",
+            "description": (
+                "Optional longer note stored in the event body. "
+                "Use this for context the user dictated ('the "
+                "plumber is coming to look at the leak under the "
+                "kitchen sink')."
+            ),
+        },
+        "location": {
+            "type": "string",
+            "description": "Optional event location.",
+        },
+        "timezone": {
+            "type": "string",
+            "description": (
+                "Optional IANA timezone name (e.g. "
+                "'America/Los_Angeles'). Stored on the event so "
+                "Google's local-time math is correct on the user's "
+                "phone. Falls back to the offset embedded in 'start'."
+            ),
+        },
+    },
+    "required": ["summary", "start"],
+}
+
+
+def _default_event_end(start: datetime) -> datetime:
+    """Default a missing end to start + 60 minutes — typical 'hold' length."""
+    return start + timedelta(minutes=60)
+
+
+async def _handle_calendar_create_event(
+    ctx: ToolContext,
+    summary: str,
+    start: str,
+    end: Optional[str] = None,
+    person: Optional[str] = None,
+    description: Optional[str] = None,
+    location: Optional[str] = None,
+    timezone: Optional[str] = None,  # noqa: A002 - matches schema
+) -> Dict[str, Any]:
+    """Create a Google calendar event on the speaker's own calendar.
+
+    Use case: "add a hold on my calendar next Tuesday at 2pm". The
+    LLM resolves the date/time to ISO 8601, picks a one-line
+    summary, and calls this tool. Two consent gates must BOTH be
+    satisfied or the call is refused with a clear, actionable
+    error message:
+
+    1. **Per-person consent** — the resolved subject's
+       ``people.ai_can_write_calendar`` flag must be ``True``. The
+       household member toggles this on themselves under their
+       Person profile in the admin console; defaulting to ``False``
+       keeps the existing read-only behaviour for households that
+       don't opt in.
+    2. **Speaker authorisation** — only the speaker may add events
+       to their own calendar. Writing on someone else's calendar
+       (even a spouse's) is refused for now: cross-person calendar
+       writes have a much higher blast radius than reads, and we'd
+       want a separate explicit consent for that case before
+       enabling it.
+
+    On success returns the event id, html link, and final
+    start/end so the agent can confirm exactly what landed (and
+    catch off-by-an-hour timezone mistakes early).
+    """
+    if ctx.assistant_id is None:
+        raise ToolError("No assistant is configured for this family.")
+    if ctx.person_id is None:
+        raise ToolError(
+            "I can't add a calendar event because I don't know who "
+            "I'm talking to. Sign in via face recognition (live "
+            "page) or use a registered email / Telegram account so "
+            "I can attribute the request to you, then ask again."
+        )
+
+    # ---- Resolve subject (defaults to the speaker themselves) -----
+    if person:
+        subject_row, calendar_pairs = _resolve_person_calendars(
+            ctx, person
+        )
+        if subject_row is None:
+            raise ToolError(
+                f"I couldn't find {person!r} in this household. Use "
+                "lookup_person to find their exact name first."
+            )
+    else:
+        subject_row = ctx.db.get(models.Person, ctx.person_id)
+        if subject_row is None:
+            raise ToolError(
+                "Your speaker record was deleted mid-session. Please "
+                "ask the family admin to re-add you, then try again."
+            )
+        calendar_pairs = _calendar_pairs_for(subject_row)
+
+    # ---- Speaker-can-write authorisation -------------------------
+    if subject_row.person_id != ctx.person_id:
+        raise ToolError(
+            f"I can only add events to your own calendar, not "
+            f"{subject_row.first_name}'s. Ask {subject_row.first_name} "
+            "to make the request themselves so they can confirm it."
+        )
+
+    # ---- Per-person consent gate --------------------------------
+    if not bool(getattr(subject_row, "ai_can_write_calendar", False)):
+        display_name = subject_row.preferred_name or subject_row.first_name
+        raise ToolError(
+            f"{display_name} hasn't given me permission to add "
+            "events to their calendar yet. Open your Person profile "
+            "in the admin console and toggle on 'Allow Avi to add "
+            "calendar events', then ask again."
+        )
+
+    # ---- Pick the personal calendar (skip work calendars) -------
+    personal = next(
+        (cid for cid, label in calendar_pairs if label == "personal"),
+        None,
+    )
+    if not personal:
+        raise ToolError(
+            "I need a personal email address on your profile to "
+            "know which calendar to write to. Add it under your "
+            "Person profile and try again."
+        )
+
+    # ---- Parse times --------------------------------------------
+    start_dt = _parse_iso_arg("start", start)
+    if end:
+        end_dt = _parse_iso_arg("end", end)
+    else:
+        end_dt = _default_event_end(start_dt)
+    if end_dt <= start_dt:
+        raise ToolError("end must be strictly after start.")
+
+    # ---- Load Google credentials --------------------------------
+    try:
+        _row, creds = google_oauth.load_credentials(ctx.db, ctx.assistant_id)
+    except google_oauth.GoogleNotConnected as e:
+        raise ToolError(str(e)) from e
+    except google_oauth.GoogleOAuthError as e:
+        raise ToolError(f"Google auth error: {e}") from e
+
+    # ---- Insert -------------------------------------------------
+    try:
+        ev = await asyncio.to_thread(
+            gcal_create_event,
+            creds,
+            calendar_id=personal,
+            summary=summary,
+            start=start_dt,
+            end=end_dt,
+            description=description,
+            location=location,
+            timezone_name=timezone,
+        )
+    except CalendarNotShared as e:
+        raise ToolError(
+            f"I can't see {personal!r} at all — share that calendar "
+            "with this assistant's Google account (Calendar → "
+            "Settings → Share with specific people → Make changes "
+            "to events) and try again."
+        ) from e
+    except CalendarReadOnly as e:
+        raise ToolError(
+            f"I can see {personal!r} but only with read access. Two "
+            "things to check: (1) on the AI Assistant settings page, "
+            "click Disconnect Google then Connect Google again so I "
+            "get the new write scope; (2) re-share the calendar in "
+            "Google Calendar with 'Make changes to events' instead "
+            "of 'See all event details'."
+        ) from e
+    except CalendarError as e:
+        raise ToolError(str(e)) from e
+
+    return {
+        "event_id": ev.event_id,
+        "calendar_id": ev.calendar_id,
+        "summary": ev.summary,
+        "start": ev.start,
+        "end": ev.end,
+        "html_link": ev.html_link,
+        "summary_text": (
+            f"Added '{ev.summary}' to your calendar from "
+            f"{_humanize_iso(ev.start)} to {_humanize_iso(ev.end)}."
+        ),
     }
 
 
@@ -2809,6 +3042,37 @@ def build_default_registry() -> ToolRegistry:
     )
     reg.register(
         Tool(
+            name="calendar_create_event",
+            label="Add a calendar event",
+            description=(
+                "Add a new event (a hold, a reminder, a block of "
+                "focus time, an appointment) to the SPEAKER's own "
+                "personal Google calendar. Only writes to the "
+                "speaker's calendar — never anyone else's. The "
+                "speaker must have flipped on 'Allow Avi to add "
+                "calendar events' on their Person profile AND "
+                "shared their personal calendar with the assistant "
+                "with 'Make changes to events' permission. The tool "
+                "returns a clear error message walking the user "
+                "through whichever consent they're missing. "
+                "Defaults to a 60-minute duration when no end time "
+                "is supplied. The user almost always speaks in "
+                "local time ('next Tues at 2pm') — translate that "
+                "into ISO 8601 with the right offset for the "
+                "household's timezone before calling."
+            ),
+            parameters=_CALENDAR_CREATE_EVENT_SCHEMA,
+            handler=_handle_calendar_create_event,
+            timeout_seconds=15.0,
+            requires=("google",),
+            examples=(
+                "Add a hold on my calendar next Tuesday at 2pm.",
+                "Block 90 minutes of focus time tomorrow morning at 9.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
             name="calendar_list_for_person",
             label="List events for one person",
             description=(
@@ -3033,6 +3297,14 @@ def detect_capabilities(db: Session, assistant_id: Optional[int]) -> set[str]:
     Today the only feature-flag-style capability is 'google' (= the
     assistant has connected an OAuth-authorised Google account with at
     least one usable scope). Add more here as we wire integrations.
+
+    The calendar scope check accepts EITHER ``calendar.readonly``
+    (legacy connections) OR ``calendar.events`` (post-write-upgrade
+    connections) so a household that only reconnected to gain the
+    write capability — but didn't re-grant gmail — still sees the
+    Google tools. Without this, an assistant that ONLY had a
+    calendar-write token would silently lose all its Google tools
+    after the OAuth scope upgrade.
     """
     caps: set[str] = set()
     if assistant_id is not None:
@@ -3043,6 +3315,8 @@ def detect_capabilities(db: Session, assistant_id: Optional[int]) -> set[str]:
                 any(s.endswith("/gmail.send") for s in scopes)
                 or any(s.endswith("/gmail.modify") for s in scopes)
                 or any(s.endswith("/calendar.readonly") for s in scopes)
+                or any(s.endswith("/calendar.events") for s in scopes)
+                or any(s.endswith("/calendar") for s in scopes)
             ):
                 caps.add("google")
     return caps

@@ -34,6 +34,7 @@ export interface Person {
   profile_photo_path: string | null;
   interests_and_activities: string | null;
   notes: string | null;
+  ai_can_write_calendar: boolean;
   created_at: string;
   updated_at: string;
 }

@@ -147,13 +147,6 @@ type ChatMessage = {
 // an M-series Mac doesn't spin up the fans; fast enough to feel "live".
 const FACE_RECOG_INTERVAL_MS = 2500;
 
-// After "Hi <name>!" plays we wait this long for the user to react before
-// volunteering a goal-based question. Long enough that a quick "Hi Avi"
-// or "what's the weather?" lands first; short enough that the silence
-// doesn't feel awkward. The clock starts when the greeting is queued
-// for playback (greeting itself takes ~1 s), so the effective gap from
-// "Avi stopped talking" to "Avi asks a follow-up" is ~4-5 s.
-const GREETING_FOLLOWUP_DELAY_MS = 5500;
 // After we greet someone, suppress re-greetings for this long so Avi
 // doesn't loop "Hi Sam!" every time they blink.
 const GREETING_SUPPRESSION_MS = 90_000;
@@ -590,6 +583,44 @@ export default function AiAssistantPage() {
     queryFn: () => api.get<TtsStatus>("/api/aiassistant/tts/status"),
     refetchInterval: 20_000,
   });
+
+  // Pre-warm both Gemma models the moment the live page mounts and
+  // again whenever the tab is foregrounded after being hidden. The
+  // backend's lifespan task warms them at process start, but Ollama
+  // unloads anything idle longer than its keep_alive window
+  // (default 5 min, we pin to 1 h). Without this nudge, the first
+  // chat after lunch eats the 3–4 s cold-load cost again — exactly
+  // the failure mode the live-chat fast-ack is designed to avoid.
+  //
+  // Best-effort: errors are swallowed so a momentarily-down Ollama
+  // never breaks page mount. The endpoint itself is idempotent and
+  // cheap (one ``num_predict=1`` ping per model).
+  useEffect(() => {
+    let cancelled = false;
+    const ping = () => {
+      void api
+        .post<unknown>("/api/aiassistant/warmup", {})
+        .then((res) => {
+          if (cancelled) return;
+          // Surface the outcome in the console so we can see when
+          // a model wasn't pulled / Ollama was down on dev boxes.
+          // eslint-disable-next-line no-console
+          console.debug("[avi] warmup", res);
+        })
+        .catch(() => {
+          /* swallow — warmup is best-effort */
+        });
+    };
+    ping();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") ping();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
 
   // Speaker toggle — persisted across reloads so a family keeps their
   // chosen default. Start muted until the user clicks once, to stay on
@@ -1694,7 +1725,19 @@ function ChatPanel({
   // overlapped Avi" wall clock, and pair it with a hard
   // stop()/start() of the recognizer (see the combined effect
   // below) so the engine doesn't even hear him in the first place.
+  //
+  // Important: this is set to `now + ECHO_GRACE_MS` whenever Avi
+  // STOPS speaking, not when he starts. Setting it on the start
+  // edge made the window expire mid-clip on anything longer than
+  // ~700 ms (e.g. the new "Hi <name>, how can I help you?"
+  // greeting), which is exactly when we need it most.
   const wasSpeakingUntilRef = useRef(0);
+  // Tracks the previous value of `audio.isSpeaking` so the combined
+  // listening/speaking effect can detect the true→false transition
+  // and arm the post-speech echo-grace window from the correct
+  // moment. Plain `useRef` (not state) so updating it doesn't
+  // schedule another render.
+  const prevIsSpeakingRef = useRef(false);
 
   const isStreamingRef = useRef(false);
   useEffect(() => {
@@ -1883,68 +1926,13 @@ function ChatPanel({
       return;
     }
 
-    // Phase 2 — defer the LLM follow-up question. We give the user a
-    // few seconds of breathing room to ask their own question. If they
-    // type, speak, or send anything, ``cancelPendingFollowup`` is
-    // called from the relevant handler and this timer never fires.
-    if (!llmStatus?.available || !llmStatus.model_pulled) {
-      return;
-    }
-    cancelPendingFollowup("rescheduling");
-    followupTimerRef.current = setTimeout(() => {
-      followupTimerRef.current = null;
-      void runFollowup(personId);
-    }, GREETING_FOLLOWUP_DELAY_MS);
-  }
-
-  async function runFollowup(personId: number) {
-    // Sanity: the user might have started something the same tick the
-    // timer fired. The chat-stream guard catches the common case.
-    if (isStreamingRef.current) {
-      console.debug("[followup] suppressed — chat already streaming");
-      return;
-    }
-    const followupMsg: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "assistant",
-      content: "",
-      streaming: true,
-      meta: "thinking of a follow-up…",
-    };
-    appendMessage(followupMsg);
-    try {
-      const resp = await api.post<{
-        question: string;
-        goal_name: string | null;
-      }>("/api/aiassistant/followup", {
-        family_id: familyId,
-        person_id: personId,
-        live_session_id: liveSessionId,
-      });
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === followupMsg.id
-            ? {
-                ...m,
-                content: resp.question,
-                streaming: false,
-                meta: resp.goal_name
-                  ? `about your goal: ${resp.goal_name}`
-                  : undefined,
-              }
-            : m
-        )
-      );
-      audio.enqueue(resp.question, {
-        gender_hint: voiceGender,
-        messageId: followupMsg.id,
-      });
-    } catch (e) {
-      setMessages((prev) =>
-        prev.filter((m) => m.id !== followupMsg.id)
-      );
-      console.debug("Followup failed", e);
-    }
+    // Note: we deliberately do NOT chain an LLM-generated "how's your
+    // diet going?" follow-up here. The greeting itself ("Hi Sam, how
+    // can I help you?") is the prompt — Avi waits for the user to
+    // answer rather than ambushing them with a goal-specific question.
+    // The /api/aiassistant/followup endpoint and the cancel-on-typing
+    // hooks below are kept in place so we can re-enable this flow
+    // cheaply if we change our mind.
   }
 
   // Keep the ref pointed at the latest closure on every render.
@@ -2192,6 +2180,19 @@ function ChatPanel({
       restartTimer = window.setTimeout(() => {
         restartTimer = null;
         if (!shouldListenRef.current) return;
+        // Don't auto-restart the recognizer while Avi is speaking
+        // (or during the post-speech echo-grace window). The other
+        // effect that watches `audio.isSpeaking` owns re-arming us
+        // once Avi finishes, so bailing out here just prevents the
+        // engine from chewing on Avi's own voice for ~95% of the
+        // clip and racing onresult against the audio.isSpeaking
+        // ref that gates it.
+        if (
+          audioSpeakingRef.current ||
+          Date.now() < wasSpeakingUntilRef.current
+        ) {
+          return;
+        }
         try {
           rec.start();
         } catch {
@@ -2406,12 +2407,29 @@ function ChatPanel({
       }
     };
 
+    const wasSpeaking = prevIsSpeakingRef.current;
+    prevIsSpeakingRef.current = audio.isSpeaking;
+
     if (audio.isSpeaking) {
+      // Push the until-time out so onresult drops anything that
+      // sneaks through during this clip. We refresh it again on the
+      // false-edge below — that's the one that actually matters,
+      // since SR engine lookback can deliver Avi's tail syllables a
+      // beat AFTER playback ends.
       wasSpeakingUntilRef.current = Date.now() + ECHO_GRACE_MS;
       setInput("");
       stop();
       console.info("[speech] paused for TTS playback");
       return;
+    }
+
+    // Just transitioned from speaking → not speaking. Arm the
+    // echo-grace window from NOW so any audio still buffered in the
+    // SR engine's lookback (typically 300-500 ms) gets dropped
+    // instead of being submitted as a "user message" containing
+    // Avi's own last words.
+    if (wasSpeaking) {
+      wasSpeakingUntilRef.current = Date.now() + ECHO_GRACE_MS;
     }
 
     if (!listening) {

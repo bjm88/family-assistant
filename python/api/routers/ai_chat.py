@@ -228,6 +228,62 @@ async def status() -> StatusResponse:
     return StatusResponse(**info)  # type: ignore[arg-type]
 
 
+# ---------- Warmup --------------------------------------------------------
+
+
+class WarmupResponse(BaseModel):
+    """Outcome of a model-warmup request.
+
+    ``heavy`` / ``fast`` are the configured model tags (so the UI
+    can display *what* it warmed). ``heavy_loaded`` / ``fast_loaded``
+    are the boolean results of the underlying ``/api/generate``
+    ping — ``False`` means Ollama was down, the model wasn't pulled,
+    or the call exceeded its timeout. Errors are swallowed by
+    :func:`api.ai.ollama.warmup_model` so this endpoint never 5xxs.
+    """
+
+    heavy: str
+    fast: str
+    heavy_loaded: bool
+    fast_loaded: bool
+
+
+@router.post("/warmup", response_model=WarmupResponse)
+async def warmup() -> WarmupResponse:
+    """Pre-load both Gemma models on demand from the live page.
+
+    The lifespan startup task already warms the models when the
+    server boots (`api.main._lifespan` -> `_ollama_warmup`), but
+    Ollama unloads anything idle longer than the configured
+    ``keep_alive`` window. After lunch / overnight, the first chat
+    of the next session would otherwise pay the 3–4 s cold-load
+    cost again — exactly the failure mode the live-chat fast-ack
+    was designed to avoid.
+
+    Calling this endpoint when the AI Assistant page mounts
+    (and again whenever the user returns to it) re-pings both
+    models with ``keep_alive="1h"`` so they're hot before the
+    user even types. The work runs in parallel and the response
+    blocks until both pings finish, so the UI can show a clear
+    "models warm" indicator.
+
+    No DB session, no auth — pure Ollama plumbing.
+    """
+    heavy_tag = ollama._model()
+    fast_tag = ollama.fast_model()
+    heavy_loaded, fast_loaded = await asyncio.gather(
+        ollama.warmup_model(heavy_tag),
+        ollama.warmup_model(fast_tag),
+        return_exceptions=False,
+    )
+    return WarmupResponse(
+        heavy=heavy_tag,
+        fast=fast_tag,
+        heavy_loaded=bool(heavy_loaded),
+        fast_loaded=bool(fast_loaded),
+    )
+
+
 # ---------- Greet ---------------------------------------------------------
 
 
@@ -270,7 +326,7 @@ async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetRe
         return GreetResponse(
             family_id=payload.family_id,
             person_id=payload.person_id,
-            greeting=f"Hi {_display_name(person)}!",
+            greeting=f"Hi {_display_name(person)}, how can I help you?",
             used_model="template",
             context_preview=context,
         )
@@ -332,7 +388,7 @@ async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetRe
             context_preview=context,
         )
 
-    greeting = f"Hi {_display_name(person)}!"
+    greeting = f"Hi {_display_name(person)}, how can I help you?"
     live_session.log_message(
         db,
         session,
@@ -902,34 +958,44 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
                 await queue.put(("done", None))
 
         async def _ack_watchdog() -> None:
-            """Live-chat fast-ack: race the e2b call against the heavy agent.
+            """Live-chat fast-ack: heuristic instant + e2b upgrade.
 
-            Differs from the Telegram / SMS path in *when* the fast
-            model is invoked. Telegram waits
-            ``AI_FAST_ACK_AFTER_SECONDS`` before even starting the
-            ack call so simple replies don't trigger two outbound
-            messages on every turn. That works there because the ack
-            is a separate Telegram message — chatty is bad UX.
+            Two-stage delivery so the user always sees *something*
+            inside the bubble within ~10 ms, even if Ollama is busy
+            or the e2b model is cold:
 
-            On the live page, the ack lives *inside* the same
-            assistant bubble (rendered as a placeholder, replaced the
-            moment the real reply arrives), so there's no spam cost
-            and we want it to land as soon as humanly possible. We
-            therefore fire the e2b call *immediately*, in parallel
-            with the heavy agent, and emit only if the fast model
-            wins the race.
+            1.  Emit a keyword-matched heuristic ack
+                (``heuristic_ack``) immediately. This is pure Python
+                — no model call — and slots into the bubble before
+                the heavy agent has even started loading its prompt.
+            2.  Fire the contextual e2b call in parallel with the
+                heavy agent. If e2b returns *first*, push it as a
+                second ``fast_ack`` event; the UI just replaces the
+                heuristic placeholder with the better wording. If
+                the heavy agent wins, the e2b result is discarded
+                silently (the user already moved past the
+                placeholder when the real content streamed in).
 
-            This also dodges a real serialisation issue we hit in the
-            previous design: if Ollama queues the e2b request behind
-            the in-flight 26b request, by the time the ack came back
-            the heavy delta had already arrived and we'd silently
-            drop it — exactly the symptom of "live chat doesn't show
-            a quick response".
+            This dodges the previous failure mode: the e2b call
+            often gets queued behind the in-flight 26b request, so
+            by the time the contextual ack came back the heavy
+            delta had already arrived and we'd silently drop it.
+            With the heuristic stage, the user always gets visible
+            text fast — the e2b stage is just polish.
 
-            Telegram and SMS keep the 3s threshold via
+            Telegram and SMS keep the 3 s threshold via
             ``generate_contextual_ack_sync``; nothing here changes
             their behaviour.
             """
+            instant = fast_ack.heuristic_ack(latest_user_content)
+            if instant and not first_delta_seen.is_set():
+                await queue.put(("fast_ack", instant))
+                logger.info(
+                    "Live chat fast-ack: heuristic emitted for task=%s "
+                    "text=%r (e2b upgrade pending)",
+                    task_id,
+                    instant,
+                )
             try:
                 ack_text = await fast_ack.generate_contextual_ack_async(
                     surface="chat",
@@ -943,17 +1009,17 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
                 return
             if not ack_text:
                 logger.info(
-                    "Live chat fast-ack returned no text for task=%s "
-                    "(model not pulled, timeout, or feature off)",
+                    "Live chat fast-ack: e2b returned no text for task=%s "
+                    "(cold timeout, model not pulled, or feature off) — "
+                    "leaving the heuristic placeholder in place",
                     task_id,
                 )
                 return
             if first_delta_seen.is_set() or agent_finished.is_set():
-                # Heavy reply already landed — emitting now would
-                # just flicker. Log so we can see when this happens.
                 logger.info(
-                    "Live chat fast-ack ready but heavy agent already "
-                    "finished for task=%s — dropping ack to avoid flicker",
+                    "Live chat fast-ack: e2b text ready for task=%s but "
+                    "heavy agent already finished — keeping heuristic "
+                    "and skipping upgrade to avoid flicker",
                     task_id,
                 )
                 return

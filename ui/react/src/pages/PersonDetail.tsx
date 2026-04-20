@@ -67,6 +67,7 @@ type PersonForm = {
   work_phone_number?: string;
   interests_and_activities?: string;
   notes?: string;
+  ai_can_write_calendar?: boolean;
 };
 
 export default function PersonDetail() {
@@ -98,6 +99,7 @@ export default function PersonDetail() {
         work_phone_number: person.work_phone_number ?? "",
         interests_and_activities: person.interests_and_activities ?? "",
         notes: person.notes ?? "",
+        ai_can_write_calendar: person.ai_can_write_calendar ?? false,
       });
     }
   }, [person, reset]);
@@ -309,6 +311,25 @@ export default function PersonDetail() {
               <div className="col-span-2">
                 <Field label="Notes" htmlFor="notes">
                   <textarea id="notes" className="input" rows={3} {...register("notes")} />
+                </Field>
+              </div>
+              <div className="col-span-2">
+                <Field
+                  label="Allow Avi to add calendar events"
+                  htmlFor="ai_can_write_calendar"
+                  hint="When on, Avi can add holds, reminders, and blocks of time to this person's personal Google calendar via voice or chat (e.g. 'add a hold on my calendar next Tuesday at 2pm'). Requires the calendar to ALSO be shared with the assistant's Google account with 'Make changes to events' permission. Defaults to off — only the person themselves can ask Avi to write to their calendar."
+                >
+                  <label className="inline-flex items-center gap-2 cursor-pointer">
+                    <input
+                      id="ai_can_write_calendar"
+                      type="checkbox"
+                      className="h-4 w-4"
+                      {...register("ai_can_write_calendar")}
+                    />
+                    <span className="text-sm text-muted-foreground">
+                      Avi may add events to this person's calendar
+                    </span>
+                  </label>
                 </Field>
               </div>
               <div className="col-span-2 flex justify-between items-center">

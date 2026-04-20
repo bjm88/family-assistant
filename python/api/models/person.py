@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import date
 from typing import List, Optional
 
-from sqlalchemy import BigInteger, Date, ForeignKey, String, Text
+from sqlalchemy import BigInteger, Boolean, Date, ForeignKey, String, Text
+from sqlalchemy.sql import false as sql_false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..db import Base
@@ -111,6 +112,22 @@ class Person(Base, TimestampMixin):
             "Filesystem path (relative to FA_STORAGE_ROOT) of the person's "
             "current profile photo. Also used as a training anchor for face "
             "recognition by the Avi assistant."
+        ),
+    )
+
+    ai_can_write_calendar: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=sql_false(),
+        comment=(
+            "Per-person consent: when true, the AI assistant is "
+            "permitted to add events (holds, reminders, blocks) to "
+            "this person's personal Google calendar via the "
+            "calendar_create_event tool. Requires the calendar to "
+            "ALSO be shared with the assistant's Google account "
+            "with edit permission — this flag is the in-app consent "
+            "half of that pair."
         ),
     )
 

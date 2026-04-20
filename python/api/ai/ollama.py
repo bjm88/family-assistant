@@ -115,6 +115,80 @@ async def generate_with_fallback(
         return text_value, fb
 
 
+async def warmup_model(
+    model: str,
+    *,
+    keep_alive: str = "1h",
+    timeout_seconds: float = 90.0,
+) -> bool:
+    """Force-load ``model`` into Ollama and pin it in memory.
+
+    Why this exists
+    ---------------
+    A cold Ollama model takes 1–10 s just to mmap into VRAM before it
+    can produce a single token. That cold-start is the dominant cause
+    of the *"the live-chat fast-ack didn't fire"* class of bugs:
+    `gemma4:e2b` is the lightweight ack model, but if the very first
+    chat of the day arrives while e2b is unloaded, the ack call needs
+    ~3–4 s just to load the weights — easily exceeding the
+    :setting:`AI_FAST_ACK_TIMEOUT_SECONDS` cap and silently dropping
+    the ack.
+
+    Sending ``num_predict=0`` with a one-word prompt makes Ollama
+    load the model and immediately return without doing real
+    inference. Combined with ``keep_alive="1h"`` (vs. the default
+    5 min) it stays resident across long quiet periods so the next
+    real call is instant.
+
+    Returns ``True`` on success; ``False`` if Ollama is unreachable
+    or the model isn't pulled. Never raises — callers (lifespan
+    startup) treat warmup as best-effort.
+    """
+    payload: Dict[str, object] = {
+        "model": model,
+        "prompt": "ok",
+        "stream": False,
+        "keep_alive": keep_alive,
+        "options": {"num_predict": 1, "temperature": 0.0},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            r = await client.post(f"{_base()}/api/generate", json=payload)
+    except httpx.ConnectError as exc:
+        logger.warning(
+            "Ollama warmup: %s is not responding (%s) — skipping warmup",
+            _base(),
+            exc,
+        )
+        return False
+    except httpx.TimeoutException:
+        logger.warning(
+            "Ollama warmup: %r exceeded %.0fs while loading — skipping",
+            model,
+            timeout_seconds,
+        )
+        return False
+    if r.status_code == 404:
+        logger.warning(
+            "Ollama warmup: model %r is not pulled. Run `ollama pull %s`.",
+            model,
+            model,
+        )
+        return False
+    if r.status_code >= 400:
+        logger.warning(
+            "Ollama warmup: %r returned %s: %s",
+            model,
+            r.status_code,
+            r.text[:200],
+        )
+        return False
+    logger.info(
+        "Ollama warmup: model %r loaded and pinned for %s", model, keep_alive
+    )
+    return True
+
+
 async def health() -> Dict[str, object]:
     """Report whether Ollama is reachable and whether the model is pulled."""
     out: Dict[str, object] = {
@@ -504,6 +578,7 @@ __all__ = [
     "health",
     "sync_health",
     "system_prompt_for_avi",
+    "warmup_model",
 ]
 
 

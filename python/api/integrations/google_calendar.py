@@ -65,6 +65,35 @@ class CalendarNotShared(CalendarError):
         self.reason = reason
 
 
+class CalendarReadOnly(CalendarError):
+    """Raised when the assistant has read-only access to a calendar.
+
+    Two distinct underlying causes both end up here so the agent can
+    give the same actionable answer regardless of which one tripped:
+
+    * The OAuth token only carries ``calendar.readonly`` scope (the
+      household connected before we upgraded to ``calendar.events``).
+      Fix: disconnect + reconnect Google on the AI Assistant
+      settings page.
+    * The calendar IS shared with the assistant but only with
+      "See all event details" / read-only permission, not "Make
+      changes to events". Fix: open the calendar's *Share with
+      specific people* settings in Google Calendar and re-share
+      with edit permission.
+
+    The agent's error message mentions both fixes since we can't
+    always tell which one applies from a single 403.
+    """
+
+    def __init__(self, calendar_id: str, detail: str = "") -> None:
+        suffix = f" — {detail}" if detail else ""
+        super().__init__(
+            f"Avi has read-only access to {calendar_id!r}{suffix}."
+        )
+        self.calendar_id = calendar_id
+        self.detail = detail
+
+
 @dataclass(frozen=True)
 class CalendarEvent:
     event_id: str
@@ -74,6 +103,12 @@ class CalendarEvent:
     end: str
     location: Optional[str] = None
     organizer_email: Optional[str] = None
+    # Web link Google generates for the event (e.g.
+    # https://www.google.com/calendar/event?eid=...). Surfaced by
+    # ``create_event`` so the agent can include a "you can find it
+    # here" link in its confirmation reply. Read paths leave this
+    # ``None`` since they don't need it.
+    html_link: Optional[str] = None
 
 
 def _service(creds: Credentials):
@@ -455,6 +490,129 @@ def events_for_calendar(
         )
     out.sort(key=lambda x: x.start)
     return out
+
+
+def create_event(
+    creds: Credentials,
+    *,
+    calendar_id: str,
+    summary: str,
+    start: datetime,
+    end: datetime,
+    description: Optional[str] = None,
+    location: Optional[str] = None,
+    timezone_name: Optional[str] = None,
+    send_updates: str = "none",
+) -> CalendarEvent:
+    """Insert a new event on ``calendar_id``.
+
+    Used by the ``calendar_create_event`` agent tool to honour
+    requests like "add a hold on my calendar next Tuesday at 2 pm".
+    The two consent gates (per-person ``ai_can_write_calendar``
+    flag in our DB AND a Google-side share with edit permission)
+    are enforced upstream; this function just performs the actual
+    insert and translates Google's error surface into our
+    typed-exception hierarchy.
+
+    Parameters
+    ----------
+    calendar_id:
+        The Google calendar to insert into. Typically the household
+        member's personal email address (their primary calendar id).
+    summary, description, location:
+        Free-form strings forwarded to Google. ``summary`` is the
+        event title shown in their calendar; ``description`` carries
+        the longer note Avi captures from the user's request.
+    start, end:
+        Timezone-aware ``datetime``s. We send them as RFC3339
+        timestamps; if a naive ``datetime`` slips through we treat
+        it as UTC to avoid silently shifting the time.
+    timezone_name:
+        IANA timezone the user thought in (e.g. ``"America/Los_Angeles"``).
+        Google stores it on the event so recurring / "next week" math
+        anchored to local time stays correct on the user's phone.
+        Optional; falls back to the ``start`` datetime's tzinfo name
+        when omitted.
+    send_updates:
+        Forwarded to Google Calendar's ``sendUpdates`` query param.
+        Default ``"none"`` because holds rarely warrant an email
+        blast — pass ``"all"`` for invites that need to actually
+        notify attendees.
+
+    Errors
+    ------
+    * :class:`CalendarNotShared` — Google returned 404 (the
+      calendar isn't shared with us at all).
+    * :class:`CalendarReadOnly` — Google returned 403 with an
+      ``insufficient_scope`` / ``forbiddenForServiceAccounts`` /
+      "writer access" style payload. Either the OAuth token is
+      stuck on the legacy read-only scope, or the calendar share
+      is read-only.
+    * :class:`CalendarError` — anything else.
+    """
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    tz_name = timezone_name
+    if not tz_name:
+        # Use the start datetime's named tz when present; tzname()
+        # returns e.g. "PDT" or "+00:00" depending on platform, both
+        # of which Google accepts.
+        tz_name = start.tzname() or "UTC"
+
+    body: dict = {
+        "summary": (summary or "Untitled event").strip(),
+        "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
+        "end": {"dateTime": end.isoformat(), "timeZone": tz_name},
+    }
+    if description:
+        body["description"] = description.strip()
+    if location:
+        body["location"] = location.strip()
+
+    try:
+        svc = _service(creds)
+        ev = (
+            svc.events()
+            .insert(
+                calendarId=calendar_id,
+                body=body,
+                sendUpdates=send_updates,
+            )
+            .execute()
+        )
+    except HttpError as exc:
+        status = getattr(exc.resp, "status", None) if exc.resp else None
+        # 404 → calendar isn't visible at all.
+        if status == 404:
+            raise CalendarNotShared(
+                calendar_id, reason="http_404"
+            ) from exc
+        # 403 covers BOTH "insufficient_scope" (token is read-only)
+        # and "forbiddenForReadOnlyAccess" (the share itself is
+        # read-only). Surface a single typed error and let the
+        # caller render guidance for both fixes.
+        if status == 403:
+            raise CalendarReadOnly(
+                calendar_id, detail=_summarise_http_error(exc)
+            ) from exc
+        raise CalendarError(_summarise_http_error(exc)) from exc
+
+    s = ev.get("start", {})
+    e = ev.get("end", {})
+    organizer = ev.get("organizer", {}) or {}
+    return CalendarEvent(
+        event_id=ev.get("id", ""),
+        calendar_id=calendar_id,
+        summary=ev.get("summary", body["summary"]),
+        start=s.get("dateTime") or s.get("date") or "",
+        end=e.get("dateTime") or e.get("date") or "",
+        location=ev.get("location"),
+        organizer_email=organizer.get("email"),
+        html_link=ev.get("htmlLink"),
+    )
 
 
 def find_free_slots(
