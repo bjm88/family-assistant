@@ -1061,6 +1061,145 @@ def _default_scopes() -> tuple[str, ...]:
     return google_oauth.DEFAULT_SCOPES
 
 
+async def check_telegram_api() -> StatusCheck:
+    """Verify the Telegram Bot API is reachable and the token is valid.
+
+    Calls ``getMe`` (cheap, free, idempotent) and reports the bot's
+    identity. We deliberately do NOT poke ``getUpdates`` from here —
+    it would steal the next update from the live inbox poller and
+    create exactly one missed message. ``getMe`` is the canonical
+    "is the token alive" probe and is what BotFather itself uses.
+
+    The summary surfaces the configured long-poll window so the
+    occasional ``Telegram getUpdates failed: transport error: The
+    read operation timed out`` warning in the backend log can be
+    cross-referenced against it without grepping config: a 25 s
+    long-poll riding a 35 s httpx budget naturally races a flaky
+    LTE / Wi-Fi link every once in a while, the poller already
+    backs off + retries, and that warning is benign as long as
+    *this* check stays green.
+    """
+    settings = get_settings()
+    token = settings.TELEGRAM_BOT_TOKEN
+
+    if not token:
+        return StatusCheck(
+            key="telegram_api",
+            label="Telegram Bot API",
+            status="unknown",
+            summary="TELEGRAM_BOT_TOKEN not set in .env.",
+            detail={
+                "inbound_enabled": settings.AI_TELEGRAM_INBOUND_ENABLED,
+            },
+            hint=(
+                "Create a bot with @BotFather, copy the token, and add "
+                "TELEGRAM_BOT_TOKEN=… to .env. Restart the backend so "
+                "the inbox long-poll loop picks it up."
+            ),
+        )
+
+    if not settings.AI_TELEGRAM_INBOUND_ENABLED:
+        return StatusCheck(
+            key="telegram_api",
+            label="Telegram Bot API",
+            status="degraded",
+            summary="Token configured but inbound poller is disabled.",
+            detail={
+                "inbound_enabled": False,
+                "longpoll_seconds": settings.AI_TELEGRAM_LONGPOLL_SECONDS,
+            },
+            hint=(
+                "Set AI_TELEGRAM_INBOUND_ENABLED=true in .env to start the "
+                "long-poll loop on next backend restart."
+            ),
+        )
+
+    # Local import keeps the orchestrator import-cheap. The integration
+    # module pulls in dataclasses + httpx defaults that nothing else on
+    # the status page needs.
+    from ..integrations import telegram
+
+    started = _now_ms()
+    try:
+        identity = await asyncio.wait_for(
+            asyncio.to_thread(telegram.get_me, token, timeout_seconds=6.0),
+            timeout=8.0,
+        )
+    except asyncio.TimeoutError:
+        return StatusCheck(
+            key="telegram_api",
+            label="Telegram Bot API",
+            status="down",
+            latency_ms=round(_now_ms() - started, 1),
+            summary="getMe timed out after 8 s.",
+            detail={
+                "longpoll_seconds": settings.AI_TELEGRAM_LONGPOLL_SECONDS,
+            },
+            hint=(
+                "Either the network is blocking api.telegram.org or "
+                "Telegram is having an outage — check "
+                "https://downdetector.com/status/telegram/."
+            ),
+        )
+    except telegram.TelegramReadError as exc:
+        # Distinguish "Telegram says no" (token invalid / revoked /
+        # bot deleted) from "we can't reach Telegram at all" (DNS,
+        # firewall, captive portal). Both are 'down', but the hints
+        # are very different.
+        msg = str(exc)
+        is_transport = msg.startswith("transport error")
+        if is_transport:
+            hint = (
+                "Verify outbound HTTPS to api.telegram.org works "
+                "(`curl -sS https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getMe`). "
+                "DNS, firewall, or captive portal usually."
+            )
+        elif "401" in msg or "Unauthorized" in msg:
+            hint = (
+                "Token rejected. Re-issue with @BotFather → /token, "
+                "paste the new value into TELEGRAM_BOT_TOKEN in .env, "
+                "then restart the backend."
+            )
+        else:
+            hint = (
+                "See backend logs for the full error. Common causes: "
+                "rate-limit (429), bot deleted, or Telegram outage."
+            )
+        return StatusCheck(
+            key="telegram_api",
+            label="Telegram Bot API",
+            status="down",
+            latency_ms=round(_now_ms() - started, 1),
+            summary=f"getMe failed: {msg[:120]}",
+            detail={
+                "error": msg,
+                "longpoll_seconds": settings.AI_TELEGRAM_LONGPOLL_SECONDS,
+                "token_suffix": f"…{token[-6:]}" if len(token) > 6 else "(short)",
+            },
+            hint=hint,
+        )
+
+    latency = round(_now_ms() - started, 1)
+    handle = f"@{identity.username}" if identity.username else "(no @username set)"
+    return StatusCheck(
+        key="telegram_api",
+        label="Telegram Bot API",
+        status="ok",
+        latency_ms=latency,
+        summary=f"{handle} reachable in {int(latency)} ms",
+        detail={
+            "bot_user_id": identity.user_id,
+            "bot_username": identity.username,
+            "bot_first_name": identity.first_name,
+            "inbound_enabled": True,
+            "longpoll_seconds": settings.AI_TELEGRAM_LONGPOLL_SECONDS,
+            "max_per_tick": settings.AI_TELEGRAM_INBOX_MAX_PER_TICK,
+            "auto_link_by_phone": settings.AI_TELEGRAM_AUTO_LINK_BY_PHONE,
+            "token_suffix": f"…{token[-6:]}" if len(token) > 6 else "(short)",
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -1078,6 +1217,7 @@ _CHECK_REGISTRY: list[tuple[str, str, Callable[[], Awaitable[StatusCheck]]]] = [
     ("ai_agent", "AI agent", check_ai_agent),
     ("gemini_api", "Gemini API", check_gemini_api),
     ("google_apis", "Google APIs (Gmail + Calendar)", check_google_apis),
+    ("telegram_api", "Telegram Bot API", check_telegram_api),
     ("ngrok_local", "ngrok agent", check_ngrok_local),
     ("ngrok_public", "ngrok public URL", check_ngrok_public),
     ("ui", "React UI", check_ui),
