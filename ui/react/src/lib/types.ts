@@ -351,6 +351,10 @@ export type TaskPriority =
   | "future_idea";
 export type TaskCommentAuthorKind = "person" | "assistant";
 export type TaskAttachmentKind = "photo" | "pdf" | "document" | "other";
+export type TaskOwnerKind = "human" | "ai";
+export type TaskKind = "todo" | "monitoring";
+export type TaskLastRunStatus = "ok" | "error" | "running";
+export type TaskLinkAddedByKind = "assistant" | "person";
 
 export interface Task {
   task_id: number;
@@ -367,9 +371,23 @@ export interface Task {
   completed_at: string | null;
   created_at: string;
   updated_at: string;
+  // Monitoring + ownership extensions. owner_kind and task_kind are
+  // ALWAYS present (server defaults to human/todo); the cron + run-state
+  // fields are populated only for monitoring tasks but the type lists
+  // them on every Task for ergonomics — clients null-check.
+  owner_kind: TaskOwnerKind;
+  task_kind: TaskKind;
+  cron_schedule: string | null;
+  cron_description: string | null;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_run_status: TaskLastRunStatus | null;
+  last_run_error: string | null;
+  monitoring_paused: boolean;
   follower_count: number;
   comment_count: number;
   attachment_count: number;
+  link_count: number;
 }
 
 export interface TaskComment {
@@ -400,10 +418,22 @@ export interface TaskAttachment {
   created_at: string;
 }
 
+export interface TaskLink {
+  task_link_id: number;
+  task_id: number;
+  url: string;
+  title: string | null;
+  summary: string | null;
+  added_by_kind: TaskLinkAddedByKind;
+  added_by_person_id: number | null;
+  created_at: string;
+}
+
 export interface TaskDetail extends Task {
   followers: TaskFollower[];
   comments: TaskComment[];
   attachments: TaskAttachment[];
+  links: TaskLink[];
 }
 
 export interface DocumentRecord {

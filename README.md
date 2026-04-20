@@ -232,7 +232,8 @@ sequenceDiagram
 | Heavy chat model | **`gemma4:26b`** via Ollama | Tool-using agent, multi-turn reasoning. Default for every surface. |
 | Fast model | **`gemma4:e2b`** via Ollama (`/api/chat`, `think: false`) | 1-sentence contextual acknowledgments inside the 3-second race window so push surfaces never sit silent. |
 | Agent loop | `ai/agent.py` | Plan/execute/observe loop, async generator that yields `task_started · step · delta · task_completed · task_failed` events to the SSE channel and writes one `agent_steps` row per emission. |
-| Tool registry | `ai/tools.py` | 16 callable tools: `sql_query`, `lookup_person`, `reveal_sensitive_identifier`, `reveal_secret`, `gmail_send`, `calendar_list_upcoming`, `calendar_check_availability`, `calendar_find_free_slots`, `calendar_list_for_person`, `task_create / list / get / update / add_comment / add_follower`, `telegram_invite`. Each is a `Tool(name, description, parameters, handler, timeout, requires)`. |
+| Tool registry | `ai/tools.py` | 19 callable tools: `sql_query`, `lookup_person`, `reveal_sensitive_identifier`, `reveal_secret`, `gmail_send`, `calendar_list_upcoming`, `calendar_check_availability`, `calendar_find_free_slots`, `calendar_list_for_person`, `task_create / list / get / update / add_comment / add_follower / set_schedule / attach_link`, `web_search`, `telegram_invite`. Each is a `Tool(name, description, parameters, handler, timeout, requires)`. |
+| Monitoring scheduler | `services/monitoring_scheduler.py` | Single-process `asyncio` loop launched in the FastAPI lifespan. Every `AI_MONITORING_TICK_SECONDS` it scans for `owner_kind='ai'` + `task_kind='monitoring'` rows whose `next_run_at` has elapsed, claims them under a row lock, advances `next_run_at` from the cron schedule (interpreted in `families.timezone`), and dispatches the run through the shared agent background pool. Monitoring runs use `AI_OLLAMA_THINKING_MODEL` with Ollama's `think:true` reasoning flag and have `web_search` available (Brave or Tavily, gated by `FA_SEARCH_PROVIDER`). |
 | SQL sandbox | `ai/sql_tool.py` | Read-only Postgres role + statement-level guard; the model can write SELECTs against `llm_schema_catalog` without touching ciphertext. |
 | Authz scope | `ai/authz.py` | Per-speaker access policy (self / spouse / parent / child / unauthorized) injected into every system prompt and re-checked inside sensitive tools. |
 | RAG context | `ai/rag.py` · `ai/prompts.py` · `ai/schema_catalog.py` | Builds the household overview (people, goals, vehicles, residences, accounts) and the dynamic schema dump that lets the model write SQL on the fly. |
@@ -466,8 +467,32 @@ GEMINI_PROJECT_ID=
 # Local AI assistant (Avi)
 AI_OLLAMA_HOST=http://localhost:11434
 AI_OLLAMA_MODEL=gemma4:26b
+# Optional: separate, beefier model used for Avi's monitoring runs
+# (deep-thinking research). Defaults to AI_OLLAMA_MODEL when unset.
+AI_OLLAMA_THINKING_MODEL=
+AI_OLLAMA_THINKING_ENABLED=true
 AI_FACE_MATCH_THRESHOLD=0.40
 AI_MAC_STUDIO_OPTIMIZED=true
+
+# AI monitoring scheduler (owner_kind=ai + task_kind=monitoring)
+AI_MONITORING_ENABLED=true
+AI_MONITORING_TICK_SECONDS=30
+AI_MONITORING_DEFAULT_CRON=0 9 * * *      # daily at 09:00 family-tz
+AI_MONITORING_RUN_TIMEOUT_SECONDS=600
+
+# Web search for monitoring runs.
+#   "gemini" (default) — uses GEMINI_API_KEY above + Gemini's
+#                        google_search tool grounding; returns a
+#                        synthesised, citation-backed answer that
+#                        the local Gemma then re-reads with family
+#                        context to produce the task comment.
+#   "brave"  — classic SERP API (free tier 2k/mo); set BRAVE_SEARCH_API_KEY.
+#   "tavily" — AI-tuned SERP w/ page extracts;       set TAVILY_API_KEY.
+#   ""       — disable web search entirely.
+FA_SEARCH_PROVIDER=gemini
+BRAVE_SEARCH_API_KEY=
+TAVILY_API_KEY=
+AI_WEB_SEARCH_DEFAULT_LIMIT=5
 
 # Text-to-speech (Kokoro-82M). First `/tts` call lazy-downloads ~330 MB.
 AI_TTS_ENABLED=true
@@ -666,8 +691,12 @@ Tables today, grouped by domain:
   `telegram_inbox_attachments`.
 - **Telegram onboarding** — `telegram_invites` (deep-link claims),
   `telegram_contact_verifications` (SMS-2FA for contact-share linking).
-- **Tasks (kanban)** — `tasks`, `task_comments`, `task_followers`,
-  `task_attachments`.
+- **Tasks (kanban + monitoring)** — `tasks` (carries `owner_kind` ∈
+  `{human, ai}`, `task_kind` ∈ `{todo, monitoring}`, plus
+  `cron_schedule` / `next_run_at` / `last_run_*` /
+  `monitoring_paused` for AI-owned standing jobs), `task_comments`,
+  `task_followers`, `task_attachments`, `task_links` (URL citations
+  added by Avi during monitoring runs).
 - **Agent audit** — `agent_tasks`, `agent_steps`.
 - **External-service credentials** — `google_oauth_credentials`
   (Fernet-encrypted refresh tokens for Gmail + Calendar).
@@ -743,7 +772,7 @@ family-assistant/
 │           ├── MedicalPage, MedicationsPage, PhysiciansPage
 │           ├── PetsPage, ResidencesPage, VehiclesPage
 │           ├── InsurancePoliciesPage, FinancialAccountsPage, DocumentsPage
-│           ├── TasksPage, AgentTasksPage   (kanban + agent run audit)
+│           ├── TasksPage, AgentTasksPage   (kanban "todo" + AI "monitoring" tabs + agent run audit)
 │           ├── AssistantPage               (admin Avi config + Google OAuth)
 │           └── AiAssistantPage             (live /aiassistant/:familyId)
 ├── docs/                          long-form docs (DATA_MODEL.md, ...)

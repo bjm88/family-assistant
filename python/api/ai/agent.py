@@ -162,6 +162,8 @@ async def run_agent(
     registry: tools.ToolRegistry,
     capabilities: set[str],
     max_steps: int = DEFAULT_MAX_STEPS,
+    model_override: Optional[str] = None,
+    think: Optional[bool] = None,
 ) -> AsyncIterator[AgentEvent]:
     """Drive a single agent task to completion, yielding SSE events.
 
@@ -196,7 +198,7 @@ async def run_agent(
             payload={
                 "task_id": task.agent_task_id,
                 "tools": tool_names_for_log,
-                "model": ollama._model(),
+                "model": model_override or ollama._model(),
             },
         )
 
@@ -222,7 +224,11 @@ async def run_agent(
 
         step_index = 0
         final_text: str = ""
-        primary_model = ollama._model()
+        # ``model_override`` lets specialised callers (e.g. the
+        # monitoring scheduler) point one run at the dedicated
+        # AI_OLLAMA_THINKING_MODEL without changing the conversational
+        # default for the rest of the surface area.
+        primary_model = model_override or ollama._model()
 
         for cycle in range(max_steps):
             cycle_started = time.monotonic()
@@ -233,6 +239,7 @@ async def run_agent(
                     system=system_prompt,
                     model=primary_model,
                     timeout_seconds=DEFAULT_LLM_TIMEOUT_S,
+                    think=think,
                 )
             except ollama.OllamaUnavailable as exc:
                 step = _append_step(

@@ -31,7 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .ai import ollama as ai_ollama
 from .config import get_settings
-from .services import email_inbox, telegram_inbox
+from .services import email_inbox, monitoring_scheduler, telegram_inbox
 
 
 # Wire up Python logging the FIRST thing we do, so every ``logger.info``
@@ -124,6 +124,17 @@ async def _lifespan(app: FastAPI):
         logging.getLogger(__name__).info(
             "Telegram inbox loop disabled via AI_TELEGRAM_INBOUND_ENABLED=false"
         )
+
+    # Avi's standing research jobs (AI-owned monitoring tasks). Always
+    # safe to start — the scheduler short-circuits inside its tick if
+    # AI_MONITORING_ENABLED is false, so we don't need a parallel
+    # gate at the lifespan level.
+    background_tasks.append(
+        asyncio.create_task(
+            monitoring_scheduler.run_monitoring_loop(stop_event),
+            name="monitoring_scheduler",
+        )
+    )
 
     # Pre-warm both Ollama models so the first chat doesn't pay the
     # 1–10 s cold-load cost. The fast (e2b) ack model is the more

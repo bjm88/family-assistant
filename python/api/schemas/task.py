@@ -24,6 +24,10 @@ TaskStatus = Literal["new", "in_progress", "finalizing", "done"]
 TaskPriority = Literal["urgent", "high", "normal", "low", "future_idea"]
 TaskCommentAuthorKind = Literal["person", "assistant"]
 TaskAttachmentKind = Literal["photo", "pdf", "document", "other"]
+TaskOwnerKind = Literal["human", "ai"]
+TaskKind = Literal["todo", "monitoring"]
+TaskLastRunStatus = Literal["ok", "error", "running"]
+TaskLinkAddedByKind = Literal["assistant", "person"]
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +79,25 @@ class TaskAttachmentRead(OrmModel):
     created_at: datetime
 
 
+class TaskLinkRead(OrmModel):
+    task_link_id: int
+    task_id: int
+    url: str
+    title: Optional[str]
+    summary: Optional[str]
+    added_by_kind: TaskLinkAddedByKind
+    added_by_person_id: Optional[int]
+    created_at: datetime
+
+
+class TaskLinkCreate(BaseModel):
+    url: str = Field(..., min_length=1, max_length=2000)
+    title: Optional[str] = Field(default=None, max_length=500)
+    summary: Optional[str] = None
+    added_by_kind: TaskLinkAddedByKind = "person"
+    added_by_person_id: Optional[int] = None
+
+
 # ---------------------------------------------------------------------------
 # Task itself
 # ---------------------------------------------------------------------------
@@ -89,6 +112,20 @@ class TaskBase(BaseModel):
     start_date: Optional[date] = None
     desired_end_date: Optional[date] = None
     end_date: Optional[date] = None
+    # Owner / shape — defaults match the original kanban behaviour so
+    # existing clients don't need to send these.
+    owner_kind: TaskOwnerKind = "human"
+    task_kind: TaskKind = "todo"
+    cron_schedule: Optional[str] = Field(
+        default=None,
+        max_length=120,
+        description=(
+            "Standard 5-field cron expression. Required when "
+            "owner_kind='ai' AND task_kind='monitoring' — the API "
+            "fills the configured default if omitted."
+        ),
+    )
+    monitoring_paused: bool = False
 
 
 class TaskCreate(TaskBase):
@@ -115,6 +152,10 @@ class TaskUpdate(BaseModel):
     start_date: Optional[date] = None
     desired_end_date: Optional[date] = None
     end_date: Optional[date] = None
+    owner_kind: Optional[TaskOwnerKind] = None
+    task_kind: Optional[TaskKind] = None
+    cron_schedule: Optional[str] = Field(default=None, max_length=120)
+    monitoring_paused: Optional[bool] = None
 
 
 class TaskRead(OrmModel):
@@ -132,11 +173,29 @@ class TaskRead(OrmModel):
     completed_at: Optional[datetime]
     created_at: datetime
     updated_at: datetime
+    # ------ Owner / monitoring fields ------
+    owner_kind: TaskOwnerKind = "human"
+    task_kind: TaskKind = "todo"
+    cron_schedule: Optional[str] = None
+    cron_description: Optional[str] = Field(
+        default=None,
+        description=(
+            "Human-readable rendering of cron_schedule (e.g. 'At 09:00 "
+            "AM, every day'), produced by the `cron-descriptor` library "
+            "in the API layer. Always None on non-monitoring tasks."
+        ),
+    )
+    next_run_at: Optional[datetime] = None
+    last_run_at: Optional[datetime] = None
+    last_run_status: Optional[TaskLastRunStatus] = None
+    last_run_error: Optional[str] = None
+    monitoring_paused: bool = False
     # Counts so list views can render "3 comments · 1 attachment" without
     # an N+1 round trip. The router populates these when serialising.
     follower_count: int = 0
     comment_count: int = 0
     attachment_count: int = 0
+    link_count: int = 0
 
 
 class TaskDetail(TaskRead):
@@ -145,3 +204,25 @@ class TaskDetail(TaskRead):
     followers: List[TaskFollowerRead] = []
     comments: List[TaskCommentRead] = []
     attachments: List[TaskAttachmentRead] = []
+    links: List[TaskLinkRead] = []
+
+
+class TaskScheduleUpdate(BaseModel):
+    """Payload for the dedicated schedule-edit endpoint.
+
+    Kept separate from :class:`TaskUpdate` so the UI can PATCH
+    ``cron_schedule`` and have the API atomically recompute
+    ``next_run_at`` (and validate the cron string) without the caller
+    having to know the cron-helpers contract.
+    """
+
+    cron_schedule: Optional[str] = Field(
+        default=None,
+        max_length=120,
+        description=(
+            "New cron expression. Validated server-side; an invalid "
+            "string returns 422. Setting to NULL pauses auto-runs by "
+            "clearing next_run_at."
+        ),
+    )
+    monitoring_paused: Optional[bool] = None

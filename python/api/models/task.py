@@ -31,6 +31,7 @@ from typing import List, Optional
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -66,6 +67,25 @@ TASK_COMMENT_AUTHOR_KINDS = ("person", "assistant")
 # document chip" hint the UI needs.
 TASK_ATTACHMENT_KINDS = ("photo", "pdf", "document", "other")
 
+# Who is accountable for moving a task forward. Most tasks are owned
+# by a person on the household ("human_task"); standing research /
+# monitoring jobs are owned by the assistant itself ("ai_task") which
+# is what flips a task into the cron-driven background pipeline.
+TASK_OWNER_KINDS = ("human", "ai")
+
+# Coarse shape of the task. "todo" is the classic kanban card; nothing
+# changes about how it behaves. "monitoring" is an AI-owned standing
+# job: a cron schedule, an LLM-driven research loop that posts its
+# findings as comments + links, and a separate UI tab so it doesn't
+# clutter the kanban board.
+TASK_KINDS = ("todo", "monitoring")
+
+# Outcome of the most recent monitoring run. Used by the UI to draw
+# the green/red pill on the row and by the scheduler to decide whether
+# to retry on a tighter cadence (not implemented today, but the column
+# is shaped for it).
+TASK_LAST_RUN_STATUSES = ("ok", "error", "running")
+
 
 class Task(Base, TimestampMixin):
     __tablename__ = "tasks"
@@ -76,6 +96,23 @@ class Task(Base, TimestampMixin):
         CheckConstraint(
             f"priority IN {TASK_PRIORITIES!r}", name="ck_tasks_priority"
         ),
+        CheckConstraint(
+            f"owner_kind IN {TASK_OWNER_KINDS!r}", name="ck_tasks_owner_kind"
+        ),
+        CheckConstraint(
+            f"task_kind IN {TASK_KINDS!r}", name="ck_tasks_task_kind"
+        ),
+        CheckConstraint(
+            f"last_run_status IS NULL OR last_run_status IN {TASK_LAST_RUN_STATUSES!r}",
+            name="ck_tasks_last_run_status",
+        ),
+        # AI-owned monitoring tasks are the only kind that actually
+        # need the cron + run-state columns to be populated; human todo
+        # tasks leave them NULL. We *don't* hard-enforce the
+        # owner_kind/task_kind/cron triad as a check constraint because
+        # it makes mid-flight schema migrations (e.g. someone changes a
+        # human todo into a monitoring job) painful — the validation
+        # lives in the API layer instead.
         # The kanban board groups by status and filters by priority +
         # assignee — index that exact triple so the page loads in one
         # cheap scan even when the family has hundreds of tasks.
@@ -90,12 +127,27 @@ class Task(Base, TimestampMixin):
             "family_id",
             "assigned_to_person_id",
         ),
+        # The monitoring scheduler scans for "ai-owned monitoring tasks
+        # whose next_run_at is due and that aren't paused" on every
+        # tick. Index the exact filter so the scan stays O(due-rows)
+        # even with thousands of human todos in the same table.
+        Index(
+            "ix_tasks_monitoring_due",
+            "owner_kind",
+            "task_kind",
+            "monitoring_paused",
+            "next_run_at",
+        ),
         {
             "comment": (
                 "Family-wide to-do tracker. One row per task; comments, "
-                "followers, and attachments live in their own tables. "
-                "Distinct from agent_tasks (which audits one AI loop "
-                "invocation) — this is the human-facing kanban board."
+                "followers, attachments and AI-discovered links live in "
+                "their own tables. Two coarse shapes share this table: "
+                "human-owned 'todo' kanban cards (the default), and "
+                "AI-owned 'monitoring' standing research jobs that run "
+                "on a cron schedule and post findings as comments + "
+                "task_links. Distinct from agent_tasks (which audits a "
+                "single AI loop invocation)."
             )
         },
     )
@@ -201,6 +253,97 @@ class Task(Base, TimestampMixin):
         ),
     )
 
+    # ------ Owner / shape ----------------------------------------------
+    owner_kind: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default="human",
+        server_default="human",
+        comment=(
+            "Who is accountable for moving this task forward. "
+            "'human' = a household member (assigned_to_person_id); "
+            "'ai' = the assistant itself, which only makes sense in "
+            "combination with task_kind='monitoring'. Defaults to "
+            "'human' so existing rows behave exactly as before."
+        ),
+    )
+    task_kind: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="todo",
+        server_default="todo",
+        comment=(
+            "Coarse shape of the task. 'todo' = a kanban card on the "
+            "main board. 'monitoring' = an AI-owned standing research "
+            "job (cron-driven, posts findings as comments + links, "
+            "lives on its own UI tab). The kanban view filters to "
+            "task_kind='todo' so monitoring jobs don't pollute the board."
+        ),
+    )
+
+    # ------ Cron / schedule (only meaningful for AI monitoring tasks) --
+    cron_schedule: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+        comment=(
+            "Standard 5-field cron expression "
+            "(minute hour day-of-month month day-of-week) describing "
+            "when the monitoring job should run. Interpreted in the "
+            "owning family's timezone (families.timezone). NULL on "
+            "human todo tasks; required on AI monitoring tasks (the "
+            "API fills the default '0 9 * * *' if the creator omits it)."
+        ),
+    )
+    next_run_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=(
+            "Wall-clock UTC of the next scheduled monitoring run. "
+            "Computed from cron_schedule + family timezone whenever the "
+            "schedule changes or a run completes. The scheduler scans "
+            "this column to find due work — NULL means 'never auto-run' "
+            "(use 'Run now' to fire manually)."
+        ),
+    )
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Wall-clock UTC of the most recent monitoring run start.",
+    )
+    last_run_status: Mapped[Optional[str]] = mapped_column(
+        String(10),
+        nullable=True,
+        comment=(
+            "Outcome of the last monitoring run: 'ok' (agent completed "
+            "and posted a comment), 'error' (the run raised), 'running' "
+            "(currently executing — protects against the scheduler "
+            "double-firing the same task). NULL until the first run."
+        ),
+    )
+    last_run_error: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment=(
+            "Short error message captured when last_run_status='error'. "
+            "Surfaced in the monitoring tab so the user can tell at a "
+            "glance whether a job has been silently failing."
+        ),
+    )
+    monitoring_paused: Mapped[bool] = mapped_column(
+        Boolean,
+        # Defaults to FALSE so a freshly created monitoring task starts
+        # running immediately on its schedule. Toggle via the UI to
+        # take a job offline without losing the cron / context.
+        nullable=False,
+        default=False,
+        server_default="false",
+        comment=(
+            "When true, the scheduler skips this task on every tick "
+            "regardless of next_run_at. 'Run now' still works. "
+            "Always false on human todo tasks."
+        ),
+    )
+
     family: Mapped["Family"] = relationship(back_populates="tasks")  # noqa: F821
     created_by: Mapped[Optional["Person"]] = relationship(  # noqa: F821
         foreign_keys=[created_by_person_id],
@@ -221,6 +364,11 @@ class Task(Base, TimestampMixin):
         back_populates="task",
         cascade="all, delete-orphan",
         order_by="TaskAttachment.created_at.asc()",
+    )
+    links: Mapped[List["TaskLink"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskLink.created_at.desc()",
     )
 
 
@@ -385,3 +533,86 @@ class TaskAttachment(Base):
     )
 
     task: Mapped["Task"] = relationship(back_populates="attachments")
+
+
+class TaskLink(Base):
+    """A URL the AI surfaced while researching a monitoring task.
+
+    Distinct from :class:`TaskAttachment` (which carries on-disk bytes).
+    Links live in their own table so the monitoring tab can render
+    "Avi found these 12 sources this week" cleanly without us
+    overloading attachment_kind with sentinels like 'link'. Anyone can
+    add a link via the UI; the AI adds them through the
+    ``task_attach_link`` tool when it cites a source.
+    """
+
+    __tablename__ = "task_links"
+    __table_args__ = (
+        Index("ix_task_links_task_created", "task_id", "created_at"),
+        # Same URL surfaced twice on the same task is almost always
+        # noise — the model will sometimes re-cite a source it already
+        # added on a previous run. Unique-on-(task_id, url) collapses
+        # the dup at write time so the UI doesn't have to dedupe.
+        UniqueConstraint("task_id", "url", name="uq_task_links_task_url"),
+        {
+            "comment": (
+                "External URLs the assistant cited while working on a "
+                "task — typically populated by the monitoring agent "
+                "loop as it researches with the web_search tool. The "
+                "UI renders these as a flat list of source chips on "
+                "the task detail page."
+            )
+        },
+    )
+
+    task_link_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.task_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    url: Mapped[str] = mapped_column(
+        String(2000),
+        nullable=False,
+        comment="Full URL the assistant (or a person) wants to cite.",
+    )
+    title: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
+        comment=(
+            "Display label for the link — typically the page <title> "
+            "captured by the web_search result. Falls back to the URL "
+            "host when missing."
+        ),
+    )
+    summary: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment=(
+            "One-paragraph summary of why this link is relevant. "
+            "Populated by the monitoring agent so the user doesn't "
+            "have to click through every source."
+        ),
+    )
+    added_by_kind: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="assistant",
+        server_default="assistant",
+        comment=(
+            "'assistant' (added by Avi during a monitoring run) or "
+            "'person' (manually added in the UI)."
+        ),
+    )
+    added_by_person_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("people.person_id", ondelete="SET NULL"),
+        nullable=True,
+        comment="Author when added_by_kind='person'.",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="When the link was attached to the task.",
+    )
+
+    task: Mapped["Task"] = relationship(back_populates="links")

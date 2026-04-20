@@ -316,19 +316,60 @@ new one is issued.
 
 ---
 
-## Tasks (kanban)
+## Tasks (kanban + monitoring)
 
-Long-lived household to-do items, distinct from the short-lived
-`agent_tasks` audit row. The kanban board has four columns
+Long-lived household work, distinct from the short-lived
+`agent_tasks` audit row. Tasks come in two shapes governed by two
+columns on the `tasks` row:
+
+* **`owner_kind`** — `human` (the default; an actual family member
+  is accountable) or `ai` (Avi owns the work as a standing job).
+* **`task_kind`** — `todo` (a one-shot kanban card) or `monitoring`
+  (an ongoing investigation re-run on a schedule).
+
+The classic kanban experience is `owner_kind='human'` +
+`task_kind='todo'` — four columns
 (`new · in_progress · finalizing · done`) and five priorities
 (`urgent · high · normal · low · future_idea`).
 
+The new "Monitoring" tab lives on `owner_kind='ai'` +
+`task_kind='monitoring'`. These rows additionally carry:
+
+* `cron_schedule` — standard 5-field cron expression interpreted in
+  the family timezone (`families.timezone`, IANA — e.g.
+  `America/New_York`).
+* `next_run_at` / `last_run_at` (UTC, tz-aware), plus
+  `last_run_status ∈ {ok, error, running}` and `last_run_error` for
+  the most recent failure message.
+* `monitoring_paused` — when `TRUE`, the scheduler skips the row
+  entirely; un-pausing recomputes `next_run_at` from now.
+
 | Table | Notes |
 |---|---|
-| `tasks` | Title, description, status, priority, due date, asker / owner / family ids. |
-| `task_comments` | `author_kind = 'person' \| 'assistant'`; assistant-authored notes survive when their human author is deleted. |
+| `tasks` | Title, description, status, priority, due date, asker / owner / family ids, plus the `owner_kind`/`task_kind`/cron + run-state columns above. |
+| `task_comments` | `author_kind = 'person' \| 'assistant'`; assistant-authored notes survive when their human author is deleted. Monitoring runs append a comment with their final summary on every fire. |
 | `task_followers` | M:N — extra people who get notified on changes. |
 | `task_attachments` | Photos / PDFs / docs; `kind` is a coarse "thumbnail vs document chip" UI hint, `mime_type` carries the precise type. |
+| `task_links` | URL citations (title, summary, `added_by_kind`) attached during monitoring runs by Avi (or manually by a person). Idempotent on `(task_id, url)` so re-running a monitor doesn't duplicate sources. |
+
+### Monitoring scheduler
+
+A single `asyncio` loop (`python/api/services/monitoring_scheduler.py`)
+runs in the FastAPI lifespan. It ticks every
+`AI_MONITORING_TICK_SECONDS` (default 30 s), claims any AI monitoring
+tasks whose `next_run_at` has elapsed, advances `next_run_at` to the
+*following* fire-time, and dispatches the work to the shared agent
+background pool. Creating a monitoring task or hitting
+`POST /api/admin/tasks/{id}/run-now` short-circuits the scheduler and
+fires immediately. Monitoring runs use the dedicated
+`AI_OLLAMA_THINKING_MODEL` (falling back to `AI_OLLAMA_MODEL`) with
+Ollama's `think:true` reasoning flag and the `web_search` tool. The
+default `web_search` provider is Gemini's `google_search` grounding
+(re-using the existing `GEMINI_API_KEY`) — Gemini does the search +
+synthesis pass, then Gemma re-reads the synthesised answer in family
+context to write the actual task comment. `FA_SEARCH_PROVIDER` can
+also be set to `brave` or `tavily` if you'd rather pay those vendors
+than Google.
 
 ---
 

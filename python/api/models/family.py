@@ -36,6 +36,18 @@ class Family(Base, TimestampMixin):
         nullable=True,
         comment="Free-form notes about the family manager or household.",
     )
+    timezone: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        server_default="America/New_York",
+        comment=(
+            "IANA timezone name (e.g. 'America/New_York', "
+            "'Europe/London') used to interpret cron schedules on this "
+            "family's monitoring tasks and to format wall-clock times "
+            "in the UI. Defaults to America/New_York; change via the "
+            "family-settings page."
+        ),
+    )
 
     people: Mapped[List["Person"]] = relationship(  # noqa: F821
         back_populates="family", cascade="all, delete-orphan"

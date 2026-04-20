@@ -40,7 +40,12 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..config import get_settings
 from ..crypto import decrypt_str
-from ..integrations import google_oauth, telegram as telegram_api, twilio_sms
+from ..integrations import (
+    google_oauth,
+    telegram as telegram_api,
+    twilio_sms,
+    web_search as web_search_integration,
+)
 from ..integrations.gmail import GmailSendError, send_email
 from ..integrations.google_calendar import (
     CalendarError,
@@ -54,6 +59,7 @@ from ..integrations.google_calendar import (
     list_upcoming_events,
     merge_busy_intervals,
 )
+from ..services import cron_helpers
 from . import authz, sql_tool
 
 
@@ -1874,6 +1880,23 @@ def _assistant_email(ctx: ToolContext) -> Optional[str]:
 
 _TASK_STATUSES_LIST = list(models.TASK_STATUSES)
 _TASK_PRIORITIES_LIST = list(models.TASK_PRIORITIES)
+_TASK_OWNER_KINDS_LIST = list(models.TASK_OWNER_KINDS)
+_TASK_KINDS_LIST = list(models.TASK_KINDS)
+
+
+def _resolve_family_timezone_for_tool(
+    db: Session, family_id: int
+) -> str:
+    """Look up the family's IANA timezone for cron parsing.
+
+    Mirrors the router-side helper but lives here so the tool layer
+    doesn't import from ``api.routers`` (which would create a cycle).
+    Falls back to ``America/New_York`` to match the column default.
+    """
+    fam = db.get(models.Family, family_id)
+    if fam is not None and getattr(fam, "timezone", None):
+        return fam.timezone
+    return "America/New_York"
 
 
 def _serialize_task_for_model(t: models.Task) -> Dict[str, Any]:
@@ -1883,11 +1906,13 @@ def _serialize_task_for_model(t: models.Task) -> Dict[str, Any]:
     the context window healthy — the model can call ``task_get`` for
     full detail when the user asks for it.
     """
-    return {
+    out: Dict[str, Any] = {
         "task_id": t.task_id,
         "title": t.title,
         "status": t.status,
         "priority": t.priority,
+        "owner_kind": t.owner_kind,
+        "task_kind": t.task_kind,
         "assigned_to_person_id": t.assigned_to_person_id,
         "created_by_person_id": t.created_by_person_id,
         "start_date": t.start_date.isoformat() if t.start_date else None,
@@ -1899,6 +1924,28 @@ def _serialize_task_for_model(t: models.Task) -> Dict[str, Any]:
         "created_at": t.created_at.isoformat(),
         "updated_at": t.updated_at.isoformat(),
     }
+    # Monitoring tasks carry their schedule + last-run state. We only
+    # include the fields when relevant so the kanban-task payloads
+    # stay small in the model's context window.
+    if t.task_kind == "monitoring":
+        out["cron_schedule"] = t.cron_schedule
+        if t.cron_schedule:
+            try:
+                out["cron_description"] = cron_helpers.describe(
+                    t.cron_schedule
+                )
+            except Exception:  # noqa: BLE001 - never crash a serialise
+                out["cron_description"] = None
+        out["monitoring_paused"] = bool(t.monitoring_paused)
+        out["next_run_at"] = (
+            t.next_run_at.isoformat() if t.next_run_at else None
+        )
+        out["last_run_at"] = (
+            t.last_run_at.isoformat() if t.last_run_at else None
+        )
+        out["last_run_status"] = t.last_run_status
+        out["last_run_error"] = t.last_run_error
+    return out
 
 
 # ---- task_create ------------------------------------------------------
@@ -1970,6 +2017,53 @@ _TASK_CREATE_SCHEMA: Dict[str, Any] = {
                 "include EXTRAS here."
             ),
         },
+        "owner_kind": {
+            "type": "string",
+            "enum": _TASK_OWNER_KINDS_LIST,
+            "description": (
+                "Who is accountable for the work. 'human' (default) "
+                "means a person on the kanban board owns it. 'ai' "
+                "means YOU (Avi) own it as a standing agentic job — "
+                "use this when the user says 'monitor', 'keep an eye "
+                "on', 'research and update me on', 'watch for', or "
+                "asks for ongoing investigation Avi should run "
+                "herself. AI-owned tasks ignore assigned_to_person_id."
+            ),
+        },
+        "task_kind": {
+            "type": "string",
+            "enum": _TASK_KINDS_LIST,
+            "description": (
+                "Shape of the task. 'todo' (default) is a one-shot "
+                "kanban card. 'monitoring' is an ongoing job with a "
+                "cron schedule that Avi re-runs on a cadence — use "
+                "for 'monitor for X', 'check weekly for Y', "
+                "'research and keep updated' style asks. Pair with "
+                "owner_kind='ai' for the standing-job pattern."
+            ),
+        },
+        "cron_schedule": {
+            "type": ["string", "null"],
+            "description": (
+                "Standard 5-field cron expression "
+                "(minute hour day-of-month month day-of-week) "
+                "interpreted in the family's timezone. ONLY meaningful "
+                "for monitoring tasks. Omit to use the household "
+                "default (typically once a day mid-morning). Examples: "
+                "'0 9 * * *' = daily 9am, '0 9 * * 1' = Mondays 9am, "
+                "'0 */6 * * *' = every 6 hours."
+            ),
+        },
+        "monitoring_paused": {
+            "type": "boolean",
+            "description": (
+                "If true, create the monitoring task in a PAUSED "
+                "state — no immediate first run, no cron firing — "
+                "until the user unpauses it. Defaults to false. "
+                "Useful when the user wants to set something up "
+                "but isn't ready for Avi to start working yet."
+            ),
+        },
     },
     "required": ["title"],
 }
@@ -1985,6 +2079,10 @@ async def _handle_task_create(
     desired_end_date: Optional[str] = None,
     start_date: Optional[str] = None,
     follower_person_ids: Optional[List[int]] = None,
+    owner_kind: str = "human",
+    task_kind: str = "todo",
+    cron_schedule: Optional[str] = None,
+    monitoring_paused: bool = False,
 ) -> Dict[str, Any]:
     cleaned_title = (title or "").strip()
     if not cleaned_title:
@@ -1997,10 +2095,27 @@ async def _handle_task_create(
         raise ToolError(
             f"status must be one of {list(models.TASK_STATUSES)}, got {status!r}"
         )
+    if owner_kind not in models.TASK_OWNER_KINDS:
+        raise ToolError(
+            f"owner_kind must be one of {list(models.TASK_OWNER_KINDS)}, got {owner_kind!r}"
+        )
+    if task_kind not in models.TASK_KINDS:
+        raise ToolError(
+            f"task_kind must be one of {list(models.TASK_KINDS)}, got {task_kind!r}"
+        )
 
-    owner = assigned_to_person_id
-    if owner is None and ctx.person_id is not None:
-        owner = ctx.person_id
+    is_ai_monitoring = owner_kind == "ai" and task_kind == "monitoring"
+
+    # AI-owned monitoring tasks have no human assignee — Avi owns
+    # them. Force the assignee to NULL even if the model passed one
+    # so the kanban-style UI doesn't try to render an owner badge on
+    # a row that Avi is responsible for.
+    if owner_kind == "ai":
+        owner = None
+    else:
+        owner = assigned_to_person_id
+        if owner is None and ctx.person_id is not None:
+            owner = ctx.person_id
 
     if owner is not None:
         if (
@@ -2016,6 +2131,37 @@ async def _handle_task_create(
             raise ToolError(
                 f"Assignee person_id={owner} is not a member of this family."
             )
+
+    # Validate cron up-front (only meaningful for monitoring tasks)
+    # so a bad expression surfaces as a tool error instead of a
+    # silent NULL on the row. For AI monitoring tasks with no cron
+    # supplied we fall back to the household default.
+    settings = get_settings()
+    next_run_utc: Optional[datetime] = None
+    cron_to_apply: Optional[str] = cron_schedule
+    if task_kind == "monitoring":
+        if is_ai_monitoring and not (cron_to_apply and cron_to_apply.strip()):
+            cron_to_apply = settings.AI_MONITORING_DEFAULT_CRON
+        if cron_to_apply and cron_to_apply.strip():
+            tz_name = _resolve_family_timezone_for_tool(
+                ctx.db, ctx.family_id
+            )
+            try:
+                info = cron_helpers.parse(cron_to_apply, tz_name)
+            except cron_helpers.CronError as exc:
+                raise ToolError(
+                    f"Invalid cron_schedule {cron_to_apply!r}: {exc}"
+                ) from exc
+            cron_to_apply = info.expression
+            if not monitoring_paused:
+                next_run_utc = info.next_run_utc
+        else:
+            cron_to_apply = None
+    else:
+        # Non-monitoring tasks must not carry a cron expression — it'd
+        # confuse the scheduler if the type were later flipped.
+        cron_to_apply = None
+        monitoring_paused = False
 
     def _parse_date(label: str, raw: Optional[str]) -> Optional["date"]:
         if raw is None:
@@ -2035,6 +2181,11 @@ async def _handle_task_create(
         description=description,
         status=status,
         priority=priority,
+        owner_kind=owner_kind,
+        task_kind=task_kind,
+        cron_schedule=cron_to_apply,
+        monitoring_paused=bool(monitoring_paused),
+        next_run_at=next_run_utc,
         start_date=_parse_date("start_date", start_date),
         desired_end_date=_parse_date("desired_end_date", desired_end_date),
         completed_at=datetime.now(timezone.utc) if status == "done" else None,
@@ -2069,6 +2220,30 @@ async def _handle_task_create(
 
     ctx.db.flush()
     ctx.db.refresh(task)
+
+    # Kick off the immediate first run for AI monitoring tasks so the
+    # user sees research start happening as soon as they say "monitor
+    # X" — without waiting for the next cron tick. Commit first so the
+    # background worker (running in its own session) can read the row.
+    if is_ai_monitoring and not task.monitoring_paused:
+        try:
+            ctx.db.commit()
+        except Exception:  # noqa: BLE001 - keep the tool result useful
+            logger.exception(
+                "task_create: commit before monitoring kickoff failed for task %d",
+                task.task_id,
+            )
+        else:
+            try:
+                from ..services import monitoring_scheduler
+
+                monitoring_scheduler.run_now_in_background(task.task_id)
+            except Exception:  # noqa: BLE001 - never fail the create on this
+                logger.exception(
+                    "task_create: failed to kick off first run for task %d",
+                    task.task_id,
+                )
+
     return {"created": _serialize_task_for_model(task)}
 
 
@@ -2470,6 +2645,339 @@ async def _handle_task_add_follower(
         "person_id": follower.person_id,
         "already_following": False,
     }
+
+
+# ---- task_set_schedule ------------------------------------------------
+
+
+_TASK_SET_SCHEDULE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {
+            "type": "integer",
+            "description": "tasks.task_id of the monitoring task to retune.",
+        },
+        "cron_schedule": {
+            "type": ["string", "null"],
+            "description": (
+                "Standard 5-field cron expression, interpreted in the "
+                "family's timezone. Pass null to clear the schedule "
+                "(effectively pauses the auto-runs without flipping "
+                "monitoring_paused). Examples: '0 9 * * *' = daily 9am, "
+                "'0 9 * * 1' = Mondays 9am, '*/30 * * * *' = every 30 "
+                "minutes."
+            ),
+        },
+        "monitoring_paused": {
+            "type": ["boolean", "null"],
+            "description": (
+                "If true, pause the monitoring task — the cron stops "
+                "firing until unpaused. If false, resume it. Omit to "
+                "leave the pause state unchanged."
+            ),
+        },
+        "run_now": {
+            "type": "boolean",
+            "description": (
+                "If true AND the task is unpaused after this update, "
+                "kick off an immediate monitoring run in the "
+                "background so the user sees fresh research right "
+                "away. Defaults to false (the next cron tick will pick "
+                "it up)."
+            ),
+        },
+    },
+    "required": ["task_id"],
+}
+
+
+async def _handle_task_set_schedule(
+    ctx: ToolContext,
+    task_id: int,
+    cron_schedule: Optional[str] = None,
+    monitoring_paused: Optional[bool] = None,
+    run_now: bool = False,
+) -> Dict[str, Any]:
+    task = ctx.db.get(models.Task, int(task_id))
+    if task is None or task.family_id != ctx.family_id:
+        raise ToolError(f"No task with id={task_id} in this family.")
+    if task.task_kind != "monitoring":
+        raise ToolError(
+            "Only monitoring tasks have a cron schedule. Convert "
+            "the task to task_kind='monitoring' first (or use "
+            "task_update for non-schedule fields)."
+        )
+
+    # Detect what the model wanted to change. We accept the JSON
+    # shape ``{"cron_schedule": null}`` as "clear it" — distinct from
+    # ``{}`` which leaves it alone — by relying on whether the key
+    # was passed at all. The dispatcher always calls handlers with
+    # explicit kwargs, so unset keys arrive as the function's
+    # defaults; we treat ``None`` for cron the same as an explicit
+    # null because the schema says null = clear.
+    if cron_schedule is not None:
+        cleaned = cron_schedule.strip()
+        if not cleaned:
+            task.cron_schedule = None
+            task.next_run_at = None
+        else:
+            tz_name = _resolve_family_timezone_for_tool(
+                ctx.db, ctx.family_id
+            )
+            try:
+                info = cron_helpers.parse(cleaned, tz_name)
+            except cron_helpers.CronError as exc:
+                raise ToolError(
+                    f"Invalid cron_schedule {cleaned!r}: {exc}"
+                ) from exc
+            task.cron_schedule = info.expression
+            # Defer next_run_at decision to the pause logic below so
+            # we don't accidentally schedule a paused task.
+            task.next_run_at = (
+                None if task.monitoring_paused else info.next_run_utc
+            )
+
+    if monitoring_paused is not None:
+        task.monitoring_paused = bool(monitoring_paused)
+        if task.monitoring_paused:
+            task.next_run_at = None
+        elif task.cron_schedule and task.next_run_at is None:
+            tz_name = _resolve_family_timezone_for_tool(
+                ctx.db, ctx.family_id
+            )
+            try:
+                task.next_run_at = cron_helpers.next_run(
+                    task.cron_schedule, tz_name
+                )
+            except cron_helpers.CronError:
+                task.next_run_at = None
+
+    ctx.db.flush()
+    ctx.db.refresh(task)
+
+    fired = False
+    if run_now and task.owner_kind == "ai" and not task.monitoring_paused:
+        try:
+            ctx.db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "task_set_schedule: commit before run_now failed for task %d",
+                task.task_id,
+            )
+        else:
+            try:
+                from ..services import monitoring_scheduler
+
+                monitoring_scheduler.run_now_in_background(task.task_id)
+                fired = True
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "task_set_schedule: failed to fire run_now for task %d",
+                    task.task_id,
+                )
+
+    return {
+        "updated": _serialize_task_for_model(task),
+        "run_now_fired": fired,
+    }
+
+
+# ---- task_attach_link -------------------------------------------------
+
+
+_TASK_ATTACH_LINK_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {
+            "type": "integer",
+            "description": "tasks.task_id to attach the citation to.",
+        },
+        "url": {
+            "type": "string",
+            "description": (
+                "Full URL of the source. Must include the scheme "
+                "(https://…). Re-attaching the same URL is idempotent "
+                "— the existing row is returned instead of erroring."
+            ),
+        },
+        "title": {
+            "type": ["string", "null"],
+            "description": (
+                "Display label for the link, typically the page "
+                "<title> or the article headline. Falls back to the "
+                "URL host when omitted."
+            ),
+        },
+        "summary": {
+            "type": ["string", "null"],
+            "description": (
+                "One-paragraph note explaining why this source is "
+                "relevant to the task — what claim or data point it "
+                "supports. Lets the user skim citations without "
+                "clicking every link."
+            ),
+        },
+        "added_by_kind": {
+            "type": "string",
+            "enum": ["assistant", "person"],
+            "description": (
+                "'assistant' (default) when Avi cited this herself "
+                "during research; 'person' when relaying a link the "
+                "speaker shared verbally."
+            ),
+        },
+    },
+    "required": ["task_id", "url"],
+}
+
+
+async def _handle_task_attach_link(
+    ctx: ToolContext,
+    task_id: int,
+    url: str,
+    title: Optional[str] = None,
+    summary: Optional[str] = None,
+    added_by_kind: str = "assistant",
+) -> Dict[str, Any]:
+    task = ctx.db.get(models.Task, int(task_id))
+    if task is None or task.family_id != ctx.family_id:
+        raise ToolError(f"No task with id={task_id} in this family.")
+
+    cleaned_url = (url or "").strip()
+    if not cleaned_url:
+        raise ToolError("Cannot attach an empty URL.")
+    if not (cleaned_url.startswith("http://") or cleaned_url.startswith("https://")):
+        raise ToolError(
+            f"URL must include http:// or https:// scheme, got {cleaned_url!r}"
+        )
+    if added_by_kind not in ("assistant", "person"):
+        raise ToolError(
+            f"added_by_kind must be 'assistant' or 'person', got {added_by_kind!r}"
+        )
+
+    # Idempotent on (task_id, url) so re-running a monitoring job
+    # that re-cites the same source doesn't duplicate the chip in
+    # the UI.
+    existing = (
+        ctx.db.query(models.TaskLink)
+        .filter(
+            models.TaskLink.task_id == task.task_id,
+            models.TaskLink.url == cleaned_url,
+        )
+        .first()
+    )
+    if existing is not None:
+        return {
+            "task_link_id": existing.task_link_id,
+            "task_id": existing.task_id,
+            "url": existing.url,
+            "title": existing.title,
+            "summary": existing.summary,
+            "added_by_kind": existing.added_by_kind,
+            "already_attached": True,
+        }
+
+    cleaned_title = (title or "").strip() or None
+    link = models.TaskLink(
+        task_id=task.task_id,
+        url=cleaned_url,
+        title=cleaned_title,
+        summary=summary,
+        added_by_kind=added_by_kind,
+        added_by_person_id=(
+            ctx.person_id if added_by_kind == "person" else None
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+    ctx.db.add(link)
+    ctx.db.flush()
+    ctx.db.refresh(link)
+    return {
+        "task_link_id": link.task_link_id,
+        "task_id": link.task_id,
+        "url": link.url,
+        "title": link.title,
+        "summary": link.summary,
+        "added_by_kind": link.added_by_kind,
+        "already_attached": False,
+    }
+
+
+# ---- web_search -------------------------------------------------------
+
+
+_WEB_SEARCH_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": (
+                "Plain-language search query. Be specific — include "
+                "the household-relevant qualifiers ('Yankees tickets "
+                "May 2026 cheap', 'Tesla stock news today'). Avoid "
+                "site-restricted operators; the provider handles "
+                "ranking."
+            ),
+        },
+        "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 15,
+            "description": (
+                "Max number of result rows to return. Defaults to "
+                "the configured household default (typically 5). "
+                "Bump up only when you genuinely need more breadth."
+            ),
+        },
+    },
+    "required": ["query"],
+}
+
+
+async def _handle_web_search(
+    ctx: ToolContext,
+    query: str,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    cleaned = (query or "").strip()
+    if not cleaned:
+        raise ToolError("Cannot run an empty web search.")
+    try:
+        response = await web_search_integration.search(cleaned, limit=limit)
+    except web_search_integration.SearchUnavailable as exc:
+        raise ToolError(str(exc)) from exc
+
+    payload: Dict[str, Any] = {
+        "query": response.query,
+        "provider": response.provider,
+        "result_count": len(response.results),
+        "results": [
+            {
+                "title": r.title,
+                "url": r.url,
+                "snippet": r.snippet,
+                # Tavily-style page extracts can be huge; truncate so
+                # one tool call doesn't blow the context window.
+                "extract": (
+                    (r.extracted_content[:1500] + "…")
+                    if r.extracted_content and len(r.extracted_content) > 1500
+                    else r.extracted_content
+                ),
+            }
+            for r in response.results
+        ],
+    }
+    # Gemini-style providers return a synthesised, grounded answer
+    # alongside the citations. Surface it so the local LLM can read
+    # one paragraph instead of guessing from raw snippets — and so
+    # the model is reminded that the URLs in ``results`` are the
+    # citations that back the summary (which it should pass to
+    # ``task_attach_link``).
+    if response.summary:
+        payload["summary"] = response.summary
+    if response.issued_queries:
+        payload["issued_queries"] = response.issued_queries
+    return payload
 
 
 # ---- telegram_invite --------------------------------------------------
@@ -3103,25 +3611,32 @@ def build_default_registry() -> ToolRegistry:
             name="task_create",
             label="Create a household task",
             description=(
-                "Add a new task to the family kanban board. Use when "
-                "the user says things like 'add a task to…', 'remind "
-                "me to…', 'we should…', or describes work they want "
-                "tracked. The speaker is recorded as the creator "
-                "automatically; if no assignee is supplied the "
-                "speaker also becomes the owner. Default priority is "
+                "Add a new task to the family workspace. Two shapes: "
+                "(1) HUMAN TODOS (default — owner_kind='human', "
+                "task_kind='todo') land on the kanban board. The "
+                "speaker is the creator and, unless told otherwise, "
+                "the assignee. Use for 'add a task to…', 'remind me "
+                "to…', 'we should…'. (2) AI MONITORING JOBS "
+                "(owner_kind='ai', task_kind='monitoring') are "
+                "standing investigations YOU (Avi) own and re-run on "
+                "a cron schedule — use for 'monitor for…', 'keep an "
+                "eye on…', 'research and update me on…', 'watch for…'. "
+                "AI monitoring tasks immediately kick off a first run "
+                "in the background; you do NOT need to call any other "
+                "tool to start the analysis. Default priority is "
                 "'normal'; bump to 'urgent'/'high' only when the user "
                 "is explicit, and use 'future_idea' for casual "
-                "'someday' mentions so they don't pollute the active "
-                "board. After creating a task, briefly confirm what "
-                "was tracked (title + priority + owner) in 1-2 "
-                "sentences."
+                "'someday' mentions. After creating, briefly confirm "
+                "what was tracked (title + kind + cron when "
+                "monitoring) in 1-2 sentences."
             ),
             parameters=_TASK_CREATE_SCHEMA,
             handler=_handle_task_create,
             timeout_seconds=5.0,
             examples=(
                 "Add a task to fix the east gate latch this weekend.",
-                "Remind me to renew Maddie's passport — high priority.",
+                "Monitor for good Yankees ticket deals in May.",
+                "Research college options for Jackson — biology programs, 25k+ students.",
             ),
         )
     )
@@ -3259,6 +3774,85 @@ def build_default_registry() -> ToolRegistry:
             ),
         )
     )
+    reg.register(
+        Tool(
+            name="task_set_schedule",
+            label="Set a monitoring task's cron schedule",
+            description=(
+                "Edit the cron schedule and/or pause flag of a "
+                "MONITORING task you own. Use when the user says "
+                "things like 'check that weekly instead of daily', "
+                "'pause the Yankees-tickets monitor', 'resume the "
+                "college research', 'run that monitor every six "
+                "hours'. The expression is interpreted in the "
+                "family's timezone. Pass run_now=true after a "
+                "schedule change when the user wants to see fresh "
+                "results immediately rather than waiting for the next "
+                "tick."
+            ),
+            parameters=_TASK_SET_SCHEDULE_SCHEMA,
+            handler=_handle_task_set_schedule,
+            timeout_seconds=5.0,
+            examples=(
+                "Change the Yankees ticket monitor to run every six hours.",
+                "Pause the Tesla stock monitor for now.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="task_attach_link",
+            label="Attach a source URL to a task",
+            description=(
+                "Cite a source on a task — typically called by Avi "
+                "during a monitoring run after web_search to record "
+                "where a finding came from, but also fine for "
+                "manual 'save this link to the college research "
+                "task' requests. Idempotent on (task_id, url) — "
+                "re-citing the same URL returns the existing row. "
+                "Provide a short summary so the user can skim "
+                "citations without clicking through."
+            ),
+            parameters=_TASK_ATTACH_LINK_SCHEMA,
+            handler=_handle_task_attach_link,
+            timeout_seconds=4.0,
+            examples=(
+                "Save this NYT article on the college task.",
+                "Attach the StubHub listing to the Yankees monitor.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="web_search",
+            label="Search the web",
+            description=(
+                "Run a real-time web search via the configured "
+                "provider. By default this is Gemini's google_search "
+                "grounding, which returns a `summary` field "
+                "(synthesised, citation-backed answer) alongside the "
+                "list of source `results`; alternative SERP providers "
+                "(Brave / Tavily) return only `results` with snippets. "
+                "Use this during monitoring runs and for any 'look up "
+                "X on the web' / 'what's the latest on Y' / 'find me "
+                "current prices for Z' style asks. When `summary` is "
+                "present, treat it as the grounded answer and use "
+                "the `results` URLs as the citations to attach via "
+                "task_attach_link. The provider may be unavailable on "
+                "fresh installs — surface the error to the user "
+                "verbatim if so (it explains how the admin can "
+                "enable it)."
+            ),
+            parameters=_WEB_SEARCH_SCHEMA,
+            handler=_handle_web_search,
+            timeout_seconds=20.0,
+            requires=("web_search",),
+            examples=(
+                "Search the web for the latest Tesla earnings news.",
+                "Look up cheap Yankees-vs-Red Sox tickets this May.",
+            ),
+        )
+    )
     return reg
 
 
@@ -3319,6 +3913,11 @@ def detect_capabilities(db: Session, assistant_id: Optional[int]) -> set[str]:
                 or any(s.endswith("/calendar") for s in scopes)
             ):
                 caps.add("google")
+    # web_search is available whenever a search provider is configured
+    # AND its API key is present. Hidden from the model when missing so
+    # Avi never offers a research capability we can't actually execute.
+    if web_search_integration.get_provider() is not None:
+        caps.add("web_search")
     return caps
 
 

@@ -3,22 +3,33 @@ import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import {
+  Activity,
+  AlertTriangle,
+  Bot,
+  CalendarClock,
   CheckCircle2,
   CircleDashed,
   Clock,
   Download,
+  ExternalLink,
   Flag,
   GripVertical,
+  Layers,
+  Link as LinkIcon,
   ListTodo,
   Loader2,
   MessageSquare,
   Paperclip,
+  Pause,
+  Play,
   Plus,
+  Sparkles,
   Trash2,
   Undo2,
   UploadCloud,
   Users,
   X,
+  Zap,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
@@ -28,6 +39,9 @@ import type {
   TaskComment,
   TaskDetail,
   TaskFollower,
+  TaskKind,
+  TaskLastRunStatus,
+  TaskLink,
   TaskPriority,
   TaskStatus,
 } from "@/lib/types";
@@ -148,6 +162,66 @@ function personLabel(people: Map<number, Person>, id: number | null): string {
 }
 
 // ---------------------------------------------------------------------------
+// Monitoring helpers
+// ---------------------------------------------------------------------------
+
+function formatDateTime(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    return new Date(value).toLocaleString();
+  } catch {
+    return value;
+  }
+}
+
+function formatRelativeTime(value: string | null): string | null {
+  if (!value) return null;
+  const target = new Date(value).getTime();
+  if (Number.isNaN(target)) return value;
+  const diffMs = target - Date.now();
+  const absSeconds = Math.round(Math.abs(diffMs) / 1000);
+  const future = diffMs >= 0;
+  let label: string;
+  if (absSeconds < 60) label = `${absSeconds}s`;
+  else if (absSeconds < 3600) label = `${Math.round(absSeconds / 60)}m`;
+  else if (absSeconds < 86400) label = `${Math.round(absSeconds / 3600)}h`;
+  else label = `${Math.round(absSeconds / 86400)}d`;
+  return future ? `in ${label}` : `${label} ago`;
+}
+
+const RUN_STATUS_META: Record<
+  TaskLastRunStatus,
+  { label: string; badgeClass: string; icon: typeof Activity }
+> = {
+  ok: {
+    label: "OK",
+    badgeClass: "bg-emerald-100 text-emerald-700 border-emerald-200",
+    icon: CheckCircle2,
+  },
+  error: {
+    label: "Error",
+    badgeClass: "bg-red-100 text-red-700 border-red-200",
+    icon: AlertTriangle,
+  },
+  running: {
+    label: "Running…",
+    badgeClass: "bg-blue-100 text-blue-700 border-blue-200",
+    icon: Loader2,
+  },
+};
+
+/** "0 9 * * *" → presence in this list maps to a friendly preset label. */
+const CRON_PRESETS: Array<{ label: string; expr: string }> = [
+  { label: "Every 30 minutes", expr: "*/30 * * * *" },
+  { label: "Every hour", expr: "0 * * * *" },
+  { label: "Every 6 hours", expr: "0 */6 * * *" },
+  { label: "Daily — 9 AM", expr: "0 9 * * *" },
+  { label: "Daily — 6 AM", expr: "0 6 * * *" },
+  { label: "Weekdays — 8 AM", expr: "0 8 * * 1-5" },
+  { label: "Weekly — Monday 9 AM", expr: "0 9 * * 1" },
+];
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -155,6 +229,12 @@ export default function TasksPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
   const toast = useToast();
+
+  // Top-level tab — kanban (human todos) vs. monitoring (Avi-owned
+  // standing jobs). Persisted only in component state so a hard
+  // refresh lands on the kanban; a future enhancement can move this
+  // to URL search params.
+  const [tab, setTab] = useState<TaskKind>("todo");
 
   const [createOpen, setCreateOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<number | null>(null);
@@ -187,8 +267,19 @@ export default function TasksPage() {
     queryFn: () => api.get<Task[]>(`/api/tasks?family_id=${familyId}`),
   });
 
+  // Tab counts driven off the unfiltered list so toggling kind
+  // doesn't make the badge numbers jump around.
+  const todoTasks = useMemo(
+    () => (tasks ?? []).filter((t) => t.task_kind === "todo"),
+    [tasks],
+  );
+  const monitoringTasks = useMemo(
+    () => (tasks ?? []).filter((t) => t.task_kind === "monitoring"),
+    [tasks],
+  );
+
   const filtered = useMemo(() => {
-    let rows = tasks ?? [];
+    let rows = todoTasks;
     if (filterPerson === "unassigned") {
       rows = rows.filter((t) => t.assigned_to_person_id === null);
     } else if (filterPerson !== "all") {
@@ -207,7 +298,7 @@ export default function TasksPage() {
       );
     }
     return rows;
-  }, [tasks, filterPerson, filterPriority, search]);
+  }, [todoTasks, filterPerson, filterPriority, search]);
 
   const grouped = useMemo(() => {
     const out: Record<TaskStatus, Task[]> = {
@@ -283,130 +374,180 @@ export default function TasksPage() {
     updateStatus.mutate({ task_id: dragged.task_id, status });
   };
 
-  const totalCount = tasks?.length ?? 0;
+  const todoTotal = todoTasks.length;
+  const monitoringTotal = monitoringTasks.length;
   const visibleCount = filtered.length;
 
   return (
     <div>
       <PageHeader
         title="Tasks"
-        description="Household kanban — drag any card between columns, click ✓ to complete, or 🗑 to delete. Avi can also create, update, and complete tasks for you."
+        description={
+          tab === "todo"
+            ? "Household kanban — drag any card between columns, click ✓ to complete, or 🗑 to delete. Avi can also create, update, and complete tasks for you."
+            : "Standing investigations Avi runs on a cron schedule. Edit the cadence, pause / resume, or click 'Run now' to refresh the latest findings on demand."
+        }
         actions={
           <button className="btn-primary" onClick={() => setCreateOpen(true)}>
-            <Plus className="h-4 w-4" /> New task
+            <Plus className="h-4 w-4" />
+            {tab === "todo" ? "New task" : "New monitor"}
           </button>
         }
       />
 
-      {/* Filter bar */}
-      <div className="card mb-4">
-        <div className="card-body grid grid-cols-1 sm:grid-cols-4 gap-3">
-          <div>
-            <label className="label">Search</label>
-            <input
-              className="input"
-              placeholder="Title or description"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-          </div>
-          <div>
-            <label className="label">Person</label>
-            <select
-              className="input"
-              value={filterPerson}
-              onChange={(e) => setFilterPerson(e.target.value)}
-            >
-              <option value="all">Everyone</option>
-              <option value="unassigned">Unassigned</option>
-              {(people ?? []).map((p) => (
-                <option key={p.person_id} value={p.person_id}>
-                  {p.preferred_name || `${p.first_name} ${p.last_name}`.trim()}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="label">Priority</label>
-            <select
-              className="input"
-              value={filterPriority}
-              onChange={(e) =>
-                setFilterPriority(e.target.value as TaskPriority | "all")
-              }
-            >
-              <option value="all">All priorities</option>
-              {PRIORITY_OPTIONS.map((p) => (
-                <option key={p} value={p}>
-                  {formatPriority(p)}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex items-end justify-end text-xs text-muted-foreground">
-            {visibleCount === totalCount
-              ? `${totalCount} task${totalCount === 1 ? "" : "s"}`
-              : `${visibleCount} of ${totalCount} shown`}
-          </div>
-        </div>
+      {/* Tab strip — kanban vs monitoring */}
+      <div className="mb-4 border-b border-border flex items-center gap-1">
+        <TabButton
+          active={tab === "todo"}
+          onClick={() => setTab("todo")}
+          icon={Layers}
+          label="Kanban"
+          count={todoTotal}
+        />
+        <TabButton
+          active={tab === "monitoring"}
+          onClick={() => setTab("monitoring")}
+          icon={Bot}
+          label="Monitoring"
+          count={monitoringTotal}
+          accent
+        />
       </div>
 
-      {isLoading ? (
-        <div className="text-sm text-muted-foreground py-12 text-center">
-          Loading tasks…
-        </div>
-      ) : !tasks || tasks.length === 0 ? (
-        <EmptyState
-          icon={ListTodo}
-          title="No tasks yet"
-          description="Create one here, or just ask Avi: 'Add a task to fix the gate this weekend.'"
-          action={
-            <button className="btn-primary" onClick={() => setCreateOpen(true)}>
-              <Plus className="h-4 w-4" /> New task
-            </button>
-          }
-        />
-      ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-          {COLUMNS.map((col) => (
-            <KanbanColumn
-              key={col.status}
-              spec={col}
-              tasks={grouped[col.status]}
-              peopleById={peopleById}
-              isDropTarget={dropTarget === col.status}
-              draggingId={draggingId}
-              onDragEnter={() => {
-                if (draggingId !== null) setDropTarget(col.status);
-              }}
-              onDragLeave={() => {
-                if (dropTarget === col.status) setDropTarget(null);
-              }}
-              onDrop={() => handleDrop(col.status)}
-              onOpen={setActiveTaskId}
-              onAdvance={(task, next) =>
-                updateStatus.mutate({ task_id: task.task_id, status: next })
+      {tab === "todo" && (
+        <>
+          {/* Filter bar (kanban only) */}
+          <div className="card mb-4">
+            <div className="card-body grid grid-cols-1 sm:grid-cols-4 gap-3">
+              <div>
+                <label className="label">Search</label>
+                <input
+                  className="input"
+                  placeholder="Title or description"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="label">Person</label>
+                <select
+                  className="input"
+                  value={filterPerson}
+                  onChange={(e) => setFilterPerson(e.target.value)}
+                >
+                  <option value="all">Everyone</option>
+                  <option value="unassigned">Unassigned</option>
+                  {(people ?? []).map((p) => (
+                    <option key={p.person_id} value={p.person_id}>
+                      {p.preferred_name ||
+                        `${p.first_name} ${p.last_name}`.trim()}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="label">Priority</label>
+                <select
+                  className="input"
+                  value={filterPriority}
+                  onChange={(e) =>
+                    setFilterPriority(e.target.value as TaskPriority | "all")
+                  }
+                >
+                  <option value="all">All priorities</option>
+                  {PRIORITY_OPTIONS.map((p) => (
+                    <option key={p} value={p}>
+                      {formatPriority(p)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-end justify-end text-xs text-muted-foreground">
+                {visibleCount === todoTotal
+                  ? `${todoTotal} task${todoTotal === 1 ? "" : "s"}`
+                  : `${visibleCount} of ${todoTotal} shown`}
+              </div>
+            </div>
+          </div>
+
+          {isLoading ? (
+            <div className="text-sm text-muted-foreground py-12 text-center">
+              Loading tasks…
+            </div>
+          ) : todoTasks.length === 0 ? (
+            <EmptyState
+              icon={ListTodo}
+              title="No tasks yet"
+              description="Create one here, or just ask Avi: 'Add a task to fix the gate this weekend.'"
+              action={
+                <button
+                  className="btn-primary"
+                  onClick={() => setCreateOpen(true)}
+                >
+                  <Plus className="h-4 w-4" /> New task
+                </button>
               }
-              onDelete={(task) => setConfirmDelete(task)}
-              onDragStart={(id) => setDraggingId(id)}
-              onDragEnd={() => {
-                setDraggingId(null);
-                setDropTarget(null);
-              }}
             />
-          ))}
-        </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+              {COLUMNS.map((col) => (
+                <KanbanColumn
+                  key={col.status}
+                  spec={col}
+                  tasks={grouped[col.status]}
+                  peopleById={peopleById}
+                  isDropTarget={dropTarget === col.status}
+                  draggingId={draggingId}
+                  onDragEnter={() => {
+                    if (draggingId !== null) setDropTarget(col.status);
+                  }}
+                  onDragLeave={() => {
+                    if (dropTarget === col.status) setDropTarget(null);
+                  }}
+                  onDrop={() => handleDrop(col.status)}
+                  onOpen={setActiveTaskId}
+                  onAdvance={(task, next) =>
+                    updateStatus.mutate({
+                      task_id: task.task_id,
+                      status: next,
+                    })
+                  }
+                  onDelete={(task) => setConfirmDelete(task)}
+                  onDragStart={(id) => setDraggingId(id)}
+                  onDragEnd={() => {
+                    setDraggingId(null);
+                    setDropTarget(null);
+                  }}
+                />
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {tab === "monitoring" && (
+        <MonitoringList
+          tasks={monitoringTasks}
+          isLoading={isLoading}
+          peopleById={peopleById}
+          familyId={Number(familyId)}
+          onOpen={setActiveTaskId}
+          onCreate={() => setCreateOpen(true)}
+          onDelete={(task) => setConfirmDelete(task)}
+        />
       )}
 
       {createOpen && (
         <CreateTaskModal
           familyId={Number(familyId)}
           people={people ?? []}
+          defaultKind={tab}
           onClose={() => setCreateOpen(false)}
           onCreated={(newTask) => {
             qc.invalidateQueries({ queryKey: tasksKey });
             setCreateOpen(false);
             setActiveTaskId(newTask.task_id);
+            setTab(newTask.task_kind);
           }}
         />
       )}
@@ -446,6 +587,370 @@ export default function TasksPage() {
           });
         }}
       />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tab strip
+// ---------------------------------------------------------------------------
+
+function TabButton({
+  active,
+  onClick,
+  icon: Icon,
+  label,
+  count,
+  accent,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: typeof Layers;
+  label: string;
+  count: number;
+  accent?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "relative -mb-px flex items-center gap-2 border-b-2 px-4 py-2 text-sm font-medium transition-colors",
+        active
+          ? accent
+            ? "border-violet-500 text-violet-700"
+            : "border-primary text-foreground"
+          : "border-transparent text-muted-foreground hover:text-foreground",
+      )}
+    >
+      <Icon className="h-4 w-4" />
+      {label}
+      <span
+        className={cn(
+          "ml-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold",
+          active
+            ? accent
+              ? "bg-violet-100 text-violet-700 border-violet-200"
+              : "bg-primary/10 text-primary border-primary/20"
+            : "bg-muted text-muted-foreground border-border",
+        )}
+      >
+        {count}
+      </span>
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Monitoring list view
+// ---------------------------------------------------------------------------
+
+interface MonitoringListProps {
+  tasks: Task[];
+  isLoading: boolean;
+  peopleById: Map<number, Person>;
+  familyId: number;
+  onOpen: (id: number) => void;
+  onCreate: () => void;
+  onDelete: (task: Task) => void;
+}
+
+function MonitoringList({
+  tasks,
+  isLoading,
+  peopleById,
+  familyId,
+  onOpen,
+  onCreate,
+  onDelete,
+}: MonitoringListProps) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const tasksKey = ["tasks", String(familyId)] as const;
+
+  const togglePause = useMutation({
+    mutationFn: ({
+      task_id,
+      paused,
+    }: {
+      task_id: number;
+      paused: boolean;
+    }) =>
+      api.put<Task>(`/api/tasks/${task_id}/schedule`, {
+        monitoring_paused: paused,
+      }),
+    onMutate: async ({ task_id, paused }) => {
+      await qc.cancelQueries({ queryKey: tasksKey });
+      const previous = qc.getQueryData<Task[]>(tasksKey);
+      qc.setQueryData<Task[]>(tasksKey, (old) =>
+        (old ?? []).map((t) =>
+          t.task_id === task_id ? { ...t, monitoring_paused: paused } : t,
+        ),
+      );
+      return { previous };
+    },
+    onError: (err: Error, _vars, ctx) => {
+      if (ctx?.previous) qc.setQueryData(tasksKey, ctx.previous);
+      toast.error(err.message);
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: tasksKey }),
+  });
+
+  const runNow = useMutation({
+    mutationFn: (task_id: number) =>
+      api.post<Task>(`/api/tasks/${task_id}/run-now`, {}),
+    onSuccess: () => {
+      toast.success("Run kicked off in the background.");
+      qc.invalidateQueries({ queryKey: tasksKey });
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  if (isLoading) {
+    return (
+      <div className="text-sm text-muted-foreground py-12 text-center">
+        Loading monitoring tasks…
+      </div>
+    );
+  }
+  if (tasks.length === 0) {
+    return (
+      <EmptyState
+        icon={Bot}
+        title="No monitoring tasks yet"
+        description={
+          "These are standing investigations Avi runs on a cron schedule — " +
+          "e.g. 'monitor for good Yankees ticket deals in May' or " +
+          "'research college options for Jackson'. Create one here, " +
+          "or just ask Avi to monitor something."
+        }
+        action={
+          <button className="btn-primary" onClick={onCreate}>
+            <Plus className="h-4 w-4" /> New monitoring task
+          </button>
+        }
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {tasks.map((t) => (
+        <MonitoringRow
+          key={t.task_id}
+          task={t}
+          peopleById={peopleById}
+          onOpen={() => onOpen(t.task_id)}
+          onDelete={() => onDelete(t)}
+          onTogglePause={() =>
+            togglePause.mutate({
+              task_id: t.task_id,
+              paused: !t.monitoring_paused,
+            })
+          }
+          onRunNow={() => runNow.mutate(t.task_id)}
+          runNowPending={runNow.isPending && runNow.variables === t.task_id}
+          togglePending={
+            togglePause.isPending &&
+            togglePause.variables?.task_id === t.task_id
+          }
+        />
+      ))}
+    </div>
+  );
+}
+
+function MonitoringRow({
+  task,
+  peopleById,
+  onOpen,
+  onDelete,
+  onTogglePause,
+  onRunNow,
+  runNowPending,
+  togglePending,
+}: {
+  task: Task;
+  peopleById: Map<number, Person>;
+  onOpen: () => void;
+  onDelete: () => void;
+  onTogglePause: () => void;
+  onRunNow: () => void;
+  runNowPending: boolean;
+  togglePending: boolean;
+}) {
+  const isRunning = task.last_run_status === "running";
+  const isAvi = task.owner_kind === "ai";
+  const statusMeta = task.last_run_status
+    ? RUN_STATUS_META[task.last_run_status]
+    : null;
+  const StatusIcon = statusMeta?.icon;
+
+  return (
+    <div className="card group">
+      <div className="card-body space-y-3">
+        <div className="flex items-start justify-between gap-3">
+          <button
+            type="button"
+            className="text-left min-w-0 flex-1"
+            onClick={onOpen}
+          >
+            <div className="flex items-center gap-2 mb-1 flex-wrap">
+              {isAvi && (
+                <span className="badge bg-violet-50 text-violet-700 border-violet-200 inline-flex items-center gap-1">
+                  <Bot className="h-3 w-3" /> Avi
+                </span>
+              )}
+              {task.monitoring_paused ? (
+                <span className="badge bg-amber-50 text-amber-700 border-amber-200 inline-flex items-center gap-1">
+                  <Pause className="h-3 w-3" /> Paused
+                </span>
+              ) : (
+                <span className="badge bg-emerald-50 text-emerald-700 border-emerald-200 inline-flex items-center gap-1">
+                  <Activity className="h-3 w-3" /> Active
+                </span>
+              )}
+              {statusMeta && StatusIcon && (
+                <span
+                  className={cn(
+                    "badge inline-flex items-center gap-1",
+                    statusMeta.badgeClass,
+                  )}
+                >
+                  <StatusIcon
+                    className={cn(
+                      "h-3 w-3",
+                      isRunning && "animate-spin",
+                    )}
+                  />
+                  {statusMeta.label}
+                </span>
+              )}
+            </div>
+            <div className="font-semibold leading-tight hover:text-primary transition-colors">
+              {task.title}
+            </div>
+            {task.description && (
+              <div className="text-sm text-muted-foreground mt-1 line-clamp-2">
+                {task.description}
+              </div>
+            )}
+          </button>
+          <div
+            className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border hover:bg-muted disabled:opacity-50"
+              onClick={onTogglePause}
+              disabled={togglePending}
+              title={
+                task.monitoring_paused ? "Resume cron schedule" : "Pause cron schedule"
+              }
+            >
+              {task.monitoring_paused ? (
+                <>
+                  <Play className="h-3.5 w-3.5" /> Resume
+                </>
+              ) : (
+                <>
+                  <Pause className="h-3.5 w-3.5" /> Pause
+                </>
+              )}
+            </button>
+            {isAvi && (
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100 disabled:opacity-50"
+                onClick={onRunNow}
+                disabled={runNowPending || isRunning}
+                title="Kick off a fresh research run right now"
+              >
+                <Zap className="h-3.5 w-3.5" />
+                {runNowPending || isRunning ? "Running…" : "Run now"}
+              </button>
+            )}
+            <button
+              type="button"
+              className="inline-flex items-center justify-center h-7 w-7 rounded border border-border text-muted-foreground hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
+              onClick={onDelete}
+              title="Delete this monitor"
+              aria-label="Delete monitoring task"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+          <div className="flex items-start gap-2">
+            <CalendarClock className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <div className="font-medium text-foreground">
+                {task.cron_description ?? task.cron_schedule ?? "No schedule"}
+              </div>
+              {task.cron_schedule && (
+                <div className="font-mono text-[10px] text-muted-foreground mt-0.5">
+                  {task.cron_schedule}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="flex items-start gap-2">
+            <Sparkles className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <div className="text-muted-foreground">Next run</div>
+              <div className="font-medium text-foreground">
+                {task.monitoring_paused
+                  ? "Paused"
+                  : task.next_run_at
+                    ? `${formatRelativeTime(task.next_run_at)} · ${formatDateTime(task.next_run_at)}`
+                    : "Not scheduled"}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-start gap-2">
+            <Clock className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <div className="text-muted-foreground">Last run</div>
+              <div className="font-medium text-foreground">
+                {task.last_run_at
+                  ? `${formatRelativeTime(task.last_run_at)} · ${formatDateTime(task.last_run_at)}`
+                  : "Never"}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {task.last_run_error && (
+          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+            <span className="font-semibold">Last error:</span>{" "}
+            {task.last_run_error}
+          </div>
+        )}
+
+        <div className="flex items-center gap-3 text-xs text-muted-foreground border-t border-border pt-2">
+          <span>
+            Created by {personLabel(peopleById, task.created_by_person_id)}
+          </span>
+          {task.comment_count > 0 && (
+            <span className="inline-flex items-center gap-1">
+              <MessageSquare className="h-3 w-3" /> {task.comment_count}
+            </span>
+          )}
+          {task.link_count > 0 && (
+            <span className="inline-flex items-center gap-1">
+              <LinkIcon className="h-3 w-3" /> {task.link_count}
+            </span>
+          )}
+          {task.attachment_count > 0 && (
+            <span className="inline-flex items-center gap-1">
+              <Paperclip className="h-3 w-3" /> {task.attachment_count}
+            </span>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -726,40 +1231,70 @@ interface CreateFormValues {
   assigned_to_person_id?: string;
   desired_end_date?: string;
   start_date?: string;
+  cron_schedule?: string;
+  monitoring_paused?: boolean;
 }
 
 function CreateTaskModal({
   familyId,
   people,
+  defaultKind,
   onClose,
   onCreated,
 }: {
   familyId: number;
   people: Person[];
+  defaultKind?: TaskKind;
   onClose: () => void;
   onCreated: (t: Task) => void;
 }) {
   const toast = useToast();
-  const { register, handleSubmit, reset } = useForm<CreateFormValues>({
-    defaultValues: { priority: "normal", status: "new" },
-  });
+  // Kind toggle lives outside react-hook-form so the cron preview can
+  // react to it without re-rendering the whole form on every keystroke.
+  const [kind, setKind] = useState<TaskKind>(defaultKind ?? "todo");
+  const { register, handleSubmit, reset, watch, setValue } =
+    useForm<CreateFormValues>({
+      defaultValues: {
+        priority: "normal",
+        status: "new",
+        cron_schedule: "",
+        monitoring_paused: false,
+      },
+    });
+  const cronWatch = watch("cron_schedule") || "";
 
   const create = useMutation({
-    mutationFn: (v: CreateFormValues) =>
-      api.post<Task>("/api/tasks", {
+    mutationFn: (v: CreateFormValues) => {
+      const isMonitoring = kind === "monitoring";
+      return api.post<Task>("/api/tasks", {
         family_id: familyId,
         title: v.title,
         description: v.description || null,
         priority: v.priority,
         status: v.status,
-        assigned_to_person_id: v.assigned_to_person_id
-          ? Number(v.assigned_to_person_id)
-          : null,
+        // AI monitoring tasks ignore the assignee — Avi owns them.
+        assigned_to_person_id: isMonitoring
+          ? null
+          : v.assigned_to_person_id
+            ? Number(v.assigned_to_person_id)
+            : null,
         desired_end_date: v.desired_end_date || null,
         start_date: v.start_date || null,
-      }),
+        owner_kind: isMonitoring ? "ai" : "human",
+        task_kind: isMonitoring ? "monitoring" : "todo",
+        cron_schedule:
+          isMonitoring && v.cron_schedule?.trim()
+            ? v.cron_schedule.trim()
+            : null,
+        monitoring_paused: isMonitoring ? Boolean(v.monitoring_paused) : false,
+      });
+    },
     onSuccess: (t) => {
-      toast.success("Task created.");
+      toast.success(
+        kind === "monitoring"
+          ? "Monitoring task created — Avi is starting the first research run now."
+          : "Task created.",
+      );
       reset();
       onCreated(t);
     },
@@ -770,7 +1305,7 @@ function CreateTaskModal({
     <Modal
       open
       onClose={onClose}
-      title="New task"
+      title={kind === "monitoring" ? "New monitoring task" : "New task"}
       footer={
         <>
           <button className="btn-secondary" onClick={onClose}>
@@ -781,24 +1316,55 @@ function CreateTaskModal({
             disabled={create.isPending}
             onClick={handleSubmit((v) => create.mutate(v))}
           >
-            {create.isPending ? "Creating…" : "Create task"}
+            {create.isPending
+              ? "Creating…"
+              : kind === "monitoring"
+                ? "Create monitor"
+                : "Create task"}
           </button>
         </>
       }
     >
       <form className="space-y-4" onSubmit={(e) => e.preventDefault()}>
+        {/* Kind selector */}
+        <div className="grid grid-cols-2 gap-2">
+          <KindCard
+            active={kind === "todo"}
+            icon={Layers}
+            title="Human todo"
+            description="A one-shot task on the kanban board, assigned to a person."
+            onClick={() => setKind("todo")}
+          />
+          <KindCard
+            active={kind === "monitoring"}
+            icon={Bot}
+            title="Avi monitor"
+            description="Standing investigation Avi runs on a cron schedule."
+            onClick={() => setKind("monitoring")}
+            accent
+          />
+        </div>
+
         <Field label="Title" htmlFor="title">
           <input
             id="title"
             className="input"
-            placeholder="e.g. Fix the east gate latch"
+            placeholder={
+              kind === "monitoring"
+                ? "e.g. Monitor for good Yankees ticket deals in May"
+                : "e.g. Fix the east gate latch"
+            }
             {...register("title", { required: true })}
           />
         </Field>
         <Field
           label="Description"
           htmlFor="description"
-          hint="Long-form context — what does done look like?"
+          hint={
+            kind === "monitoring"
+              ? "Tell Avi what to research, what counts as a 'good' result, and any constraints."
+              : "Long-form context — what does done look like?"
+          }
         >
           <textarea
             id="description"
@@ -807,64 +1373,193 @@ function CreateTaskModal({
             {...register("description")}
           />
         </Field>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Priority" htmlFor="priority">
-            <select id="priority" className="input" {...register("priority")}>
-              {PRIORITY_OPTIONS.map((p) => (
-                <option key={p} value={p}>
-                  {formatPriority(p)}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="Status" htmlFor="status">
-            <select id="status" className="input" {...register("status")}>
-              {STATUS_OPTIONS.map((s) => (
-                <option key={s} value={s}>
-                  {s.replace("_", " ")}
-                </option>
-              ))}
-            </select>
-          </Field>
-        </div>
-        <Field label="Assigned to" htmlFor="assigned_to_person_id">
-          <select
-            id="assigned_to_person_id"
-            className="input"
-            {...register("assigned_to_person_id")}
-          >
-            <option value="">— Unassigned</option>
-            {people.map((p) => (
-              <option key={p.person_id} value={p.person_id}>
-                {p.preferred_name || `${p.first_name} ${p.last_name}`.trim()}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Start date" htmlFor="start_date">
-            <input
-              id="start_date"
-              type="date"
-              className="input"
-              {...register("start_date")}
-            />
-          </Field>
-          <Field
-            label="Desired end date"
-            htmlFor="desired_end_date"
-            hint="Soft target — Avi uses this for 'due soon' filters."
-          >
-            <input
-              id="desired_end_date"
-              type="date"
-              className="input"
-              {...register("desired_end_date")}
-            />
-          </Field>
-        </div>
+
+        {kind === "monitoring" ? (
+          <>
+            <Field
+              label="Schedule"
+              htmlFor="cron_schedule"
+              hint="Cron expression interpreted in the family's timezone. Leave blank for the household default (typically once a day)."
+            >
+              <div className="space-y-2">
+                <input
+                  id="cron_schedule"
+                  className="input font-mono text-sm"
+                  placeholder="e.g. 0 9 * * *"
+                  {...register("cron_schedule")}
+                />
+                <CronPreview expression={cronWatch} />
+                <div className="flex flex-wrap gap-1">
+                  {CRON_PRESETS.map((preset) => (
+                    <button
+                      key={preset.expr}
+                      type="button"
+                      className="text-xs px-2 py-1 rounded border border-border hover:bg-muted text-muted-foreground hover:text-foreground"
+                      onClick={() =>
+                        setValue("cron_schedule", preset.expr, {
+                          shouldDirty: true,
+                        })
+                      }
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </Field>
+            <Field htmlFor="monitoring_paused">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  id="monitoring_paused"
+                  type="checkbox"
+                  className="h-4 w-4"
+                  {...register("monitoring_paused")}
+                />
+                <span>
+                  Create paused — don't kick off the first run yet.
+                </span>
+              </label>
+            </Field>
+          </>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Priority" htmlFor="priority">
+                <select id="priority" className="input" {...register("priority")}>
+                  {PRIORITY_OPTIONS.map((p) => (
+                    <option key={p} value={p}>
+                      {formatPriority(p)}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Status" htmlFor="status">
+                <select id="status" className="input" {...register("status")}>
+                  {STATUS_OPTIONS.map((s) => (
+                    <option key={s} value={s}>
+                      {s.replace("_", " ")}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+            <Field label="Assigned to" htmlFor="assigned_to_person_id">
+              <select
+                id="assigned_to_person_id"
+                className="input"
+                {...register("assigned_to_person_id")}
+              >
+                <option value="">— Unassigned</option>
+                {people.map((p) => (
+                  <option key={p.person_id} value={p.person_id}>
+                    {p.preferred_name ||
+                      `${p.first_name} ${p.last_name}`.trim()}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Start date" htmlFor="start_date">
+                <input
+                  id="start_date"
+                  type="date"
+                  className="input"
+                  {...register("start_date")}
+                />
+              </Field>
+              <Field
+                label="Desired end date"
+                htmlFor="desired_end_date"
+                hint="Soft target — Avi uses this for 'due soon' filters."
+              >
+                <input
+                  id="desired_end_date"
+                  type="date"
+                  className="input"
+                  {...register("desired_end_date")}
+                />
+              </Field>
+            </div>
+          </>
+        )}
       </form>
     </Modal>
+  );
+}
+
+function KindCard({
+  active,
+  icon: Icon,
+  title,
+  description,
+  onClick,
+  accent,
+}: {
+  active: boolean;
+  icon: typeof Layers;
+  title: string;
+  description: string;
+  onClick: () => void;
+  accent?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "rounded-md border p-3 text-left transition-all",
+        active
+          ? accent
+            ? "border-violet-400 bg-violet-50 ring-2 ring-violet-200"
+            : "border-primary bg-primary/5 ring-2 ring-primary/20"
+          : "border-border hover:border-foreground/30",
+      )}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <Icon
+          className={cn(
+            "h-4 w-4",
+            active && accent && "text-violet-600",
+            active && !accent && "text-primary",
+            !active && "text-muted-foreground",
+          )}
+        />
+        <span className="font-semibold text-sm">{title}</span>
+      </div>
+      <p className="text-xs text-muted-foreground leading-snug">{description}</p>
+    </button>
+  );
+}
+
+/**
+ * Lightweight on-page cron description that mirrors what the backend
+ * shows. We render only the five-field structure check here — the
+ * authoritative human-readable string comes back from the API after
+ * create / update — but a quick "5 fields ✓" / "needs 5 fields" hint
+ * helps the user see they typed something coherent before submit.
+ */
+function CronPreview({ expression }: { expression: string }) {
+  const trimmed = (expression || "").trim();
+  if (!trimmed) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Empty — Avi will use the household default cadence.
+      </p>
+    );
+  }
+  const parts = trimmed.split(/\s+/);
+  const ok = parts.length === 5;
+  return (
+    <p
+      className={cn(
+        "text-xs",
+        ok ? "text-emerald-700" : "text-amber-700",
+      )}
+    >
+      {ok
+        ? "Looks like a valid cron expression — Avi will confirm the human-readable version after saving."
+        : `Cron expressions need exactly 5 space-separated fields (got ${parts.length}).`}
+    </p>
   );
 }
 
@@ -967,7 +1662,31 @@ function TaskDetailModal({
     onError: (err: Error) => toast.error(err.message),
   });
 
+  const updateSchedule = useMutation({
+    mutationFn: (patch: { cron_schedule?: string | null; monitoring_paused?: boolean }) =>
+      api.put<Task>(`/api/tasks/${taskId}/schedule`, patch),
+    onSuccess: invalidate,
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const runNow = useMutation({
+    mutationFn: () => api.post<Task>(`/api/tasks/${taskId}/run-now`, {}),
+    onSuccess: () => {
+      toast.success("Run kicked off in the background.");
+      invalidate();
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const removeLink = useMutation({
+    mutationFn: (linkId: number) =>
+      api.del(`/api/tasks/${taskId}/links/${linkId}`),
+    onSuccess: invalidate,
+    onError: (err: Error) => toast.error(err.message),
+  });
+
   const t = detailQuery.data;
+  const isMonitoring = t?.task_kind === "monitoring";
 
   const [commentDraft, setCommentDraft] = useState("");
   const [followerToAdd, setFollowerToAdd] = useState<string>("");
@@ -988,7 +1707,20 @@ function TaskDetailModal({
             <Trash2 className="h-4 w-4" /> Delete
           </button>
           <div className="flex items-center gap-2">
-            {t && t.status !== "done" && (
+            {t && isMonitoring && t.owner_kind === "ai" && (
+              <button
+                className="btn-secondary"
+                onClick={() => runNow.mutate()}
+                disabled={runNow.isPending || t.last_run_status === "running"}
+                title="Kick off a fresh research run right now"
+              >
+                <Zap className="h-4 w-4 text-violet-600" />
+                {runNow.isPending || t.last_run_status === "running"
+                  ? "Running…"
+                  : "Run now"}
+              </button>
+            )}
+            {t && !isMonitoring && t.status !== "done" && (
               <button
                 className="btn-secondary"
                 onClick={() => patchTask.mutate({ status: "done" })}
@@ -1012,6 +1744,18 @@ function TaskDetailModal({
         </div>
       ) : (
         <div className="space-y-5">
+          {/* Kind banner — makes monitoring tasks visually distinct */}
+          {isMonitoring && (
+            <div className="flex items-center gap-2 rounded-md border border-violet-200 bg-violet-50 px-3 py-2 text-sm text-violet-700">
+              <Bot className="h-4 w-4" />
+              <span>
+                <strong>Avi is monitoring this</strong> on a cron schedule.
+                Edit the cadence below or click "Run now" in the footer to
+                refresh on demand.
+              </span>
+            </div>
+          )}
+
           {/* Title + quick edit */}
           <div>
             <input
@@ -1024,77 +1768,116 @@ function TaskDetailModal({
             />
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <Field label="Status" htmlFor="status-edit">
-              <select
-                id="status-edit"
-                className="input"
-                value={t.status}
-                onChange={(e) =>
-                  patchTask.mutate({ status: e.target.value as TaskStatus })
-                }
-              >
-                {STATUS_OPTIONS.map((s) => (
-                  <option key={s} value={s}>
-                    {s.replace("_", " ")}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="Priority" htmlFor="priority-edit">
-              <select
-                id="priority-edit"
-                className="input"
-                value={t.priority}
-                onChange={(e) =>
-                  patchTask.mutate({
-                    priority: e.target.value as TaskPriority,
-                  })
-                }
-              >
-                {PRIORITY_OPTIONS.map((p) => (
-                  <option key={p} value={p}>
-                    {formatPriority(p)}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="Owner" htmlFor="owner-edit">
-              <select
-                id="owner-edit"
-                className="input"
-                value={t.assigned_to_person_id ?? ""}
-                onChange={(e) =>
-                  patchTask.mutate({
-                    assigned_to_person_id: e.target.value
-                      ? Number(e.target.value)
-                      : null,
-                  })
-                }
-              >
-                <option value="">— Unassigned</option>
-                {people.map((p) => (
-                  <option key={p.person_id} value={p.person_id}>
-                    {p.preferred_name ||
-                      `${p.first_name} ${p.last_name}`.trim()}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="Desired end" htmlFor="desired-edit">
-              <input
-                id="desired-edit"
-                type="date"
-                className="input"
-                defaultValue={t.desired_end_date ?? ""}
-                onBlur={(e) =>
-                  patchTask.mutate({
-                    desired_end_date: e.target.value || null,
-                  })
-                }
-              />
-            </Field>
-          </div>
+          {isMonitoring ? (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Field label="Priority" htmlFor="priority-edit">
+                <select
+                  id="priority-edit"
+                  className="input"
+                  value={t.priority}
+                  onChange={(e) =>
+                    patchTask.mutate({
+                      priority: e.target.value as TaskPriority,
+                    })
+                  }
+                >
+                  {PRIORITY_OPTIONS.map((p) => (
+                    <option key={p} value={p}>
+                      {formatPriority(p)}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Status" htmlFor="status-edit">
+                <select
+                  id="status-edit"
+                  className="input"
+                  value={t.status}
+                  onChange={(e) =>
+                    patchTask.mutate({ status: e.target.value as TaskStatus })
+                  }
+                >
+                  {STATUS_OPTIONS.map((s) => (
+                    <option key={s} value={s}>
+                      {s.replace("_", " ")}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <Field label="Status" htmlFor="status-edit">
+                <select
+                  id="status-edit"
+                  className="input"
+                  value={t.status}
+                  onChange={(e) =>
+                    patchTask.mutate({ status: e.target.value as TaskStatus })
+                  }
+                >
+                  {STATUS_OPTIONS.map((s) => (
+                    <option key={s} value={s}>
+                      {s.replace("_", " ")}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Priority" htmlFor="priority-edit">
+                <select
+                  id="priority-edit"
+                  className="input"
+                  value={t.priority}
+                  onChange={(e) =>
+                    patchTask.mutate({
+                      priority: e.target.value as TaskPriority,
+                    })
+                  }
+                >
+                  {PRIORITY_OPTIONS.map((p) => (
+                    <option key={p} value={p}>
+                      {formatPriority(p)}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Owner" htmlFor="owner-edit">
+                <select
+                  id="owner-edit"
+                  className="input"
+                  value={t.assigned_to_person_id ?? ""}
+                  onChange={(e) =>
+                    patchTask.mutate({
+                      assigned_to_person_id: e.target.value
+                        ? Number(e.target.value)
+                        : null,
+                    })
+                  }
+                >
+                  <option value="">— Unassigned</option>
+                  {people.map((p) => (
+                    <option key={p.person_id} value={p.person_id}>
+                      {p.preferred_name ||
+                        `${p.first_name} ${p.last_name}`.trim()}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Desired end" htmlFor="desired-edit">
+                <input
+                  id="desired-edit"
+                  type="date"
+                  className="input"
+                  defaultValue={t.desired_end_date ?? ""}
+                  onBlur={(e) =>
+                    patchTask.mutate({
+                      desired_end_date: e.target.value || null,
+                    })
+                  }
+                />
+              </Field>
+            </div>
+          )}
 
           <Field label="Description" htmlFor="desc-edit">
             <textarea
@@ -1107,6 +1890,22 @@ function TaskDetailModal({
               }
             />
           </Field>
+
+          {isMonitoring && (
+            <ScheduleSection
+              task={t}
+              busy={updateSchedule.isPending}
+              onSubmit={(patch) => updateSchedule.mutate(patch)}
+            />
+          )}
+
+          {isMonitoring && (
+            <LinksSection
+              links={t.links}
+              busy={removeLink.isPending}
+              onRemove={(id) => removeLink.mutate(id)}
+            />
+          )}
 
           <div className="text-xs text-muted-foreground">
             Created {formatDate(t.created_at)} by{" "}
@@ -1331,5 +2130,244 @@ function CommentRow({
       </div>
       <div className="whitespace-pre-wrap">{comment.body}</div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Schedule editor (monitoring tasks only)
+// ---------------------------------------------------------------------------
+
+function ScheduleSection({
+  task,
+  busy,
+  onSubmit,
+}: {
+  task: TaskDetail;
+  busy: boolean;
+  onSubmit: (patch: {
+    cron_schedule?: string | null;
+    monitoring_paused?: boolean;
+  }) => void;
+}) {
+  // Local draft so the user can type a cron expression before saving.
+  // Reset when the server-provided schedule changes (e.g. another tab
+  // edited it) so we never silently overwrite a fresh value.
+  const [draft, setDraft] = useState(task.cron_schedule ?? "");
+  const lastServerCron = useRef(task.cron_schedule ?? "");
+  if (lastServerCron.current !== (task.cron_schedule ?? "")) {
+    lastServerCron.current = task.cron_schedule ?? "";
+    setDraft(task.cron_schedule ?? "");
+  }
+
+  const dirty = draft.trim() !== (task.cron_schedule ?? "").trim();
+
+  const statusMeta = task.last_run_status
+    ? RUN_STATUS_META[task.last_run_status]
+    : null;
+  const StatusIcon = statusMeta?.icon;
+
+  return (
+    <section>
+      <div className="flex items-center gap-2 mb-2">
+        <CalendarClock className="h-4 w-4 text-muted-foreground" />
+        <h3 className="font-semibold text-sm">Schedule</h3>
+      </div>
+      <div className="rounded-md border border-border bg-muted/30 p-3 space-y-3">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+          <div>
+            <div className="text-muted-foreground">Next run</div>
+            <div className="font-medium text-sm text-foreground">
+              {task.monitoring_paused
+                ? "Paused"
+                : task.next_run_at
+                  ? `${formatRelativeTime(task.next_run_at)} · ${formatDateTime(task.next_run_at)}`
+                  : "Not scheduled"}
+            </div>
+          </div>
+          <div>
+            <div className="text-muted-foreground">Last run</div>
+            <div className="font-medium text-sm text-foreground">
+              {task.last_run_at
+                ? `${formatRelativeTime(task.last_run_at)} · ${formatDateTime(task.last_run_at)}`
+                : "Never"}
+            </div>
+          </div>
+          <div>
+            <div className="text-muted-foreground">Status</div>
+            {statusMeta && StatusIcon ? (
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1 badge mt-1",
+                  statusMeta.badgeClass,
+                )}
+              >
+                <StatusIcon
+                  className={cn(
+                    "h-3 w-3",
+                    task.last_run_status === "running" && "animate-spin",
+                  )}
+                />
+                {statusMeta.label}
+              </span>
+            ) : (
+              <div className="text-sm text-muted-foreground italic">—</div>
+            )}
+          </div>
+        </div>
+
+        {task.last_run_error && (
+          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+            <span className="font-semibold">Last error:</span>{" "}
+            {task.last_run_error}
+          </div>
+        )}
+
+        <div>
+          <label className="label">Cron expression</label>
+          <input
+            className="input font-mono text-sm"
+            placeholder="e.g. 0 9 * * *"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+          {task.cron_description && (
+            <p className="text-xs text-muted-foreground mt-1">
+              Currently: <span className="font-medium">{task.cron_description}</span>
+            </p>
+          )}
+          <div className="mt-2 flex flex-wrap gap-1">
+            {CRON_PRESETS.map((preset) => (
+              <button
+                key={preset.expr}
+                type="button"
+                className="text-xs px-2 py-1 rounded border border-border hover:bg-white text-muted-foreground hover:text-foreground"
+                onClick={() => setDraft(preset.expr)}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border hover:bg-white"
+            onClick={() =>
+              onSubmit({ monitoring_paused: !task.monitoring_paused })
+            }
+            disabled={busy}
+          >
+            {task.monitoring_paused ? (
+              <>
+                <Play className="h-3.5 w-3.5" /> Resume
+              </>
+            ) : (
+              <>
+                <Pause className="h-3.5 w-3.5" /> Pause
+              </>
+            )}
+          </button>
+          <div className="flex items-center gap-2">
+            {dirty && (
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setDraft(task.cron_schedule ?? "")}
+              >
+                Discard
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={!dirty || busy}
+              onClick={() =>
+                onSubmit({
+                  cron_schedule: draft.trim() ? draft.trim() : null,
+                })
+              }
+            >
+              {busy ? "Saving…" : "Save schedule"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sources / links (monitoring tasks only)
+// ---------------------------------------------------------------------------
+
+function LinksSection({
+  links,
+  busy,
+  onRemove,
+}: {
+  links: TaskLink[];
+  busy: boolean;
+  onRemove: (linkId: number) => void;
+}) {
+  return (
+    <section>
+      <div className="flex items-center gap-2 mb-2">
+        <LinkIcon className="h-4 w-4 text-muted-foreground" />
+        <h3 className="font-semibold text-sm">Sources</h3>
+        <span className="text-xs text-muted-foreground">
+          ({links.length})
+        </span>
+      </div>
+      {links.length === 0 ? (
+        <div className="text-xs text-muted-foreground italic">
+          Avi will cite the URLs she relies on here as monitoring runs
+          turn up new findings.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {links.map((link) => (
+            <div
+              key={link.task_link_id}
+              className="rounded-md border border-border bg-white p-3 text-sm flex items-start justify-between gap-2"
+            >
+              <div className="min-w-0 flex-1">
+                <a
+                  href={link.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-medium text-primary hover:underline inline-flex items-center gap-1"
+                >
+                  {link.title || link.url}
+                  <ExternalLink className="h-3 w-3 shrink-0" />
+                </a>
+                <div className="text-xs text-muted-foreground truncate">
+                  {link.url}
+                </div>
+                {link.summary && (
+                  <p className="text-xs text-muted-foreground mt-1 leading-snug">
+                    {link.summary}
+                  </p>
+                )}
+                <div className="text-[10px] text-muted-foreground mt-1">
+                  {link.added_by_kind === "assistant" ? "Cited by Avi" : "Added manually"}
+                  {" · "}
+                  {formatDate(link.created_at)}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="text-muted-foreground hover:text-destructive shrink-0"
+                onClick={() => onRemove(link.task_link_id)}
+                disabled={busy}
+                aria-label="Remove link"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }

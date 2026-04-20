@@ -2,11 +2,14 @@
 
 URL layout (all under ``/api/admin``)::
 
-    GET    /tasks?family_id=&status=&priority=&assigned_to=&q=&include_done=
+    GET    /tasks?family_id=&status=&priority=&assigned_to=&task_kind=&q=&include_done=
     POST   /tasks
-    GET    /tasks/{task_id}                # detail with comments / followers / attachments
+    GET    /tasks/{task_id}                # detail with comments / followers / attachments / links
     PATCH  /tasks/{task_id}
     DELETE /tasks/{task_id}
+
+    PUT    /tasks/{task_id}/schedule       # cron edit + pause/resume (monitoring tasks)
+    POST   /tasks/{task_id}/run-now        # fire a monitoring run immediately
 
     POST   /tasks/{task_id}/comments
     DELETE /tasks/{task_id}/comments/{comment_id}
@@ -18,6 +21,9 @@ URL layout (all under ``/api/admin``)::
     GET    /tasks/{task_id}/attachments/{attachment_id}/download
     DELETE /tasks/{task_id}/attachments/{attachment_id}
 
+    POST   /tasks/{task_id}/links          # AI-discovered or person-added URL
+    DELETE /tasks/{task_id}/links/{link_id}
+
 The AI assistant uses :mod:`api.ai.tools` directly against the ORM
 rather than going through HTTP — keeping the in-process call cheap —
 but the surface area here matches what the admin UI consumes 1:1 so a
@@ -26,6 +32,7 @@ future external integration can drive everything via REST.
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -45,7 +52,12 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .. import models, schemas, storage
+from ..config import get_settings
 from ..db import get_db
+from ..services import cron_helpers
+
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -82,9 +94,21 @@ def _serialize_task(
     follower_count: Optional[int] = None,
     comment_count: Optional[int] = None,
     attachment_count: Optional[int] = None,
+    link_count: Optional[int] = None,
 ) -> schemas.TaskRead:
     """Hand-built serialiser so the count fields can be supplied from
-    a single grouped query (no N+1)."""
+    a single grouped query (no N+1).
+
+    Renders ``cron_description`` from ``cron_schedule`` on the way out
+    so the client never has to parse cron itself — every monitoring
+    list view gets a free "At 09:00 AM, every day" string.
+    """
+    cron_description: Optional[str] = None
+    if task.cron_schedule:
+        # describe() is best-effort and never raises, so this can't
+        # break a list response if the user typed a malformed cron.
+        cron_description = cron_helpers.describe(task.cron_schedule)
+
     return schemas.TaskRead(
         task_id=task.task_id,
         family_id=task.family_id,
@@ -100,9 +124,19 @@ def _serialize_task(
         completed_at=task.completed_at,
         created_at=task.created_at,
         updated_at=task.updated_at,
+        owner_kind=task.owner_kind,  # type: ignore[arg-type]
+        task_kind=task.task_kind,  # type: ignore[arg-type]
+        cron_schedule=task.cron_schedule,
+        cron_description=cron_description,
+        next_run_at=task.next_run_at,
+        last_run_at=task.last_run_at,
+        last_run_status=task.last_run_status,  # type: ignore[arg-type]
+        last_run_error=task.last_run_error,
+        monitoring_paused=bool(task.monitoring_paused),
         follower_count=int(follower_count or 0),
         comment_count=int(comment_count or 0),
         attachment_count=int(attachment_count or 0),
+        link_count=int(link_count or 0),
     )
 
 
@@ -111,6 +145,72 @@ def _get_task_or_404(db: Session, task_id: int) -> models.Task:
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+def _resolve_family_timezone(db: Session, family_id: int) -> str:
+    """Look up the family's IANA timezone, falling back to ET."""
+    fam = db.get(models.Family, family_id)
+    if fam is not None and getattr(fam, "timezone", None):
+        return fam.timezone
+    return "America/New_York"
+
+
+def _validate_and_apply_schedule(
+    db: Session,
+    task: models.Task,
+    *,
+    cron_expression: Optional[str],
+) -> None:
+    """Validate ``cron_expression`` and update the task's schedule cols.
+
+    Centralised so the create / patch / dedicated-schedule endpoints
+    behave identically: same validation, same next_run_at recompute.
+    Raises HTTP 422 on a bad cron string (the only reason cron parsing
+    can fail in user input).
+    """
+    if cron_expression is None or not cron_expression.strip():
+        # Clearing the schedule "pauses" auto-runs by leaving
+        # next_run_at NULL. We don't change monitoring_paused here —
+        # callers can do that explicitly.
+        task.cron_schedule = None
+        task.next_run_at = None
+        return
+
+    tz_name = _resolve_family_timezone(db, task.family_id)
+    try:
+        info = cron_helpers.parse(cron_expression, tz_name)
+    except cron_helpers.CronError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    task.cron_schedule = info.expression
+    # Only update next_run_at if the task is unpaused; a paused task
+    # keeps next_run_at NULL so the scheduler scan skips it cheaply.
+    task.next_run_at = None if task.monitoring_paused else info.next_run_utc
+
+
+def _maybe_kick_off_first_run(task: models.Task) -> None:
+    """Submit an immediate first run for an AI-owned monitoring task.
+
+    Called after creation. Imports the scheduler service lazily to
+    avoid a router→scheduler→router import cycle and to keep the
+    router importable even if the scheduler module is broken.
+    """
+    if task.owner_kind != "ai" or task.task_kind != "monitoring":
+        return
+    if task.monitoring_paused:
+        return
+    try:
+        from ..services import monitoring_scheduler
+
+        monitoring_scheduler.run_now_in_background(task.task_id)
+    except Exception:  # noqa: BLE001 - never let scheduling failure 500 the create
+        logger.exception(
+            "tasks.create: failed to kick off first run for task %d",
+            task.task_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +238,17 @@ def list_tasks(
     ),
     created_by: Optional[int] = Query(
         None, description="Person id of the creator."
+    ),
+    task_kind: Optional[schemas.TaskKind] = Query(
+        None,
+        description=(
+            "Limit to a single task shape: 'todo' for the kanban board, "
+            "'monitoring' for the AI standing-job tab. Omit for both."
+        ),
+    ),
+    owner_kind: Optional[schemas.TaskOwnerKind] = Query(
+        None,
+        description="Limit to 'human' or 'ai'-owned tasks.",
     ),
     q: Optional[str] = Query(
         None,
@@ -183,6 +294,11 @@ def list_tasks(
             )
     if created_by is not None:
         stmt = stmt.where(models.Task.created_by_person_id == int(created_by))
+
+    if task_kind is not None:
+        stmt = stmt.where(models.Task.task_kind == task_kind)
+    if owner_kind is not None:
+        stmt = stmt.where(models.Task.owner_kind == owner_kind)
 
     if q:
         like = f"%{q}%"
@@ -253,6 +369,16 @@ def list_tasks(
             .group_by(models.TaskAttachment.task_id)
         ).all()
     )
+    link_counts = dict(
+        db.execute(
+            select(
+                models.TaskLink.task_id,
+                func.count(models.TaskLink.task_link_id),
+            )
+            .where(models.TaskLink.task_id.in_(ids))
+            .group_by(models.TaskLink.task_id)
+        ).all()
+    )
 
     return [
         _serialize_task(
@@ -260,6 +386,7 @@ def list_tasks(
             follower_count=follower_counts.get(r.task_id, 0),
             comment_count=comment_counts.get(r.task_id, 0),
             attachment_count=attachment_counts.get(r.task_id, 0),
+            link_count=link_counts.get(r.task_id, 0),
         )
         for r in rows
     ]
@@ -284,10 +411,24 @@ def create_task(
     ):
         raise HTTPException(status_code=404, detail="Assignee person not found")
 
+    # AI monitoring tasks have a different shape from human todos —
+    # the assignee is meaningless (Avi is the owner) so we clear it,
+    # and a missing cron string is filled with the configured default.
+    is_ai_monitoring = (
+        payload.owner_kind == "ai" and payload.task_kind == "monitoring"
+    )
+    settings = get_settings()
+    cron_to_apply: Optional[str] = payload.cron_schedule
+    assigned_to_person_id = payload.assigned_to_person_id
+    if is_ai_monitoring:
+        assigned_to_person_id = None
+        if not cron_to_apply or not cron_to_apply.strip():
+            cron_to_apply = settings.AI_MONITORING_DEFAULT_CRON
+
     task = models.Task(
         family_id=payload.family_id,
         created_by_person_id=payload.created_by_person_id,
-        assigned_to_person_id=payload.assigned_to_person_id,
+        assigned_to_person_id=assigned_to_person_id,
         title=payload.title.strip(),
         description=payload.description,
         status=payload.status,
@@ -296,7 +437,15 @@ def create_task(
         desired_end_date=payload.desired_end_date,
         end_date=payload.end_date,
         completed_at=_now() if payload.status == "done" else None,
+        owner_kind=payload.owner_kind,
+        task_kind=payload.task_kind,
+        monitoring_paused=payload.monitoring_paused,
     )
+    # Validate cron + compute next_run_at against the family's tz. We
+    # do this on the un-committed task so a bad cron 422s before any
+    # row is written.
+    _validate_and_apply_schedule(db, task, cron_expression=cron_to_apply)
+
     db.add(task)
     db.flush()
 
@@ -304,7 +453,7 @@ def create_task(
     # implicit subscribers; the table only carries the EXTRAS.
     implicit = {
         i
-        for i in (payload.created_by_person_id, payload.assigned_to_person_id)
+        for i in (payload.created_by_person_id, assigned_to_person_id)
         if i is not None
     }
     for pid in payload.follower_person_ids:
@@ -324,6 +473,15 @@ def create_task(
 
     db.flush()
     db.refresh(task)
+
+    # Kick off the first monitoring run AFTER the row is fully
+    # committed so the background worker can read it. We commit
+    # explicitly rather than relying on the request lifecycle so the
+    # background thread sees the row immediately.
+    if is_ai_monitoring and not task.monitoring_paused:
+        db.commit()
+        _maybe_kick_off_first_run(task)
+
     return _serialize_task(task, follower_count=len(task.followers))
 
 
@@ -335,6 +493,7 @@ def get_task(task_id: int, db: Session = Depends(get_db)) -> schemas.TaskDetail:
             selectinload(models.Task.followers),
             selectinload(models.Task.comments),
             selectinload(models.Task.attachments),
+            selectinload(models.Task.links),
         )
         .filter(models.Task.task_id == task_id)
         .first()
@@ -347,6 +506,7 @@ def get_task(task_id: int, db: Session = Depends(get_db)) -> schemas.TaskDetail:
             follower_count=len(task.followers),
             comment_count=len(task.comments),
             attachment_count=len(task.attachments),
+            link_count=len(task.links),
         ).model_dump(),
         followers=[
             schemas.TaskFollowerRead.model_validate(f) for f in task.followers
@@ -358,6 +518,7 @@ def get_task(task_id: int, db: Session = Depends(get_db)) -> schemas.TaskDetail:
             schemas.TaskAttachmentRead.model_validate(a)
             for a in task.attachments
         ],
+        links=[schemas.TaskLinkRead.model_validate(link) for link in task.links],
     )
 
 
@@ -383,8 +544,38 @@ def update_task(
         elif new_status != "done" and task.completed_at is not None:
             task.completed_at = None
 
+    # Pull cron-related fields out of the generic setattr loop so we
+    # can re-validate + recompute next_run_at atomically.
+    cron_change = changes.pop("cron_schedule", "<unset>")
+    pause_change = changes.pop("monitoring_paused", "<unset>")
+
     for field, value in changes.items():
         setattr(task, field, value)
+
+    if pause_change != "<unset>":
+        task.monitoring_paused = bool(pause_change)
+    if cron_change != "<unset>":
+        _validate_and_apply_schedule(db, task, cron_expression=cron_change)
+    elif pause_change != "<unset>":
+        # Schedule didn't change but pause did; if we just unpaused
+        # and there's a cron, recompute next_run from "now".
+        if (
+            not task.monitoring_paused
+            and task.cron_schedule
+            and task.next_run_at is None
+        ):
+            tz_name = _resolve_family_timezone(db, task.family_id)
+            try:
+                task.next_run_at = cron_helpers.next_run(
+                    task.cron_schedule, tz_name
+                )
+            except cron_helpers.CronError:
+                # Stored cron somehow became invalid; leave next_run
+                # null so the scheduler skips it and surface the cron
+                # string to the UI for the user to fix.
+                task.next_run_at = None
+        elif task.monitoring_paused:
+            task.next_run_at = None
 
     db.flush()
     db.refresh(task)
@@ -421,6 +612,12 @@ def _counts_for(db: Session, task_id: int) -> dict:
         "attachment_count": db.scalar(
             select(func.count(models.TaskAttachment.task_attachment_id)).where(
                 models.TaskAttachment.task_id == task_id
+            )
+        )
+        or 0,
+        "link_count": db.scalar(
+            select(func.count(models.TaskLink.task_link_id)).where(
+                models.TaskLink.task_id == task_id
             )
         )
         or 0,
@@ -616,3 +813,167 @@ def delete_attachment(
         raise HTTPException(status_code=404, detail="Attachment not found")
     storage.delete_if_exists(att.stored_file_path)
     db.delete(att)
+
+
+# ---------------------------------------------------------------------------
+# Schedule + run-now (monitoring tasks)
+# ---------------------------------------------------------------------------
+
+
+@router.put("/{task_id}/schedule", response_model=schemas.TaskRead)
+def update_schedule(
+    task_id: int,
+    payload: schemas.TaskScheduleUpdate,
+    db: Session = Depends(get_db),
+) -> schemas.TaskRead:
+    """Edit the cron schedule and/or pause flag on a monitoring task.
+
+    Separated from :func:`update_task` so the UI can wire a cron
+    editor to a single endpoint that atomically validates the cron
+    expression AND recomputes ``next_run_at`` against the family's
+    timezone. A bad cron returns 422 with a readable error.
+    """
+    task = _get_task_or_404(db, task_id)
+    if task.task_kind != "monitoring":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Only monitoring tasks have a cron schedule. Convert "
+                "the task to task_kind='monitoring' first."
+            ),
+        )
+
+    changes = payload.model_dump(exclude_unset=True)
+    if "monitoring_paused" in changes:
+        task.monitoring_paused = bool(changes["monitoring_paused"])
+
+    if "cron_schedule" in changes:
+        _validate_and_apply_schedule(
+            db, task, cron_expression=changes["cron_schedule"]
+        )
+    elif "monitoring_paused" in changes:
+        # Schedule untouched but pause toggled — recompute or clear
+        # next_run_at to match the new pause state.
+        if task.monitoring_paused:
+            task.next_run_at = None
+        elif task.cron_schedule and task.next_run_at is None:
+            tz_name = _resolve_family_timezone(db, task.family_id)
+            try:
+                task.next_run_at = cron_helpers.next_run(
+                    task.cron_schedule, tz_name
+                )
+            except cron_helpers.CronError:
+                task.next_run_at = None
+
+    db.flush()
+    db.refresh(task)
+    counts = _counts_for(db, task.task_id)
+    return _serialize_task(task, **counts)
+
+
+@router.post(
+    "/{task_id}/run-now",
+    response_model=schemas.TaskRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def run_now(task_id: int, db: Session = Depends(get_db)) -> schemas.TaskRead:
+    """Fire a monitoring run for this task right now, in the background.
+
+    Useful for "Run now" buttons in the UI and for the
+    'I just edited the cron, let me see results' workflow. The agent
+    work is submitted to the shared background pool — this endpoint
+    returns immediately with the (still-running) task row. Poll the
+    detail endpoint to see comments / links materialise.
+    """
+    task = _get_task_or_404(db, task_id)
+    if task.task_kind != "monitoring" or task.owner_kind != "ai":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Only AI-owned monitoring tasks can be run via this "
+                "endpoint."
+            ),
+        )
+
+    try:
+        from ..services import monitoring_scheduler
+
+        monitoring_scheduler.run_now_in_background(task.task_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "tasks.run_now: failed to submit task %d", task.task_id
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start run: {exc}",
+        ) from exc
+
+    db.refresh(task)
+    counts = _counts_for(db, task.task_id)
+    return _serialize_task(task, **counts)
+
+
+# ---------------------------------------------------------------------------
+# Links (AI-discovered or person-added URL citations)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{task_id}/links",
+    response_model=schemas.TaskLinkRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_link(
+    task_id: int,
+    payload: schemas.TaskLinkCreate,
+    db: Session = Depends(get_db),
+) -> models.TaskLink:
+    task = _get_task_or_404(db, task_id)
+
+    if (
+        payload.added_by_kind == "person"
+        and payload.added_by_person_id is not None
+        and db.get(models.Person, payload.added_by_person_id) is None
+    ):
+        raise HTTPException(status_code=404, detail="Author person not found")
+
+    # Idempotent on (task_id, url) so the AI re-citing the same source
+    # on a follow-up run doesn't 500 — return the existing row.
+    existing = db.execute(
+        select(models.TaskLink)
+        .where(models.TaskLink.task_id == task.task_id)
+        .where(models.TaskLink.url == payload.url)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    link = models.TaskLink(
+        task_id=task.task_id,
+        url=payload.url.strip(),
+        title=(payload.title or "").strip() or None,
+        summary=payload.summary,
+        added_by_kind=payload.added_by_kind,
+        added_by_person_id=(
+            payload.added_by_person_id
+            if payload.added_by_kind == "person"
+            else None
+        ),
+        created_at=_now(),
+    )
+    db.add(link)
+    db.flush()
+    db.refresh(link)
+    return link
+
+
+@router.delete(
+    "/{task_id}/links/{link_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_link(
+    task_id: int, link_id: int, db: Session = Depends(get_db)
+) -> None:
+    link = db.get(models.TaskLink, link_id)
+    if link is None or link.task_id != task_id:
+        raise HTTPException(status_code=404, detail="Link not found")
+    db.delete(link)

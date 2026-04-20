@@ -363,6 +363,7 @@ async def chat_with_tools(
     model: Optional[str] = None,
     temperature: float = 0.2,
     timeout_seconds: float = 90.0,
+    think: Optional[bool] = None,
 ) -> ChatWithToolsResult:
     """Single non-streaming chat turn with tool-calling enabled.
 
@@ -373,6 +374,11 @@ async def chat_with_tools(
     ``tool_calls`` and our tool results to ``messages`` between turns.
     Temperature defaults low because tool selection is a structured
     decision; bump it for the final answer if you want more flair.
+
+    ``think`` (when not None) is forwarded to Ollama's ``/api/chat`` as
+    the top-level ``think`` flag — set ``True`` for monitoring runs to
+    enable extended reasoning on Gemma 4 / models that support it.
+    Models that don't expose the flag silently ignore it.
     """
     target_model = model or _model()
     ollama_messages: List[Dict[str, Any]] = []
@@ -387,6 +393,8 @@ async def chat_with_tools(
         "tools": tools,
         "options": {"temperature": temperature},
     }
+    if think is not None:
+        payload["think"] = bool(think)
 
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:

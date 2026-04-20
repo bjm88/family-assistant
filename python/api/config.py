@@ -81,6 +81,21 @@ class Settings(BaseSettings):
     # the natural choice when the user has pulled it; falls back to
     # the main model if this one isn't installed in Ollama.
     AI_OLLAMA_FAST_MODEL: str = "gemma4:e2b"
+    # Optional third tier — used by AI-owned monitoring tasks
+    # (`task_kind="monitoring"`, `owner_kind="ai"`) where a single run
+    # can spend 30+ s reasoning over web-search results. Defaults to
+    # the heavy model so a fresh install needs no extra `ollama pull`,
+    # but you can point this at a beefier reasoner (e.g.
+    # ``gpt-oss:120b``, ``qwen2.5:72b``) once it's installed and
+    # monitoring runs will use it instead of the conversational model.
+    # Empty string means "fall back to AI_OLLAMA_MODEL".
+    AI_OLLAMA_THINKING_MODEL: str = ""
+    # When true the monitoring agent loop sends ``"think": true`` on
+    # /api/chat so Ollama runs the model's extended-reasoning path
+    # (Gemma 4 supports this) — slower but markedly better on
+    # multi-source research. No effect for models that don't expose
+    # the flag; Ollama silently ignores unknown options.
+    AI_OLLAMA_THINKING_ENABLED: bool = True
 
     # ---- Tiered messaging: fast acknowledgement before heavy reply -----
     # Push-style surfaces (Telegram, SMS) leave the user staring at a
@@ -261,6 +276,61 @@ class Settings(BaseSettings):
     AI_TELEGRAM_VERIFY_TTL_MINUTES: int = 10
     AI_TELEGRAM_VERIFY_MAX_ATTEMPTS: int = 5
     AI_TELEGRAM_VERIFY_CODE_LENGTH: int = 6
+
+    # ---- Monitoring tasks (Avi's standing research jobs) ---------------
+    # AI-owned tasks of kind "monitoring" run on a cron schedule. The
+    # scheduler is a single asyncio loop in
+    # ``services/monitoring_scheduler.py`` that wakes every
+    # ``AI_MONITORING_TICK_SECONDS`` and submits any due task to the
+    # shared background-agent pool. Disable to keep monitoring tasks in
+    # the database but skip auto-running them (manual "Run now" still
+    # works).
+    AI_MONITORING_ENABLED: bool = True
+    # How often the scheduler wakes to look for due tasks. 30 s is
+    # plenty given the smallest cron resolution is one minute; the
+    # only reason to lower this is to make "Run now" feel more
+    # responsive on a quiet system (the immediate-run path doesn't
+    # depend on the tick).
+    AI_MONITORING_TICK_SECONDS: int = 30
+    # Default cron expression applied to a new monitoring task when the
+    # creator (UI or AI tool) doesn't specify one. Daily at 9am family-
+    # local-time is a sensible "get me a fresh briefing each morning"
+    # default. Standard 5-field cron: minute, hour, day-of-month,
+    # month, day-of-week.
+    AI_MONITORING_DEFAULT_CRON: str = "0 9 * * *"
+    # Hard ceiling on a single monitoring run's wall-clock time. A
+    # runaway research job could otherwise tie up an agent worker
+    # forever. The agent loop already enforces per-tool timeouts and
+    # ``DEFAULT_MAX_STEPS`` cycles, this is the belt to that
+    # suspenders.
+    AI_MONITORING_RUN_TIMEOUT_SECONDS: int = 600
+    # Max agent reasoning cycles allowed inside a single monitoring
+    # run. Chat turns default to ``DEFAULT_MAX_STEPS=5``, but a
+    # monitoring job typically needs more — search, read the
+    # synthesis, attach citations, post a comment, write the final
+    # narrative — and overflowing the budget surfaces as a
+    # ``last_run_status='error'`` even when most of the useful work
+    # already landed. 10 gives comfortable headroom without letting
+    # a wedged agent burn unbounded Ollama time.
+    AI_MONITORING_MAX_STEPS: int = 10
+
+    # ---- Web search (for Avi's research tools) -------------------------
+    # Pluggable provider behind ``integrations/web_search.py``. Set
+    # ``gemini`` (default — uses the existing ``GEMINI_API_KEY`` and
+    # Gemini's ``google_search`` tool grounding), ``brave``, ``tavily``,
+    # or leave empty to disable the ``web_search`` tool entirely (the
+    # agent will say "search not configured" instead of crashing).
+    # Adding a new provider is one adapter file.
+    FA_SEARCH_PROVIDER: str = "gemini"
+    # Brave Search API key — get one free at
+    # https://api.search.brave.com (2k queries/mo on the free tier).
+    BRAVE_SEARCH_API_KEY: Optional[str] = None
+    # Tavily API key — https://tavily.com — purpose-built for AI
+    # agents (returns extracted page content alongside the SERP).
+    TAVILY_API_KEY: Optional[str] = None
+    # Default page size for ``web_search``. The model can request more
+    # via the tool args; this is just what it gets when it doesn't ask.
+    AI_WEB_SEARCH_DEFAULT_LIMIT: int = 5
 
     @property
     def database_url(self) -> str:
