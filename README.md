@@ -36,11 +36,13 @@ The project has three cooperating layers:
    LLM-generated follow-up question about their top goal — spoken out
    loud when the greeting finishes. A microphone toggle enables
    Web-Speech-API voice input, and a header speaker toggle mutes Avi.
-   Avi himself is rendered on stage as a **rigged Live2D character**
-   (Pixi.js + Cubism 4) — real lip-sync driven by the playing TTS
-   clip, auto-blinking, hair/clothing physics, a wave-and-smile on
-   greet, and pupils that follow the viewer's cursor. The Gemini-
-   generated portrait still appears as a small badge in the corner.
+   Avi himself is rendered on stage as the **Gemini-generated portrait**
+   with a soft glow + sonar echo rings while speaking, an
+   amplitude-driven SVG mouth overlay anchored to the portrait's
+   detected landmarks, and a wave-and-smile on greet — no canvas, no
+   WebGL, no proprietary runtime. (An earlier rigged Live2D experiment
+   was removed; the simpler avatar reads the same emotionally and ships
+   nothing but SVG.)
 3. **Shared backend** (`/api/*`) — FastAPI on top of SQLAlchemy 2.0 and
    Postgres. The schema is intentionally verbose and self-describing:
    every table and column carries a Postgres `COMMENT`, and a read-only
@@ -197,7 +199,7 @@ sequenceDiagram
         Chat-->>UI: streamed bubble
         UI->>TTS: POST /tts (text)
         TTS-->>UI: WAV (cached or fresh)
-        UI->>UI: Live2D lip-sync to playback
+        UI->>UI: SVG mouth lip-sync to playback (amplitude-driven)
     end
 ```
 
@@ -242,9 +244,7 @@ sequenceDiagram
 
 | Category | Package | Why |
 |---|---|---|
-| 2D character | **Live2D Cubism 4** runtime (self-hosted) · `pixi.js@7` · `pixi-live2d-display-lipsyncpatch` | Rigged character with real lip-sync, auto-blink, breathing + hair physics, greet/tap motions, pupil tracking |
-| Starter model | **Natori** (Live2D Inc., Free Material License) | Bundled under `ui/react/public/live2d/natori/`. Swap in any other Cubism 4 model by dropping its folder next to Natori's and updating the constants at the top of `AiAssistantPage.tsx`. |
-| SVG mouth fallback | Inline component `SpeakingMouth.tsx` | Real amplitude-driven lip-sync *without* Live2D — used on mobile browsers, when the Cubism runtime fails to load, or while the rigged model is still downloading. Morphs a single path between closed, open, and smiling shapes, with a teeth hint on louder syllables. |
+| Avatar | Inline component `SpeakingMouth.tsx` over the Gemini-generated portrait | Lightweight, dependency-free animated avatar. Composites a soft glow + concentric "echo" rings over the portrait while Avi is speaking, an SVG mouth path morphed in real time by audio amplitude (closed → open → smiling, with a teeth hint on louder syllables), and a waving-hand emoji on greet. Mouth position is anchored to the InsightFace landmarks captured when the portrait was generated, falling back to "roughly 72 % down, 22 % wide" if no face was detected. We previously experimented with a rigged Live2D character (Pixi.js + Cubism 4) but pulled it: the basic SVG path looks just as alive, ships zero proprietary runtime, and works on every browser. |
 
 ### Frontend · Node, Vite
 
@@ -620,46 +620,6 @@ curl -s -X POST http://localhost:8000/api/aiassistant/tts \
 afplay /tmp/hello.wav   # macOS
 ```
 
-### 10. Live2D character assets
-
-Avi's rigged body on the live page comes from the free **Natori**
-model shipped by Live2D Inc. under their
-[Free Material License](https://www.live2d.com/en/terms/live2d-free-material-license-agreement/).
-The model files (moc3, textures, physics, motions, expressions) live
-under `ui/react/public/live2d/natori/` and are served statically by
-Vite. The proprietary Cubism 4 Core JS runtime
-(`live2dcubismcore.min.js`, ~200 KB) is **self-hosted** alongside the
-model — it's redistributable under Live2D's Proprietary Software
-License (see `public/live2d/CORE_LICENSE.md`). No npm install, no CDN
-dependency, works offline on the Mac Studio.
-
-If the Cubism runtime or the model files can't load for any reason
-(older mobile browser, corporate firewall, offline dev), the stage
-automatically degrades to an **animated SVG fallback**: the Gemini
-portrait with a real amplitude-driven mouth overlay and a smile curve
-on greetings. Kids still see Avi talking and smiling, just without the
-hair physics / pupil tracking / idle motions. The mode is shown in the
-header as `Avatar: live` (Live2D) vs `Avatar: SVG fallback`.
-
-To **swap characters**:
-
-1. Download any Cubism 4 sample from
-   [`Live2D/CubismWebSamples`](https://github.com/Live2D/CubismWebSamples/tree/develop/Samples/Resources)
-   or a ready-made model from Nizima / BOOTH.
-2. Drop the folder under `ui/react/public/live2d/<name>/`.
-3. Update the two constants at the top of
-   `ui/react/src/pages/AiAssistantPage.tsx`:
-
-   ```ts
-   const AVI_LIVE2D_MODEL_PATH = "<name>";           // folder
-   const AVI_LIVE2D_MODEL_FILE = "<Name>.model3.json"; // entry file
-   ```
-
-If the Cubism runtime fails to load (offline, CSP blocking) or a model
-is missing, `AviLive2D` silently falls back to the static Gemini
-portrait with the existing CSS-driven mouth-pulse + wave animations,
-so the live page never breaks.
-
 ---
 
 ## Data model (LLM-friendly)
@@ -776,7 +736,7 @@ family-assistant/
 │   └── src/
 │       ├── App.tsx                route tree (/admin/..., /aiassistant/:id)
 │       ├── lib/api.ts             fetch wrapper + resolveApiPath rewriting
-│       ├── components/            Layout, Modal, PageHeader, Toast, Live2D bits, etc.
+│       ├── components/            Layout, Modal, PageHeader, Toast, etc.
 │       └── pages/
 │           ├── FamiliesList, FamilyDashboard, FamilySettings
 │           ├── PeoplePage, PersonDetail, RelationshipsPage
