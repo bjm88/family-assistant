@@ -44,6 +44,11 @@ import { useToast } from "@/components/Toast";
 import { cn } from "@/lib/cn";
 import AviLive2D, { type AviLive2DState } from "./AviLive2D";
 import SpeakingMouth from "./SpeakingMouth";
+import {
+  useLocalFaceWatcher,
+  type LocalFaceWatcherStatus,
+  type LocalTrack,
+} from "@/lib/localFaceWatcher";
 
 // Live2D character bundled under /public/live2d. Keep this folder name
 // in sync with the directory you drop a new model into. (We use the
@@ -57,10 +62,14 @@ const AVI_LIVE2D_MODEL_FILE = "Natori.model3.json";
  *
  * Three subsystems share this screen:
  *
- *  1. **Camera** — continuous webcam preview, with a background loop that
- *     snaps a JPEG roughly every 2 seconds and posts it to
- *     `/api/aiassistant/face/recognize`. When a new person is identified
- *     we fire a one-shot greeting and append it to the chat.
+ *  1. **Camera** — continuous webcam preview. A *local* MediaPipe
+ *     BlazeFace detector (in `lib/localFaceWatcher.ts`) runs at
+ *     ~4 Hz on the video element and only escalates to the backend's
+ *     heavyweight `/api/aiassistant/face/recognize` (InsightFace +
+ *     ArcFace) when a brand-new face track is born. This frees the
+ *     Mac's CoreML / ANE for chat + agent tools instead of burning
+ *     them on a 2.5 s polling loop that fired even with nobody on
+ *     screen.
  *  2. **Microphone** — optional Web Speech API listener that dictates
  *     into the chat input. Off by default; toggling it prompts the
  *     browser mic permission.
@@ -143,9 +152,13 @@ type ChatMessage = {
   fastAck?: string | null;
 };
 
-// How often we snap a webcam frame for face recognition. Slow enough that
-// an M-series Mac doesn't spin up the fans; fast enough to feel "live".
-const FACE_RECOG_INTERVAL_MS = 2500;
+// Backend-only fallback: how often we re-poll `/face/recognize` when
+// the in-browser MediaPipe detector failed to load (e.g. WASM blocked
+// by CSP, model file missing, very old browser). The local watcher
+// path uses *track events* instead of a wall-clock timer and so has
+// no equivalent constant — it only calls the backend when a brand-new
+// face appears on camera.
+const FACE_RECOG_FALLBACK_INTERVAL_MS = 2500;
 
 // After we greet someone, suppress re-greetings for this long so Avi
 // doesn't loop "Hi Sam!" every time they blink.
@@ -1425,6 +1438,11 @@ function LiveCameraPanel({
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [lastRecognition, setLastRecognition] =
     useState<RecognizeResponse | null>(null);
+  // Surface the in-browser detector's state in the camera badge so
+  // we can tell at a glance whether we're in the efficient path
+  // ("Local: 1 face") or the fallback path ("Backend-only").
+  const [watcherStatus, setWatcherStatus] =
+    useState<LocalFaceWatcherStatus>({ kind: "loading" });
 
   // Mount / unmount the getUserMedia stream.
   useEffect(() => {
@@ -1498,6 +1516,9 @@ function LiveCameraPanel({
                 LIVE
               </span>
             )}
+            {cameraOn && !cameraError && (
+              <LocalWatcherBadge status={watcherStatus} />
+            )}
             {lastRecognition?.matched && (
               <span className="inline-flex items-center gap-1 bg-emerald-500/90 text-white text-xs px-2 py-1 rounded-full">
                 <User className="h-3 w-3" />
@@ -1532,46 +1553,124 @@ function LiveCameraPanel({
         </div>
       </div>
 
-      <FaceRecognitionLoop
+      <FaceRecognitionDriver
         familyId={familyId}
         liveSessionId={liveSessionId}
         videoRef={videoRef}
         canvasRef={canvasRef}
         cameraOn={cameraOn && !cameraError}
         onRecognize={setLastRecognition}
+        onWatcherStatus={setWatcherStatus}
       />
     </div>
   );
 }
 
 /**
- * Background loop: snap a frame every FACE_RECOG_INTERVAL_MS and post to
- * /api/aiassistant/face/recognize. When a new person is identified, push
- * a greeting into the chat by dispatching a `CustomEvent('avi:greet')`.
+ * Tiny visual indicator that surfaces which face pipeline is live:
  *
- * Intentionally renders nothing — it's an effect-only component so the
- * surrounding presentational code stays readable.
+ *   - "Local: N face(s)" — MediaPipe is detecting faces in the
+ *     browser. Backend recognize calls are gated on track births
+ *     and are happening only when something genuinely changes.
+ *   - "Local: standby" — detector is up, no faces in frame; the
+ *     backend is completely idle for face work.
+ *   - "Backend only" — local detector failed to load; we've fallen
+ *     back to the legacy 2.5s polling loop.
+ *   - "Detector loading" — first-mount initialization (~1-2s while
+ *     the WASM warms up).
  */
-function FaceRecognitionLoop({
+function LocalWatcherBadge({
+  status,
+}: {
+  status: LocalFaceWatcherStatus;
+}) {
+  let label: string;
+  let cls: string;
+  let title: string;
+  if (status.kind === "loading") {
+    label = "Detector loading";
+    cls = "bg-black/60 text-white";
+    title = "Loading the in-browser face detector (MediaPipe BlazeFace).";
+  } else if (status.kind === "error") {
+    label = "Backend only";
+    cls = "bg-amber-500/90 text-white";
+    title =
+      "Local detector failed to load — falling back to backend polling. " +
+      "Check the console for the WASM/model load error.";
+  } else if (status.activeTrackCount === 0) {
+    label = "Local: standby";
+    cls = "bg-black/60 text-white";
+    title =
+      "In-browser detector active. No faces in frame — backend recognition is idle.";
+  } else {
+    label = `Local: ${status.activeTrackCount} face${
+      status.activeTrackCount === 1 ? "" : "s"
+    }`;
+    cls = "bg-sky-500/90 text-white";
+    title =
+      "In-browser detector tracking " +
+      `${status.activeTrackCount} face(s). Backend recognize is only called ` +
+      "when a brand-new track appears.";
+  }
+  return (
+    <span
+      className={cn("inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full", cls)}
+      title={title}
+    >
+      <Camera className="h-3 w-3" />
+      {label}
+    </span>
+  );
+}
+
+/**
+ * Wires the in-browser face detector (`useLocalFaceWatcher`) to the
+ * backend recognize endpoint, plus a fallback path for when the
+ * detector can't load. Renders nothing — it's effects all the way
+ * down so the surrounding camera markup stays readable.
+ *
+ * Track-event-driven flow (the happy path):
+ *
+ *   1. MediaPipe spots a new face in the video element.
+ *   2. Watcher births a track and hands us a tight JPEG crop.
+ *   3. We POST that crop to /face/recognize. Single round-trip per
+ *      track instead of one every 2.5s indefinitely.
+ *   4. If backend says "matched", we dispatch `avi:greet` (with the
+ *      same per-person 90s suppression as before).
+ *   5. If backend says "unknown", we leave a short cooldown so the
+ *      same stranger doesn't get re-checked on every frame.
+ *
+ * Fallback flow (only when MediaPipe init failed):
+ *
+ *   - Run the legacy whole-frame poll at FACE_RECOG_FALLBACK_INTERVAL_MS
+ *     so the assistant keeps recognizing people even if the local
+ *     detector is unavailable. Same `avi:greet` semantics.
+ */
+function FaceRecognitionDriver({
   familyId,
   liveSessionId,
   videoRef,
   canvasRef,
   cameraOn,
   onRecognize,
+  onWatcherStatus,
 }: {
   familyId: number;
-  // Triggers a suppression-map flush + immediate recognition tick
-  // whenever it changes — see the effect below for the rationale.
+  // Triggers a suppression-map flush whenever it changes — see the
+  // effect below for the rationale.
   liveSessionId: number | null;
   videoRef: React.RefObject<HTMLVideoElement>;
+  // Reused by the fallback path for whole-frame JPEG snapshots. The
+  // local watcher uses its own offscreen canvas so the two never
+  // contend for the same DOM node.
   canvasRef: React.RefObject<HTMLCanvasElement>;
   cameraOn: boolean;
   onRecognize: (r: RecognizeResponse) => void;
+  onWatcherStatus: (s: LocalFaceWatcherStatus) => void;
 }) {
   // Per-person "we already said hi to them within the last 90s"
-  // suppression. Stops a continuously-detected face from spamming
-  // /greet on every recognition tick (every 2.5s).
+  // suppression. Stops a re-detected family member from spamming
+  // /greet every time MediaPipe re-acquires a lost track.
   //
   // CRITICAL: this map is reset whenever the session id changes so
   // a fresh session re-greets everyone. The backend already enforces
@@ -1582,21 +1681,130 @@ function FaceRecognitionLoop({
   // greet them again". That's why "End & reset" used to leave the
   // page silent until the suppression naturally aged out 90s later.
   const lastGreetedRef = useRef<Map<number, number>>(new Map());
+  // Last-known status from the local watcher. Drives whether the
+  // fallback effect arms its timer.
+  const [watcherStatusInternal, setWatcherStatusInternal] =
+    useState<LocalFaceWatcherStatus>({ kind: "loading" });
+
+  // Latest props in refs so the long-lived watcher callbacks below
+  // don't have to redeclare on every render.
+  const familyIdRef = useRef(familyId);
+  familyIdRef.current = familyId;
+  const onRecognizeRef = useRef(onRecognize);
+  onRecognizeRef.current = onRecognize;
 
   useEffect(() => {
-    // Clear the per-person greet suppression so the new session can
-    // greet everyone again from scratch. The recognition effect
-    // below also has `liveSessionId` in its dep array, so it tears
-    // down + restarts in the same render — that fresh start fires
-    // an immediate `void tick()` against the just-cleared map and
-    // the user gets greeted within milliseconds of End & reset
-    // (or any session rollover) rather than waiting for the next
-    // scheduled interval.
     lastGreetedRef.current.clear();
   }, [liveSessionId]);
 
+  // ── Helper: POST one crop to /face/recognize and fire greet on match.
+  const recognizeBlob = useCallback(
+    async (blob: Blob, _trackId: number | null) => {
+      try {
+        const form = new FormData();
+        form.append("family_id", String(familyIdRef.current));
+        form.append("file", blob, "frame.jpg");
+        const result = await api.upload<RecognizeResponse>(
+          "/api/aiassistant/face/recognize",
+          form,
+        );
+        onRecognizeRef.current(result);
+        if (result.matched && result.person_id !== null) {
+          const last = lastGreetedRef.current.get(result.person_id) ?? 0;
+          if (Date.now() - last > GREETING_SUPPRESSION_MS) {
+            lastGreetedRef.current.set(result.person_id, Date.now());
+            window.dispatchEvent(
+              new CustomEvent("avi:greet", {
+                detail: {
+                  person_id: result.person_id,
+                  person_name: result.person_name,
+                },
+              }),
+            );
+          }
+        }
+        return result;
+      } catch (e) {
+        // Swallow transient errors — the status badge surfaces the
+        // persistent ones (Ollama down, no enrolled embeddings).
+        console.debug("recognize failed", e);
+        return null;
+      }
+    },
+    [],
+  );
+
+  // ── Per-track recognition state. Tracks here are local IDs from
+  //   useLocalFaceWatcher; we use this to avoid re-querying the
+  //   backend for a face we've already identified, and to retry on
+  //   a slow cadence when the backend says "unknown".
+  type TrackRecState =
+    | { kind: "pending" }
+    | { kind: "matched"; personId: number }
+    | { kind: "unknown"; lastCheckedAt: number };
+  const trackStateRef = useRef<Map<number, TrackRecState>>(new Map());
+
+  const handleTrackAppeared = useCallback(
+    async (track: LocalTrack, blob: Blob) => {
+      trackStateRef.current.set(track.id, { kind: "pending" });
+      const result = await recognizeBlob(blob, track.id);
+      if (!result) {
+        trackStateRef.current.delete(track.id);
+        return;
+      }
+      if (result.matched && result.person_id !== null) {
+        trackStateRef.current.set(track.id, {
+          kind: "matched",
+          personId: result.person_id,
+        });
+      } else {
+        trackStateRef.current.set(track.id, {
+          kind: "unknown",
+          lastCheckedAt: Date.now(),
+        });
+        // We *could* re-probe the same track on a slow cadence to
+        // catch a person who got enrolled in another tab between
+        // their birth and now. That'd require either a richer
+        // watcher hook (re-emit on cooldown) or a peer timer here;
+        // skipped in v1 because most households don't expect
+        // strangers in front of the live page.
+      }
+    },
+    [recognizeBlob],
+  );
+
+  const handleTrackLost = useCallback(
+    (trackId: number) => {
+      trackStateRef.current.delete(trackId);
+    },
+    [],
+  );
+
+  const handleStatusChange = useCallback(
+    (s: LocalFaceWatcherStatus) => {
+      setWatcherStatusInternal(s);
+      onWatcherStatus(s);
+    },
+    [onWatcherStatus],
+  );
+
+  useLocalFaceWatcher({
+    videoRef,
+    enabled: cameraOn,
+    callbacks: {
+      onTrackAppeared: handleTrackAppeared,
+      onTrackLost: handleTrackLost,
+      onStatusChange: handleStatusChange,
+    },
+  });
+
+  // ── Fallback timer: only arms when the local watcher entered the
+  //   error state. Runs the legacy whole-frame poll so the page
+  //   keeps recognizing people even if MediaPipe is unavailable.
   useEffect(() => {
     if (!cameraOn) return;
+    if (watcherStatusInternal.kind !== "error") return;
+
     let cancelled = false;
     let inflight = false;
 
@@ -1613,54 +1821,29 @@ function FaceRecognitionLoop({
         if (!ctx) return;
         ctx.drawImage(v, 0, 0, c.width, c.height);
         const blob: Blob | null = await new Promise((resolve) =>
-          c.toBlob(resolve, "image/jpeg", 0.8)
+          c.toBlob(resolve, "image/jpeg", 0.8),
         );
-        if (!blob) return;
-
-        const form = new FormData();
-        form.append("family_id", String(familyId));
-        form.append("file", blob, "frame.jpg");
-        const result = await api.upload<RecognizeResponse>(
-          "/api/aiassistant/face/recognize",
-          form
-        );
-        if (cancelled) return;
-        onRecognize(result);
-
-        if (result.matched && result.person_id !== null) {
-          const last = lastGreetedRef.current.get(result.person_id) ?? 0;
-          if (Date.now() - last > GREETING_SUPPRESSION_MS) {
-            lastGreetedRef.current.set(result.person_id, Date.now());
-            window.dispatchEvent(
-              new CustomEvent("avi:greet", {
-                detail: {
-                  person_id: result.person_id,
-                  person_name: result.person_name,
-                },
-              })
-            );
-          }
-        }
-      } catch (e) {
-        // Swallow transient recognition errors — the status badge covers
-        // the persistent failure modes (Ollama down, no embeddings).
-        console.debug("recognize failed", e);
+        if (!blob || cancelled) return;
+        await recognizeBlob(blob, null);
       } finally {
         inflight = false;
       }
     };
 
-    const id = window.setInterval(tick, FACE_RECOG_INTERVAL_MS);
+    const id = window.setInterval(tick, FACE_RECOG_FALLBACK_INTERVAL_MS);
     void tick();
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-    // `liveSessionId` is in the dep array so a session rollover
-    // (End & reset, idle sweep, etc.) tears the loop down and
-    // restarts it with a fresh closure — guaranteeing an immediate
-    // recognition tick that uses the just-cleared suppression map.
-  }, [cameraOn, familyId, liveSessionId, videoRef, canvasRef, onRecognize]);
+  }, [
+    cameraOn,
+    watcherStatusInternal,
+    videoRef,
+    canvasRef,
+    recognizeBlob,
+    liveSessionId,
+  ]);
 
   return null;
 }

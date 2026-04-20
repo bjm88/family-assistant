@@ -25,6 +25,12 @@ node_modules/
 ui/react/dist/
 ui/react/.vite/
 
+# MediaPipe Tasks Vision assets — copied out of node_modules and
+# lazy-downloaded by ui/react/scripts/copy-mediapipe-assets.mjs at
+# `npm install` time. Treated like the Kokoro / InsightFace weight
+# packs: regenerable, machine-specific, never committed.
+ui/react/public/mediapipe/
+
 # Uploaded family data (private — never commit)
 resources/family/*
 !resources/family/.gitkeep

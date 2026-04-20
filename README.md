@@ -24,10 +24,13 @@ The project has three cooperating layers:
    dashboard. Admin API routes live under `/api/admin/*` so they can be
    guarded by a separate auth layer later.
 2. **Live AI assistant** (`/aiassistant/:familyId`) — a standalone page
-   that opens the webcam, runs continuous face recognition against the
-   enrolled gallery, hands structured context ("who is in front of the
-   camera, what are their goals, who are their siblings") to a local
-   LLM, and streams the reply back into a chat panel. Recognized
+   that opens the webcam, runs **a two-stage face pipeline** (MediaPipe
+   BlazeFace in the browser to detect *that there is a face*, then the
+   backend's InsightFace + ArcFace recognizer only on brand-new face
+   tracks to identify *who it is*), hands structured context ("who is
+   in front of the camera, what are their goals, who are their
+   siblings") to a local LLM, and streams the reply back into a chat
+   panel. Recognized
    family members get an **instant spoken greeting** (no-LLM template
    → Kokoro-82M TTS, ~300 ms end-to-end) followed by a contextual
    LLM-generated follow-up question about their top goal — spoken out
@@ -144,9 +147,18 @@ flowchart TB
 
 ### Request flow — "Avi, say hi to whoever walks in"
 
+The face pipeline is **two-stage** to keep the backend free for chat
++ agent work. A lightweight **MediaPipe BlazeFace** detector runs
+in the browser at ~4 Hz and only escalates to the heavyweight
+backend recognizer when it sees a brand-new face track. Result:
+when nobody is in front of the camera (or the same person has been
+sitting there for an hour), the InsightFace + ArcFace path on the
+Mac fires **zero** times instead of every 2.5 s.
+
 ```mermaid
 sequenceDiagram
     participant UI as "Live AI page (browser)"
+    participant MP as "MediaPipe BlazeFace<br/>(browser, WASM)"
     participant Face as "/api/aiassistant/face"
     participant Insight as "InsightFace (CoreML)"
     participant Chat as "/api/aiassistant/chat (SSE)"
@@ -156,8 +168,14 @@ sequenceDiagram
     participant Ollama as "Ollama · gemma4:26b"
     participant TTS as "ai/tts.py · Kokoro"
 
-    loop every 2.5s while camera on
-        UI->>Face: POST /recognize (JPEG, family_id)
+    loop every 250ms while camera on
+        UI->>MP: detectForVideo(<video>)
+        MP-->>UI: bboxes + scores
+        Note over UI: IoU tracker updates;<br/>backend stays idle
+    end
+
+    alt new face track born
+        UI->>Face: POST /recognize (cropped JPEG, family_id)
         Face->>Insight: extract_embedding()
         Insight-->>Face: 512-d vector
         Face->>PG: SELECT face_embeddings WHERE family_id=?
@@ -239,6 +257,7 @@ sequenceDiagram
 | Forms | `react-hook-form` | Minimal-rerender form state |
 | Styling | **Tailwind CSS** · shadcn-style components | Utility-first UI |
 | Icons | `lucide-react` | Consistent icon set |
+| In-browser face detection | **`@mediapipe/tasks-vision`** (BlazeFace short-range) | First-pass face/figure detection at ~4 Hz, ~225 KB tflite + 2 MB WASM, runs entirely client-side. Gates the backend's heavyweight InsightFace recognizer so it only fires on new face *tracks* (someone walks in), not every 2.5 s. WASM + model are mirrored into `ui/react/public/mediapipe/` by `scripts/copy-mediapipe-assets.mjs` (`postinstall` hook); see `src/lib/localFaceWatcher.ts`. |
 
 ### Local AI daemons
 
