@@ -3833,12 +3833,22 @@ def build_default_registry() -> ToolRegistry:
                 "(synthesised, citation-backed answer) alongside the "
                 "list of source `results`; alternative SERP providers "
                 "(Brave / Tavily) return only `results` with snippets. "
-                "Use this during monitoring runs and for any 'look up "
-                "X on the web' / 'what's the latest on Y' / 'find me "
-                "current prices for Z' style asks. When `summary` is "
-                "present, treat it as the grounded answer and use "
-                "the `results` URLs as the citations to attach via "
-                "task_attach_link. The provider may be unavailable on "
+                "Reach for this WHENEVER the user asks a current, "
+                "factual question whose answer lives on the open web "
+                "and isn't in the household database — it is your "
+                "everyday 'look it up' tool, not just a monitoring "
+                "verb. Use it for one-shot chat asks ('what's the "
+                "weather in Asheville this weekend', 'who won the "
+                "Knicks game last night', 'what time does Trader "
+                "Joe's close today', 'find me a sheet-pan salmon "
+                "recipe', 'latest news on X'), AND inside monitoring "
+                "runs to gather material for a comment. When "
+                "`summary` is present, treat it as the grounded "
+                "answer and synthesise — do not parrot raw URLs. "
+                "Inside a monitoring run, also pass the source URLs "
+                "to `task_attach_link` so the citation lives on the "
+                "task; for casual chat answers you do NOT need to "
+                "attach links. The provider may be unavailable on "
                 "fresh installs — surface the error to the user "
                 "verbatim if so (it explains how the admin can "
                 "enable it)."
@@ -3848,8 +3858,9 @@ def build_default_registry() -> ToolRegistry:
             timeout_seconds=20.0,
             requires=("web_search",),
             examples=(
+                "What's the weather in Asheville this weekend?",
+                "Who won the Knicks game last night?",
                 "Search the web for the latest Tesla earnings news.",
-                "Look up cheap Yankees-vs-Red Sox tickets this May.",
             ),
         )
     )

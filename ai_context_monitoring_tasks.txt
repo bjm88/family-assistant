@@ -70,9 +70,15 @@ schedule change.
 
 WEB SEARCH AVAILABILITY
 
-The `web_search` tool is only present when the household admin has
-configured a search provider (Brave or Tavily). If it isn't in your
-tool list this turn, you cannot do open-web research right now —
-acknowledge that limitation rather than promising to "look it up
-later" and suggest the admin set `FA_SEARCH_PROVIDER` and the
-matching API key.
+Inside a monitoring run, `web_search` is your primary research
+verb — pair every meaningful finding with a `task_attach_link` call
+so the citation lives on the task. Note that `web_search` is ALSO
+available for ordinary one-shot chat questions (weather, scores,
+store hours, recipes, current events, etc.) — see
+`ai_context_web_search.txt` for the chat-side guidance. Do not
+restrict yourself to using it only inside monitoring runs.
+
+If the tool isn't in your list this turn, the household admin has
+not configured a search provider — acknowledge that limitation
+rather than promising to "look it up later" and suggest they set
+`FA_SEARCH_PROVIDER` and the matching API key.
