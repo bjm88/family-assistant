@@ -7,13 +7,14 @@ import {
 } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { useEffect, useState } from "react";
-import { ArrowLeft, Camera, HeartPulse, Image as ImageIcon, Pencil, Pill, Plus, Stethoscope, Target, Trash2, Upload, X } from "lucide-react";
+import { ArrowLeft, Briefcase, Camera, HeartPulse, Image as ImageIcon, Pencil, Pill, Plus, Stethoscope, Target, Trash2, Upload, X } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   Goal,
   GoalPriority,
   IdentityDocument,
   IdentityDocumentImageSide,
+  Job,
   MedicalCondition,
   Medication,
   Person,
@@ -61,7 +62,6 @@ type PersonForm = {
   gender?: string;
   primary_family_relationship?: string;
   email_address?: string;
-  work_email?: string;
   mobile_phone_number?: string;
   home_phone_number?: string;
   work_phone_number?: string;
@@ -93,7 +93,6 @@ export default function PersonDetail() {
         gender: person.gender ?? "",
         primary_family_relationship: person.primary_family_relationship ?? "",
         email_address: person.email_address ?? "",
-        work_email: person.work_email ?? "",
         mobile_phone_number: person.mobile_phone_number ?? "",
         home_phone_number: person.home_phone_number ?? "",
         work_phone_number: person.work_phone_number ?? "",
@@ -251,25 +250,13 @@ export default function PersonDetail() {
               <Field
                 label="Personal email"
                 htmlFor="email_address"
-                hint="Used to verify the sender on inbound email AND as the personal Google Calendar id Avi reads from."
+                hint="Used to verify the sender on inbound email AND as the personal Google Calendar id Avi reads from. Add work emails (which double as work calendar ids) under Jobs below."
               >
                 <input
                   id="email_address"
                   type="email"
                   className="input"
                   {...register("email_address")}
-                />
-              </Field>
-              <Field
-                label="Work email"
-                htmlFor="work_email"
-                hint="Optional second mailbox / calendar (e.g. employer Google Workspace). Avi merges work + personal calendars when checking availability; work events typically show as free/busy only."
-              >
-                <input
-                  id="work_email"
-                  type="email"
-                  className="input"
-                  {...register("work_email")}
                 />
               </Field>
               <Field label="Mobile phone" htmlFor="mobile_phone_number">
@@ -366,6 +353,9 @@ export default function PersonDetail() {
         </div>
         <div className="lg:col-span-3">
           <GoalsSection personId={Number(personId)} />
+        </div>
+        <div className="lg:col-span-3">
+          <JobsSection personId={Number(personId)} />
         </div>
         <div className="lg:col-span-3">
           <MedicalConditionsSection personId={Number(personId)} />
@@ -2374,3 +2364,296 @@ function PhysicianModal({
     </Modal>
   );
 }
+
+
+// ---------- Jobs ---------------------------------------------------------
+
+function JobsSection({ personId }: { personId: number }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [editingId, setEditingId] = useState<number | "new" | null>(null);
+
+  const { data: jobs } = useQuery<Job[]>({
+    queryKey: ["jobs", personId],
+    queryFn: () => api.get<Job[]>(`/api/jobs?person_id=${personId}`),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => api.del(`/api/jobs/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["jobs", personId] });
+      toast.success("Job removed.");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const editing =
+    typeof editingId === "number"
+      ? jobs?.find((j) => j.job_id === editingId) ?? null
+      : null;
+
+  return (
+    <div className="card">
+      <div className="card-header flex items-center justify-between">
+        <div className="card-title flex items-center gap-2">
+          <Briefcase className="h-4 w-4 text-indigo-500" /> Jobs
+        </div>
+        <button className="btn-secondary" onClick={() => setEditingId("new")}>
+          <Plus className="h-4 w-4" /> Add job
+        </button>
+      </div>
+      <div className="card-body">
+        {!jobs || jobs.length === 0 ? (
+          <div className="text-sm text-muted-foreground">
+            No jobs on file. Add an employer (and a work email if Avi should
+            merge that calendar into availability checks).
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="text-xs text-muted-foreground">
+              <tr className="border-b border-border">
+                <th className="text-left py-2">Company</th>
+                <th className="text-left">Role</th>
+                <th className="text-left">Work email</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {jobs.map((j) => (
+                <tr
+                  key={j.job_id}
+                  className="border-b border-border table-row-hover cursor-pointer"
+                  onClick={() => setEditingId(j.job_id)}
+                >
+                  <td className="py-2">
+                    <div className="font-medium">
+                      {j.company_name || (
+                        <span className="text-muted-foreground italic">
+                          (unnamed)
+                        </span>
+                      )}
+                    </div>
+                    {j.company_website && (
+                      <div className="text-xs text-muted-foreground line-clamp-1">
+                        {j.company_website}
+                      </div>
+                    )}
+                  </td>
+                  <td>{j.role_title || "—"}</td>
+                  <td>
+                    {j.work_email ? (
+                      <code className="text-xs">{j.work_email}</code>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
+                  <td className="text-right whitespace-nowrap">
+                    <button
+                      className="text-muted-foreground hover:text-foreground mr-3"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditingId(j.job_id);
+                      }}
+                      aria-label="Edit job"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </button>
+                    <button
+                      className="text-destructive hover:text-destructive/80"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (confirm("Delete this job?")) del.mutate(j.job_id);
+                      }}
+                      aria-label="Delete job"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <JobModal
+        open={editingId !== null}
+        mode={editingId === "new" ? "create" : "edit"}
+        job={editing}
+        personId={personId}
+        onClose={() => setEditingId(null)}
+      />
+    </div>
+  );
+}
+
+type JobForm = {
+  company_name?: string;
+  company_website?: string;
+  role_title?: string;
+  work_email?: string;
+  description?: string;
+};
+
+const emptyJobForm = (): JobForm => ({
+  company_name: "",
+  company_website: "",
+  role_title: "",
+  work_email: "",
+  description: "",
+});
+
+function JobModal({
+  open,
+  mode,
+  job,
+  personId,
+  onClose,
+}: {
+  open: boolean;
+  mode: "create" | "edit";
+  job: Job | null;
+  personId: number;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { register, handleSubmit, reset } = useForm<JobForm>({
+    defaultValues: emptyJobForm(),
+  });
+
+  useEffect(() => {
+    if (mode === "edit" && job) {
+      reset({
+        company_name: job.company_name ?? "",
+        company_website: job.company_website ?? "",
+        role_title: job.role_title ?? "",
+        work_email: job.work_email ?? "",
+        description: job.description ?? "",
+      });
+    } else if (mode === "create") {
+      reset(emptyJobForm());
+    }
+  }, [mode, job, reset, open]);
+
+  const create = useMutation({
+    mutationFn: (v: JobForm) =>
+      api.post<Job>(
+        "/api/jobs",
+        cleanPayload({ ...v, person_id: personId })
+      ),
+    onSuccess: (j) => {
+      qc.invalidateQueries({ queryKey: ["jobs", personId] });
+      toast.success(`Added job${j.company_name ? ` at ${j.company_name}` : ""}.`);
+      onClose();
+    },
+    onError: (err: Error) => toast.error(`Could not add job: ${err.message}`),
+  });
+
+  const update = useMutation({
+    mutationFn: (v: JobForm) => {
+      if (!job) throw new Error("No job to update");
+      return api.patch<Job>(`/api/jobs/${job.job_id}`, cleanPayload(v));
+    },
+    onSuccess: (j) => {
+      qc.invalidateQueries({ queryKey: ["jobs", personId] });
+      toast.success(`Saved${j.company_name ? ` ${j.company_name}` : " job"}.`);
+      onClose();
+    },
+    onError: (err: Error) => toast.error(`Save failed: ${err.message}`),
+  });
+
+  const pending = create.isPending || update.isPending;
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={mode === "create" ? "Add job" : "Edit job"}
+      footer={
+        <>
+          <button className="btn-secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn-primary"
+            disabled={pending}
+            onClick={handleSubmit((v) =>
+              mode === "create" ? create.mutate(v) : update.mutate(v)
+            )}
+          >
+            {pending
+              ? "Saving…"
+              : mode === "create"
+              ? "Add job"
+              : "Save changes"}
+          </button>
+        </>
+      }
+    >
+      <form className="grid grid-cols-2 gap-4" onSubmit={(e) => e.preventDefault()}>
+        <Field label="Company" htmlFor="job_company_name">
+          <input
+            id="job_company_name"
+            className="input"
+            placeholder="Acme Corp"
+            {...register("company_name")}
+          />
+        </Field>
+        <Field
+          label="Role"
+          htmlFor="job_role_title"
+          hint="What they do at this company."
+        >
+          <input
+            id="job_role_title"
+            className="input"
+            placeholder="Senior Engineer"
+            {...register("role_title")}
+          />
+        </Field>
+        <Field
+          label="Company website"
+          htmlFor="job_company_website"
+          hint="Optional — store exactly what you'd type into a browser."
+        >
+          <input
+            id="job_company_website"
+            className="input"
+            placeholder="https://acme.com"
+            {...register("company_website")}
+          />
+        </Field>
+        <Field
+          label="Work email"
+          htmlFor="job_work_email"
+          hint="Doubles as a Google Calendar id. Avi merges this work calendar into availability checks (typically free/busy only)."
+        >
+          <input
+            id="job_work_email"
+            type="email"
+            className="input"
+            placeholder="ben@acme.com"
+            {...register("work_email")}
+          />
+        </Field>
+        <div className="col-span-2">
+          <Field
+            label="Description"
+            htmlFor="job_description"
+            hint="Free-form notes — team, scope, work schedule, anything Avi should know."
+          >
+            <textarea
+              id="job_description"
+              rows={3}
+              className="input"
+              placeholder="Backend team, mostly remote, usually in meetings 10–4 ET."
+              {...register("description")}
+            />
+          </Field>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+

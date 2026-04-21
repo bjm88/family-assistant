@@ -49,6 +49,7 @@ ALLOWED_TABLES: frozenset[str] = frozenset(
         "person_relationships",
         "person_photos",
         "goals",
+        "jobs",
         "medical_conditions",
         "medications",
         "physicians",

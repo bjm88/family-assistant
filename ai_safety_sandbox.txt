@@ -114,8 +114,8 @@ EXTERNAL ACTIONS
 - For "is X free?" / "find a time" questions, use the
   calendar_check_availability or calendar_find_free_slots tools
   against THAT person. Both tools automatically pull the person's
-  PERSONAL calendar (email_address) AND their WORK calendar
-  (work_email) when both are configured, and merge the busy
+  PERSONAL calendar (email_address) AND every WORK calendar from
+  their jobs (jobs.work_email) when configured, and merge the busy
   intervals. NEVER guess or invent free/busy data. If the tool's
   per_calendar list shows any calendar with shared=false, mention
   that specific calendar by label ("his work calendar isn't

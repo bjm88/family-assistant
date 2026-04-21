@@ -69,17 +69,6 @@ class Person(Base, TimestampMixin):
             "Avi is keyed off this address."
         ),
     )
-    work_email: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-        comment=(
-            "Work / employer email address. Used by the AI assistant "
-            "as a SECOND Google Calendar id when checking availability "
-            "or listing events for this person — work calendars are "
-            "typically only shared as free/busy, while personal "
-            "calendars are full-detail. Optional."
-        ),
-    )
     mobile_phone_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     home_phone_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     work_phone_number: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
@@ -156,6 +145,9 @@ class Person(Base, TimestampMixin):
         back_populates="person", cascade="all, delete-orphan"
     )
     goals: Mapped[List["Goal"]] = relationship(  # noqa: F821
+        back_populates="person", cascade="all, delete-orphan"
+    )
+    jobs: Mapped[List["Job"]] = relationship(  # noqa: F821
         back_populates="person", cascade="all, delete-orphan"
     )
     medical_conditions: Mapped[List["MedicalCondition"]] = relationship(  # noqa: F821

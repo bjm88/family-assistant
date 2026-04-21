@@ -86,10 +86,41 @@ def build_person_context(
     email_bits: List[str] = []
     if person.email_address:
         email_bits.append(f"personal {person.email_address}")
-    if person.work_email:
-        email_bits.append(f"work {person.work_email}")
+    for job in person.jobs or []:
+        work = (job.work_email or "").strip()
+        if not work:
+            continue
+        if job.company_name:
+            email_bits.append(f"work {work} ({job.company_name})")
+        else:
+            email_bits.append(f"work {work}")
     if email_bits:
         lines.append("Email: " + ", ".join(email_bits))
+
+    # Job(s) — surface where the person works and what role they
+    # play, so Avi can answer "where does Mom work?" or "who's the
+    # lawyer in the family?" without the model having to fish the
+    # info back out of the email line above.
+    job_lines: List[str] = []
+    for job in person.jobs or []:
+        bits: List[str] = []
+        if job.role_title and job.company_name:
+            bits.append(f"{job.role_title} at {job.company_name}")
+        elif job.role_title:
+            bits.append(job.role_title)
+        elif job.company_name:
+            bits.append(f"works at {job.company_name}")
+        if not bits:
+            continue
+        if job.company_website:
+            bits.append(job.company_website)
+        if job.description:
+            bits.append(job.description)
+        job_lines.append(" — ".join(bits))
+    if job_lines:
+        lines.append("Jobs:")
+        for jl in job_lines:
+            lines.append(f"  - {jl}")
 
     # Goals (ordered by priority).
     priority_rank = {"urgent": 0, "semi_urgent": 1, "normal": 2, "low": 3}

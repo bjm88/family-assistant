@@ -21,6 +21,7 @@ from .person_photo import PersonPhoto
 from .face_embedding import FaceEmbedding
 from .person_relationship import PersonRelationship, RELATIONSHIP_TYPES
 from .goal import Goal, GOAL_PRIORITIES
+from .job import Job
 from .medical_condition import MedicalCondition
 from .medication import Medication
 from .physician import Physician
@@ -104,6 +105,7 @@ __all__ = [
     "RELATIONSHIP_TYPES",
     "Goal",
     "GOAL_PRIORITIES",
+    "Job",
     "MedicalCondition",
     "Medication",
     "Physician",

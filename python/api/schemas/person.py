@@ -17,7 +17,6 @@ class PersonBase(BaseModel):
     gender: Optional[str] = Field(None, max_length=32)
     primary_family_relationship: Optional[str] = Field(None, max_length=40)
     email_address: Optional[EmailStr] = None
-    work_email: Optional[EmailStr] = None
     mobile_phone_number: Optional[str] = Field(None, max_length=40)
     home_phone_number: Optional[str] = Field(None, max_length=40)
     work_phone_number: Optional[str] = Field(None, max_length=40)
@@ -61,7 +60,6 @@ class PersonUpdate(BaseModel):
     gender: Optional[str] = Field(None, max_length=32)
     primary_family_relationship: Optional[str] = Field(None, max_length=40)
     email_address: Optional[EmailStr] = None
-    work_email: Optional[EmailStr] = None
     mobile_phone_number: Optional[str] = Field(None, max_length=40)
     home_phone_number: Optional[str] = Field(None, max_length=40)
     work_phone_number: Optional[str] = Field(None, max_length=40)
@@ -83,7 +81,6 @@ class PersonRead(OrmModel):
     gender: Optional[str]
     primary_family_relationship: Optional[str]
     email_address: Optional[str]
-    work_email: Optional[str]
     mobile_phone_number: Optional[str]
     home_phone_number: Optional[str]
     work_phone_number: Optional[str]

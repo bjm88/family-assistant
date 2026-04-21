@@ -601,19 +601,24 @@ def _lookup_family_member_by_email(
 ) -> Optional[models.Person]:
     if not email:
         return None
-    # Case-insensitive exact match against EITHER the personal or
-    # work mailbox so a family member writing from their work email
-    # is still recognised. We don't strip plus-tags or domain
-    # aliases on purpose — if the user sends from
+    # Case-insensitive exact match against EITHER the personal email
+    # on the person row OR the work_email on ANY of their jobs, so a
+    # family member writing from their work mailbox is still
+    # recognised. The jobs check is an EXISTS subquery so multiple
+    # jobs don't multiply the parent row. We don't strip plus-tags
+    # or domain aliases on purpose — if the user sends from
     # ben+work@example.com we want them to register that exact
     # alias rather than have Avi silently broaden the security gate.
+    job_email_match = (
+        select(models.Job.person_id)
+        .where(models.Job.person_id == models.Person.person_id)
+        .where(models.Job.work_email.ilike(email))
+        .exists()
+    )
     return db.execute(
         select(models.Person)
         .where(models.Person.family_id == family_id)
-        .where(
-            models.Person.email_address.ilike(email)
-            | models.Person.work_email.ilike(email)
-        )
+        .where(models.Person.email_address.ilike(email) | job_email_match)
         .limit(1)
     ).scalar_one_or_none()
 

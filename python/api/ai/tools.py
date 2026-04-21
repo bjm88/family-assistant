@@ -349,7 +349,16 @@ async def _handle_lookup_person(ctx: ToolContext, name: str) -> List[Dict[str, A
                     "preferred_name": p.preferred_name,
                     "last_name": p.last_name,
                     "email_address": p.email_address,
-                    "work_email": p.work_email,
+                    "jobs": [
+                        {
+                            "company_name": j.company_name,
+                            "company_website": j.company_website,
+                            "role_title": j.role_title,
+                            "work_email": j.work_email,
+                            "description": j.description,
+                        }
+                        for j in (p.jobs or [])
+                    ],
                     "gender": p.gender,
                 }
             )
@@ -949,17 +958,23 @@ def _resolve_person_calendars(
         return None, []
 
     if _looks_like_email(needle):
-        # Match against EITHER personal or work email so "ben@work.io"
-        # still resolves to the person row + pulls in their personal
-        # calendar too.
+        # Match against EITHER the person's personal email_address OR
+        # the work_email on ANY of their jobs, so "ben@work.io" still
+        # resolves to the person row + pulls in their personal calendar
+        # too. The jobs check is an EXISTS subquery so we don't have
+        # to deduplicate the parent row when a person has multiple
+        # jobs.
         lowered = needle.lower()
+        from sqlalchemy import exists as _sa_exists
+
+        job_email_match = _sa_exists().where(
+            (models.Job.person_id == models.Person.person_id)
+            & models.Job.work_email.ilike(needle)
+        )
         match = (
             ctx.db.query(models.Person)
             .filter(models.Person.family_id == ctx.family_id)
-            .filter(
-                models.Person.email_address.ilike(needle)
-                | models.Person.work_email.ilike(needle)
-            )
+            .filter(models.Person.email_address.ilike(needle) | job_email_match)
             .first()
         )
         if match is None:
@@ -1006,12 +1021,24 @@ def _calendar_pairs_for(
     """
     pairs: List[tuple[str, str]] = []
     personal = (person.email_address or "").strip()
-    work = (person.work_email or "").strip()
     requested_l = (requested_email or "").lower()
 
     if personal:
         pairs.append((personal, "personal"))
-    if work:
+
+    # A person can have multiple jobs; each job's work_email is its
+    # own Google Calendar id (e.g. day job + side consulting). De-dupe
+    # case-insensitively so a job rolled forward with the same email
+    # doesn't double-count.
+    seen_work: set[str] = set()
+    for job in person.jobs or []:
+        work = (job.work_email or "").strip()
+        if not work:
+            continue
+        key = work.lower()
+        if key in seen_work or key == personal.lower():
+            continue
+        seen_work.add(key)
         pairs.append((work, "work"))
 
     if requested_l:
@@ -3505,7 +3532,7 @@ def build_default_registry() -> ToolRegistry:
                 "Check whether one specific household member is free "
                 "or busy in a given time window. Hits Google freebusy "
                 "against BOTH the person's personal calendar "
-                "(email_address) AND their work calendar (work_email) "
+                "(email_address) AND every work calendar from their jobs "
                 "when both are configured, and merges the results so "
                 "a slot only counts as free if the person is free on "
                 "both. Returns per_calendar so you can mention if a "

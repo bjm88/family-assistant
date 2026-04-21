@@ -63,6 +63,8 @@ from .routers import (
     google,
     identity_documents,
     insurance_policies,
+    jobs,
+    landing,
     legal,
     live_sessions,
     media,
@@ -201,6 +203,7 @@ def create_app() -> FastAPI:
         person_photos.router,
         person_relationships.router,
         goals.router,
+        jobs.router,
         medical_conditions.router,
         medications.router,
         physicians.router,
@@ -232,6 +235,11 @@ def create_app() -> FastAPI:
     # ``https://<host>/legal/privacy-policy`` rather than being buried under
     # /api/*. Twilio's reviewer fetches each URL once during A2P approval.
     app.include_router(legal.router)
+    # Public marketing landing page at the site root ("/"). Mounted
+    # last among the root-level routes so the explicit /api/*, /admin/*,
+    # /aiassistant/*, and /legal/* routes still match first; this just
+    # gives the ngrok tunnel a real homepage instead of a 404.
+    app.include_router(landing.router)
 
     app.include_router(ai_face.router, prefix=AI_PREFIX)
     app.include_router(ai_chat.router, prefix=AI_PREFIX)

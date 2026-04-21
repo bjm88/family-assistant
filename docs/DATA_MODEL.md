@@ -115,9 +115,12 @@ Individual household members. Notable columns:
   by `preferred_name` if set, otherwise `first_name`.
 - `primary_family_relationship` — convenience label only; the
   authoritative tree lives in `person_relationships`.
-- `email_address`, `work_email` — also used as Google Calendar ids by
-  the calendar tools (personal calendar is full-detail, work calendar
-  is typically free/busy only).
+- `email_address` — personal mailbox; doubles as the personal Google
+  Calendar id used by the calendar tools (full-detail).
+- Work email lives on `jobs.work_email` (one row per employer). Each
+  job's work_email is also a Google Calendar id — Avi merges the
+  personal calendar with every work calendar when checking
+  availability. Work calendars are typically free/busy only.
 - `mobile_phone_number` / `home_phone_number` / `work_phone_number` —
   the SMS surface matches inbound `From:` against all three.
 - `telegram_user_id` (`BIGINT`) and `telegram_username` — populated

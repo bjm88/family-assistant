@@ -16,6 +16,16 @@ export interface FamilySummary {
   documents_count: number;
 }
 
+export interface Job {
+  job_id: number;
+  person_id: number;
+  company_name: string | null;
+  company_website: string | null;
+  role_title: string | null;
+  work_email: string | null;
+  description: string | null;
+}
+
 export interface Person {
   person_id: number;
   family_id: number;
@@ -27,7 +37,6 @@ export interface Person {
   gender: string | null;
   primary_family_relationship: string | null;
   email_address: string | null;
-  work_email: string | null;
   mobile_phone_number: string | null;
   home_phone_number: string | null;
   work_phone_number: string | null;
