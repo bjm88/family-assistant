@@ -63,6 +63,7 @@ from .financial_account import (
 from .document import DocumentRead, DocumentUpdate
 from .sms_inbox import (
     SmsInboxAttachmentRead,
+    SmsInboxChannel,
     SmsInboxMessageRead,
     SmsInboxStatus,
 )
@@ -162,6 +163,7 @@ __all__ = [
     "DocumentRead",
     "DocumentUpdate",
     "SmsInboxAttachmentRead",
+    "SmsInboxChannel",
     "SmsInboxMessageRead",
     "SmsInboxStatus",
     "TaskAttachmentKind",

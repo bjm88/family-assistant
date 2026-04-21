@@ -54,6 +54,7 @@ from .email_inbox_message import EmailInboxMessage, EMAIL_INBOX_STATUSES
 from .sms_inbox_message import (
     SmsInboxAttachment,
     SmsInboxMessage,
+    SMS_INBOX_CHANNELS,
     SMS_INBOX_STATUSES,
 )
 from .telegram_inbox_message import (
@@ -134,6 +135,7 @@ __all__ = [
     "EMAIL_INBOX_STATUSES",
     "SmsInboxMessage",
     "SmsInboxAttachment",
+    "SMS_INBOX_CHANNELS",
     "SMS_INBOX_STATUSES",
     "TelegramInboxMessage",
     "TelegramInboxAttachment",

@@ -50,22 +50,32 @@ LIVE_SESSION_END_REASONS: tuple[str, ...] = (
 
 # Where this session originated. Drives badging in the history UI and
 # the "should the email poller reopen this thread?" lookup.
-LIVE_SESSION_SOURCES: tuple[str, ...] = ("live", "email", "sms", "telegram")
+LIVE_SESSION_SOURCES: tuple[str, ...] = (
+    "live",
+    "email",
+    "sms",
+    "telegram",
+    "whatsapp",
+)
 
 
 class LiveSession(Base, TimestampMixin):
     __tablename__ = "live_sessions"
     __table_args__ = (
         CheckConstraint(
-            "source IN ('live', 'email', 'sms', 'telegram')",
+            "source IN ('live', 'email', 'sms', 'telegram', 'whatsapp')",
             name="ck_live_sessions_source",
         ),
         # Partial unique index — only enforce uniqueness on rows that
         # actually have an external thread id, so live (non-email)
-        # sessions don't collide on a shared NULL.
+        # sessions don't collide on a shared NULL. ``source`` is part
+        # of the key so SMS and WhatsApp sessions for the same phone
+        # number don't collide (they share the E.164 string as the
+        # thread id but are distinct conversations).
         Index(
             "uq_live_sessions_external_thread",
             "family_id",
+            "source",
             "external_thread_id",
             unique=True,
             postgresql_where=text("external_thread_id IS NOT NULL"),

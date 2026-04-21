@@ -1,30 +1,42 @@
-"""SMS-driven AI assistant — Twilio webhook handler + per-message agent dispatch.
+"""SMS / WhatsApp Twilio webhook handler + per-message agent dispatch.
 
 Big picture
 -----------
-This module turns Avi into an **SMS auto-responder for registered
-family members only**. Unlike the email path (which polls Gmail every
-60 s) Twilio pushes — :func:`process_inbound_sms` is invoked
-synchronously from the ``POST /api/sms/twilio/inbound`` webhook
-handler in ``routers/sms_webhook.py``.
+This module turns Avi into an **SMS / WhatsApp auto-responder for
+registered family members only**. Unlike the email path (which polls
+Gmail every 60 s) Twilio pushes — :func:`process_inbound_sms` is
+invoked synchronously from the ``POST /api/sms/twilio/inbound``
+webhook handler in ``routers/sms_webhook.py``. The same webhook /
+service handles both surfaces because Twilio's WhatsApp Programmable
+Messaging API is a strict superset of SMS: same payload, same
+``MessageSid`` namespace, same Basic-auth credentials. Inbound rows
+are tagged with ``channel='sms' | 'whatsapp'`` (parsed from the
+``whatsapp:`` prefix on the ``From`` address) and the per-channel
+divergences (sender number, length cap, env flag, live-session
+``source``) are encapsulated in :func:`_channel_config_for`.
 
 * Inbound webhook is signature-verified (see
   :func:`api.integrations.twilio_sms.verify_twilio_signature`) before
   we ever look at the form contents — anything Twilio didn't sign is
   dropped at the router layer.
 * Dedup happens at the storage layer (``twilio_message_sid`` UNIQUE),
-  so a Twilio retry never re-spends an LLM call.
+  so a Twilio retry never re-spends an LLM call. The same SID space
+  is shared across SMS and WhatsApp, which is exactly what we want.
 * The sender's phone number is matched against
   ``people.{mobile,home,work}_phone_number`` for every family in the
-  database. **All unmatched senders are silently ignored, recorded in
-  ``sms_inbox_messages`` with ``status='ignored_unknown_sender'``.**
-  This is the single security gate — no other code path replies to
-  SMS.
+  database, after stripping the ``whatsapp:`` prefix so the same
+  person reaching us on SMS and on WhatsApp resolves to the same
+  household member. **All unmatched senders are silently ignored,
+  recorded in ``sms_inbox_messages`` with
+  ``status='ignored_unknown_sender'``.** This is the single security
+  gate — no other code path replies to either surface.
 * When the sender does match a registered person we open / reuse a
-  ``LiveSession`` keyed on the counterparty's E.164 phone, log the
-  inbound message into the transcript, run the same agent loop the
-  live chat uses, and send the final answer back via Twilio's REST
-  API.
+  ``LiveSession`` keyed on the counterparty's E.164 phone with
+  ``source='sms'`` or ``source='whatsapp'`` so the two surfaces keep
+  separate transcripts (different reply-length norms, different
+  opt-in conventions), log the inbound into the transcript, run the
+  same agent loop the live chat uses, and send the final answer back
+  via Twilio's REST API (``send_sms`` / ``send_whatsapp``).
 
 Architectural parity with email
 -------------------------------
@@ -40,16 +52,18 @@ What this code DELIBERATELY does not do
 * Reply to STOP / UNSUBSCRIBE / END keywords. Twilio handles the
   carrier-level opt-out; we still record the row but never fire
   the agent loop.
-* Loop on its own outbound traffic. If an inbound's ``From`` matches
-  ``TWILIO_PRIMARY_PHONE`` it's recorded as ``ignored_self`` and
-  dropped.
+* Loop on its own outbound traffic. If an inbound's ``From`` (after
+  stripping ``whatsapp:``) matches ``TWILIO_PRIMARY_PHONE`` (for SMS)
+  or ``TWILIO_WHATSAPP_SENDER_NUMBER`` (for WhatsApp) it's recorded
+  as ``ignored_self`` and dropped.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple
 
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -62,7 +76,7 @@ from ..ai import ollama, prompts, rag, schema_catalog
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
 from ..ai import web_search_shortcut
-from ..config import get_settings
+from ..config import Settings, get_settings
 from ..db import SessionLocal
 from ..integrations import twilio_sms
 from ..utils.phone import normalize_phone
@@ -87,6 +101,97 @@ def _utcnow():
 
 
 # ---------------------------------------------------------------------------
+# Per-channel configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ChannelConfig:
+    """Per-channel knobs derived once per inbound message.
+
+    Keeping all the SMS-vs-WhatsApp branches in one bundle (built up
+    front by :func:`_channel_config_for`) makes the main pipeline read
+    linearly — every later step just dereferences the right field
+    instead of re-checking ``inbound.channel`` over and over.
+    """
+
+    channel: str  # 'sms' | 'whatsapp'
+    label: str  # 'SMS' / 'WhatsApp' — for logs and prompt text
+    inbound_kind: str  # transcript meta `kind` for the user-message log
+    reply_kind: str  # transcript meta `kind` for the assistant log
+    feature_enabled: bool  # AI_{SMS|WHATSAPP}_INBOUND_ENABLED
+    feature_flag_name: str  # for status_reason wording
+    sender_number: Optional[str]  # TWILIO_PRIMARY_PHONE / TWILIO_WHATSAPP_SENDER_NUMBER
+    sender_env_name: str
+    reply_max_chars: int
+    agent_task_kind: str  # 'sms' / 'whatsapp'
+    surface_description: str  # for the system prompt so the LLM knows where it landed
+
+
+def _channel_config_for(
+    inbound: twilio_sms.InboundSms, settings: Settings
+) -> _ChannelConfig:
+    """Resolve per-surface settings for one inbound Twilio webhook."""
+    if inbound.channel == "whatsapp":
+        return _ChannelConfig(
+            channel="whatsapp",
+            label="WhatsApp",
+            inbound_kind="whatsapp",
+            reply_kind="whatsapp_reply",
+            feature_enabled=settings.AI_WHATSAPP_INBOUND_ENABLED,
+            feature_flag_name="AI_WHATSAPP_INBOUND_ENABLED",
+            sender_number=settings.TWILIO_WHATSAPP_SENDER_NUMBER,
+            sender_env_name="TWILIO_WHATSAPP_SENDER_NUMBER",
+            reply_max_chars=settings.AI_WHATSAPP_REPLY_MAX_CHARS,
+            agent_task_kind="whatsapp",
+            surface_description="WhatsApp message",
+        )
+    return _ChannelConfig(
+        channel="sms",
+        label="SMS",
+        inbound_kind="sms",
+        reply_kind="sms_reply",
+        feature_enabled=settings.AI_SMS_INBOUND_ENABLED,
+        feature_flag_name="AI_SMS_INBOUND_ENABLED",
+        sender_number=settings.TWILIO_PRIMARY_PHONE,
+        sender_env_name="TWILIO_PRIMARY_PHONE",
+        reply_max_chars=settings.AI_SMS_REPLY_MAX_CHARS,
+        agent_task_kind="sms",
+        surface_description="SMS",
+    )
+
+
+def _send_for_channel(
+    chan: _ChannelConfig,
+) -> Callable[..., str]:
+    """Return the right Twilio outbound function for ``chan``."""
+    if chan.channel == "whatsapp":
+        return twilio_sms.send_whatsapp
+    return twilio_sms.send_sms
+
+
+def _open_session_for_channel(
+    db: Session,
+    chan: _ChannelConfig,
+    *,
+    family_id: int,
+    counterparty_phone: str,
+) -> Tuple[models.LiveSession, bool]:
+    """Open / reuse the right LiveSession row for ``chan``."""
+    if chan.channel == "whatsapp":
+        return live_session.find_or_create_whatsapp_session(
+            db,
+            family_id=family_id,
+            counterparty_phone=counterparty_phone,
+        )
+    return live_session.find_or_create_sms_session(
+        db,
+        family_id=family_id,
+        counterparty_phone=counterparty_phone,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point — invoked from the webhook router
 # ---------------------------------------------------------------------------
 
@@ -103,7 +208,17 @@ def process_inbound_sms(
     matches the way ``services.email_inbox._handle_one_message`` works.
     """
     settings = get_settings()
+    chan = _channel_config_for(inbound, settings)
+
+    # `From` may carry a `whatsapp:` prefix on WhatsApp inbound; strip
+    # it once up front so every downstream phone-number consumer
+    # (normalize, person lookup, session key, self-loop) sees the bare
+    # E.164 form. The prefixed value is preserved on the audit row +
+    # transcript so it's obvious which surface a message came from.
+    from_phone_bare = twilio_sms.strip_whatsapp_prefix(inbound.from_phone)
+
     common = dict(
+        channel=chan.channel,
         twilio_message_sid=inbound.message_sid,
         twilio_messaging_service_sid=inbound.messaging_service_sid,
         from_phone=inbound.from_phone,
@@ -114,7 +229,10 @@ def process_inbound_sms(
     )
 
     if not inbound.message_sid:
-        logger.warning("Twilio webhook missing MessageSid; refusing to process.")
+        logger.warning(
+            "Twilio %s webhook missing MessageSid; refusing to process.",
+            chan.label,
+        )
         return _save_audit(
             db,
             family_id=None,
@@ -136,14 +254,14 @@ def process_inbound_sms(
         )
 
     # ---- Self-loop ---------------------------------------------------
-    own_number = normalize_phone(settings.TWILIO_PRIMARY_PHONE)
-    if own_number and normalize_phone(inbound.from_phone) == own_number:
+    own_number = normalize_phone(chan.sender_number)
+    if own_number and normalize_phone(from_phone_bare) == own_number:
         return _save_audit(
             db,
             family_id=None,
             person_id=None,
             status="ignored_self",
-            status_reason="Sender matches our own Twilio number.",
+            status_reason=f"Sender matches our own Twilio {chan.label} number.",
             **common,
         )
 
@@ -162,10 +280,11 @@ def process_inbound_sms(
         )
 
     # ---- Person lookup ----------------------------------------------
-    person = _lookup_family_member_by_phone(db, inbound.from_phone)
+    person = _lookup_family_member_by_phone(db, from_phone_bare)
     if person is None:
         logger.info(
-            "SMS inbox: ignoring unknown sender %r (sid=%s)",
+            "%s inbox: ignoring unknown sender %r (sid=%s)",
+            chan.label,
             inbound.from_phone,
             inbound.message_sid,
         )
@@ -181,10 +300,15 @@ def process_inbound_sms(
             **common,
         )
 
-    # ---- Open / reuse the SMS session -------------------------------
-    counterparty = normalize_phone(inbound.from_phone) or inbound.from_phone
-    session, _created = live_session.find_or_create_sms_session(
+    # ---- Open / reuse the per-channel session ----------------------
+    # Same person reaching us on SMS vs. WhatsApp lands on different
+    # session rows because the surfaces have different reply-length
+    # and tone conventions; we don't want one transcript to bleed into
+    # the other.
+    counterparty = normalize_phone(from_phone_bare) or from_phone_bare
+    session, _created = _open_session_for_channel(
         db,
+        chan,
         family_id=person.family_id,
         counterparty_phone=counterparty,
     )
@@ -203,7 +327,7 @@ def process_inbound_sms(
         **common,
     )
 
-    # ---- Download MMS media (if any) and persist + log -------------
+    # ---- Download MMS / WhatsApp media (if any) and persist + log --
     attachments_meta = _persist_attachments(db, audit, inbound)
     if attachments_meta:
         db.commit()
@@ -217,7 +341,8 @@ def process_inbound_sms(
         content=inbound_text,
         person_id=person.person_id,
         meta={
-            "kind": "sms",
+            "kind": chan.inbound_kind,
+            "channel": chan.channel,
             "twilio_message_sid": inbound.message_sid,
             "from_phone": inbound.from_phone,
             "to_phone": inbound.to_phone,
@@ -225,10 +350,10 @@ def process_inbound_sms(
         },
     )
 
-    # ---- Skip the agent loop if SMS is disabled --------------------
-    if not settings.AI_SMS_INBOUND_ENABLED:
+    # ---- Skip the agent loop if this surface is disabled -----------
+    if not chan.feature_enabled:
         audit.status = "failed"
-        audit.status_reason = "AI_SMS_INBOUND_ENABLED=false"
+        audit.status_reason = f"{chan.feature_flag_name}=false"
         db.commit()
         return audit
 
@@ -238,18 +363,18 @@ def process_inbound_sms(
         family_id=person.family_id,
         live_session_id=session.live_session_id,
         person_id=person.person_id,
-        kind="sms",
+        kind=chan.agent_task_kind,
         input_text=inbound.body or "",
         model=ollama._model(),
     )
     audit.agent_task_id = task.agent_task_id
     db.commit()
 
-    user_message = _format_user_message_for_agent(inbound, person)
+    user_message = _format_user_message_for_agent(inbound, person, chan)
 
     # ---- Fast-path web-search shortcut ----------------------------
     # Skip the heavy agent entirely when the lightweight Gemma
-    # classifier is confident this SMS is a pure web-lookup ask.
+    # classifier is confident this message is a pure web-lookup ask.
     # Saves ~5-10 s of round-trips. We hand it the RAW body (not the
     # `[Text message from ...]` wrapper) because the wrapper is a
     # surface hint for the heavy agent, not signal for the
@@ -263,15 +388,17 @@ def process_inbound_sms(
         )
     except Exception:  # noqa: BLE001 - shortcut must never break the inbound
         logger.exception(
-            "SMS inbox: web-search shortcut crashed for sid=%s — "
+            "%s inbox: web-search shortcut crashed for sid=%s — "
             "falling through to heavy agent",
+            chan.label,
             inbound.message_sid,
         )
         shortcut_text = None
     if shortcut_text:
         logger.info(
-            "SMS inbox: web-search shortcut handled sid=%s task=%s "
+            "%s inbox: web-search shortcut handled sid=%s task=%s "
             "(skipping heavy agent).",
+            chan.label,
             inbound.message_sid,
             task.agent_task_id,
         )
@@ -284,9 +411,10 @@ def process_inbound_sms(
             family_id=person.family_id,
             person=person,
             from_phone=inbound.from_phone,
+            chan=chan,
         )
 
-        # The contract with the user is: every inbound SMS from a
+        # The contract with the user is: every inbound message from a
         # registered family member gets a reply, period. Even if the
         # agent loop crashes (LLM offline, tool exception, asyncio
         # glitch, …) we still want SOMETHING to land on their phone
@@ -307,40 +435,50 @@ def process_inbound_sms(
             )
         except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
             logger.exception(
-                "SMS inbox: agent loop crashed for sid=%s task=%s",
+                "%s inbox: agent loop crashed for sid=%s task=%s",
+                chan.label,
                 inbound.message_sid,
                 task.agent_task_id,
             )
             agent_failed = True
             final_text = (
-                "Got your text — Avi here. I hit a snag on my end and "
-                "couldn't finish that just now. I'll look into it."
+                f"Got your message — Avi here. I hit a snag on my end "
+                "and couldn't finish that just now. I'll look into it."
             )
 
     final_text = twilio_sms.truncate_for_sms(
-        final_text or "Got your text — nothing to add right now.",
-        max_chars=settings.AI_SMS_REPLY_MAX_CHARS,
+        final_text or "Got your message — nothing to add right now.",
+        max_chars=chan.reply_max_chars,
     )
 
     # ---- Send the reply via Twilio ---------------------------------
-    if not settings.TWILIO_PRIMARY_PHONE:
+    if not chan.sender_number:
         audit.status = "failed"
-        audit.status_reason = "TWILIO_PRIMARY_PHONE not configured."
+        audit.status_reason = f"{chan.sender_env_name} not configured."
         db.commit()
         return audit
 
+    send_func = _send_for_channel(chan)
     try:
-        reply_sid = twilio_sms.send_sms(
+        reply_sid = send_func(
             account_sid=settings.TWILIO_ACCOUNT_SID or "",
             auth_token=settings.TWILIO_AUTH_TOKEN or "",
-            from_phone=settings.TWILIO_PRIMARY_PHONE,
+            from_phone=chan.sender_number,
+            # send_whatsapp adds the `whatsapp:` prefix idempotently;
+            # send_sms uses the value verbatim. Either way, passing the
+            # original prefixed `inbound.from_phone` is safe — the
+            # WhatsApp sender helper will not double-prefix.
             to_phone=inbound.from_phone,
             body=final_text,
         )
     except twilio_sms.TwilioSendError as exc:
-        logger.exception("SMS inbox: send_sms failed for sid=%s", inbound.message_sid)
+        logger.exception(
+            "%s inbox: outbound send failed for sid=%s",
+            chan.label,
+            inbound.message_sid,
+        )
         audit.status = "failed"
-        audit.status_reason = f"send_sms: {exc}"
+        audit.status_reason = f"twilio send: {exc}"
         db.commit()
         return audit
 
@@ -352,7 +490,8 @@ def process_inbound_sms(
         content=final_text,
         person_id=person.person_id,
         meta={
-            "kind": "sms_reply",
+            "kind": chan.reply_kind,
+            "channel": chan.channel,
             "agent_task_id": task.agent_task_id,
             "twilio_message_sid": reply_sid,
             "in_reply_to": inbound.message_sid,
@@ -538,9 +677,17 @@ def _format_inbound_for_log(
 
 
 def _format_user_message_for_agent(
-    inbound: twilio_sms.InboundSms, person: models.Person
+    inbound: twilio_sms.InboundSms,
+    person: models.Person,
+    chan: _ChannelConfig,
 ) -> str:
-    """Wrap the SMS so the agent knows what surface this came through."""
+    """Wrap the inbound so the agent knows what surface this came through.
+
+    Tagging the surface in the user-message header lets the agent
+    instinctively right-size its reply (a one-line SMS reply vs. a
+    chat-style WhatsApp reply) without us having to pile every nuance
+    into the system prompt.
+    """
     name = person.preferred_name or person.first_name or inbound.from_phone
     media_hint = ""
     if inbound.num_media:
@@ -548,8 +695,9 @@ def _format_user_message_for_agent(
             f" (with {inbound.num_media} attached "
             f"{'image' if inbound.num_media == 1 else 'images'})"
         )
+    surface = "Text message" if chan.channel == "sms" else "WhatsApp message"
     return (
-        f"[Text message from {name} <{inbound.from_phone}>{media_hint}]\n\n"
+        f"[{surface} from {name} <{inbound.from_phone}>{media_hint}]\n\n"
         f"{(inbound.body or '').strip() or '(no body)'}"
     )
 
@@ -560,13 +708,18 @@ def _build_sms_system_prompt(
     family_id: int,
     person: models.Person,
     from_phone: str,
+    chan: _ChannelConfig,
 ) -> str:
-    """Mirror the email system prompt, but tuned for an SMS reply.
+    """Mirror the email system prompt, but tuned for an SMS / WhatsApp reply.
 
     Differs from the email build:
-    * Reply must fit in ~480 characters.
+    * Reply must fit in the channel-specific cap (480 chars for SMS;
+      ~1024 for WhatsApp where users tolerate longer chat-style messages).
     * No subject line, no sign-off — the recipient already knows it's
       Avi (one number, ongoing thread).
+
+    The ``chan`` bundle controls the surface-specific bits so we don't
+    duplicate this whole prompt for WhatsApp.
     """
     family = db.get(models.Family, family_id)
     assistant_name = (
@@ -579,8 +732,12 @@ def _build_sms_system_prompt(
         rag_block = rag.build_family_overview(
             db, family, requestor_person_id=person.person_id
         )
-    person_block = "Currently texting with:\n" + rag.build_person_context(
-        db, person, requestor_person_id=person.person_id
+    surface_verb = "texting" if chan.channel == "sms" else "messaging on WhatsApp"
+    person_block = (
+        f"Currently {surface_verb} with:\n"
+        + rag.build_person_context(
+            db, person, requestor_person_id=person.person_id
+        )
     )
 
     registry = agent_tools.build_default_registry()
@@ -610,24 +767,49 @@ def _build_sms_system_prompt(
         "Sensitive columns are encrypted; use the *_last_four helpers.\n\n"
         + schema_catalog.dump_text(db)
     )
-    max_chars = get_settings().AI_SMS_REPLY_MAX_CHARS
-    parts.append(
-        "--- How to reply to this text message ---\n"
-        f"This message arrived as an SMS from {from_phone}. Your final "
-        f"answer will be sent verbatim as the body of an SMS reply. "
-        "Therefore:\n"
-        f"* Keep the reply UNDER {max_chars} characters — ideally one "
-        "  or two short sentences. Texts are read on a phone screen; "
-        "  brevity reads as competence.\n"
-        "* Plain text only. No Markdown, no bullet lists, no asterisks.\n"
-        "* No subject line, no greeting, no 'Sincerely, Avi'. The "
-        "  recipient knows who you are; jump straight to the answer.\n"
-        "* Use at most one round of tool calls before writing the "
-        "  reply. SMS is asynchronous — if you need more info, ask "
-        "  the user one specific question and stop.\n"
-        "* NEVER include encrypted identifiers, passwords, or anything "
-        "  ending in _encrypted in the reply body.\n"
-    )
+    max_chars = chan.reply_max_chars
+    if chan.channel == "whatsapp":
+        parts.append(
+            f"--- How to reply to this WhatsApp message ---\n"
+            f"This message arrived as a WhatsApp text from {from_phone}. "
+            "Your final answer will be sent verbatim as the body of a "
+            "WhatsApp reply via Twilio's Programmable Messaging API. "
+            "Therefore:\n"
+            f"* Keep the reply UNDER {max_chars} characters — WhatsApp "
+            "  readers tolerate longer chat-style messages than SMS, "
+            "  but two-three short paragraphs is the sweet spot.\n"
+            "* Plain text only. No Markdown, no bullet lists, no "
+            "  asterisks (WhatsApp doesn't render Markdown — asterisks "
+            "  show up as literal stars).\n"
+            "* No subject line, no greeting, no 'Sincerely, Avi'. The "
+            "  recipient knows who you are; jump straight to the answer.\n"
+            "* Use at most one round of tool calls before writing the "
+            "  reply. WhatsApp is asynchronous — if you need more "
+            "  info, ask the user one specific question and stop.\n"
+            "* You're inside the 24-hour customer-care window opened "
+            "  by the user's inbound. Free-form replies are allowed; "
+            "  don't worry about templates.\n"
+            "* NEVER include encrypted identifiers, passwords, or "
+            "  anything ending in _encrypted in the reply body.\n"
+        )
+    else:
+        parts.append(
+            "--- How to reply to this text message ---\n"
+            f"This message arrived as an SMS from {from_phone}. Your final "
+            f"answer will be sent verbatim as the body of an SMS reply. "
+            "Therefore:\n"
+            f"* Keep the reply UNDER {max_chars} characters — ideally one "
+            "  or two short sentences. Texts are read on a phone screen; "
+            "  brevity reads as competence.\n"
+            "* Plain text only. No Markdown, no bullet lists, no asterisks.\n"
+            "* No subject line, no greeting, no 'Sincerely, Avi'. The "
+            "  recipient knows who you are; jump straight to the answer.\n"
+            "* Use at most one round of tool calls before writing the "
+            "  reply. SMS is asynchronous — if you need more info, ask "
+            "  the user one specific question and stop.\n"
+            "* NEVER include encrypted identifiers, passwords, or anything "
+            "  ending in _encrypted in the reply body.\n"
+        )
     return prompts.with_safety("\n\n".join(parts))
 
 

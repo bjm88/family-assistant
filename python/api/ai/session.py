@@ -222,6 +222,56 @@ def find_or_create_sms_session(
     return session, True
 
 
+def find_or_create_whatsapp_session(
+    db: Session,
+    *,
+    family_id: int,
+    counterparty_phone: str,
+) -> Tuple[models.LiveSession, bool]:
+    """Return ``(session, created)`` for an inbound WhatsApp thread.
+
+    Mirrors :func:`find_or_create_sms_session` but namespaces the
+    session under ``source='whatsapp'`` so a single household member
+    who reaches Avi on both SMS and WhatsApp gets a separate
+    transcript per surface — they're distinct conversations with
+    different reply-length conventions and different opt-in /
+    opt-out semantics, and merging them would confuse the agent
+    when it builds context for the next turn.
+
+    ``counterparty_phone`` is the bare E.164 phone number (no
+    ``whatsapp:`` prefix); the prefix is stripped at the inbox
+    boundary so this column stays comparable across surfaces.
+
+    Like SMS / email / Telegram threads, WhatsApp sessions skip the
+    live-page idle sweep — a back-and-forth that takes a week is
+    still one session.
+    """
+    existing = db.execute(
+        select(models.LiveSession)
+        .where(models.LiveSession.family_id == family_id)
+        .where(models.LiveSession.source == "whatsapp")
+        .where(models.LiveSession.external_thread_id == counterparty_phone)
+        .order_by(models.LiveSession.started_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.last_activity_at = _now()
+        if existing.ended_at is not None:
+            existing.ended_at = None
+            existing.end_reason = None
+        return existing, False
+
+    session = models.LiveSession(
+        family_id=family_id,
+        source="whatsapp",
+        external_thread_id=counterparty_phone,
+        start_context=f"whatsapp_thread:{counterparty_phone}",
+    )
+    db.add(session)
+    db.flush()
+    return session, True
+
+
 def find_or_create_telegram_session(
     db: Session,
     *,

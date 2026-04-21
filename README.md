@@ -64,6 +64,7 @@ flowchart TB
         direction LR
         Web["Web chat"]
         SMS["SMS"]
+        WA["WhatsApp"]
         Email["Email"]
         Telegram["Telegram"]
     end
@@ -98,6 +99,7 @@ flowchart TB
     %% ─── Wiring ─────────────────────────────────────────────────
     Web --> Hub
     SMS --> Hub
+    WA --> Hub
     Email --> Hub
     Telegram --> Hub
 
@@ -133,7 +135,7 @@ flowchart TB
     classDef ai fill:#fdf4ff,stroke:#a21caf,color:#581c87,stroke-width:2px
     classDef integ fill:#ecfeff,stroke:#0891b2,color:#164e63,stroke-width:2px
     classDef data fill:#fff7ed,stroke:#d97706,color:#7c2d12,stroke-width:2px
-    class Web,SMS,Email,Telegram inbound
+    class Web,SMS,WA,Email,Telegram inbound
     class Hub,Agent core
     class AdminUI,CRUD admin
     class LLM,RAG,Face,Voice,Tasks,Cron ai
@@ -146,7 +148,8 @@ flowchart TB
 | Surface | Trigger | Identity gate | Response path | Session row |
 |---|---|---|---|---|
 | **Live page** | `/api/aiassistant/chat` (SSE) or face match | family-scoped (single-machine trust) | streaming SSE deltas (+ optional fast-ack placeholder) | `live_sessions(source='live')`, idle 30 min |
-| **SMS** | Twilio inbound webhook (signed) | `from` matches `people.mobile_phone_number` (E.164) | TwiML reply via Twilio | `live_sessions(source='sms', external_thread_id=<E.164>)`, never auto-closed |
+| **SMS** | Twilio inbound webhook (signed) | `from` matches `people.mobile_phone_number` (E.164) | REST `Messages.create` reply via Twilio (empty TwiML on the webhook) | `live_sessions(source='sms', external_thread_id=<E.164>)`, never auto-closed |
+| **WhatsApp** | Twilio inbound webhook (signed) — same `/api/sms/twilio/inbound` URL as SMS, dispatched on the `whatsapp:` prefix | `from` (after stripping `whatsapp:`) matches `people.{mobile,home,work}_phone_number` (E.164) | REST `Messages.create` with `From`/`To` `whatsapp:` prefixes via `TWILIO_WHATSAPP_SENDER_NUMBER` | `live_sessions(source='whatsapp', external_thread_id=<E.164>)`, never auto-closed |
 | **Telegram** | bot long-poll, 25 s window | `message.from.id` ↔ `people.telegram_user_id` (or `@username`); unknowns get a one-tap "Share contact" prompt + SMS-2FA bind | `sendMessage` (+ optional fast-ack pre-message) | `live_sessions(source='telegram', external_thread_id=<chat_id>)` |
 | **Email** | Gmail unread poll, 60 s | `From:` matches `people.email_address` | `users.messages.send` reply, threaded | `live_sessions(source='email', external_thread_id=<thread_id>)` |
 | **Doorbird gate** | scaffold only (planned) | LAN device, no auth surface yet | open / ring | n/a |
@@ -226,6 +229,7 @@ sequenceDiagram
 | Image gen (optional) | `google-genai` | Avatar generation for Avi's profile image |
 | Google APIs | `google-auth` · `google-auth-oauthlib` · raw REST via `httpx` | Gmail send/list/get + Calendar free/busy + OAuth refresh |
 | SMS | Twilio REST + signed webhooks (validated in-process) | Two-way SMS as a chat surface, plus the second factor for Telegram contact verification |
+| WhatsApp | Twilio Programmable Messaging WhatsApp Sender (REST + same signed webhook as SMS, dispatched on the `whatsapp:` prefix) | Two-way WhatsApp Business as a chat surface alongside SMS — same auth, dedup, and audit table |
 | Telegram | Bot API over `httpx` (no python-telegram-bot dep) | `getUpdates` long-poll, `sendMessage`, `request_contact`, file download |
 | Door / gate | local `httpx` calls to a Doorbird IP | Open-gate intent (scaffold) |
 
@@ -243,7 +247,7 @@ sequenceDiagram
 | RAG context | `ai/rag.py` · `ai/prompts.py` · `ai/schema_catalog.py` | Builds the household overview (people, goals, vehicles, residences, accounts) and the dynamic schema dump that lets the model write SQL on the fly. |
 | Fast-ack | `ai/fast_ack.py` + `services/background_agent.py` | Surface-agnostic latency hider. Telegram + SMS submit the heavy run to a shared `ThreadPoolExecutor` and call `generate_contextual_ack_sync`; the live `/chat` SSE handler races the agent on the event loop with `generate_contextual_ack_async`. Either way, if the heavy model hasn't started replying after `AI_FAST_ACK_AFTER_SECONDS` (default 3 s), `gemma4:e2b` mints a one-sentence ack ("Looking up Sara's calendar.") that's delivered as a Telegram pre-message / SMS pre-message / SSE `fast_ack` event before the real reply. |
 | Inbox pollers | `services/email_inbox.py` · `services/telegram_inbox.py` | Long-poll loops started from FastAPI's `lifespan`. Each maintains its own dedup, audit-row writes, and per-thread `LiveSession`. |
-| SMS surface | `routers/sms_webhook.py` · `services/sms_inbox.py` | Twilio inbound webhook (signature verified) → person lookup → agent loop → TwiML reply. |
+| SMS / WhatsApp surface | `routers/sms_webhook.py` · `services/sms_inbox.py` · `integrations/twilio_sms.py` | Single Twilio inbound webhook (signature verified) handles **both** SMS and WhatsApp; the inbox service dispatches on `inbound.channel` (parsed from the `whatsapp:` prefix) for outbound sender, length cap, and live-session source. Audit rows share `sms_inbox_messages` distinguished by the `channel` column. |
 
 ### Frontend avatar rendering
 

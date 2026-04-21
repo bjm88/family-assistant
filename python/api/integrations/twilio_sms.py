@@ -1,4 +1,4 @@
-"""Twilio SMS / MMS adapter.
+"""Twilio SMS / MMS / WhatsApp adapter.
 
 Three jobs, all small enough to live in one file:
 
@@ -11,16 +11,21 @@ Three jobs, all small enough to live in one file:
 2. **Send** an outbound reply via Twilio's REST API. We use plain
    ``httpx`` (no Twilio SDK dependency) because the API is just two
    form fields against one URL and pulling in the SDK would balloon
-   our import time and lock-step our Python version.
-3. **Download** an MMS attachment from a Twilio Media URL. The URLs
-   are protected by HTTP Basic with the same ``account_sid`` /
-   ``auth_token`` as the REST API and stop working a few minutes
-   after the message arrives, so we always copy them to local
-   storage immediately.
+   our import time and lock-step our Python version. Both SMS and
+   WhatsApp share the exact same endpoint — WhatsApp simply requires a
+   ``whatsapp:`` prefix on the ``From`` and ``To`` fields, which
+   :func:`send_whatsapp` adds for you.
+3. **Download** an MMS / WhatsApp attachment from a Twilio Media URL.
+   The URLs are protected by HTTP Basic with the same ``account_sid``
+   / ``auth_token`` as the REST API and stop working a few minutes
+   after the message arrives, so we always copy them to local storage
+   immediately.
 
 Nothing in this module looks at the database — it's pure adapter code.
 The orchestration (dedup, person lookup, agent loop, reply) lives in
-:mod:`api.services.sms_inbox`.
+:mod:`api.services.sms_inbox` for both SMS and WhatsApp; the inbound
+form parser sets :attr:`InboundSms.channel` based on the ``whatsapp:``
+prefix on ``From`` so the service can branch on the right surface.
 """
 
 from __future__ import annotations
@@ -103,6 +108,49 @@ def verify_twilio_signature(
 _TWILIO_API_BASE = "https://api.twilio.com/2010-04-01"
 
 
+# Twilio's WhatsApp surface uses the same Programmable Messaging
+# endpoint as SMS but tags every party with this prefix on both inbound
+# (``From=whatsapp:+1...``) and outbound (the API rejects unprefixed
+# numbers when sending from a WhatsApp sender).
+WHATSAPP_PREFIX = "whatsapp:"
+
+
+def is_whatsapp_address(addr: Optional[str]) -> bool:
+    """True iff ``addr`` is a Twilio WhatsApp-style address.
+
+    Used by the webhook router / inbox service to decide whether the
+    inbound form belongs to the SMS branch or the WhatsApp branch
+    without needing a separate webhook URL or ``?senderType=`` query
+    param.
+    """
+    return bool(addr) and addr.startswith(WHATSAPP_PREFIX)
+
+
+def strip_whatsapp_prefix(addr: Optional[str]) -> str:
+    """Return ``addr`` with any ``whatsapp:`` prefix removed.
+
+    Useful for handing the bare E.164 phone number to anything that
+    expects an SMS-shaped string (e.g. ``utils.phone.normalize_phone``,
+    person-lookup, audit log fields).
+    """
+    if not addr:
+        return ""
+    if addr.startswith(WHATSAPP_PREFIX):
+        return addr[len(WHATSAPP_PREFIX):]
+    return addr
+
+
+def with_whatsapp_prefix(addr: str) -> str:
+    """Return ``addr`` guaranteed to carry the ``whatsapp:`` prefix.
+
+    Idempotent so callers can safely pass either ``+15551234567`` or
+    ``whatsapp:+15551234567`` without double-prefixing.
+    """
+    if addr.startswith(WHATSAPP_PREFIX):
+        return addr
+    return f"{WHATSAPP_PREFIX}{addr}"
+
+
 def send_sms(
     *,
     account_sid: str,
@@ -182,6 +230,48 @@ def send_sms(
         len(body),
     )
     return sid
+
+
+def send_whatsapp(
+    *,
+    account_sid: str,
+    auth_token: str,
+    from_phone: str,
+    to_phone: str,
+    body: str,
+    media_urls: Optional[Iterable[str]] = None,
+    timeout_seconds: float = 15.0,
+) -> str:
+    """Send a single WhatsApp reply via Twilio and return the MessageSid.
+
+    Thin wrapper around :func:`send_sms` that adds the ``whatsapp:``
+    prefix Twilio requires on both ``From`` and ``To`` for WhatsApp
+    business sends. ``from_phone`` should be your approved WhatsApp
+    sender number (E.164 — e.g. ``+14155238886`` for the Twilio
+    sandbox); ``to_phone`` should be the user's WhatsApp-registered
+    phone number, also E.164. Either may already carry the prefix
+    (e.g. when the inbound webhook's ``From`` is forwarded straight
+    through) — :func:`with_whatsapp_prefix` is idempotent.
+
+    Twilio's REST behaviour:
+    * ``Body`` may be up to 4096 chars for free-form replies inside
+      the 24-hour customer-care window.
+    * Outside that window the API returns HTTP 400 / Twilio error
+      63016 ("Failed to send freeform message because you are outside
+      the allowed window") and the call must use a pre-approved
+      template instead. We surface that as :class:`TwilioSendError`
+      verbatim — the caller can decide whether to retry with a
+      template or just record the failure.
+    """
+    return send_sms(
+        account_sid=account_sid,
+        auth_token=auth_token,
+        from_phone=with_whatsapp_prefix(from_phone),
+        to_phone=with_whatsapp_prefix(to_phone),
+        body=body,
+        media_urls=media_urls,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -297,21 +387,33 @@ def parse_inbound_form(form: Mapping[str, str]) -> "InboundSms":
         ctype = form.get(f"MediaContentType{i}") or "application/octet-stream"
         if url:
             media.append((i, url, ctype))
+    raw_from = form.get("From", "")
+    raw_to = form.get("To", "")
+    # Twilio prefixes both From and To with `whatsapp:` for WhatsApp
+    # messages on the same Programmable Messaging webhook used for SMS.
+    # Detecting on `From` is sufficient because Twilio always tags both
+    # ends consistently — but we look at both so a misconfigured
+    # template can never silently route a WhatsApp message into the SMS
+    # branch (or vice versa) just because one field happens to match.
+    channel = "whatsapp" if (
+        is_whatsapp_address(raw_from) or is_whatsapp_address(raw_to)
+    ) else "sms"
     return InboundSms(
         message_sid=form.get("MessageSid") or form.get("SmsMessageSid") or "",
         messaging_service_sid=form.get("MessagingServiceSid"),
         account_sid=form.get("AccountSid", ""),
-        from_phone=form.get("From", ""),
-        to_phone=form.get("To", ""),
+        from_phone=raw_from,
+        to_phone=raw_to,
         body=body,
         num_media=num_media,
         media=media,
+        channel=channel,
     )
 
 
 @dataclass
 class InboundSms:
-    """A parsed Twilio inbound SMS/MMS webhook."""
+    """A parsed Twilio inbound SMS / MMS / WhatsApp webhook."""
 
     message_sid: str
     messaging_service_sid: Optional[str]
@@ -321,6 +423,11 @@ class InboundSms:
     body: str
     num_media: int
     media: List[Tuple[int, str, str]]  # (index, url, content-type)
+    # 'sms' for plain SMS / MMS; 'whatsapp' when From/To carry the
+    # ``whatsapp:`` prefix Twilio uses for its WhatsApp Programmable
+    # Messaging surface. Defaulted so older callers and tests that
+    # construct InboundSms by hand keep working unchanged.
+    channel: str = "sms"
 
 
 # ---------------------------------------------------------------------------
@@ -359,14 +466,19 @@ def truncate_for_sms(text: str, *, max_chars: int) -> str:
 __all__ = [
     "DownloadedMedia",
     "InboundSms",
-    "TwilioSendError",
     "TwilioMediaError",
+    "TwilioSendError",
+    "WHATSAPP_PREFIX",
     "compute_twilio_signature",
     "download_media",
     "empty_twiml",
     "extension_for_mime",
+    "is_whatsapp_address",
     "parse_inbound_form",
     "send_sms",
+    "send_whatsapp",
+    "strip_whatsapp_prefix",
     "truncate_for_sms",
     "verify_twilio_signature",
+    "with_whatsapp_prefix",
 ]

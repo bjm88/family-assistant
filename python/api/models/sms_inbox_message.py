@@ -1,9 +1,12 @@
-"""The ``sms_inbox_messages`` table — one row per inbound Twilio SMS Avi sees.
+"""The ``sms_inbox_messages`` table — one row per inbound Twilio message Avi sees.
 
-This is the audit trail for the SMS-driven AI assistant, structured
-identically to ``email_inbox_messages`` so the two surfaces stay easy
-to reason about side-by-side. Every time the Twilio webhook fires we
-write a row here with the explicit security verdict (:attr:`status`):
+Despite the table name, this audit trail covers BOTH Twilio SMS / MMS
+and Twilio WhatsApp. Twilio's WhatsApp surface is the same
+Programmable Messaging API as SMS — same webhook payload, same
+``MessageSid`` namespace, same media URLs — so we keep one table and
+distinguish the two with the ``channel`` column ('sms' | 'whatsapp').
+Every time the Twilio webhook fires we write a row here with the
+explicit security verdict (:attr:`status`):
 
 * ``processed_replied``       — sender matched a registered family
   member, the agent loop ran, and Twilio accepted the reply send.
@@ -60,6 +63,12 @@ SMS_INBOX_STATUSES: tuple[str, ...] = (
     "failed",
 )
 
+# Twilio Programmable Messaging surface this row arrived on. Kept in
+# lock-step with the CHECK constraint added in
+# ``migrations/versions/0027_whatsapp_channel.py`` and the Pydantic
+# literal in ``schemas/sms_inbox.py``.
+SMS_INBOX_CHANNELS: tuple[str, ...] = ("sms", "whatsapp")
+
 
 class SmsInboxMessage(Base, TimestampMixin):
     __tablename__ = "sms_inbox_messages"
@@ -76,8 +85,18 @@ class SmsInboxMessage(Base, TimestampMixin):
             ")",
             name="ck_sms_inbox_messages_status",
         ),
+        CheckConstraint(
+            "channel IN ('sms', 'whatsapp')",
+            name="ck_sms_inbox_messages_channel",
+        ),
         Index(
             "ix_sms_inbox_messages_family_processed",
+            "family_id",
+            "processed_at",
+        ),
+        Index(
+            "ix_sms_inbox_messages_channel_family_processed",
+            "channel",
             "family_id",
             "processed_at",
         ),
@@ -97,6 +116,19 @@ class SmsInboxMessage(Base, TimestampMixin):
 
     sms_inbox_message_id: Mapped[int] = mapped_column(
         primary_key=True, autoincrement=True
+    )
+    channel: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="sms",
+        server_default="sms",
+        comment=(
+            "Twilio Programmable Messaging surface this row arrived on. "
+            "'sms' = standard SMS / MMS via TWILIO_PRIMARY_PHONE; "
+            "'whatsapp' = WhatsApp via TWILIO_WHATSAPP_SENDER_NUMBER. "
+            "Drives the choice of outbound sender, reply length cap, "
+            "and live-session source."
+        ),
     )
     family_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("families.family_id", ondelete="CASCADE"),

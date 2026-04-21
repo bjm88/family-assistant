@@ -20,8 +20,8 @@ document is the human-friendly companion to that catalog.
 | **Health** | `medical_conditions`, `medications`, `physicians` | Per-person medical context Avi can fetch when relevant. |
 | **Household assets** | `pets`, `pet_photos`, `residences`, `residence_photos`, `addresses`, `vehicles`, `insurance_policies`, `insurance_policy_people`, `insurance_policy_vehicles`, `financial_accounts`, `documents` | Things the family owns or insures. |
 | **Identity (encrypted)** | `identity_documents`, `sensitive_identifiers` | Passports, SSNs, ITINs, etc. Stored as Fernet ciphertext + a plaintext last-four. |
-| **AI conversation surfaces** | `live_sessions`, `live_session_participants`, `live_session_messages` | One row per continuous interaction (live, sms, telegram, email) and its transcript. |
-| **Inbox audit** | `email_inbox_messages`, `sms_inbox_messages`, `sms_inbox_attachments`, `telegram_inbox_messages`, `telegram_inbox_attachments` | One row per inbound message Avi inspected, with an explicit security verdict (`processed_replied`, `ignored_unknown_sender`, etc.). |
+| **AI conversation surfaces** | `live_sessions`, `live_session_participants`, `live_session_messages` | One row per continuous interaction (live, sms, whatsapp, telegram, email) and its transcript. |
+| **Inbox audit** | `email_inbox_messages`, `sms_inbox_messages` (incl. WhatsApp via the `channel` column), `sms_inbox_attachments`, `telegram_inbox_messages`, `telegram_inbox_attachments` | One row per inbound message Avi inspected, with an explicit security verdict (`processed_replied`, `ignored_unknown_sender`, etc.). |
 | **Telegram onboarding** | `telegram_invites`, `telegram_contact_verifications` | Deep-link invites + the SMS-2FA challenge that confirms a contact-share before binding `Person.telegram_user_id`. |
 | **Tasks (kanban)** | `tasks`, `task_comments`, `task_followers`, `task_attachments` | User-facing household to-do board. Avi can create / update tasks via tools. |
 | **Agent audit** | `agent_tasks`, `agent_steps` | One row per agent invocation + per-step transcript (thinking, tool_call, tool_result, final). |
@@ -122,7 +122,9 @@ Individual household members. Notable columns:
   personal calendar with every work calendar when checking
   availability. Work calendars are typically free/busy only.
 - `mobile_phone_number` / `home_phone_number` / `work_phone_number` —
-  the SMS surface matches inbound `From:` against all three.
+  the SMS **and WhatsApp** surfaces match inbound `From:` against all
+  three (the WhatsApp `From` is the user's phone number prefixed with
+  `whatsapp:`, which the inbox service strips before lookup).
 - `telegram_user_id` (`BIGINT`) and `telegram_username` — populated
   either by a deep-link invite claim or by an SMS-verified
   contact-share (see `telegram_contact_verifications`).
@@ -238,9 +240,12 @@ opened it. Key columns:
   collide on `NULL`.
 
 Idle policy: the live page closes a session after
-`AI_LIVE_SESSION_IDLE_MINUTES` (default 30). Email / SMS / Telegram
-sessions stay open across days because `external_thread_id` matching
-is what reuses the row.
+`AI_LIVE_SESSION_IDLE_MINUTES` (default 30). Email / SMS / WhatsApp /
+Telegram sessions stay open across days because `external_thread_id`
+matching is what reuses the row. SMS and WhatsApp sessions for the
+same person stay separate (different `source` values) so the agent
+doesn't accidentally cross-contaminate transcripts between two
+surfaces with very different reply-length conventions.
 
 ### `live_session_participants`
 
@@ -260,10 +265,10 @@ what the user actually saw.
 
 ## Inbox audit
 
-Three structurally identical tables — one per inbound channel — give
-the family a tamper-evident receipt of **every message Avi looked at
-and what he decided to do about it**. They share the same status
-vocabulary (`processed_replied`, `ignored_unknown_sender`,
+Three structurally identical tables — one per inbound transport —
+give the family a tamper-evident receipt of **every message Avi
+looked at and what he decided to do about it**. They share the same
+status vocabulary (`processed_replied`, `ignored_unknown_sender`,
 `ignored_self`, `ignored_already_seen`, `failed`, plus channel-
 specific extras), and each one has a `UNIQUE` constraint on the
 upstream message id so retries can't double-process.
@@ -271,7 +276,7 @@ upstream message id so retries can't double-process.
 | Table | Dedup key | Channel-specific statuses |
 |---|---|---|
 | `email_inbox_messages` | `(assistant_id, gmail_message_id)` | `ignored_bulk` (auto-replies / mailing lists) |
-| `sms_inbox_messages` (+ `sms_inbox_attachments`) | `twilio_message_sid` | `ignored_stop` (STOP keyword) |
+| `sms_inbox_messages` (+ `sms_inbox_attachments`) — also holds Twilio WhatsApp rows, distinguished by the `channel` column (`'sms' \| 'whatsapp'`) | `twilio_message_sid` | `ignored_stop` (STOP keyword) |
 | `telegram_inbox_messages` (+ `telegram_inbox_attachments`) | `telegram_update_id` | `ignored_non_message` (edits / channel posts), `prompted_for_contact_share` |
 
 `status_reason` is a free-form string for human investigation when

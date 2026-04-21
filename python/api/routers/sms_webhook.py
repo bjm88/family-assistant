@@ -1,14 +1,20 @@
-"""Twilio inbound-SMS webhook.
+"""Twilio inbound-SMS / WhatsApp webhook.
 
-Configure your Twilio phone number's "A MESSAGE COMES IN" URL to
-``POST {your-public-host}/api/sms/twilio/inbound``. We:
+Configure your Twilio phone number's "A MESSAGE COMES IN" URL — and,
+for the WhatsApp business sender, the WhatsApp Sandbox / Sender's
+inbound webhook — to ``POST {your-public-host}/api/sms/twilio/inbound``.
+The same endpoint handles both surfaces: WhatsApp messages arrive with
+a ``whatsapp:`` prefix on ``From`` / ``To`` and we dispatch internally
+on that. We:
 
 1. Read the raw form body (Twilio sends ``application/x-www-form-urlencoded``).
 2. Verify the ``X-Twilio-Signature`` header against ``TWILIO_AUTH_TOKEN``
-   so a forged form post never reaches the agent loop.
-3. Hand the parsed message off to :func:`api.services.sms_inbox.process_inbound_sms`
-   which does dedup, person lookup, session bookkeeping, agent
-   dispatch, and reply-send.
+   so a forged form post never reaches the agent loop. The signature
+   algorithm is identical for SMS and WhatsApp.
+3. Hand the parsed message off to :func:`api.services.sms_inbox.process_inbound_sms`,
+   which inspects ``inbound.channel`` and routes through the SMS or
+   WhatsApp branch (different sender number, length cap, live-session
+   source, etc.).
 4. Always return empty TwiML — the actual reply is sent asynchronously
    via Twilio's REST API so we don't have to keep the inbound HTTP
    socket open for the 5-30 s the agent needs.
@@ -122,7 +128,8 @@ async def twilio_inbound(
     # ---- Parse + schedule the heavy work --------------------------------
     inbound = twilio_sms.parse_inbound_form(form)
     logger.info(
-        "Twilio inbound sid=%s from=%s to=%s body_len=%d num_media=%d",
+        "Twilio inbound channel=%s sid=%s from=%s to=%s body_len=%d num_media=%d",
+        inbound.channel,
         inbound.message_sid,
         inbound.from_phone,
         inbound.to_phone,

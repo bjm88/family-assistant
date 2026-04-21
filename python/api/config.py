@@ -220,6 +220,28 @@ class Settings(BaseSettings):
     # OK reading on a phone screen.
     AI_SMS_REPLY_MAX_CHARS: int = 480
 
+    # ---- WhatsApp inbox (Twilio) ---------------------------------------
+    # Master switch for the inbound-WhatsApp branch of the Twilio
+    # webhook. Off by default — flip to true once
+    # TWILIO_WHATSAPP_SENDER_NUMBER is set and the WhatsApp business
+    # sender is approved on the Twilio side. When OFF the webhook still
+    # logs the inbound (status='failed', status_reason explains the
+    # disable) but never invokes the agent loop or sends a reply.
+    AI_WHATSAPP_INBOUND_ENABLED: bool = False
+    # The WhatsApp Business sender (E.164, e.g. ``+14155238886`` for the
+    # Twilio sandbox) Avi sends from. Twilio expects the API to receive
+    # this with a ``whatsapp:`` prefix; we add the prefix in
+    # ``integrations.twilio_sms.send_whatsapp`` so this value should be
+    # the bare E.164 number without the prefix. When unset the webhook
+    # records the inbound row but cannot reply.
+    TWILIO_WHATSAPP_SENDER_NUMBER: Optional[str] = None
+    # WhatsApp permits much longer message bodies than SMS (Twilio caps
+    # at 4096 chars for free-form replies). 1024 still keeps replies
+    # phone-screen-readable while giving the agent room for richer
+    # answers since WhatsApp readers expect chat-style longer messages
+    # vs. SMS terseness.
+    AI_WHATSAPP_REPLY_MAX_CHARS: int = 1024
+
     # ---- Telegram inbox ------------------------------------------------
     # Master switch for the Telegram long-poll loop. When OFF the bot
     # poller never starts and inbound messages pile up on Telegram's

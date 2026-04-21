@@ -1,8 +1,10 @@
-"""Pydantic schemas for the SMS inbox audit trail.
+"""Pydantic schemas for the SMS / WhatsApp inbox audit trail.
 
 These are read-only — the only writer is the Twilio webhook handler in
 ``api.services.sms_inbox``. We expose them so a future admin page can
-list "every SMS Avi has seen" without having to re-derive the shape.
+list "every SMS / WhatsApp message Avi has seen" without having to
+re-derive the shape. The same table holds both surfaces, distinguished
+by ``channel``.
 """
 
 from __future__ import annotations
@@ -23,6 +25,9 @@ SmsInboxStatus = Literal[
 ]
 
 
+SmsInboxChannel = Literal["sms", "whatsapp"]
+
+
 class SmsInboxAttachmentRead(OrmModel):
     sms_inbox_attachment_id: int
     sms_inbox_message_id: int
@@ -36,6 +41,7 @@ class SmsInboxAttachmentRead(OrmModel):
 
 class SmsInboxMessageRead(OrmModel):
     sms_inbox_message_id: int
+    channel: SmsInboxChannel
     family_id: Optional[int]
     twilio_message_sid: str
     twilio_messaging_service_sid: Optional[str]
