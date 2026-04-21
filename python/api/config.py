@@ -332,6 +332,25 @@ class Settings(BaseSettings):
     # via the tool args; this is just what it gets when it doesn't ask.
     AI_WEB_SEARCH_DEFAULT_LIMIT: int = 5
 
+    # Fast-path web-search shortcut. When enabled, every inbound user
+    # message is first run through the lightweight Gemma classifier
+    # (``api.ai.web_search_shortcut``); if it decides the message is
+    # a pure web-lookup ask that needs no household context, we skip
+    # the heavy agent loop entirely and stream Gemini's grounded
+    # answer straight back to the user. Saves ~5-10 s per qualifying
+    # turn (no heavy-model invocations, no tool round-trips). Falls
+    # through to the normal agent path on classifier "no", on Gemini
+    # error, or when the active provider isn't Gemini. Set false to
+    # always go through the heavy agent.
+    AI_WEB_SEARCH_SHORTCUT_ENABLED: bool = True
+    # Hard cap on how long the fast-Gemma classifier may run before
+    # we give up and fall through to the heavy agent. The classifier
+    # is a one-token reply (`WEB` / `AGENT`) so a warm e2b should
+    # finish in 200-500 ms; this cap is the safety net for a cold
+    # load. Going over should be RARE — if you see it firing often,
+    # the lifespan warmup isn't running or `keep_alive` got cleared.
+    AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S: float = 2.5
+
     @property
     def database_url(self) -> str:
         return (

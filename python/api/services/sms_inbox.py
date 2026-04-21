@@ -61,6 +61,7 @@ from ..ai import authz
 from ..ai import ollama, prompts, rag, schema_catalog
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
+from ..ai import web_search_shortcut
 from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import twilio_sms
@@ -244,44 +245,77 @@ def process_inbound_sms(
     audit.agent_task_id = task.agent_task_id
     db.commit()
 
-    system_prompt = _build_sms_system_prompt(
-        db,
-        family_id=person.family_id,
-        person=person,
-        from_phone=inbound.from_phone,
-    )
     user_message = _format_user_message_for_agent(inbound, person)
 
-    # The contract with the user is: every inbound SMS from a registered
-    # family member gets a reply, period. Even if the agent loop crashes
-    # (LLM offline, tool exception, asyncio glitch, …) we still want
-    # SOMETHING to land on their phone so they know we received the
-    # message and aren't silently dropping it. So: catch everything here
-    # and fall back to a short, honest "I tried but hit a snag" string —
-    # the audit row + the agent_task row keep the full forensic trail
-    # for debugging.
+    # ---- Fast-path web-search shortcut ----------------------------
+    # Skip the heavy agent entirely when the lightweight Gemma
+    # classifier is confident this SMS is a pure web-lookup ask.
+    # Saves ~5-10 s of round-trips. We hand it the RAW body (not the
+    # `[Text message from ...]` wrapper) because the wrapper is a
+    # surface hint for the heavy agent, not signal for the
+    # classifier. Failure / classifier-says-no -> None -> normal flow.
     agent_failed = False
+    final_text: Optional[str] = None
+    shortcut_used = False
     try:
-        final_text = _run_agent_to_completion(
-            task_id=task.agent_task_id,
-            family_id=person.family_id,
-            assistant_id=_assistant_id_for_family(db, person.family_id),
-            person_id=person.person_id,
-            system_prompt=system_prompt,
-            history=[],
-            user_message=user_message,
+        shortcut_text = web_search_shortcut.try_shortcut_sync(
+            (inbound.body or "").strip()
         )
-    except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
+    except Exception:  # noqa: BLE001 - shortcut must never break the inbound
         logger.exception(
-            "SMS inbox: agent loop crashed for sid=%s task=%s",
+            "SMS inbox: web-search shortcut crashed for sid=%s — "
+            "falling through to heavy agent",
+            inbound.message_sid,
+        )
+        shortcut_text = None
+    if shortcut_text:
+        logger.info(
+            "SMS inbox: web-search shortcut handled sid=%s task=%s "
+            "(skipping heavy agent).",
             inbound.message_sid,
             task.agent_task_id,
         )
-        agent_failed = True
-        final_text = (
-            "Got your text — Avi here. I hit a snag on my end and "
-            "couldn't finish that just now. I'll look into it."
+        final_text = shortcut_text
+        shortcut_used = True
+
+    if not shortcut_used:
+        system_prompt = _build_sms_system_prompt(
+            db,
+            family_id=person.family_id,
+            person=person,
+            from_phone=inbound.from_phone,
         )
+
+        # The contract with the user is: every inbound SMS from a
+        # registered family member gets a reply, period. Even if the
+        # agent loop crashes (LLM offline, tool exception, asyncio
+        # glitch, …) we still want SOMETHING to land on their phone
+        # so they know we received the message and aren't silently
+        # dropping it. So: catch everything here and fall back to a
+        # short, honest "I tried but hit a snag" string — the audit
+        # row + the agent_task row keep the full forensic trail for
+        # debugging.
+        try:
+            final_text = _run_agent_to_completion(
+                task_id=task.agent_task_id,
+                family_id=person.family_id,
+                assistant_id=_assistant_id_for_family(db, person.family_id),
+                person_id=person.person_id,
+                system_prompt=system_prompt,
+                history=[],
+                user_message=user_message,
+            )
+        except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
+            logger.exception(
+                "SMS inbox: agent loop crashed for sid=%s task=%s",
+                inbound.message_sid,
+                task.agent_task_id,
+            )
+            agent_failed = True
+            final_text = (
+                "Got your text — Avi here. I hit a snag on my end and "
+                "couldn't finish that just now. I'll look into it."
+            )
 
     final_text = twilio_sms.truncate_for_sms(
         final_text or "Got your text — nothing to add right now.",
@@ -322,6 +356,7 @@ def process_inbound_sms(
             "agent_task_id": task.agent_task_id,
             "twilio_message_sid": reply_sid,
             "in_reply_to": inbound.message_sid,
+            **({"shortcut": "web_search"} if shortcut_used else {}),
         },
     )
     if agent_failed:

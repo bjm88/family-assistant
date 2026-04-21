@@ -69,6 +69,7 @@ from ..ai import fast_ack
 from ..ai import ollama, prompts, rag, schema_catalog
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
+from ..ai import web_search_shortcut
 from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import telegram, twilio_sms
@@ -446,38 +447,74 @@ def process_inbound_update(
     audit.agent_task_id = task.agent_task_id
     db.commit()
 
-    system_prompt = _build_telegram_system_prompt(
-        db,
-        family_id=person.family_id,
-        person=person,
-        sender_display_name=inbound.sender_display_name
-        or inbound.from_username
-        or str(inbound.from_user_id or "?"),
-    )
     user_message = _format_user_message_for_agent(inbound, person)
     assistant_id_for_family = _assistant_id_for_family(db, person.family_id)
 
-    # ---- Race-and-ack pattern (see api.ai.fast_ack docstring) -------
-    # Kick the heavy agent off on a background thread immediately so
-    # we can either:
-    #   (a) send a single reply if the agent finishes inside the
-    #       AI_FAST_ACK_AFTER_SECONDS window (no ack noise for short
-    #       answers), or
-    #   (b) fire a quick contextual "I'm on it" ack from the fast
-    #       model and follow up with the real answer when the heavy
-    #       agent converges.
-    # Either way the audit row reflects exactly what was sent.
-    final_text, agent_failed, ack_sent_message_id = _run_agent_with_fast_ack(
-        db,
-        inbound=inbound,
-        person=person,
-        task_id=task.agent_task_id,
-        assistant_id=assistant_id_for_family,
-        system_prompt=system_prompt,
-        user_message=user_message,
-        session=session,
-        audit=audit,
-    )
+    # ---- Fast-path web-search shortcut -----------------------------
+    # If the lightweight Gemma classifier decides this Telegram
+    # message is a pure web-lookup ask, skip the heavy agent (and
+    # therefore also the fast-ack race) and go straight to Gemini's
+    # grounded answer. Saves ~5-10 s and removes the ack noise on
+    # turns where the answer arrives well inside the ack threshold
+    # anyway. We pass the RAW body — the formatted "[Telegram from
+    # X]" wrapper is a hint for the heavy agent, not signal for the
+    # classifier.
+    shortcut_text: Optional[str] = None
+    try:
+        shortcut_text = web_search_shortcut.try_shortcut_sync(
+            (inbound.body or "").strip()
+        )
+    except Exception:  # noqa: BLE001 - shortcut must never break the inbound
+        logger.exception(
+            "Telegram inbox: web-search shortcut crashed for "
+            "update_id=%s — falling through to heavy agent",
+            inbound.update_id,
+        )
+        shortcut_text = None
+
+    if shortcut_text:
+        logger.info(
+            "Telegram inbox: web-search shortcut handled "
+            "update_id=%s task=%s (skipping heavy agent + ack race).",
+            inbound.update_id,
+            task.agent_task_id,
+        )
+        final_text = shortcut_text
+        agent_failed = False
+        ack_sent_message_id: Optional[int] = None
+        shortcut_used = True
+    else:
+        system_prompt = _build_telegram_system_prompt(
+            db,
+            family_id=person.family_id,
+            person=person,
+            sender_display_name=inbound.sender_display_name
+            or inbound.from_username
+            or str(inbound.from_user_id or "?"),
+        )
+
+        # ---- Race-and-ack pattern (see api.ai.fast_ack docstring) -
+        # Kick the heavy agent off on a background thread immediately
+        # so we can either:
+        #   (a) send a single reply if the agent finishes inside the
+        #       AI_FAST_ACK_AFTER_SECONDS window (no ack noise for
+        #       short answers), or
+        #   (b) fire a quick contextual "I'm on it" ack from the fast
+        #       model and follow up with the real answer when the
+        #       heavy agent converges.
+        # Either way the audit row reflects exactly what was sent.
+        final_text, agent_failed, ack_sent_message_id = _run_agent_with_fast_ack(
+            db,
+            inbound=inbound,
+            person=person,
+            task_id=task.agent_task_id,
+            assistant_id=assistant_id_for_family,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            session=session,
+            audit=audit,
+        )
+        shortcut_used = False
 
     final_text = telegram.truncate_for_telegram(
         final_text or "Got your message — nothing to add right now.",
@@ -519,11 +556,16 @@ def process_inbound_update(
             # reading the transcript can see both halves of the
             # exchange in the right order.
             "ack_telegram_message_id": ack_sent_message_id,
+            **({"shortcut": "web_search"} if shortcut_used else {}),
         },
     )
     audit.status = "processed_replied"
     if agent_failed:
         audit.status_reason = "Agent loop crashed; sent fallback apology."
+    elif shortcut_used:
+        audit.status_reason = (
+            "Web-search shortcut handled (skipped heavy agent + ack race)."
+        )
     elif ack_sent_message_id is not None:
         audit.status_reason = (
             f"Sent fast-ack (msg={ack_sent_message_id}) then full reply "

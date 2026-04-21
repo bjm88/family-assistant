@@ -36,6 +36,9 @@ instead of crashing the run.
 from __future__ import annotations
 
 import logging
+import random
+import re
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Protocol
 
@@ -45,6 +48,20 @@ from ..config import get_settings
 
 
 logger = logging.getLogger(__name__)
+
+
+# HTTP statuses Google explicitly documents as transient for Gemini —
+# all of them are retry-with-backoff candidates rather than hard
+# failures. 429 is rate-limit, 5xx are upstream capacity. We keep the
+# set small and explicit so a 4xx client error (bad key, bad arg)
+# still fails fast.
+_TRANSIENT_HTTP_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+# Pulled out of the exception text since the google-genai SDK has
+# moved exception class paths around between minor versions. The
+# string repr of every variant we've seen leads with the numeric
+# status (e.g. "503 UNAVAILABLE. {...}").
+_STATUS_RE = re.compile(r"\b([45]\d{2})\b")
 
 
 @dataclass(frozen=True)
@@ -96,6 +113,37 @@ class WebSearchProvider(Protocol):
     async def search(self, query: str, *, limit: int) -> SearchResponse: ...
 
 
+def _extract_status_code(exc: BaseException) -> Optional[int]:
+    """Best-effort HTTP status pull from a provider SDK exception.
+
+    The google-genai SDK raises a few different exception classes
+    depending on the version (``ClientError``, ``ServerError``,
+    ``APIError`` …) but they all stringify with the numeric HTTP
+    status as the leading token (e.g. ``"503 UNAVAILABLE. {...}"``).
+    We try a couple of structured attributes first for forward
+    compatibility, then fall back to scraping the ``str(exc)`` for
+    a 4xx/5xx token. Returns ``None`` when no status can be
+    inferred (e.g. a local network hiccup) so callers treat the
+    error as opaquely transient.
+    """
+    for attr in ("status_code", "code", "http_status", "status"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, int) and 400 <= val < 600:
+            return val
+        if isinstance(val, str) and val.isdigit():
+            ival = int(val)
+            if 400 <= ival < 600:
+                return ival
+    text = str(exc)
+    m = _STATUS_RE.search(text)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Gemini google_search adapter (default)
 # ---------------------------------------------------------------------------
@@ -133,6 +181,16 @@ class GeminiSearchProvider:
     name = "gemini"
     DEFAULT_MODEL = "gemini-2.5-flash"
 
+    # Retry budget for transient (5xx / 429) errors. The Gemini
+    # google_search backend regularly throws 503 UNAVAILABLE for
+    # 10-30 s during demand spikes; a tight retry loop with a touch
+    # of jitter usually rides through it without the user noticing.
+    # Total worst-case wait ≈ 0.8 + 1.6 + 3.2 ≈ 5.6 s, comfortably
+    # inside the tool's 30 s registry timeout.
+    _RETRY_ATTEMPTS = 3
+    _RETRY_BASE_DELAY_S = 0.8
+    _RETRY_MAX_DELAY_S = 4.0
+
     def __init__(self, api_key: str, model: Optional[str] = None):
         # Late-import the SDK so `import web_search` stays cheap on
         # boxes that haven't installed google-genai (this package is
@@ -163,8 +221,147 @@ class GeminiSearchProvider:
 
         return await asyncio.to_thread(_call)
 
-    def _sync_search(self, query: str, *, limit: int) -> SearchResponse:
+    async def chat_answer(
+        self, query: str, *, style_hint: Optional[str] = None
+    ) -> str:
+        """Async wrapper around :meth:`_sync_chat_answer`."""
+        import asyncio
+
+        def _call() -> str:
+            return self._sync_chat_answer(query, style_hint=style_hint)
+
+        return await asyncio.to_thread(_call)
+
+    # ------------------------------------------------------------------
+    # Internals shared between the structured `search()` path and the
+    # one-shot grounded-chat-answer path used by the "skip the heavy
+    # agent for pure web-search asks" shortcut (see
+    # ``api.ai.web_search_shortcut``). Both flavours need the same
+    # google_search tool config and the same retry-with-backoff
+    # behaviour around the transient 429 / 5xx errors that Gemini's
+    # grounded endpoint is prone to during demand spikes.
+    # ------------------------------------------------------------------
+
+    def _build_grounded_config(self) -> object:
+        """Common ``GenerateContentConfig`` for every grounded call."""
         types = self._types
+        tool = types.Tool(google_search=types.GoogleSearch())
+        return types.GenerateContentConfig(
+            tools=[tool],
+            # Slightly cooler than chat default — we want the
+            # synthesis to stick to what the citations support.
+            temperature=0.2,
+        )
+
+    def _invoke_grounded(self, prompt: str, *, query_label: str) -> object:
+        """Call Gemini ``generate_content`` with retry + status mapping.
+
+        Returns the raw SDK response on success. Raises
+        :class:`SearchUnavailable` on a non-transient 4xx (fail fast)
+        or after the retry budget is exhausted on transient codes
+        (429 / 5xx). ``query_label`` is only used for log lines so
+        we can correlate retries to the inbound query without leaking
+        the full prompt.
+        """
+        config = self._build_grounded_config()
+
+        last_exc: Optional[Exception] = None
+        last_status: Optional[int] = None
+        for attempt in range(1, self._RETRY_ATTEMPTS + 1):
+            try:
+                return self._client.models.generate_content(
+                    model=self._model,
+                    contents=prompt,
+                    config=config,
+                )
+            except Exception as exc:  # noqa: BLE001 - normalize to our error
+                status = _extract_status_code(exc)
+                last_exc = exc
+                last_status = status
+                # Non-transient (e.g. 400 bad request, 401 bad key,
+                # 403 grounding not enabled) — fail fast, no retry.
+                if status is not None and status not in _TRANSIENT_HTTP_STATUSES:
+                    raise SearchUnavailable(
+                        f"Gemini google_search call failed: {exc}"
+                    ) from exc
+                if attempt >= self._RETRY_ATTEMPTS:
+                    break
+                # Exponential backoff with a small jitter so a whole
+                # household firing at once doesn't synchronise its
+                # retries on the next second boundary.
+                delay = min(
+                    self._RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
+                    self._RETRY_MAX_DELAY_S,
+                )
+                delay += random.uniform(0, 0.25 * delay)
+                logger.info(
+                    "web_search: Gemini transient error %s on attempt %d/%d "
+                    "(query=%r); retrying in %.2fs",
+                    status if status is not None else "?",
+                    attempt,
+                    self._RETRY_ATTEMPTS,
+                    query_label[:60],
+                    delay,
+                )
+                time.sleep(delay)
+
+        assert last_exc is not None
+        if last_status in (429, 503):
+            friendly = (
+                f"Gemini's web-search backend is overloaded right now "
+                f"(HTTP {last_status}) and didn't recover after "
+                f"{self._RETRY_ATTEMPTS} attempts. This is a "
+                "transient capacity issue on Google's side — tell the "
+                "user the search engine is briefly unavailable and "
+                "offer to retry in a minute."
+            )
+        else:
+            friendly = (
+                f"Gemini google_search call failed after "
+                f"{self._RETRY_ATTEMPTS} attempts: {last_exc}"
+            )
+        raise SearchUnavailable(friendly) from last_exc
+
+    def _sync_chat_answer(
+        self, query: str, *, style_hint: Optional[str] = None
+    ) -> str:
+        """One-shot grounded chat answer suitable for direct delivery.
+
+        Used by the "fast-path" shortcut: the local fast Gemma
+        decides the user's message is purely a web-search ask, we
+        invoke this method, and the returned text streams straight
+        back to the user without going through the heavy agent.
+
+        ``style_hint`` is prepended to the prompt to steer Gemini's
+        output toward Avi's spoken-English / no-Markdown / 1-3
+        sentence house style without burning a separate polish hop.
+        """
+        # Gemini follows simple, direct instructions well — keep
+        # this short. The query is quoted so accidental imperatives
+        # in the user text ("ignore previous instructions and …")
+        # are clearly framed as data, not directives.
+        instruction = (style_hint or "").strip()
+        if not instruction:
+            instruction = (
+                "Use Google Search to find the answer, then reply in "
+                "1-3 short, plain-spoken English sentences. No "
+                "Markdown, no bullet lists, no asterisks, no "
+                "headings, no source URLs in the body — just the "
+                "answer. Cite a source by name in prose only when it "
+                "is genuinely load-bearing (e.g. 'According to the "
+                "NYT, ...'). If the answer isn't reliably available, "
+                "say so plainly."
+            )
+        prompt = f"{instruction}\n\nUser asked: \"\"\"{query.strip()}\"\"\""
+        resp = self._invoke_grounded(prompt, query_label=query)
+        text = (getattr(resp, "text", None) or "").strip()
+        if not text:
+            raise SearchUnavailable(
+                "Gemini grounded chat answer was empty."
+            )
+        return text
+
+    def _sync_search(self, query: str, *, limit: int) -> SearchResponse:
         # Bound the model's verbosity — we want a tight, citable
         # answer, not an essay. ~`limit` results is the right ballpark.
         prompt = (
@@ -175,23 +372,7 @@ class GeminiSearchProvider:
             f"{max(1, min(limit, 10))} distinct authoritative sources.\n\n"
             f"Request: {query}"
         )
-        try:
-            tool = types.Tool(google_search=types.GoogleSearch())
-            config = types.GenerateContentConfig(
-                tools=[tool],
-                # Slightly cooler than chat default — we want the
-                # synthesis to stick to what the citations support.
-                temperature=0.2,
-            )
-            resp = self._client.models.generate_content(
-                model=self._model,
-                contents=prompt,
-                config=config,
-            )
-        except Exception as exc:  # noqa: BLE001 - normalize to our error
-            raise SearchUnavailable(
-                f"Gemini google_search call failed: {exc}"
-            ) from exc
+        resp = self._invoke_grounded(prompt, query_label=query)
 
         summary = (getattr(resp, "text", None) or "").strip() or None
 
@@ -467,3 +648,39 @@ async def search(query: str, *, limit: Optional[int] = None) -> SearchResponse:
     settings = get_settings()
     n = limit if limit is not None else settings.AI_WEB_SEARCH_DEFAULT_LIMIT
     return await provider.search(query, limit=n)
+
+
+async def grounded_chat_answer(
+    query: str, *, style_hint: Optional[str] = None
+) -> str:
+    """Skip-the-agent shortcut: one Gemini grounded call → answer text.
+
+    Used by :mod:`api.ai.web_search_shortcut` when the local fast
+    Gemma decides an inbound message is a pure web-lookup ask that
+    doesn't need the heavy agent loop's RAG / tools / persona
+    machinery. The returned text is intended for direct delivery to
+    the end user (chat / SMS / Telegram / email reply) so we instruct
+    Gemini up front to obey Avi's spoken-English / no-Markdown house
+    style — that saves the second polish hop.
+
+    Raises :class:`SearchUnavailable` when the configured provider is
+    something other than Gemini (Brave / Tavily don't synthesise an
+    answer themselves), when the Gemini key is missing, or when all
+    retries fail. Callers handle the failure by falling back to the
+    full agent loop, so a transient outage degrades into "slower"
+    rather than "broken".
+    """
+    provider = get_provider()
+    if provider is None:
+        raise SearchUnavailable(
+            "Web search is not configured. The fast-path shortcut is "
+            "disabled until FA_SEARCH_PROVIDER + GEMINI_API_KEY are "
+            "set."
+        )
+    if not isinstance(provider, GeminiSearchProvider):
+        raise SearchUnavailable(
+            f"The web-search shortcut requires the Gemini provider "
+            f"(it relies on grounded-answer synthesis). Active "
+            f"provider is '{provider.name}'."
+        )
+    return await provider.chat_answer(query, style_hint=style_hint)

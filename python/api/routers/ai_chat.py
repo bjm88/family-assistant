@@ -34,6 +34,7 @@ from ..ai import schema_catalog
 from ..ai import session as live_session
 from ..ai import sql_tool
 from ..ai import tools as agent_tools
+from ..ai import web_search_shortcut
 from ..config import get_settings
 from ..db import SessionLocal, get_db
 
@@ -157,6 +158,95 @@ def _build_rag_block(
                 )
             )
     return "\n\n".join(parts).strip()
+
+
+def _shortcut_stream_response(
+    *,
+    final_text: str,
+    live_session_id: Optional[int],
+    family_id: int,
+    recognized_person_id: Optional[int],
+    user_message: str,
+) -> StreamingResponse:
+    """Wrap a one-shot web-search-shortcut answer as a SSE stream.
+
+    Matches the shape the live-chat UI already consumes from the
+    heavy-agent path so the front-end needs no changes:
+
+    1. ``{"task_id": null}`` — no agent_task row exists for shortcut
+       turns (per the "minimal audit" design choice). The UI tolerates
+       a null id; the navigation breadcrumb just won't be clickable.
+    2. ``{"delta": "..."}`` — the answer text in one chunk.
+    3. ``{"type": "task_completed", "summary": ...}`` — synthesised so
+       any client logic that waits on ``task_completed`` keeps working.
+    4. ``{"done": true}`` — terminal marker, identical to the heavy
+       path.
+
+    The user message has already been logged to the live-session
+    transcript by the caller (or rather, would have been — but the
+    shortcut path runs BEFORE the normal logging step, so we do
+    BOTH the user log and the assistant log here in one pass).
+    """
+
+    async def _stream():
+        yield f"data: {json.dumps({'task_id': None})}\n\n"
+        yield f"data: {json.dumps({'delta': final_text})}\n\n"
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "task_completed",
+                    "task_id": None,
+                    "summary": final_text,
+                    "shortcut": "web_search",
+                }
+            )
+            + "\n\n"
+        )
+
+        # Persist BOTH messages so the History view shows the full
+        # exchange. We open a private session because the request-
+        # scoped one was closed when the StreamingResponse started.
+        if live_session_id is not None:
+            log_db = SessionLocal()
+            try:
+                log_session = log_db.get(models.LiveSession, live_session_id)
+                if log_session is not None and log_session.family_id == family_id:
+                    if user_message:
+                        live_session.log_message(
+                            log_db,
+                            log_session,
+                            role="user",
+                            content=user_message,
+                            person_id=recognized_person_id,
+                            meta={"kind": "chat"},
+                        )
+                    live_session.log_message(
+                        log_db,
+                        log_session,
+                        role="assistant",
+                        content=final_text,
+                        person_id=recognized_person_id,
+                        meta={
+                            "kind": "chat",
+                            "shortcut": "web_search",
+                            "used_model": "gemini_grounded",
+                        },
+                    )
+                    log_db.commit()
+            except Exception:  # noqa: BLE001 — logging must never break the stream
+                logger.exception(
+                    "web_search shortcut: failed to log assistant chat "
+                    "message for live_session=%s",
+                    live_session_id,
+                )
+                log_db.rollback()
+            finally:
+                log_db.close()
+
+        yield f"data: {json.dumps({'done': True})}\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
 def _build_system_prompt(
@@ -781,6 +871,51 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
     """
     if db.get(models.Family, payload.family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
+
+    # ---------- Fast-path web-search shortcut ---------------------------
+    #
+    # Before we do ANY heavy setup (RAG, registry, schema dump, system
+    # prompt), give the lightweight Gemma classifier ~300 ms to decide
+    # whether this turn is a pure web-lookup ask. If yes, we stream
+    # Gemini's grounded answer straight back and skip the heavy agent
+    # loop entirely (~5-10 s saved). If no — or if anything fails —
+    # we fall through to the existing flow with no behavioural change.
+    # The classifier itself is bounded by
+    # `AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S` and returns
+    # `False` on every error path, so this is always safe to call.
+    latest_user_for_shortcut = next(
+        (m.content for m in reversed(payload.messages) if m.role == "user"),
+        "",
+    ).strip()
+    if (
+        latest_user_for_shortcut
+        and get_settings().AI_WEB_SEARCH_SHORTCUT_ENABLED
+    ):
+        shortcut_text: Optional[str] = None
+        try:
+            shortcut_text = await web_search_shortcut.try_shortcut(
+                latest_user_for_shortcut
+            )
+        except Exception:  # noqa: BLE001 - shortcut must NEVER break chat
+            logger.exception(
+                "Web-search shortcut crashed before heavy agent — "
+                "falling through to the normal chat flow"
+            )
+            shortcut_text = None
+        if shortcut_text:
+            logger.info(
+                "Live chat: web-search shortcut handled this turn "
+                "(family_id=%s, message=%r); skipping heavy agent.",
+                payload.family_id,
+                latest_user_for_shortcut[:80],
+            )
+            return _shortcut_stream_response(
+                final_text=shortcut_text,
+                live_session_id=payload.live_session_id,
+                family_id=payload.family_id,
+                recognized_person_id=payload.recognized_person_id,
+                user_message=latest_user_for_shortcut,
+            )
 
     assistant_name, family_name = _load_assistant(db, payload.family_id)
     assistant_id = _assistant_id_for(db, payload.family_id)

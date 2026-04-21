@@ -3855,7 +3855,10 @@ def build_default_registry() -> ToolRegistry:
             ),
             parameters=_WEB_SEARCH_SCHEMA,
             handler=_handle_web_search,
-            timeout_seconds=20.0,
+            # Generous because the Gemini google_search backend
+            # occasionally needs a couple of retries to ride out a
+            # 503 spike (see GeminiSearchProvider._RETRY_*).
+            timeout_seconds=30.0,
             requires=("web_search",),
             examples=(
                 "What's the weather in Asheville this weekend?",

@@ -59,6 +59,7 @@ from ..ai import authz
 from ..ai import ollama, prompts, rag, schema_catalog
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
+from ..ai import web_search_shortcut
 from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import gmail
@@ -419,47 +420,79 @@ def _handle_one_message(
     )
     db.commit()
 
-    system_prompt = _build_email_system_prompt(
-        db,
-        family_id=family_id,
-        person=person,
-        sender_email=msg.sender_email,
-        subject=msg.subject,
-        assistant_id=assistant_id,
-    )
-
     user_message = _format_user_message_for_agent(msg, person)
     history: List[dict] = []  # email is one-shot per turn, no in-memory history
 
-    # Drive the agent loop synchronously by draining the async generator.
-    # Same contract as the SMS / chat paths: every inbound from a
-    # registered family member gets a reply, full stop. If the agent
-    # itself crashes (LLM offline, tool exception, asyncio glitch, …)
-    # we still send a short, honest fallback so the sender knows we
-    # received their email and aren't silently dropping it.
+    # ---- Fast-path web-search shortcut --------------------------------
+    # When the user emails Avi asking a pure web-lookup question
+    # ("What's the latest on the Fed rate decision?"), short-circuit
+    # the heavy agent and reply with Gemini's grounded answer
+    # directly. The classifier sees the raw body (subject is
+    # informational metadata only); failure / "no" → fall through to
+    # the heavy agent untouched.
     agent_failed = False
+    final_text: Optional[str] = None
+    shortcut_used = False
     try:
-        final_text = _run_agent_to_completion(
-            task_id=task.agent_task_id,
-            family_id=family_id,
-            assistant_id=assistant_id,
-            person_id=person.person_id,
-            system_prompt=system_prompt,
-            history=history,
-            user_message=user_message,
+        shortcut_text = web_search_shortcut.try_shortcut_sync(
+            (msg.body_text or "").strip()
         )
-    except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
+    except Exception:  # noqa: BLE001 - shortcut must never break the inbound
         logger.exception(
-            "Email inbox: agent loop crashed for message_id=%s task=%s",
+            "Email inbox: web-search shortcut crashed for message_id=%s "
+            "— falling through to heavy agent",
+            msg.message_id,
+        )
+        shortcut_text = None
+    if shortcut_text:
+        logger.info(
+            "Email inbox: web-search shortcut handled message_id=%s "
+            "task=%s (skipping heavy agent).",
             msg.message_id,
             task.agent_task_id,
         )
-        agent_failed = True
-        final_text = (
-            "Hi — Avi here. I got your message but hit a snag on my end "
-            "and couldn't put together a real answer just now. I'll look "
-            "into it and follow up as soon as I can."
+        final_text = shortcut_text
+        shortcut_used = True
+
+    if not shortcut_used:
+        system_prompt = _build_email_system_prompt(
+            db,
+            family_id=family_id,
+            person=person,
+            sender_email=msg.sender_email,
+            subject=msg.subject,
+            assistant_id=assistant_id,
         )
+
+        # Drive the agent loop synchronously by draining the async
+        # generator. Same contract as the SMS / chat paths: every
+        # inbound from a registered family member gets a reply, full
+        # stop. If the agent itself crashes (LLM offline, tool
+        # exception, asyncio glitch, …) we still send a short, honest
+        # fallback so the sender knows we received their email and
+        # aren't silently dropping it.
+        try:
+            final_text = _run_agent_to_completion(
+                task_id=task.agent_task_id,
+                family_id=family_id,
+                assistant_id=assistant_id,
+                person_id=person.person_id,
+                system_prompt=system_prompt,
+                history=history,
+                user_message=user_message,
+            )
+        except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
+            logger.exception(
+                "Email inbox: agent loop crashed for message_id=%s task=%s",
+                msg.message_id,
+                task.agent_task_id,
+            )
+            agent_failed = True
+            final_text = (
+                "Hi — Avi here. I got your message but hit a snag on my end "
+                "and couldn't put together a real answer just now. I'll look "
+                "into it and follow up as soon as I can."
+            )
 
     # ---- Send the reply -----------------------------------------------
     reply_subject = msg.subject or "(no subject)"
@@ -504,16 +537,18 @@ def _handle_one_message(
             "in_reply_to": msg.message_id,
         },
     )
+    if agent_failed:
+        status_reason: Optional[str] = "Agent loop crashed; sent fallback apology."
+    elif shortcut_used:
+        status_reason = "Web-search shortcut handled (skipped heavy agent)."
+    else:
+        status_reason = None
     _save_audit(
         db,
         **common_audit,
         person_id=person.person_id,
         status="processed_replied",
-        status_reason=(
-            "Agent loop crashed; sent fallback apology."
-            if agent_failed
-            else None
-        ),
+        status_reason=status_reason,
         reply_message_id=reply_id,
         agent_task_id=task.agent_task_id,
         live_session_id=session.live_session_id,
