@@ -133,6 +133,92 @@ def list_calendar_ids(creds: Credentials) -> List[str]:
     ]
 
 
+@dataclass(frozen=True)
+class VisibleCalendar:
+    """One calendar visible to the assistant + the share level Google grants.
+
+    ``access_role`` mirrors Google's CalendarList.accessRole values:
+
+    * ``owner`` / ``writer`` — full read + write. Avi can list events,
+      see details, AND add holds. Required for the
+      ``calendar_create_event`` tool to succeed against this calendar.
+    * ``reader`` — full read only. Events list works (titles,
+      locations, organizers visible). Writes refused with 403
+      insufficient_scope; we surface that as :class:`CalendarReadOnly`.
+    * ``freeBusyReader`` — only ``freebusy.query`` is permitted.
+      Calling ``events.list`` returns 403 insufficientPermissions
+      (which googleapiclient logs as a WARNING regardless of whether
+      our code catches it). This is the typical "share only my
+      busy/free, hide titles" mode used for work calendars.
+    * ``none`` — Google still returns the row (the calendar was
+      added to the user's list at some point) but no read of any
+      kind is allowed.
+    """
+
+    calendar_id: str
+    summary: str
+    summary_override: Optional[str]
+    description: Optional[str]
+    primary: bool
+    selected: bool
+    access_role: str  # owner|writer|reader|freeBusyReader|none
+    background_color: Optional[str]
+    foreground_color: Optional[str]
+    time_zone: Optional[str]
+
+
+def list_visible_calendars(creds: Credentials) -> List[VisibleCalendar]:
+    """Return every calendar visible to the assistant with its access level.
+
+    The Assistant settings page renders this so admins can see exactly
+    which calendars Avi can read events from vs. only see free/busy on
+    vs. write to. Without it, a 403 in the agent logs is opaque ("which
+    calendar? what kind of share?"); with it, the answer is one glance.
+    """
+    try:
+        svc = _service(creds)
+        resp = svc.calendarList().list().execute()
+    except HttpError as exc:
+        raise CalendarError(_summarise_http_error(exc)) from exc
+    out: List[VisibleCalendar] = []
+    for item in resp.get("items", []):
+        cal_id = item.get("id")
+        if not cal_id:
+            continue
+        out.append(
+            VisibleCalendar(
+                calendar_id=cal_id,
+                summary=item.get("summary") or cal_id,
+                summary_override=item.get("summaryOverride"),
+                description=item.get("description"),
+                primary=bool(item.get("primary")),
+                selected=bool(item.get("selected", True)),
+                access_role=item.get("accessRole") or "unknown",
+                background_color=item.get("backgroundColor"),
+                foreground_color=item.get("foregroundColor"),
+                time_zone=item.get("timeZone"),
+            )
+        )
+    # Sort: primary first, then writeable before read-only before
+    # free-busy-only, then alphabetical so the same household always
+    # renders in the same order.
+    role_rank = {
+        "owner": 0,
+        "writer": 1,
+        "reader": 2,
+        "freeBusyReader": 3,
+        "none": 4,
+    }
+    out.sort(
+        key=lambda c: (
+            0 if c.primary else 1,
+            role_rank.get(c.access_role, 5),
+            (c.summary_override or c.summary).lower(),
+        )
+    )
+    return out
+
+
 def list_upcoming_events(
     creds: Credentials,
     *,

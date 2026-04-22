@@ -1,11 +1,14 @@
 import requests
 from requests.auth import HTTPBasicAuth
+import os
+
+#TODO this  integration dont work yet.  Doorbird doesn't really support a public cloud API, only select partners have.  They expect LAN access
 
 # --- YOUR SPECIFIC DATA ---
-DB_MAC = "1CCAE3761FFC"
-INTERCOM_ID = "ghurhs"
-USER = "ghurhs0000" #regular user "ghurhs0018" # Replace with your actual user (e.g., ghurhs0001)
-PASS = "nVVN7uFE5Q" # regular user pwd"aviGate8844"
+DB_MAC = os.getenv("DB_MAC")
+INTERCOM_ID = os.getenv("DB_INTERCOM_ID")
+USER =os.getenv("DB_USER")#regular user "ghurhs0018" # Replace with your actual user (e.g., ghurhs0001)
+PASS = os.getenv("DB_PASS") #regular user pwd"aviGate8844"
 # The ID must be part of the path to prevent the 404 routing error
 BASE_URL = f"https://api.doorbird.io/{INTERCOM_ID}/bha-api"
 # The Cloud URL *must* include the ID in the path to avoid a 404

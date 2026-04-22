@@ -60,7 +60,6 @@ What this code DELIBERATELY does not do
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
@@ -71,8 +70,9 @@ from sqlalchemy.orm import Session
 
 from .. import models, storage
 from ..ai import agent as agent_loop
-from ..ai import authz
-from ..ai import ollama, prompts, rag, schema_catalog
+from ..ai import agent_drain
+from ..ai import assistants as _assistants
+from ..ai import ollama
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
 from ..ai import web_search_shortcut
@@ -80,6 +80,7 @@ from ..config import Settings, get_settings
 from ..db import SessionLocal
 from ..integrations import twilio_sms
 from ..utils.phone import normalize_phone
+from . import inbound_prompts
 
 
 logger = logging.getLogger(__name__)
@@ -378,22 +379,14 @@ def process_inbound_sms(
     # Saves ~5-10 s of round-trips. We hand it the RAW body (not the
     # `[Text message from ...]` wrapper) because the wrapper is a
     # surface hint for the heavy agent, not signal for the
-    # classifier. Failure / classifier-says-no -> None -> normal flow.
+    # classifier. ``try_shortcut_sync`` itself is total — every
+    # failure mode returns ``None`` so we just check the return.
     agent_failed = False
     final_text: Optional[str] = None
     shortcut_used = False
-    try:
-        shortcut_text = web_search_shortcut.try_shortcut_sync(
-            (inbound.body or "").strip()
-        )
-    except Exception:  # noqa: BLE001 - shortcut must never break the inbound
-        logger.exception(
-            "%s inbox: web-search shortcut crashed for sid=%s — "
-            "falling through to heavy agent",
-            chan.label,
-            inbound.message_sid,
-        )
-        shortcut_text = None
+    shortcut_text = web_search_shortcut.try_shortcut_sync(
+        (inbound.body or "").strip()
+    )
     if shortcut_text:
         logger.info(
             "%s inbox: web-search shortcut handled sid=%s task=%s "
@@ -710,66 +703,17 @@ def _build_sms_system_prompt(
     from_phone: str,
     chan: _ChannelConfig,
 ) -> str:
-    """Mirror the email system prompt, but tuned for an SMS / WhatsApp reply.
+    """Build the SMS / WhatsApp-flavoured system prompt.
 
-    Differs from the email build:
-    * Reply must fit in the channel-specific cap (480 chars for SMS;
-      ~1024 for WhatsApp where users tolerate longer chat-style messages).
-    * No subject line, no sign-off — the recipient already knows it's
-      Avi (one number, ongoing thread).
-
-    The ``chan`` bundle controls the surface-specific bits so we don't
-    duplicate this whole prompt for WhatsApp.
+    Uses :func:`inbound_prompts.build_inbound_system_prompt` for the
+    common Avi/RAG/capability scaffolding. Only the surface verb and
+    the trailing "how to reply" block vary, with the SMS / WhatsApp
+    branch governed by ``chan``.
     """
-    family = db.get(models.Family, family_id)
-    assistant_name = (
-        family.assistant.assistant_name if family and family.assistant else "Avi"
-    )
-    family_name = family.family_name if family else None
-
-    rag_block = ""
-    if family is not None:
-        rag_block = rag.build_family_overview(
-            db, family, requestor_person_id=person.person_id
-        )
-    surface_verb = "texting" if chan.channel == "sms" else "messaging on WhatsApp"
-    person_block = (
-        f"Currently {surface_verb} with:\n"
-        + rag.build_person_context(
-            db, person, requestor_person_id=person.person_id
-        )
-    )
-
-    registry = agent_tools.build_default_registry()
-    capabilities = agent_tools.detect_capabilities(
-        db, _assistant_id_for_family(db, family_id)
-    )
-    capabilities_block = agent_tools.describe_capabilities(registry, capabilities)
-
-    parts = [
-        ollama.system_prompt_for_avi(assistant_name, family_name),
-        "--- What you can do ---\n" + capabilities_block,
-    ]
-    house_context = prompts.render_context_blocks()
-    if house_context:
-        parts.append("--- House context ---\n" + house_context)
-    parts.append(
-        authz.render_speaker_scope_block(
-            authz.build_speaker_scope(db, speaker_person_id=person.person_id)
-        )
-    )
-    if rag_block:
-        parts.append("--- Known household context ---\n" + rag_block)
-    parts.append(person_block)
-    parts.append(
-        "--- Database schema you can query ---\n"
-        "You have read-only access to the family Postgres database. "
-        "Sensitive columns are encrypted; use the *_last_four helpers.\n\n"
-        + schema_catalog.dump_text(db)
-    )
+    surface_verb = "texting with" if chan.channel == "sms" else "messaging on WhatsApp with"
     max_chars = chan.reply_max_chars
     if chan.channel == "whatsapp":
-        parts.append(
+        how_to_reply = (
             f"--- How to reply to this WhatsApp message ---\n"
             f"This message arrived as a WhatsApp text from {from_phone}. "
             "Your final answer will be sent verbatim as the body of a "
@@ -793,7 +737,7 @@ def _build_sms_system_prompt(
             "  anything ending in _encrypted in the reply body.\n"
         )
     else:
-        parts.append(
+        how_to_reply = (
             "--- How to reply to this text message ---\n"
             f"This message arrived as an SMS from {from_phone}. Your final "
             f"answer will be sent verbatim as the body of an SMS reply. "
@@ -810,17 +754,17 @@ def _build_sms_system_prompt(
             "* NEVER include encrypted identifiers, passwords, or anything "
             "  ending in _encrypted in the reply body.\n"
         )
-    return prompts.with_safety("\n\n".join(parts))
+    return inbound_prompts.build_inbound_system_prompt(
+        db,
+        family_id=family_id,
+        person=person,
+        surface_verb=surface_verb,
+        assistant_id=_assistant_id_for_family(db, family_id),
+        how_to_reply=how_to_reply,
+    )
 
 
-def _assistant_id_for_family(db: Session, family_id: int) -> Optional[int]:
-    """Best-effort lookup of the assistant row tied to ``family_id``."""
-    row = db.execute(
-        select(models.Assistant.assistant_id)
-        .where(models.Assistant.family_id == family_id)
-        .limit(1)
-    ).scalar_one_or_none()
-    return row
+_assistant_id_for_family = _assistants.assistant_id_for_family
 
 
 def _run_agent_to_completion(
@@ -835,46 +779,28 @@ def _run_agent_to_completion(
 ) -> str:
     """Drain the async agent generator and return the final reply text.
 
-    Mirrors ``services.email_inbox._run_agent_to_completion`` exactly
-    so the two paths share behaviour.
+    Thin wrapper over :func:`api.ai.agent_drain.drain_agent_sync`
+    that adds the SMS-flavoured fallback copy.
     """
     registry = agent_tools.build_default_registry()
     with SessionLocal() as db_for_caps:
         capabilities = agent_tools.detect_capabilities(db_for_caps, assistant_id)
 
-    final_text = ""
-    error_text: Optional[str] = None
+    result = agent_drain.drain_agent_sync(
+        task_id=task_id,
+        family_id=family_id,
+        assistant_id=assistant_id,
+        person_id=person_id,
+        system_prompt=system_prompt,
+        history=history,
+        user_message=user_message,
+        registry=registry,
+        capabilities=capabilities,
+    )
 
-    async def _drain() -> None:
-        nonlocal final_text, error_text
-        async for event in agent_loop.run_agent(
-            task_id=task_id,
-            family_id=family_id,
-            assistant_id=assistant_id,
-            person_id=person_id,
-            system_prompt=system_prompt,
-            history=history,
-            user_message=user_message,
-            registry=registry,
-            capabilities=capabilities,
-        ):
-            if event.type == "task_completed":
-                final_text = (event.payload.get("summary") or "").strip()
-            elif event.type == "task_failed":
-                error_text = str(event.payload.get("error") or "Agent failed.")
-
-    try:
-        asyncio.run(_drain())
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_drain())
-        finally:
-            loop.close()
-
-    if error_text and not final_text:
+    if result.error_text and not result.final_text:
         return "Sorry — Avi here. I tried but my server hit a snag. Try again in a bit."
-    return final_text or "Got your text — nothing to add right now."
+    return result.final_text or "Got your text — nothing to add right now."
 
 
 __all__ = ["process_inbound_sms"]

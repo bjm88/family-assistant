@@ -49,7 +49,7 @@ from typing import Optional
 import httpx
 
 from ..config import get_settings
-from .ollama import OllamaError, OllamaUnavailable, _base, fast_model
+from .ollama import OllamaError, OllamaTimeout, OllamaUnavailable, _base, fast_model
 
 
 logger = logging.getLogger(__name__)
@@ -336,12 +336,23 @@ async def _chat_oneshot(
             "temperature": temperature,
         },
     }
+    # Same structured timeout shape as chat_with_tools: fail-fast on
+    # connect, give the read the full per-call budget. The fast-ack
+    # budget is intentionally short (the user is staring at a blank
+    # live-chat bubble), so a stalled read should give up cleanly
+    # instead of letting an httpcore.ReadTimeout bubble up raw.
+    request_timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=2.0)
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=request_timeout) as client:
             r = await client.post(f"{_base()}/api/chat", json=payload)
     except httpx.ConnectError as exc:
         raise OllamaUnavailable(
             f"Ollama at {_base()} is not responding: {exc}"
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise OllamaTimeout(
+            f"Fast-ack model {model!r} did not respond within 10s "
+            f"({type(exc).__name__})."
         ) from exc
 
     if r.status_code == 404:

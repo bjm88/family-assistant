@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Users2, X } from "lucide-react";
 import { api } from "@/lib/api";
@@ -29,6 +29,7 @@ interface AddForm {
 
 export default function RelationshipsPage() {
   const { familyId } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const qc = useQueryClient();
   const toast = useToast();
 
@@ -44,16 +45,46 @@ export default function RelationshipsPage() {
       ),
   });
 
-  const [focusId, setFocusId] = useState<number | null>(null);
+  // Optional ``?focus=<id>`` URL hint — set when arriving from a
+  // family-tree node click. We make it the source of truth so
+  // (a) deep links work, (b) browser back/forward restores the
+  // previously-focused person, and (c) refreshing the page keeps
+  // the same focus instead of snapping back to "self".
+  const focusFromUrl = (() => {
+    const raw = searchParams.get("focus");
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  })();
+
+  const [focusId, setFocusIdState] = useState<number | null>(focusFromUrl);
+
+  const setFocusId = (id: number | null) => {
+    setFocusIdState(id);
+    // Mirror to URL so subsequent navigations and refreshes preserve
+    // the choice. ``replace: true`` keeps the back button useful
+    // (otherwise every node-click click would push a new history entry).
+    const next = new URLSearchParams(searchParams);
+    if (id == null) next.delete("focus");
+    else next.set("focus", String(id));
+    setSearchParams(next, { replace: true });
+  };
 
   useEffect(() => {
-    if (focusId === null && people && people.length > 0) {
+    if (!people || people.length === 0) return;
+    // If the URL specifies a focus that exists in this family, honour it.
+    if (focusFromUrl != null && people.some((p) => p.person_id === focusFromUrl)) {
+      if (focusId !== focusFromUrl) setFocusIdState(focusFromUrl);
+      return;
+    }
+    // Otherwise fall back to "self" (or first person) the first time.
+    if (focusId === null) {
       const self = people.find(
         (p) => p.primary_family_relationship === "self"
       );
-      setFocusId((self ?? people[0]).person_id);
+      setFocusIdState((self ?? people[0]).person_id);
     }
-  }, [people, focusId]);
+  }, [people, focusFromUrl, focusId]);
 
   const byId = useMemo(() => {
     const m = new Map<number, Person>();

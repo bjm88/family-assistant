@@ -42,7 +42,7 @@ def list_families(db: Session = Depends(get_db)) -> List[schemas.FamilySummary]:
 
 @router.post("", response_model=schemas.FamilyRead, status_code=status.HTTP_201_CREATED)
 def create_family(payload: schemas.FamilyCreate, db: Session = Depends(get_db)) -> models.Family:
-    family = models.Family(**payload.model_dump())
+    family = models.Family(**payload.model_dump(exclude_none=True))
     db.add(family)
     db.flush()
     db.refresh(family)

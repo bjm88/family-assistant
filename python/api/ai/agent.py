@@ -47,6 +47,14 @@ DEFAULT_MAX_STEPS = 5
 # Mac Studio can take 8-12 s for a structured response with tools.
 DEFAULT_LLM_TIMEOUT_S = 90.0
 
+# How long to wait between a transient LLM timeout and the single
+# automatic retry. Short on purpose: most ReadTimeouts on a healthy
+# host are caused by a temporary GPU stall (another process grabbing
+# Metal Performance Shaders for a frame, model weights being paged
+# back in, etc.) and clear in seconds. A longer pause just lengthens
+# the user-visible "Avi is thinking" gap on email/SMS/Telegram.
+LLM_TIMEOUT_RETRY_DELAY_S = 1.5
+
 
 # ---------------------------------------------------------------------------
 # Event payloads — exactly what the SSE channel emits.
@@ -232,47 +240,104 @@ async def run_agent(
 
         for cycle in range(max_steps):
             cycle_started = time.monotonic()
-            try:
-                turn = await ollama.chat_with_tools(
-                    messages,
-                    tools=available_tools,
-                    system=system_prompt,
-                    model=primary_model,
-                    timeout_seconds=DEFAULT_LLM_TIMEOUT_S,
-                    think=think,
-                )
-            except ollama.OllamaUnavailable as exc:
-                step = _append_step(
-                    db,
-                    task,
-                    step_index=step_index,
-                    step_type="error",
-                    error=f"LLM unavailable: {exc}",
-                )
-                db.commit()
-                yield AgentEvent(type="step", payload=_step_to_event_payload(step))
-                _finalise(db, task, status="failed", error=str(exc), started=started)
-                yield AgentEvent(
-                    type="task_failed",
-                    payload={"task_id": task.agent_task_id, "error": str(exc)},
-                )
-                return
-            except ollama.OllamaError as exc:
-                step = _append_step(
-                    db,
-                    task,
-                    step_index=step_index,
-                    step_type="error",
-                    error=f"LLM error: {exc}",
-                )
-                db.commit()
-                yield AgentEvent(type="step", payload=_step_to_event_payload(step))
-                _finalise(db, task, status="failed", error=str(exc), started=started)
-                yield AgentEvent(
-                    type="task_failed",
-                    payload={"task_id": task.agent_task_id, "error": str(exc)},
-                )
-                return
+            # Single in-cycle retry on transient ReadTimeout — the
+            # daemon accepted the request but the response stalled
+            # (typically a brief GPU contention spike). One retry
+            # converts a noisy "agent crashed" into a 1-2s blip the
+            # user never sees. We do NOT retry hard errors (4xx, 5xx,
+            # ConnectError) because those won't get better in 2 s.
+            timeout_attempts = 0
+            while True:
+                try:
+                    turn = await ollama.chat_with_tools(
+                        messages,
+                        tools=available_tools,
+                        system=system_prompt,
+                        model=primary_model,
+                        timeout_seconds=DEFAULT_LLM_TIMEOUT_S,
+                        think=think,
+                    )
+                    break
+                except ollama.OllamaTimeout as exc:
+                    timeout_attempts += 1
+                    if timeout_attempts > 1:
+                        # Already retried once. Give up cleanly with
+                        # a typed error step so the email/SMS surface
+                        # can render its fallback copy.
+                        step = _append_step(
+                            db,
+                            task,
+                            step_index=step_index,
+                            step_type="error",
+                            error=f"LLM timeout (retried once): {exc}",
+                        )
+                        db.commit()
+                        yield AgentEvent(
+                            type="step", payload=_step_to_event_payload(step)
+                        )
+                        _finalise(
+                            db,
+                            task,
+                            status="failed",
+                            error=str(exc),
+                            started=started,
+                        )
+                        yield AgentEvent(
+                            type="task_failed",
+                            payload={
+                                "task_id": task.agent_task_id,
+                                "error": str(exc),
+                            },
+                        )
+                        return
+                    logger.warning(
+                        "Agent task %s: LLM timeout on cycle %d, retrying once: %s",
+                        task.agent_task_id,
+                        cycle,
+                        exc,
+                    )
+                    await asyncio.sleep(LLM_TIMEOUT_RETRY_DELAY_S)
+                    continue
+                except ollama.OllamaUnavailable as exc:
+                    step = _append_step(
+                        db,
+                        task,
+                        step_index=step_index,
+                        step_type="error",
+                        error=f"LLM unavailable: {exc}",
+                    )
+                    db.commit()
+                    yield AgentEvent(
+                        type="step", payload=_step_to_event_payload(step)
+                    )
+                    _finalise(
+                        db, task, status="failed", error=str(exc), started=started
+                    )
+                    yield AgentEvent(
+                        type="task_failed",
+                        payload={"task_id": task.agent_task_id, "error": str(exc)},
+                    )
+                    return
+                except ollama.OllamaError as exc:
+                    step = _append_step(
+                        db,
+                        task,
+                        step_index=step_index,
+                        step_type="error",
+                        error=f"LLM error: {exc}",
+                    )
+                    db.commit()
+                    yield AgentEvent(
+                        type="step", payload=_step_to_event_payload(step)
+                    )
+                    _finalise(
+                        db, task, status="failed", error=str(exc), started=started
+                    )
+                    yield AgentEvent(
+                        type="task_failed",
+                        payload={"task_id": task.agent_task_id, "error": str(exc)},
+                    )
+                    return
 
             cycle_ms = int((time.monotonic() - cycle_started) * 1000)
 

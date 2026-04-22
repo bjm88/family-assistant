@@ -50,7 +50,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("watchfiles").setLevel(logging.WARNING)
 from .routers import (
-    addresses,
     agent_tasks,
     ai_chat,
     ai_face,
@@ -211,7 +210,6 @@ def create_app() -> FastAPI:
         pet_photos.router,
         residences.router,
         residence_photos.router,
-        addresses.router,
         identity_documents.router,
         sensitive_identifiers.router,
         vehicles.router,

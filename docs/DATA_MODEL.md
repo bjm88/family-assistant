@@ -256,10 +256,10 @@ Avi has already greeted them (the `greeted_already` flag prevents
 ### `live_session_messages`
 
 The chat transcript. `role` is one of `LIVE_SESSION_MESSAGE_ROLES`
-(user / assistant / system). For the push surfaces (Telegram / SMS),
-**both** the fast-ack and the final reply land here as separate
-assistant rows with cross-linked metadata, so the audit trail mirrors
-what the user actually saw.
+(user / assistant / system). On Telegram (the only push surface that
+fires a fast-ack today), **both** the fast-ack and the final reply
+land here as separate assistant rows with cross-linked metadata, so
+the audit trail mirrors what the user actually saw.
 
 ---
 

@@ -273,15 +273,29 @@ async def try_shortcut(message: str) -> Optional[str]:
     Gemma round trip and a return), so it's safe to wire into every
     user-facing surface unconditionally — when the classifier votes
     AGENT, the only cost is the classifier itself.
+
+    Wraps every failure in a single broad ``except`` so callers
+    don't have to duplicate the same defensive ``try`` block. The
+    inner ``classify`` and ``run`` helpers each catch their known
+    failure modes (timeouts, Ollama unavailable, Gemini quota); this
+    outer net is a belt-and-suspenders against anything new — the
+    shortcut is a pure latency win and must never crash the surface
+    that invoked it.
     """
     settings = get_settings()
     if not settings.AI_WEB_SEARCH_SHORTCUT_ENABLED:
         return None
 
-    is_web = await classify(message)
-    if not is_web:
+    try:
+        is_web = await classify(message)
+        if not is_web:
+            return None
+        return await run(message)
+    except Exception:  # noqa: BLE001 - shortcut must never break the caller
+        logger.exception(
+            "web_search_shortcut: try_shortcut crashed — falling through"
+        )
         return None
-    return await run(message)
 
 
 def try_shortcut_sync(message: str) -> Optional[str]:

@@ -55,8 +55,8 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..ai import agent as agent_loop
-from ..ai import authz
-from ..ai import ollama, prompts, rag, schema_catalog
+from ..ai import agent_drain
+from ..ai import ollama
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
 from ..ai import web_search_shortcut
@@ -64,6 +64,7 @@ from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import gmail
 from ..integrations import google_oauth
+from . import inbound_prompts
 
 
 logger = logging.getLogger(__name__)
@@ -428,22 +429,15 @@ def _handle_one_message(
     # ("What's the latest on the Fed rate decision?"), short-circuit
     # the heavy agent and reply with Gemini's grounded answer
     # directly. The classifier sees the raw body (subject is
-    # informational metadata only); failure / "no" → fall through to
-    # the heavy agent untouched.
+    # informational metadata only). ``try_shortcut_sync`` itself is
+    # total — every failure mode returns ``None`` so we just check
+    # the return.
     agent_failed = False
     final_text: Optional[str] = None
     shortcut_used = False
-    try:
-        shortcut_text = web_search_shortcut.try_shortcut_sync(
-            (msg.body_text or "").strip()
-        )
-    except Exception:  # noqa: BLE001 - shortcut must never break the inbound
-        logger.exception(
-            "Email inbox: web-search shortcut crashed for message_id=%s "
-            "— falling through to heavy agent",
-            msg.message_id,
-        )
-        shortcut_text = None
+    shortcut_text = web_search_shortcut.try_shortcut_sync(
+        (msg.body_text or "").strip()
+    )
     if shortcut_text:
         logger.info(
             "Email inbox: web-search shortcut handled message_id=%s "
@@ -683,73 +677,37 @@ def _build_email_system_prompt(
     subject: Optional[str],
     assistant_id: int,
 ) -> str:
-    """Mirror the live-chat system prompt, but tuned for an email reply.
+    """Build the email-flavoured system prompt.
 
-    The biggest difference is the trailing "How to reply" block — we
-    want a self-contained reply paragraph (not a chat snippet) and we
-    want the agent to be very conservative with tools (one round of
-    lookups, then write the reply).
+    Uses :func:`inbound_prompts.build_inbound_system_prompt` for the
+    common Avi/RAG/capability scaffolding and only specifies what's
+    actually email-specific: the surface verb and the trailing "how
+    to reply" block (self-contained paragraph, conservative with
+    tools, signs off as the assistant).
     """
-    family = db.get(models.Family, family_id)
-    assistant_name = family.assistant.assistant_name if family and family.assistant else "Avi"
-    family_name = family.family_name if family else None
-
-    # Email sender is the speaker for authz purposes — we identified
-    # them by their registered email address, the same role face
-    # recognition plays on the live page. RAG redaction below uses
-    # this so a child sending Avi an email cannot extract a parent's
-    # SSN by typing the question into Gmail instead of speaking it.
-    rag_block = ""
-    if family is not None:
-        rag_block = rag.build_family_overview(
-            db, family, requestor_person_id=person.person_id
-        )
-    person_block = "Currently emailing with:\n" + rag.build_person_context(
-        db, person, requestor_person_id=person.person_id
+    return inbound_prompts.build_inbound_system_prompt(
+        db,
+        family_id=family_id,
+        person=person,
+        surface_verb="emailing with",
+        assistant_id=assistant_id,
+        how_to_reply=(
+            "--- How to reply to this email ---\n"
+            f"This message arrived via email from {sender_email}. Your final "
+            f"answer will be sent verbatim as the body of an email reply on "
+            f"the subject {subject or '(no subject)'!r}. Therefore:\n"
+            "* Write a complete, self-contained reply paragraph (or short "
+            "  list). It is not a chat snippet — no 'Sure!' or 'Great!' "
+            "  openers, no trailing 'let me know if I can help'.\n"
+            "* Sign off as the assistant (use the assistant's name, not a "
+            "  human's name).\n"
+            "* Use at most one round of tool calls before writing the "
+            "  reply. Email is asynchronous — if you need more info, ask "
+            "  the user one specific question and stop.\n"
+            "* NEVER include the user's encrypted identifiers, passwords, "
+            "  or anything ending in _encrypted in the reply body.\n"
+        ),
     )
-
-    registry = agent_tools.build_default_registry()
-    capabilities = agent_tools.detect_capabilities(db, assistant_id)
-    capabilities_block = agent_tools.describe_capabilities(registry, capabilities)
-
-    parts = [
-        ollama.system_prompt_for_avi(assistant_name, family_name),
-        "--- What you can do ---\n" + capabilities_block,
-    ]
-    house_context = prompts.render_context_blocks()
-    if house_context:
-        parts.append("--- House context ---\n" + house_context)
-    parts.append(
-        authz.render_speaker_scope_block(
-            authz.build_speaker_scope(db, speaker_person_id=person.person_id)
-        )
-    )
-    if rag_block:
-        parts.append("--- Known household context ---\n" + rag_block)
-    parts.append(person_block)
-    parts.append(
-        "--- Database schema you can query ---\n"
-        "You have read-only access to the family Postgres database. "
-        "Sensitive columns are encrypted; use the *_last_four helpers.\n\n"
-        + schema_catalog.dump_text(db)
-    )
-    parts.append(
-        "--- How to reply to this email ---\n"
-        f"This message arrived via email from {sender_email}. Your final "
-        f"answer will be sent verbatim as the body of an email reply on "
-        f"the subject {subject or '(no subject)'!r}. Therefore:\n"
-        "* Write a complete, self-contained reply paragraph (or short "
-        "  list). It is not a chat snippet — no 'Sure!' or 'Great!' "
-        "  openers, no trailing 'let me know if I can help'.\n"
-        "* Sign off as the assistant (use the assistant's name, not a "
-        "  human's name).\n"
-        "* Use at most one round of tool calls before writing the "
-        "  reply. Email is asynchronous — if you need more info, ask "
-        "  the user one specific question and stop.\n"
-        "* NEVER include the user's encrypted identifiers, passwords, "
-        "  or anything ending in _encrypted in the reply body.\n"
-    )
-    return prompts.with_safety("\n\n".join(parts))
 
 
 def _run_agent_to_completion(
@@ -764,59 +722,38 @@ def _run_agent_to_completion(
 ) -> str:
     """Drain the async agent generator and return the final reply text.
 
-    The agent already persists every step + the final ``summary`` to
-    ``agent_tasks`` / ``agent_steps``, so we just need the text the
-    model actually settled on. We pull it from the ``task_completed``
-    event (preferred) or, on failure, return the canonical apology so
-    the recipient still hears back.
+    Thin wrapper over :func:`api.ai.agent_drain.drain_agent_sync`
+    that adds the email-flavoured fallback copy. The agent loop
+    already persists every step + the final ``summary`` to
+    ``agent_tasks`` / ``agent_steps``; here we just need the parsed
+    text to drop into the outbound reply.
     """
     registry = agent_tools.build_default_registry()
-    # We open a fresh session here because ``run_agent`` opens its own
-    # too — that is by design (agent loop is HTTP-request-lifetime
+    # Fresh session here because ``run_agent`` opens its own too —
+    # that is by design (agent loop is HTTP-request-lifetime
     # independent), so passing our DB session in would be wrong.
     with _session() as db_for_caps:
         capabilities = agent_tools.detect_capabilities(db_for_caps, assistant_id)
 
-    final_text = ""
-    error_text: Optional[str] = None
+    result = agent_drain.drain_agent_sync(
+        task_id=task_id,
+        family_id=family_id,
+        assistant_id=assistant_id,
+        person_id=person_id,
+        system_prompt=system_prompt,
+        history=history,
+        user_message=user_message,
+        registry=registry,
+        capabilities=capabilities,
+    )
 
-    async def _drain() -> None:
-        nonlocal final_text, error_text
-        async for event in agent_loop.run_agent(
-            task_id=task_id,
-            family_id=family_id,
-            assistant_id=assistant_id,
-            person_id=person_id,
-            system_prompt=system_prompt,
-            history=history,
-            user_message=user_message,
-            registry=registry,
-            capabilities=capabilities,
-        ):
-            if event.type == "task_completed":
-                final_text = (event.payload.get("summary") or "").strip()
-            elif event.type == "task_failed":
-                error_text = str(event.payload.get("error") or "Agent failed.")
-
-    try:
-        asyncio.run(_drain())
-    except RuntimeError:
-        # We're inside an already-running event loop (shouldn't happen
-        # because the caller used asyncio.to_thread, but be defensive).
-        # Spin up a private loop on this thread to host the run.
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_drain())
-        finally:
-            loop.close()
-
-    if error_text and not final_text:
+    if result.error_text and not result.final_text:
         return (
             "Hi — Avi here. I tried to help with your message but ran into a "
             "problem on the local server. The household admin has been "
             "notified; please try again in a bit."
         )
-    return final_text or "Hi — Avi here. I read your note but didn't have anything to add right now."
+    return result.final_text or "Hi — Avi here. I read your note but didn't have anything to add right now."
 
 
 __all__ = [

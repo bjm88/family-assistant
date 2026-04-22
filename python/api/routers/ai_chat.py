@@ -25,9 +25,11 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..ai import agent as agent_loop
-from ..ai import authz
+from ..ai import assistants as _assistants
+from ..ai import chat_prompts
 from ..ai import fast_ack
 from ..ai import ollama
+from ..ai import planner as ai_planner
 from ..ai import prompts
 from ..ai import rag
 from ..ai import schema_catalog
@@ -119,45 +121,7 @@ def _load_assistant(db: Session, family_id: int) -> tuple[str, Optional[str]]:
     return name, family.family_name
 
 
-def _assistant_id_for(db: Session, family_id: int) -> Optional[int]:
-    """Best-effort lookup of the assistant row (needed for Google tools)."""
-    family = db.get(models.Family, family_id)
-    if family is None or family.assistant is None:
-        return None
-    return family.assistant.assistant_id
-
-
-def _build_rag_block(
-    db: Session, family_id: int, person_id: Optional[int]
-) -> str:
-    """Static context block: family overview + (optional) speaker focus.
-
-    Excludes the schema catalog — that's appended separately by
-    :func:`_build_system_prompt` so it can be reused across the planner
-    + main chat call without rebuilding.
-
-    ``person_id`` here is the *speaker* (the recognized person Avi is
-    talking to). We pass it into the RAG builders as the requestor so
-    sensitive details about other family members are pre-redacted in
-    the static context — the LLM literally never sees the secrets it
-    isn't allowed to share. See :mod:`ai.authz`.
-    """
-    family = db.get(models.Family, family_id)
-    if family is None:
-        return ""
-    parts: List[str] = [
-        rag.build_family_overview(db, family, requestor_person_id=person_id)
-    ]
-    if person_id is not None:
-        person = db.get(models.Person, person_id)
-        if person is not None and person.family_id == family_id:
-            parts.append(
-                "Currently talking to:\n"
-                + rag.build_person_context(
-                    db, person, requestor_person_id=person_id
-                )
-            )
-    return "\n\n".join(parts).strip()
+_assistant_id_for = _assistants.assistant_id_for_family
 
 
 def _shortcut_stream_response(
@@ -247,66 +211,6 @@ def _shortcut_stream_response(
         yield f"data: {json.dumps({'done': True})}\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
-
-
-def _build_system_prompt(
-    db: Session,
-    *,
-    assistant_name: str,
-    family_name: Optional[str],
-    rag_block: str,
-    capabilities_block: str = "",
-    live_data_block: Optional[str] = None,
-    speaker_person_id: Optional[int] = None,
-) -> str:
-    """Assemble the full system prompt and wrap it in the safety sandbox.
-
-    Section order (top to bottom inside the safety frame):
-
-    1. Persona — who Avi is.
-    2. Capabilities — dynamic list of tools the model can use this
-       turn, with example questions. Lets "what can you do?" produce
-       accurate answers without hard-coding them in code.
-    3. House context — every ``ai_context_*.txt`` at the project root.
-    4. Household RAG context — DB-derived family overview.
-    5. Database schema + (optional) live SQL results.
-
-    The whole stack is then wrapped by :func:`prompts.with_safety` so
-    the unbreakable rules sit OUTSIDE everything below them and can't
-    be overridden by anything appended later in the conversation.
-    """
-    parts: List[str] = [ollama.system_prompt_for_avi(assistant_name, family_name)]
-    if capabilities_block:
-        parts.append("--- What you can do ---\n" + capabilities_block)
-    house_context = prompts.render_context_blocks()
-    if house_context:
-        parts.append("--- House context ---\n" + house_context)
-    # Speaker identity + privacy scope sits BETWEEN the house context
-    # and the household RAG so the LLM reads "who is talking and what
-    # may they see" before it ingests the (already-redacted) family
-    # data block. Without a speaker we still emit the block — it tells
-    # the model to treat the conversation as anonymous and clamp down.
-    parts.append(
-        authz.render_speaker_scope_block(
-            authz.build_speaker_scope(db, speaker_person_id=speaker_person_id)
-        )
-    )
-    if rag_block:
-        parts.append("--- Known household context ---\n" + rag_block)
-    parts.append(
-        "--- Database schema you can query ---\n"
-        "You have read-only access to the family Postgres database. "
-        "When the household context above isn't enough, the orchestrator "
-        "may run additional SELECT queries on your behalf and inject the "
-        "results below as 'Live data'. Tables and columns are documented "
-        "with comments — read them carefully. Sensitive columns (VINs, "
-        "account numbers, SSNs) are stored encrypted and are NOT exposed; "
-        "use the *_last_four helper columns instead.\n\n"
-        + schema_catalog.dump_text(db)
-    )
-    if live_data_block:
-        parts.append("--- Live data (just queried for this turn) ---\n" + live_data_block)
-    return prompts.with_safety("\n\n".join(parts))
 
 
 # ---------- Status --------------------------------------------------------
@@ -718,123 +622,6 @@ def run_sql(payload: SqlRequest, db: Session = Depends(get_db)) -> SqlResponse:
     return SqlResponse(**result.to_dict())
 
 
-# ---------- Planner: pick which SELECTs to run before chatting -----------
-
-
-_PLANNER_INSTRUCTIONS = (
-    "You are the data-fetching layer for a family AI assistant. Decide "
-    "which database SELECT queries (if any) would help answer the user's "
-    "next message. Use the schema documentation in the system prompt.\n\n"
-    "Rules:\n"
-    "* Reply with ONLY a JSON object: {\"queries\": [\"SELECT ...\", ...]}.\n"
-    "* Use [] when the household context already contains the answer.\n"
-    "* Each query MUST be a single SELECT or WITH ... SELECT, no semicolons.\n"
-    "* Always scope by family_id = {family_id} where the table has it.\n"
-    "* Prefer narrow column lists; never SELECT * on people, vehicles, "
-    "  insurance_policies, or financial_accounts.\n"
-    "* Do not query encrypted columns (anything ending in _encrypted) — "
-    "  use the *_last_four helpers.\n"
-    "* Cap at 3 queries per turn.\n"
-)
-
-
-async def _plan_queries(
-    *,
-    family_id: int,
-    rag_block: str,
-    schema_dump: str,
-    last_user_message: str,
-) -> List[str]:
-    """Ask the LLM which SELECTs (if any) to pre-run for this turn."""
-    instructions = _PLANNER_INSTRUCTIONS.replace("{family_id}", str(family_id))
-    prompt = (
-        f"{instructions}\n\n"
-        f"--- Household context ---\n{rag_block}\n\n"
-        f"--- Schema ---\n{schema_dump}\n\n"
-        f"--- User just said ---\n{last_user_message}\n\n"
-        'Reply with a JSON object only, e.g. {"queries": []}.'
-    )
-    # The planner is a structured-output task — Gemma's tiny e2b
-    # variant runs it in well under a second on Apple Silicon, so we
-    # never want to burn a 26B-parameter pass on it. The fallback
-    # wrapper auto-routes to the main chat model when the fast tag
-    # isn't pulled (yet), so a missing model doesn't break chat.
-    try:
-        raw, _ = await ollama.generate_with_fallback(
-            prompt,
-            primary_model=ollama.fast_model(),
-            system=prompts.with_safety(
-                "You return strict JSON. No prose. No markdown fences."
-            ),
-            temperature=0.1,
-            max_tokens=400,
-        )
-    except ollama.OllamaError as e:
-        logger.warning("Planner call failed: %s", e)
-        return []
-
-    queries = _parse_planner_output(raw)
-    return queries[:3]
-
-
-def _parse_planner_output(raw: str) -> List[str]:
-    """Extract a JSON queries list from the planner reply, tolerantly."""
-    if not raw:
-        return []
-    text_value = raw.strip()
-    # Strip ``` fences if the model added them despite instructions.
-    if text_value.startswith("```"):
-        text_value = text_value.strip("`")
-        # drop optional `json` language tag
-        if text_value.lower().startswith("json"):
-            text_value = text_value[4:]
-        text_value = text_value.strip()
-    # Locate the first {...} block to be resilient to leading text.
-    start = text_value.find("{")
-    end = text_value.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        return []
-    try:
-        obj = json.loads(text_value[start : end + 1])
-    except json.JSONDecodeError:
-        return []
-    qs = obj.get("queries") if isinstance(obj, dict) else None
-    if not isinstance(qs, list):
-        return []
-    return [q.strip() for q in qs if isinstance(q, str) and q.strip()]
-
-
-def _execute_planner_queries(
-    db: Session, family_id: int, queries: List[str]
-) -> str:
-    """Run each planner-generated query, return a prompt-ready block.
-
-    Failures are surfaced inline so the LLM can see what didn't work and
-    avoid suggesting the same query the next turn.
-    """
-    if not queries:
-        return ""
-    sections: List[str] = []
-    for i, q in enumerate(queries, 1):
-        header = f"### Query {i}\n```sql\n{q}\n```"
-        try:
-            result = sql_tool.run_safe_query(db, q, family_id=family_id)
-        except sql_tool.SqlToolError as e:
-            sections.append(f"{header}\nError: {e}")
-            continue
-        if not result.rows:
-            sections.append(f"{header}\nNo rows.")
-            continue
-        # Render as a tiny table — small enough that the model can read
-        # it, structured enough that it doesn't get parsed as prose.
-        body = json.dumps(result.rows, ensure_ascii=False, default=str)
-        truncation = " (truncated)" if result.truncated else ""
-        sections.append(
-            f"{header}\nRows ({result.row_count}{truncation}): {body}"
-        )
-    return "\n\n".join(sections)
-
-
 # ---------- Chat stream ---------------------------------------------------
 
 
@@ -891,17 +678,11 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
         latest_user_for_shortcut
         and get_settings().AI_WEB_SEARCH_SHORTCUT_ENABLED
     ):
-        shortcut_text: Optional[str] = None
-        try:
-            shortcut_text = await web_search_shortcut.try_shortcut(
-                latest_user_for_shortcut
-            )
-        except Exception:  # noqa: BLE001 - shortcut must NEVER break chat
-            logger.exception(
-                "Web-search shortcut crashed before heavy agent — "
-                "falling through to the normal chat flow"
-            )
-            shortcut_text = None
+        # ``try_shortcut`` is total — every failure mode returns
+        # ``None`` so we just check the return.
+        shortcut_text = await web_search_shortcut.try_shortcut(
+            latest_user_for_shortcut
+        )
         if shortcut_text:
             logger.info(
                 "Live chat: web-search shortcut handled this turn "
@@ -919,7 +700,9 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
 
     assistant_name, family_name = _load_assistant(db, payload.family_id)
     assistant_id = _assistant_id_for(db, payload.family_id)
-    rag_block = _build_rag_block(db, payload.family_id, payload.recognized_person_id)
+    rag_block = chat_prompts.build_rag_block(
+        db, payload.family_id, payload.recognized_person_id
+    )
 
     # Build the tool registry up-front so the same instance is used to
     # (a) describe Avi's capabilities to the model in the system prompt
@@ -945,7 +728,7 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
         )
         if latest_user:
             try:
-                planner_queries = await _plan_queries(
+                planner_queries = await ai_planner.plan_queries(
                     family_id=payload.family_id,
                     rag_block=rag_block,
                     schema_dump=schema_catalog.dump_text(db),
@@ -964,13 +747,13 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
                     [q[:80] for q in planner_queries],
                 )
                 live_data_block = (
-                    _execute_planner_queries(
+                    ai_planner.execute_planner_queries(
                         db, payload.family_id, planner_queries
                     )
                     or None
                 )
 
-    system = _build_system_prompt(
+    system = chat_prompts.build_system_prompt(
         db,
         assistant_name=assistant_name,
         family_name=family_name,

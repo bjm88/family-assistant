@@ -34,6 +34,7 @@ from ..integrations.gmail import GmailSendError, send_email
 from ..integrations.google_calendar import (
     CalendarError,
     list_upcoming_events,
+    list_visible_calendars,
 )
 
 
@@ -55,7 +56,20 @@ class GoogleStatus(BaseModel):
     # Implies inbox read + mark-as-read; the email-inbox poller refuses
     # to start unless this is True for the assistant.
     can_read_inbox: bool = False
+    # True iff the OAuth token carries any scope that lets us list
+    # calendars + read events. Per-calendar permissions are determined
+    # by how each owner shares (see /test/calendars).
     can_read_calendar: bool = False
+    # True iff the token can also INSERT events. Set by the
+    # ``calendar.events`` and ``calendar`` scopes; legacy
+    # ``calendar.readonly`` connections show false here and the
+    # ``calendar_create_event`` agent tool refuses to fire.
+    can_write_calendar: bool = False
+    # True iff the token authorises ``calendarList.list()`` —
+    # required for the per-calendar visibility panel. Connects made
+    # before this scope was added to DEFAULT_SCOPES will return false
+    # and need a disconnect + reconnect.
+    can_list_calendars: bool = False
     email_matches_assistant: Optional[bool] = None
     oauth_configured: bool = False
 
@@ -95,10 +109,37 @@ def _status_for(
             s.endswith("/gmail.modify") or s.endswith("/gmail.readonly")
             for s in scopes
         ),
+        # Any of the three calendar scopes grants list + read.
+        # ``calendar.events`` is what we request on new connects;
+        # ``calendar.readonly`` is the legacy read-only scope; the
+        # umbrella ``calendar`` scope (granted to some legacy hookups)
+        # also covers reads. Without one of these the calendar tools
+        # cannot list events at all.
         can_read_calendar=any(
-            s.endswith("/calendar.readonly") or s.endswith("/calendar")
+            s.endswith("/calendar.readonly")
+            or s.endswith("/calendar.events")
+            or s.endswith("/calendar")
             for s in scopes
         ),
+    # Inserts (and edits) require either ``calendar.events`` or the
+    # umbrella ``calendar`` scope. The read-only scope is excluded
+    # so the UI can correctly nudge legacy connections to reconnect.
+    can_write_calendar=any(
+        s.endswith("/calendar.events") or s.endswith("/calendar")
+        for s in scopes
+    ),
+    # Required by ``calendarList.list()`` — i.e. the "show me every
+    # calendar Avi can see" UI panel. Independent of read/write
+    # event scopes because Google chose to gate calendar enumeration
+    # behind its own scope. Folded into ``calendar.readonly`` and
+    # the umbrella ``calendar`` scope on legacy connections.
+    can_list_calendars=any(
+        s.endswith("/calendar.calendarlist.readonly")
+        or s.endswith("/calendar.calendarlist")
+        or s.endswith("/calendar.readonly")
+        or s.endswith("/calendar")
+        for s in scopes
+    ),
         email_matches_assistant=matches,
         oauth_configured=oauth_configured,
     )
@@ -347,4 +388,94 @@ def test_upcoming_events(
     return UpcomingEventsResponse(
         granted_email=row.granted_email,
         events=[UpcomingEvent(**e.__dict__) for e in events],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-calendar visibility — the Assistant settings page replaces its single
+# "Can read calendar" yes/no with the actual list of visible calendars and
+# the share level Google grants for each. Lets an admin diagnose the
+# "agent logs say 403 but the reply still went out" symptom in one glance:
+# any calendar with accessRole == 'freeBusyReader' will produce a 403
+# every time the agent tries to enumerate its events (events.list refuses;
+# only freebusy.query works for that share level).
+# ---------------------------------------------------------------------------
+
+
+class VisibleCalendarOut(BaseModel):
+    calendar_id: str
+    summary: str
+    summary_override: Optional[str] = None
+    description: Optional[str] = None
+    primary: bool
+    selected: bool
+    access_role: str  # owner|writer|reader|freeBusyReader|none|unknown
+    background_color: Optional[str] = None
+    foreground_color: Optional[str] = None
+    time_zone: Optional[str] = None
+    can_read_events: bool
+    can_write: bool
+
+
+class VisibleCalendarsResponse(BaseModel):
+    granted_email: str
+    calendars: list[VisibleCalendarOut]
+
+
+def _classify_role(role: str) -> tuple[bool, bool]:
+    """Return ``(can_read_events, can_write)`` from a Google accessRole.
+
+    ``freeBusyReader`` and ``none`` cannot read individual events
+    (events.list returns 403). Only ``owner``/``writer`` can insert.
+    """
+    can_write = role in ("owner", "writer")
+    can_read_events = role in ("owner", "writer", "reader")
+    return can_read_events, can_write
+
+
+@router.get("/test/calendars", response_model=VisibleCalendarsResponse)
+def test_visible_calendars(
+    assistant_id: int = Query(...),
+    db: Session = Depends(get_db),
+) -> VisibleCalendarsResponse:
+    """List every calendar Avi can see + its share level.
+
+    Used by the Assistant settings page to render a per-calendar
+    permissions table instead of a single yes/no badge.
+    """
+    assistant = db.get(models.Assistant, assistant_id)
+    if assistant is None:
+        raise HTTPException(status_code=404, detail="Assistant not found")
+    try:
+        row, creds = oauth_lib.load_credentials(db, assistant_id)
+    except oauth_lib.GoogleNotConnected as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except oauth_lib.GoogleOAuthError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    try:
+        cals = list_visible_calendars(creds)
+    except CalendarError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    out: list[VisibleCalendarOut] = []
+    for c in cals:
+        can_read, can_write = _classify_role(c.access_role)
+        out.append(
+            VisibleCalendarOut(
+                calendar_id=c.calendar_id,
+                summary=c.summary,
+                summary_override=c.summary_override,
+                description=c.description,
+                primary=c.primary,
+                selected=c.selected,
+                access_role=c.access_role,
+                background_color=c.background_color,
+                foreground_color=c.foreground_color,
+                time_zone=c.time_zone,
+                can_read_events=can_read,
+                can_write=can_write,
+            )
+        )
+    return VisibleCalendarsResponse(
+        granted_email=row.granted_email, calendars=out
     )

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import {
   useMutation,
@@ -15,6 +15,7 @@ import {
   CheckCircle2,
   Mail,
   PlugZap,
+  Upload,
   XCircle,
 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
@@ -32,6 +33,8 @@ type GoogleStatus = {
   can_send_email: boolean;
   can_read_inbox: boolean;
   can_read_calendar: boolean;
+  can_write_calendar: boolean;
+  can_list_calendars: boolean;
   email_matches_assistant: boolean | null;
   oauth_configured: boolean;
 };
@@ -44,6 +47,27 @@ type UpcomingEvent = {
   end: string;
   location: string | null;
   organizer_email: string | null;
+};
+
+type VisibleCalendar = {
+  calendar_id: string;
+  summary: string;
+  summary_override: string | null;
+  description: string | null;
+  primary: boolean;
+  selected: boolean;
+  // owner | writer | reader | freeBusyReader | none | unknown
+  access_role: string;
+  background_color: string | null;
+  foreground_color: string | null;
+  time_zone: string | null;
+  can_read_events: boolean;
+  can_write: boolean;
+};
+
+type VisibleCalendarsResponse = {
+  granted_email: string;
+  calendars: VisibleCalendar[];
 };
 
 type AssistantForm = {
@@ -81,6 +105,7 @@ export default function AssistantPage() {
     window.history.replaceState({}, "", url.pathname + url.search);
     qc.invalidateQueries({ queryKey: ["assistants", familyId] });
     qc.invalidateQueries({ queryKey: ["google-status"] });
+    qc.invalidateQueries({ queryKey: ["google-calendars"] });
   }, [familyId, qc, toast]);
 
   return (
@@ -250,6 +275,7 @@ function AssistantEditor({
   onToastErr: (msg: string) => void;
 }) {
   const { register, handleSubmit, reset } = useForm<AssistantForm>();
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     reset({
@@ -272,13 +298,7 @@ function AssistantEditor({
       }),
     onSuccess: (a) => {
       onSaved();
-      if (a.avatar_generation_note) {
-        onToastErr(
-          `Saved ${a.assistant_name}, but avatar generation failed.`
-        );
-      } else {
-        onToastOk(`Saved ${a.assistant_name}.`);
-      }
+      onToastOk(`Saved ${a.assistant_name}.`);
     },
     onError: (err: Error) => onToastErr(err.message),
   });
@@ -299,19 +319,67 @@ function AssistantEditor({
     onError: (err: Error) => onToastErr(err.message),
   });
 
+  const upload = useMutation({
+    mutationFn: (file: File) => {
+      const form = new FormData();
+      form.append("file", file);
+      return api.upload<Assistant>(
+        `/api/assistants/${assistant.assistant_id}/upload-avatar`,
+        form
+      );
+    },
+    onSuccess: (a) => {
+      onSaved();
+      onToastOk(`New avatar uploaded for ${a.assistant_name}.`);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    },
+    onError: (err: Error) => {
+      onToastErr(err.message);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    },
+  });
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div className="card lg:col-span-1 self-start">
         <div className="card-body flex flex-col items-center gap-4">
           <AssistantAvatar assistant={assistant} />
-          <button
-            className="btn-secondary"
-            disabled={regen.isPending}
-            onClick={() => regen.mutate()}
-          >
-            <RefreshCw className={regen.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
-            {regen.isPending ? "Generating…" : "Regenerate avatar"}
-          </button>
+          <p className="text-xs text-muted-foreground text-center -mt-2">
+            Saving the persona never changes the avatar — use the buttons
+            below to swap it.
+          </p>
+          <div className="flex flex-col gap-2 w-full">
+            <button
+              type="button"
+              className="btn-secondary justify-center"
+              disabled={regen.isPending || upload.isPending}
+              onClick={() => regen.mutate()}
+              title="Ask Gemini for a new portrait based on the current name, gender, and visual description."
+            >
+              <RefreshCw className={regen.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+              {regen.isPending ? "Generating…" : "Regenerate with Gemini"}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary justify-center"
+              disabled={regen.isPending || upload.isPending}
+              onClick={() => fileInputRef.current?.click()}
+              title="Upload a PNG, JPEG, WebP, or GIF to use as the avatar instead of an AI-generated image."
+            >
+              <Upload className={upload.isPending ? "h-4 w-4 animate-pulse" : "h-4 w-4"} />
+              {upload.isPending ? "Uploading…" : "Upload image"}
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) upload.mutate(file);
+              }}
+            />
+          </div>
           {assistant.avatar_generation_note && (
             <div className="w-full border border-destructive/30 bg-destructive/5 text-destructive text-xs rounded-md p-3 flex gap-2">
               <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
@@ -372,7 +440,7 @@ function AssistantEditor({
               <Field
                 label="Visual description"
                 htmlFor="visual_description"
-                hint="Saving triggers a new avatar if this or the name/gender change."
+                hint="Used by Regenerate with Gemini. Editing this field will not change the avatar on its own."
               >
                 <textarea
                   id="visual_description"
@@ -438,6 +506,30 @@ function GoogleAccountSection({
     refetchOnWindowFocus: true,
   });
 
+  // Per-calendar visibility + access role. Replaces the old single
+  // "Can read calendar" yes/no with the actual list of calendars Avi
+  // can see and what level of share Google grants on each.
+  // Only fires when we know we're connected to avoid an extra Google
+  // round-trip on every status refresh.
+  const {
+    data: visibleCalendars,
+    isLoading: calendarsLoading,
+    error: calendarsError,
+    refetch: refetchCalendars,
+  } = useQuery<VisibleCalendarsResponse>({
+    queryKey: ["google-calendars", assistant.assistant_id],
+    queryFn: () =>
+      api.get<VisibleCalendarsResponse>(
+        `/api/google/test/calendars?assistant_id=${assistant.assistant_id}`
+      ),
+    // calendarList requires its own scope (calendar.calendarlist.readonly).
+    // Skip the call when the token doesn't carry it — the panel renders
+    // a "reconnect to enable" hint instead of triggering a 403.
+    enabled: !!status?.connected && !!status?.can_list_calendars,
+    refetchOnWindowFocus: false,
+    staleTime: 60_000,
+  });
+
   const disconnect = useMutation({
     mutationFn: () =>
       api.del(`/api/google/credentials?assistant_id=${assistant.assistant_id}`),
@@ -445,6 +537,7 @@ function GoogleAccountSection({
       onToastOk("Google account disconnected.");
       setEvents(null);
       qc.invalidateQueries({ queryKey: ["google-status", assistant.assistant_id] });
+      qc.invalidateQueries({ queryKey: ["google-calendars", assistant.assistant_id] });
     },
     onError: (err: Error) => onToastErr(err.message),
   });
@@ -567,11 +660,32 @@ function GoogleAccountSection({
                 }
               />
               <KV
-                label="Can read calendar"
-                value={status.can_read_calendar ? "yes" : "no"}
+                label="Calendar OAuth scope"
+                value={
+                  status.can_write_calendar
+                    ? "read + write"
+                    : status.can_read_calendar
+                    ? "read only (legacy)"
+                    : "missing"
+                }
                 ok={status.can_read_calendar}
+                hint={
+                  status.can_write_calendar
+                    ? "calendar.events granted — Avi can list events AND add holds. Per-calendar access depends on how each owner shares (see table below)."
+                    : status.can_read_calendar
+                    ? "Legacy calendar.readonly scope: Avi can list events but cannot add holds. Disconnect + reconnect to upgrade to calendar.events."
+                    : "Reconnect Google to grant calendar.events. Until then, Avi can't list events or add holds."
+                }
               />
             </div>
+
+            <CalendarVisibilityPanel
+              status={status}
+              data={visibleCalendars}
+              loading={calendarsLoading}
+              error={calendarsError as Error | null}
+              onRefresh={() => refetchCalendars()}
+            />
 
             <div className="flex flex-wrap gap-2">
               <button
@@ -645,6 +759,250 @@ function GoogleAccountSection({
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// Friendly labels + per-row colour for Google's accessRole values. We
+// also surface the "this share level can't list events" gotcha here
+// because that's the root cause of the 403 warnings the agent logs
+// when it tries to read events on a free/busy-only share.
+function describeAccessRole(role: string): {
+  label: string;
+  tone: "ok" | "warn" | "muted";
+  description: string;
+} {
+  switch (role) {
+    case "owner":
+      return {
+        label: "Owner",
+        tone: "ok",
+        description:
+          "Full read + write. Avi can list events and add holds here.",
+      };
+    case "writer":
+      return {
+        label: "Writer",
+        tone: "ok",
+        description:
+          "Read + write. Avi can list events and add holds here.",
+      };
+    case "reader":
+      return {
+        label: "Read only",
+        tone: "warn",
+        description:
+          "Avi can see event titles, locations, and times but cannot add holds. Re-share with 'Make changes to events' to enable writes.",
+      };
+    case "freeBusyReader":
+      return {
+        label: "Free/busy only",
+        tone: "warn",
+        description:
+          "Avi can only see busy/free intervals — listing individual events returns 403 (Google logs this as a warning). Re-share with 'See all event details' to expose titles, or 'Make changes to events' to also allow writes.",
+      };
+    case "none":
+      return {
+        label: "No access",
+        tone: "warn",
+        description:
+          "The calendar is in Avi's list but has no read access at all. Ask the owner to re-share.",
+      };
+    default:
+      return {
+        label: role || "unknown",
+        tone: "muted",
+        description: "Unrecognised access level — check Google Calendar settings.",
+      };
+  }
+}
+
+function CalendarVisibilityPanel({
+  status,
+  data,
+  loading,
+  error,
+  onRefresh,
+}: {
+  status: GoogleStatus;
+  data: VisibleCalendarsResponse | undefined;
+  loading: boolean;
+  error: Error | null;
+  onRefresh: () => void;
+}) {
+  if (!status.can_read_calendar) {
+    // Without any calendar scope we can't even hit calendarList.
+    return null;
+  }
+
+  return (
+    <div className="border border-border rounded-md">
+      <div className="flex items-center justify-between px-3 py-2 bg-muted/30 border-b border-border">
+        <div className="text-sm font-medium flex items-center gap-2">
+          <CalendarDays className="h-4 w-4 text-muted-foreground" />
+          Visible calendars + permission level
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={loading || !status.can_list_calendars}
+          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground disabled:opacity-60"
+          title="Re-query Google for the calendar list."
+        >
+          <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
+          Refresh
+        </button>
+      </div>
+
+      {!status.can_list_calendars && (
+        <div className="px-3 py-3 text-sm flex items-start gap-2 text-amber-800 dark:text-amber-200 bg-amber-50/40 dark:bg-amber-950/10">
+          <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+          <div>
+            <div className="font-medium mb-1">
+              Calendar list scope not granted
+            </div>
+            <div>
+              Avi can read events and add holds on calendars whose ids
+              we already know (which is why messages and event creation
+              still work), but Google requires a separate scope to{" "}
+              <span className="font-mono">enumerate</span> every
+              calendar shared with this account. Click <strong>
+                Reconnect
+              </strong> above to grant{" "}
+              <span className="font-mono">
+                calendar.calendarlist.readonly
+              </span>{" "}
+              and this panel will populate.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {status.can_list_calendars && loading && !data && (
+        <div className="px-3 py-3 text-sm text-muted-foreground">
+          Querying Google for visible calendars…
+        </div>
+      )}
+
+      {error && (
+        <div className="px-3 py-3 text-sm text-destructive">
+          Could not load calendar list: {error.message}
+        </div>
+      )}
+
+      {data && data.calendars.length === 0 && (
+        <div className="px-3 py-3 text-sm text-muted-foreground">
+          No calendars are visible to {data.granted_email}. Ask family
+          members to share their calendars with this account from
+          Google Calendar → Settings → Share with specific people.
+        </div>
+      )}
+
+      {data && data.calendars.length > 0 && (
+        <>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-muted/20 text-muted-foreground">
+                <tr>
+                  <th className="text-left px-3 py-2 font-medium">Calendar</th>
+                  <th className="text-left px-3 py-2 font-medium">Calendar id</th>
+                  <th className="text-left px-3 py-2 font-medium">Access</th>
+                  <th className="text-left px-3 py-2 font-medium whitespace-nowrap">
+                    List events
+                  </th>
+                  <th className="text-left px-3 py-2 font-medium whitespace-nowrap">
+                    Add holds
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.calendars.map((c) => {
+                  const role = describeAccessRole(c.access_role);
+                  const displayName = c.summary_override || c.summary;
+                  return (
+                    <tr key={c.calendar_id} className="border-t border-border">
+                      <td className="px-3 py-2 align-top">
+                        <div className="flex items-center gap-2">
+                          {c.background_color && (
+                            <span
+                              className="h-3 w-3 rounded-sm shrink-0 border border-border"
+                              style={{ backgroundColor: c.background_color }}
+                            />
+                          )}
+                          <div>
+                            <div className="font-medium">
+                              {displayName}
+                              {c.primary && (
+                                <span className="ml-2 text-[10px] uppercase tracking-wide text-primary">
+                                  primary
+                                </span>
+                              )}
+                            </div>
+                            {c.description && (
+                              <div className="text-xs text-muted-foreground line-clamp-2">
+                                {c.description}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 align-top text-xs text-muted-foreground font-mono break-all max-w-[16rem]">
+                        {c.calendar_id}
+                      </td>
+                      <td className="px-3 py-2 align-top">
+                        <div
+                          className={
+                            role.tone === "ok"
+                              ? "inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-400"
+                              : role.tone === "warn"
+                              ? "inline-flex items-center gap-1 text-amber-700 dark:text-amber-400"
+                              : "inline-flex items-center gap-1 text-muted-foreground"
+                          }
+                          title={role.description}
+                        >
+                          {role.tone === "ok" ? (
+                            <CheckCircle2 className="h-4 w-4" />
+                          ) : role.tone === "warn" ? (
+                            <AlertTriangle className="h-4 w-4" />
+                          ) : null}
+                          <span className="font-medium">{role.label}</span>
+                        </div>
+                        <div className="text-xs text-muted-foreground mt-1 max-w-[28rem]">
+                          {role.description}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 align-top">
+                        {c.can_read_events ? (
+                          <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                        ) : (
+                          <XCircle
+                            className="h-4 w-4 text-amber-600"
+                            aria-label="Cannot list events — produces 403 in agent logs"
+                          />
+                        )}
+                      </td>
+                      <td className="px-3 py-2 align-top">
+                        {c.can_write ? (
+                          <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                        ) : (
+                          <XCircle className="h-4 w-4 text-muted-foreground" />
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="px-3 py-2 border-t border-border bg-muted/20 text-xs text-muted-foreground">
+            403 "insufficientPermissions" warnings in the API logs are
+            expected when Avi's agent tries to list events on a
+            calendar shared with "Free/busy only" — it falls back to
+            free/busy queries and the user reply still goes out. Share
+            the calendar with "See all event details" to silence them.
+          </div>
+        </>
+      )}
     </div>
   );
 }

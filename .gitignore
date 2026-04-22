@@ -35,6 +35,10 @@ ui/react/public/mediapipe/
 resources/family/*
 !resources/family/.gitkeep
 
+# Scratch storage root used by ./scripts/run_tests.sh — keeps the
+# integration suite from ever writing into resources/family/.
+resources/_test_scratch/
+
 # Lazy-downloaded AI model weights (hundreds of MB each — fetched on
 # first use of InsightFace face recognition and Kokoro TTS).
 resources/models/
@@ -54,6 +58,10 @@ resources/models/
 # Runtime state from scripts/start.sh (PID files, logs)
 .run/
 logs/
+
+# Postgres backups produced by scripts/db_backup.sh — contain encrypted
+# secrets and personally-identifying data. Never commit.
+backups/
 
 # OS
 .DS_Store

@@ -51,7 +51,8 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..ai import agent as agent_loop
-from ..ai import authz
+from ..ai import agent_drain, authz
+from ..ai import assistants as _assistants
 from ..ai import ollama, prompts, rag, schema_catalog
 from ..ai import tools as agent_tools
 from ..config import get_settings
@@ -342,59 +343,42 @@ def _drain_agent(
 ) -> str:
     """Drive the async agent generator from a sync worker thread.
 
-    Mirrors :func:`api.services.email_inbox._run_agent_to_completion`
-    but injects the dedicated thinking model + ``think=True`` so
-    monitoring runs benefit from extended reasoning.
+    Thin wrapper over :func:`api.ai.agent_drain.drain_agent_sync`
+    that injects the dedicated thinking model + ``think=True`` and
+    a larger ``max_steps`` budget so monitoring runs (search →
+    synthesise → attach links → comment → finalise) have room to
+    breathe. Re-raises on agent failure so the failure surfaces on
+    the task row instead of being papered over with a fallback
+    apology like the chat surfaces do.
     """
     settings = get_settings()
     registry = agent_tools.build_default_registry()
     with _session() as db:
         capabilities = agent_tools.detect_capabilities(db, assistant_id)
 
-    model_override = _thinking_model()
-    think_flag: Optional[bool] = (
-        True if settings.AI_OLLAMA_THINKING_ENABLED else None
+    extra: dict[str, object] = {
+        "model_override": _thinking_model(),
+        "max_steps": settings.AI_MONITORING_MAX_STEPS,
+    }
+    if settings.AI_OLLAMA_THINKING_ENABLED:
+        extra["think"] = True
+
+    result = agent_drain.drain_agent_sync(
+        task_id=agent_task_id,
+        family_id=family_id,
+        assistant_id=assistant_id,
+        person_id=person_id,
+        system_prompt=system_prompt,
+        history=[],
+        user_message=user_message,
+        registry=registry,
+        capabilities=capabilities,
+        extra_run_kwargs=extra,
     )
 
-    final_text = ""
-    error_text: Optional[str] = None
-
-    async def _drain() -> None:
-        nonlocal final_text, error_text
-        async for event in agent_loop.run_agent(
-            task_id=agent_task_id,
-            family_id=family_id,
-            assistant_id=assistant_id,
-            person_id=person_id,
-            system_prompt=system_prompt,
-            history=[],
-            user_message=user_message,
-            registry=registry,
-            capabilities=capabilities,
-            model_override=model_override,
-            think=think_flag,
-            # Monitoring runs need more steps than a chat turn —
-            # search → synthesis → attach links → write comment →
-            # finalize easily exceeds the 5-step chat default.
-            max_steps=settings.AI_MONITORING_MAX_STEPS,
-        ):
-            if event.type == "task_completed":
-                final_text = (event.payload.get("summary") or "").strip()
-            elif event.type == "task_failed":
-                error_text = str(event.payload.get("error") or "Agent failed.")
-
-    try:
-        asyncio.run(_drain())
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_drain())
-        finally:
-            loop.close()
-
-    if error_text and not final_text:
-        raise RuntimeError(error_text)
-    return final_text
+    if result.error_text and not result.final_text:
+        raise RuntimeError(result.error_text)
+    return result.final_text
 
 
 def _build_user_message(
@@ -511,13 +495,7 @@ def _session() -> Session:
     return SessionLocal()
 
 
-def _assistant_id_for_family(db: Session, family_id: int) -> Optional[int]:
-    row = db.execute(
-        select(models.Assistant.assistant_id)
-        .where(models.Assistant.family_id == family_id)
-        .limit(1)
-    ).scalar_one_or_none()
-    return row
+_assistant_id_for_family = _assistants.assistant_id_for_family
 
 
 def _resolve_family_timezone(db: Session, family_id: int) -> str:

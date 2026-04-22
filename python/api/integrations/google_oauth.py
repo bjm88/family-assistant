@@ -104,6 +104,18 @@ DEFAULT_SCOPES: tuple[str, ...] = (
     # AI Assistant settings page to gain the write capability;
     # see the module docstring for why.
     "https://www.googleapis.com/auth/calendar.events",
+    # calendar.events is intentionally narrow: it grants per-event
+    # access on calendars whose ids we already know, but it does NOT
+    # authorise the ``calendarList.list()`` endpoint Google uses to
+    # *enumerate* every calendar the user has access to. Without this
+    # extra scope the agent's existing tools still work (they always
+    # pass an explicit calendar id from the DB), but the Assistant
+    # settings page's "Visible calendars + permission level" panel
+    # 403s with "insufficient authentication scopes". This scope is
+    # read-only and trivial — Google's consent screen folds it into
+    # the same "View your calendars" line so the user doesn't see an
+    # extra checkbox.
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
 )
 
 

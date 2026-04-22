@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -50,3 +51,5 @@ class AddressRead(OrmModel):
     country: str
     is_primary_residence: bool
     notes: Optional[str]
+    created_at: datetime
+    updated_at: datetime

@@ -132,7 +132,6 @@ def can_see_calendar_details(
     *,
     requestor_person_id: Optional[int],
     subject_person_id: int,
-    family_id: Optional[int] = None,
 ) -> AccessDecision:
     """Decide whether ``requestor`` may see ``subject``'s calendar EVENT detail.
 
@@ -208,13 +207,13 @@ def can_access_sensitive(
     *,
     requestor_person_id: Optional[int],
     subject_person_id: int,
-    family_id: Optional[int] = None,
 ) -> AccessDecision:
     """Decide whether ``requestor`` may see ``subject``'s sensitive data.
 
-    ``family_id`` is optional but recommended — when supplied we also
-    enforce that subject and requestor belong to the same family so a
-    bug elsewhere can't accidentally leak between households.
+    Cross-family access is refused as a belt-and-suspenders check
+    (see ``cross_family`` branch below): even if a relationship row
+    somehow links two people in different families, this function
+    denies. Privacy is per-household.
     """
     # Anonymous speaker — face/email lookup didn't identify anyone.
     if requestor_person_id is None:

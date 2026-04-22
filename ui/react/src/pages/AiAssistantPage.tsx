@@ -20,6 +20,7 @@ import {
   Mail,
   Mic,
   MicOff,
+  RefreshCw,
   Search,
   Send,
   SkipForward,
@@ -163,6 +164,17 @@ const GREETING_SUPPRESSION_MS = 90_000;
 // is comfortably longer than typical engine lookback (~300-500 ms)
 // without feeling laggy in conversation.
 const ECHO_GRACE_MS = 700;
+
+// End-of-utterance grace window. The browser's SpeechRecognition flips
+// `isFinal` after ~700-1000 ms of trailing silence — fast enough to feel
+// snappy in dictation, but too aggressive for natural conversation where
+// people pause mid-sentence to think. We wait an additional
+// SUBMIT_DEBOUNCE_MS after the *last* final or interim result before
+// actually sending; any new audio (interim OR final) cancels and restarts
+// the timer. Net effect: a continuous talker submits ~1.8 s after they
+// genuinely stop, while back-to-back final chunks accumulate into one
+// message instead of firing N separate sends.
+const SUBMIT_DEBOUNCE_MS = 1800;
 
 // -------------------------------------------------------------------------
 // Audio queue — plays Kokoro WAV clips one after another without overlap.
@@ -724,6 +736,7 @@ export default function AiAssistantPage() {
               llm={llmStatus}
               face={faceStatus}
               tts={ttsStatus}
+              familyId={familyId}
             />
           </div>
         </div>
@@ -1126,11 +1139,39 @@ function StatusBadges({
   llm,
   face,
   tts,
+  familyId,
 }: {
   llm: LlmStatus | undefined;
   face: FaceStatus | undefined;
   tts: TtsStatus | undefined;
+  familyId: number;
 }) {
+  const qc = useQueryClient();
+  const { ok: toastOk, err: toastErr } = useToast();
+  // Recompute every face_embedding row from the family's recognition-flagged
+  // person_photos. Cheap on a warm InsightFace worker (~100–300 ms / photo)
+  // but the very first call can take 5–15 s while the model compiles its
+  // ONNX graph. Useful after disaster-recovery rebuilds (where photos are
+  // restored from the filesystem but embeddings are lost) or whenever a
+  // person's reference photos changed enough to affect matching.
+  const enroll = useMutation({
+    mutationFn: () =>
+      api.post<{
+        enrolled: number;
+        skipped_unchanged: number;
+        skipped_no_face: number;
+        errors: number;
+      }>(`/api/aiassistant/face/enroll?family_id=${familyId}`, {}),
+    onSuccess: (r) => {
+      const parts = [`${r.enrolled} embedded`];
+      if (r.skipped_unchanged) parts.push(`${r.skipped_unchanged} unchanged`);
+      if (r.skipped_no_face) parts.push(`${r.skipped_no_face} no face`);
+      if (r.errors) parts.push(`${r.errors} errors`);
+      toastOk(`Face enrollment: ${parts.join(", ")}.`);
+      qc.invalidateQueries({ queryKey: ["ai-face-status", familyId] });
+    },
+    onError: (e: Error) => toastErr(e.message),
+  });
   return (
     <div className="flex items-center gap-2">
       <Badge
@@ -1173,6 +1214,18 @@ function StatusBadges({
             : `Providers: ${face.providers.join(", ")}. Threshold: ${face.threshold}.`
         }
       />
+      <button
+        type="button"
+        onClick={() => enroll.mutate()}
+        disabled={enroll.isPending || !Number.isFinite(familyId)}
+        className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-60"
+        title="Re-extract face embeddings for every recognition-flagged photo. Run this after restoring data from a backup or after adding/swapping reference photos."
+      >
+        <RefreshCw
+          className={cn("h-3 w-3", enroll.isPending && "animate-spin")}
+        />
+        {enroll.isPending ? "Enrolling…" : "Re-enroll"}
+      </button>
       <Badge
         ok={
           !!tts?.enabled && !!tts?.model_present && !!tts?.voices_present
@@ -2163,6 +2216,15 @@ function ChatPanel({
     // so we concatenate until the user pauses *and* Avi isn't
     // speaking — only then do we submit and clear.
     let pendingFinal = "";
+    // Debounced auto-submit: armed when we see an `isFinal`, cancelled
+    // by any subsequent speech (interim or final). See SUBMIT_DEBOUNCE_MS.
+    let submitTimer: number | null = null;
+    const cancelSubmitTimer = () => {
+      if (submitTimer !== null) {
+        clearTimeout(submitTimer);
+        submitTimer = null;
+      }
+    };
     // Backoff bookkeeping for the auto-restart loop.
     let restartTimer: number | null = null;
     let consecutiveErrors = 0;
@@ -2225,6 +2287,7 @@ function ChatPanel({
         audioSpeakingRef.current ||
         Date.now() < wasSpeakingUntilRef.current
       ) {
+        cancelSubmitTimer();
         pendingFinal = "";
         setInput("");
         return;
@@ -2242,18 +2305,33 @@ function ChatPanel({
       }
       // Real transcript made it past the echo gate — the user is
       // talking, so cancel any pending goal-question timer before Avi
-      // tries to talk over them.
+      // tries to talk over them and reset the submit debounce so a
+      // mid-sentence pause never auto-fires.
       if (interim || pendingFinal) {
         cancelPendingFollowup("user speaking");
+        cancelSubmitTimer();
       }
       setInput((pendingFinal + " " + interim).trim());
       if (!sawFinal) return;
       if (isStreamingRef.current) return;
-      const toSend = pendingFinal.trim();
-      if (!toSend) return;
-      pendingFinal = "";
-      setInput("");
-      sendUserMessageRef.current(toSend);
+      // Arm (or re-arm) the debounce. The actual submit fires only
+      // after SUBMIT_DEBOUNCE_MS of true silence — any new audio above
+      // cancels this timer first, so a thinking pause keeps the floor.
+      submitTimer = window.setTimeout(() => {
+        submitTimer = null;
+        if (
+          audioSpeakingRef.current ||
+          Date.now() < wasSpeakingUntilRef.current ||
+          isStreamingRef.current
+        ) {
+          return;
+        }
+        const toSend = pendingFinal.trim();
+        if (!toSend) return;
+        pendingFinal = "";
+        setInput("");
+        sendUserMessageRef.current(toSend);
+      }, SUBMIT_DEBOUNCE_MS);
     };
 
     rec.onerror = (evt: { error?: string }) => {
@@ -2279,8 +2357,15 @@ function ChatPanel({
 
     rec.onend = () => {
       running = false;
-      // Flush any tail still parked from a mid-sentence pause before
-      // the engine ended (rare but possible on an engine-side timeout).
+      // Engine timed out (Chrome ends the recognizer every ~30-60 s in
+      // continuous mode). If a debounce is in flight let it run — the
+      // restart loop below will spin a fresh recognizer in parallel and
+      // the timer will fire on its own clock. Otherwise flush any tail
+      // parked from a mid-sentence pause that never got debounce-armed.
+      if (submitTimer !== null) {
+        scheduleRestart();
+        return;
+      }
       const tail = pendingFinal.trim();
       const inEchoWindow =
         audioSpeakingRef.current ||
@@ -2359,6 +2444,7 @@ function ChatPanel({
         clearTimeout(restartTimer);
         restartTimer = null;
       }
+      cancelSubmitTimer();
       try {
         rec.onend = null;
         rec.stop();

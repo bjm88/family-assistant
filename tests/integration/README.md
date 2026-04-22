@@ -25,10 +25,21 @@ pre-commit hook, no scheduled run. Tests fire only when a developer
 asks for them, via either:
 
 ```sh
-make test-integration                  # canonical entry point
-uv run pytest tests/integration        # equivalent
-pytest                                 # also works (pytest auto-discovers `tests/`)
+./scripts/run_tests.sh                 # canonical entry point — safest
+make test                              # same thing, via Make
+make test-integration                  # verbose flavour
+uv run pytest tests/integration        # works but bypasses run_tests.sh's safety locks
 ```
+
+**Always prefer `./scripts/run_tests.sh`.** It hard-codes
+`FA_DB_NAME=family_assistant_test`, scrubs any colliding value out of
+your shell, points `FA_STORAGE_ROOT` at a scratch directory, and
+refuses to run if the test DB name would resolve to the live DB. The
+conftest does its own "name must contain 'test'" guard as a final
+belt-and-braces, so even bare `pytest` can't reach the live DB —
+but the script gives you a clear pre-flight summary and additional
+defenses you don't get from invoking pytest directly. See the
+script's header for the full safety rationale.
 
 Pytest's auto-discovery does pick up the `tests/` directory if you
 just run `pytest` from the repo root — that's fine and intentional.
@@ -56,15 +67,19 @@ make install-test
 ## Running
 
 ```sh
-make test-integration         # verbose, full output
-make test-integration-fast    # summary only
+./scripts/run_tests.sh                  # full suite (recommended)
+./scripts/run_tests.sh -v               # verbose
+make test-integration                   # same as -v, via Make
+make test-integration-fast              # summary only
 ```
 
-You can scope to one file or one test the usual pytest way:
+You can scope to one file or one test by passing extra args through
+to pytest — the script forwards everything after the script name:
 
 ```sh
-uv run pytest tests/integration/test_inbound_channels.py -v
-uv run pytest tests/integration/test_inbound_channels.py::test_whatsapp_inbound_routes_to_agent -v
+./scripts/run_tests.sh tests/integration/test_inbound_channels.py -v
+./scripts/run_tests.sh tests/integration/test_inbound_channels.py::test_whatsapp_inbound_routes_to_agent -v
+./scripts/run_tests.sh -k whatsapp
 ```
 
 ## What's covered

@@ -96,8 +96,10 @@ export default function FamilyDashboard() {
               <FamilyTreeView
                 people={people}
                 edges={edges ?? []}
-                onSelect={() =>
-                  navigate(`/admin/families/${familyId}/relationships`)
+                onSelect={(personId) =>
+                  navigate(
+                    `/admin/families/${familyId}/relationships?focus=${personId}`
+                  )
                 }
               />
             )}

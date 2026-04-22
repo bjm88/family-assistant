@@ -1,10 +1,26 @@
-"""Assistant persona endpoints + Gemini-backed avatar generation.
+"""Assistant persona endpoints + avatar management.
 
-On create, update (of any prompt-shaping field), and explicit regenerate,
-the server asks Gemini for a fresh avatar image. Generation is
-best-effort: if Gemini is unavailable or returns an error, the assistant
-row is still saved and ``avatar_generation_note`` is populated so the UI
-can surface the reason.
+Avatar lifecycle, post-fix:
+
+* **Create** — Gemini generates the initial avatar only if the new
+  assistant has no ``profile_image_path`` (which is always the case
+  for a fresh row). This preserves the "give them a face on first
+  save" ergonomics.
+* **Update** — saves NEVER touch the avatar, even if the prompt-shaping
+  fields (name / gender / visual_description) change. Editing copy
+  shouldn't silently burn a Gemini quota or replace an avatar the
+  user is happy with.
+* **Explicit regenerate** — ``POST /{id}/regenerate-avatar`` asks
+  Gemini for a fresh image using the current persona fields. This is
+  the only way to *generate* after the initial creation.
+* **Upload** — ``POST /{id}/upload-avatar`` lets the user supply
+  their own image (any common bitmap; we don't transcode). Useful
+  when Gemini is offline, when they have a mascot they prefer, or
+  when they want a photo instead of an illustration.
+
+All Gemini calls remain best-effort: on failure the assistant row is
+still saved and ``avatar_generation_note`` is populated so the UI can
+surface the reason.
 """
 
 from __future__ import annotations
@@ -14,7 +30,15 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -120,7 +144,17 @@ def _to_read_dict(assistant: models.Assistant) -> Dict[str, Any]:
     }
 
 
-PROMPT_FIELDS = {"assistant_name", "gender", "visual_description"}
+# Mime types we accept for user-uploaded avatars. Kept narrow on
+# purpose — the avatar is rendered into a fixed 200px square slot
+# in the React UI, so animated/large/exotic formats add no value
+# and the matching extension list keeps the on-disk filename sane.
+_ALLOWED_AVATAR_MIMES: Dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
 
 
 def _build_avatar_prompt(a: models.Assistant) -> str:
@@ -242,8 +276,13 @@ def create_assistant(
             detail="This family already has an assistant.",
         ) from exc
 
-    _generate_avatar_best_effort(assistant)
-    db.flush()
+    # First-save courtesy: give the new assistant a face. Any later
+    # avatar work goes through the explicit regenerate / upload
+    # endpoints so editing the persona never silently spends Gemini
+    # quota or overwrites an avatar the user already likes.
+    if not assistant.profile_image_path:
+        _generate_avatar_best_effort(assistant)
+        db.flush()
     db.refresh(assistant)
     return _to_read_dict(assistant)
 
@@ -259,12 +298,17 @@ def update_assistant(
         raise HTTPException(status_code=404, detail="Assistant not found")
 
     changes = payload.model_dump(exclude_unset=True)
-    prompt_fields_changed = bool(PROMPT_FIELDS & set(changes.keys()))
     for field, value in changes.items():
         setattr(assistant, field, value)
     db.flush()
 
-    if prompt_fields_changed:
+    # Backstop for assistants whose first-save avatar generation failed:
+    # if an admin edits the persona later and there's still no avatar on
+    # disk, take that as an implicit "please try again" and call Gemini.
+    # The case is uncommon (Gemini was down at create time AND the user
+    # never hit Regenerate) but the recovery is free — without an
+    # existing image there is nothing to overwrite.
+    if not assistant.profile_image_path:
         _generate_avatar_best_effort(assistant)
         db.flush()
 
@@ -285,6 +329,61 @@ def regenerate_avatar(
     # a mouth in a completely different place.
     _invalidate_landmarks(assistant.profile_image_path)
     _generate_avatar_best_effort(assistant)
+    db.flush()
+    db.refresh(assistant)
+    return _to_read_dict(assistant)
+
+
+@router.post(
+    "/{assistant_id}/upload-avatar", response_model=schemas.AssistantRead
+)
+def upload_avatar(
+    assistant_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Replace the assistant's avatar with a user-supplied image.
+
+    Useful when Gemini is unavailable, when the family has a custom
+    mascot, or when they prefer a photo over an AI illustration. We
+    accept the common bitmap mimes only (see ``_ALLOWED_AVATAR_MIMES``)
+    and store the bytes verbatim — no transcoding, no resizing — so
+    what the user uploads is exactly what Avi wears.
+    """
+    assistant = db.get(models.Assistant, assistant_id)
+    if assistant is None:
+        raise HTTPException(status_code=404, detail="Assistant not found")
+
+    mime = (file.content_type or "").lower()
+    extension = _ALLOWED_AVATAR_MIMES.get(mime)
+    if extension is None:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "Avatar must be a PNG, JPEG, WebP, or GIF image "
+                f"(got {file.content_type or 'unknown'})."
+            ),
+        )
+
+    image_bytes = file.file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    rel_path, _ = storage.save_assistant_avatar(
+        assistant.family_id, image_bytes, extension
+    )
+
+    previous = assistant.profile_image_path
+    assistant.profile_image_path = rel_path
+    # An uploaded image clears any prior generation-failure note —
+    # there is nothing to retry, the user took matters into their
+    # own hands.
+    assistant.avatar_generation_note = None
+    if previous and previous != rel_path:
+        storage.delete_if_exists(previous)
+        _invalidate_landmarks(previous)
+    _invalidate_landmarks(rel_path)
+
     db.flush()
     db.refresh(assistant)
     return _to_read_dict(assistant)

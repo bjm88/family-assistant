@@ -57,16 +57,16 @@ from typing import List, Optional, Tuple
 from datetime import timedelta
 
 from sqlalchemy import or_, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 
-from .. import models, storage
+from .. import models
 from ..ai import agent as agent_loop
-from ..ai import authz
+from ..ai import agent_drain
+from ..ai import assistants as _assistants
 from ..ai import fast_ack
-from ..ai import ollama, prompts, rag, schema_catalog
+from ..ai import ollama
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
 from ..ai import web_search_shortcut
@@ -74,7 +74,7 @@ from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import telegram, twilio_sms
 from ..utils.phone import normalize_phone
-from . import background_agent
+from . import background_agent, inbound_prompts, telegram_persistence
 
 
 logger = logging.getLogger(__name__)
@@ -458,20 +458,11 @@ def process_inbound_update(
     # turns where the answer arrives well inside the ack threshold
     # anyway. We pass the RAW body — the formatted "[Telegram from
     # X]" wrapper is a hint for the heavy agent, not signal for the
-    # classifier.
-    shortcut_text: Optional[str] = None
-    try:
-        shortcut_text = web_search_shortcut.try_shortcut_sync(
-            (inbound.body or "").strip()
-        )
-    except Exception:  # noqa: BLE001 - shortcut must never break the inbound
-        logger.exception(
-            "Telegram inbox: web-search shortcut crashed for "
-            "update_id=%s — falling through to heavy agent",
-            inbound.update_id,
-        )
-        shortcut_text = None
-
+    # classifier. ``try_shortcut_sync`` itself is total — every
+    # failure mode returns ``None`` so we just check the return.
+    shortcut_text = web_search_shortcut.try_shortcut_sync(
+        (inbound.body or "").strip()
+    )
     if shortcut_text:
         logger.info(
             "Telegram inbox: web-search shortcut handled "
@@ -2100,179 +2091,16 @@ def _mask_phone_for_display(phone: str) -> str:
     return f"+{'*' * (len(digits) - 4)}{digits[-4:]}"
 
 
-def _already_processed(db: Session, telegram_update_id: int) -> bool:
-    return (
-        db.execute(
-            select(models.TelegramInboxMessage.telegram_inbox_message_id)
-            .where(
-                models.TelegramInboxMessage.telegram_update_id
-                == telegram_update_id
-            )
-            .limit(1)
-        ).scalar_one_or_none()
-        is not None
-    )
-
-
-def _lookup_family_member_by_telegram(
-    db: Session,
-    *,
-    user_id: Optional[int],
-    username: Optional[str],
-) -> Optional[models.Person]:
-    """Find the unique person whose Telegram identity matches.
-
-    Prefers ``telegram_user_id`` (stable, never re-assigned) and falls
-    back to ``telegram_username`` (case-insensitive, mutable). If both
-    are present we OR them in one query so a person who changed their
-    @handle but kept the same id still resolves cleanly.
-    """
-    if user_id is None and not username:
-        return None
-
-    clauses = []
-    if user_id is not None:
-        clauses.append(models.Person.telegram_user_id == user_id)
-    if username:
-        clauses.append(
-            models.Person.telegram_username.ilike(username)
-        )
-
-    return db.execute(
-        select(models.Person).where(or_(*clauses)).limit(1)
-    ).scalar_one_or_none()
-
-
-def _save_audit(db: Session, **kwargs) -> models.TelegramInboxMessage:
-    """Insert (or, on dedup, fetch) the telegram_inbox_messages row."""
-    row = models.TelegramInboxMessage(**kwargs)
-    db.add(row)
-    try:
-        db.commit()
-        db.refresh(row)
-        return row
-    except IntegrityError:
-        db.rollback()
-        existing = db.execute(
-            select(models.TelegramInboxMessage)
-            .where(
-                models.TelegramInboxMessage.telegram_update_id
-                == kwargs["telegram_update_id"]
-            )
-            .limit(1)
-        ).scalar_one()
-        return existing
-
-
-def _persist_attachments(
-    db: Session,
-    audit: models.TelegramInboxMessage,
-    inbound: telegram.InboundTelegramMessage,
-) -> List[dict]:
-    """Download every Telegram media file and write attachment rows.
-
-    Returns a list of ``{media_index, kind, mime_type, stored_path,
-    file_size_bytes}`` dicts so the caller can mention them in the
-    transcript meta. Failures on one media file don't block the
-    others — we log and keep going so a transient Bot API hiccup
-    doesn't drop the whole reply.
-    """
-    if not inbound.attachments or audit.family_id is None:
-        return []
-    settings = get_settings()
-    bot_token = settings.TELEGRAM_BOT_TOKEN or ""
-    out: List[dict] = []
-    for ref in inbound.attachments:
-        try:
-            blob = telegram.download_file(
-                bot_token=bot_token,
-                file_id=ref.file_id,
-                hint_mime=ref.mime_type,
-            )
-        except telegram.TelegramReadError as exc:
-            logger.warning(
-                "Telegram inbox: failed to fetch %s file_id=%s for update_id=%s: %s",
-                ref.kind,
-                ref.file_id,
-                inbound.update_id,
-                exc,
-            )
-            continue
-        rel_path, size = storage.save_telegram_attachment(
-            family_id=audit.family_id,
-            telegram_inbox_message_id=audit.telegram_inbox_message_id,
-            file_bytes=blob.file_bytes,
-            extension=telegram.extension_for_mime(blob.mime_type),
-        )
-        att = models.TelegramInboxAttachment(
-            telegram_inbox_message_id=audit.telegram_inbox_message_id,
-            media_index=ref.media_index,
-            kind=ref.kind,
-            telegram_file_id=ref.file_id,
-            mime_type=blob.mime_type,
-            file_size_bytes=size,
-            stored_path=rel_path,
-        )
-        db.add(att)
-        out.append(
-            {
-                "media_index": ref.media_index,
-                "kind": ref.kind,
-                "mime_type": blob.mime_type,
-                "stored_path": rel_path,
-                "file_size_bytes": size,
-            }
-        )
-    if out:
-        db.flush()
-    return out
-
-
-def _format_inbound_for_log(
-    inbound: telegram.InboundTelegramMessage,
-    attachments: List[dict],
-) -> str:
-    """Render an inbound Telegram message so it reads naturally in history."""
-    sender_label = (
-        inbound.sender_display_name
-        or (f"@{inbound.from_username}" if inbound.from_username else None)
-        or (str(inbound.from_user_id) if inbound.from_user_id else "(unknown)")
-    )
-    lines = [
-        f"From: {sender_label}",
-        f"Chat: {inbound.chat_id}",
-        "",
-        inbound.body or "(no text)",
-    ]
-    if attachments:
-        lines.append("")
-        for att in attachments:
-            lines.append(
-                f"[attachment {att['media_index']}: {att['kind']} "
-                f"({att['mime_type']}, {att['file_size_bytes']} bytes)]"
-            )
-    return "\n".join(lines)
-
-
-def _format_user_message_for_agent(
-    inbound: telegram.InboundTelegramMessage, person: models.Person
-) -> str:
-    """Wrap the Telegram message so the agent knows the surface."""
-    name = (
-        person.preferred_name
-        or person.first_name
-        or inbound.sender_display_name
-        or (f"@{inbound.from_username}" if inbound.from_username else "?")
-    )
-    handle_hint = f" @{inbound.from_username}" if inbound.from_username else ""
-    media_hint = ""
-    if inbound.num_media:
-        kinds = ", ".join(a.kind for a in inbound.attachments)
-        media_hint = f" (with {inbound.num_media} attached: {kinds})"
-    return (
-        f"[Telegram message from {name}{handle_hint}{media_hint}]\n\n"
-        f"{(inbound.body or '').strip() or '(no text)'}"
-    )
+# Persistence + formatting helpers live in ``telegram_persistence``;
+# private aliases keep this module's call sites looking the same.
+_already_processed = telegram_persistence.already_processed
+_lookup_family_member_by_telegram = (
+    telegram_persistence.lookup_family_member_by_telegram
+)
+_save_audit = telegram_persistence.save_audit
+_persist_attachments = telegram_persistence.persist_attachments
+_format_inbound_for_log = telegram_persistence.format_inbound_for_log
+_format_user_message_for_agent = telegram_persistence.format_user_message_for_agent
 
 
 def _build_telegram_system_prompt(
@@ -2282,87 +2110,43 @@ def _build_telegram_system_prompt(
     person: models.Person,
     sender_display_name: str,
 ) -> str:
-    """Mirror the SMS system prompt, but tuned for a Telegram reply.
+    """Build the Telegram-flavoured system prompt.
 
-    Differs from the SMS build:
-    * Reply may be longer (Telegram has no per-segment carrier cost)
-      but should still feel like a chat message, not an essay.
-    * Lightweight Markdown is fine in principle but we tell the agent
-      to stick to plain text because we deliberately omit
-      ``parse_mode`` on send to avoid hard-failing on stray ``*``.
+    Uses :func:`inbound_prompts.build_inbound_system_prompt` for the
+    common Avi/RAG/capability scaffolding and only specifies what's
+    Telegram-specific: the surface verb and the trailing "how to
+    reply" block (chat-style, plain text, ``parse_mode`` disabled
+    so stray markup characters don't crash send).
     """
-    family = db.get(models.Family, family_id)
-    assistant_name = (
-        family.assistant.assistant_name if family and family.assistant else "Avi"
-    )
-    family_name = family.family_name if family else None
-
-    rag_block = ""
-    if family is not None:
-        rag_block = rag.build_family_overview(
-            db, family, requestor_person_id=person.person_id
-        )
-    person_block = "Currently chatting with on Telegram:\n" + rag.build_person_context(
-        db, person, requestor_person_id=person.person_id
-    )
-
-    registry = agent_tools.build_default_registry()
-    capabilities = agent_tools.detect_capabilities(
-        db, _assistant_id_for_family(db, family_id)
-    )
-    capabilities_block = agent_tools.describe_capabilities(registry, capabilities)
-
-    parts = [
-        ollama.system_prompt_for_avi(assistant_name, family_name),
-        "--- What you can do ---\n" + capabilities_block,
-    ]
-    house_context = prompts.render_context_blocks()
-    if house_context:
-        parts.append("--- House context ---\n" + house_context)
-    parts.append(
-        authz.render_speaker_scope_block(
-            authz.build_speaker_scope(db, speaker_person_id=person.person_id)
-        )
-    )
-    if rag_block:
-        parts.append("--- Known household context ---\n" + rag_block)
-    parts.append(person_block)
-    parts.append(
-        "--- Database schema you can query ---\n"
-        "You have read-only access to the family Postgres database. "
-        "Sensitive columns are encrypted; use the *_last_four helpers.\n\n"
-        + schema_catalog.dump_text(db)
-    )
     max_chars = get_settings().AI_TELEGRAM_REPLY_MAX_CHARS
-    parts.append(
-        "--- How to reply to this Telegram message ---\n"
-        f"This message arrived via Telegram from {sender_display_name}. "
-        "Your final answer will be sent verbatim as a Telegram reply "
-        "(threaded under the inbound). Therefore:\n"
-        f"* Keep the reply UNDER {max_chars} characters. Telegram allows "
-        "  up to 4096 but most users prefer concise chat-style replies.\n"
-        "* Plain text only. No Markdown, no asterisks, no underscores. "
-        "  We deliberately do NOT enable Telegram's parse_mode so any "
-        "  markup characters would land verbatim instead of styling.\n"
-        "* No subject line, no greeting, no formal sign-off. The "
-        "  recipient knows who you are; jump straight to the answer.\n"
-        "* Use at most one round of tool calls before writing the "
-        "  reply. Telegram is asynchronous — if you need more info, "
-        "  ask the user one specific question and stop.\n"
-        "* NEVER include encrypted identifiers, passwords, or anything "
-        "  ending in _encrypted in the reply body.\n"
+    return inbound_prompts.build_inbound_system_prompt(
+        db,
+        family_id=family_id,
+        person=person,
+        surface_verb="chatting with on Telegram",
+        assistant_id=_assistant_id_for_family(db, family_id),
+        how_to_reply=(
+            "--- How to reply to this Telegram message ---\n"
+            f"This message arrived via Telegram from {sender_display_name}. "
+            "Your final answer will be sent verbatim as a Telegram reply "
+            "(threaded under the inbound). Therefore:\n"
+            f"* Keep the reply UNDER {max_chars} characters. Telegram allows "
+            "  up to 4096 but most users prefer concise chat-style replies.\n"
+            "* Plain text only. No Markdown, no asterisks, no underscores. "
+            "  We deliberately do NOT enable Telegram's parse_mode so any "
+            "  markup characters would land verbatim instead of styling.\n"
+            "* No subject line, no greeting, no formal sign-off. The "
+            "  recipient knows who you are; jump straight to the answer.\n"
+            "* Use at most one round of tool calls before writing the "
+            "  reply. Telegram is asynchronous — if you need more info, "
+            "  ask the user one specific question and stop.\n"
+            "* NEVER include encrypted identifiers, passwords, or anything "
+            "  ending in _encrypted in the reply body.\n"
+        ),
     )
-    return prompts.with_safety("\n\n".join(parts))
 
 
-def _assistant_id_for_family(db: Session, family_id: int) -> Optional[int]:
-    """Best-effort lookup of the assistant row tied to ``family_id``."""
-    row = db.execute(
-        select(models.Assistant.assistant_id)
-        .where(models.Assistant.family_id == family_id)
-        .limit(1)
-    ).scalar_one_or_none()
-    return row
+_assistant_id_for_family = _assistants.assistant_id_for_family
 
 
 def _run_agent_with_fast_ack(
@@ -2538,50 +2322,31 @@ def _run_agent_to_completion(
 ) -> str:
     """Drain the async agent generator and return the final reply text.
 
-    Mirrors ``services.sms_inbox._run_agent_to_completion`` /
-    ``services.email_inbox._run_agent_to_completion`` exactly so all
-    three messaging surfaces share behaviour.
+    Thin wrapper over :func:`api.ai.agent_drain.drain_agent_sync`
+    that adds the Telegram-flavoured fallback copy.
     """
     registry = agent_tools.build_default_registry()
     with SessionLocal() as db_for_caps:
         capabilities = agent_tools.detect_capabilities(db_for_caps, assistant_id)
 
-    final_text = ""
-    error_text: Optional[str] = None
+    result = agent_drain.drain_agent_sync(
+        task_id=task_id,
+        family_id=family_id,
+        assistant_id=assistant_id,
+        person_id=person_id,
+        system_prompt=system_prompt,
+        history=history,
+        user_message=user_message,
+        registry=registry,
+        capabilities=capabilities,
+    )
 
-    async def _drain() -> None:
-        nonlocal final_text, error_text
-        async for event in agent_loop.run_agent(
-            task_id=task_id,
-            family_id=family_id,
-            assistant_id=assistant_id,
-            person_id=person_id,
-            system_prompt=system_prompt,
-            history=history,
-            user_message=user_message,
-            registry=registry,
-            capabilities=capabilities,
-        ):
-            if event.type == "task_completed":
-                final_text = (event.payload.get("summary") or "").strip()
-            elif event.type == "task_failed":
-                error_text = str(event.payload.get("error") or "Agent failed.")
-
-    try:
-        asyncio.run(_drain())
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_drain())
-        finally:
-            loop.close()
-
-    if error_text and not final_text:
+    if result.error_text and not result.final_text:
         return (
             "Sorry — Avi here. I tried but my server hit a snag. "
             "Try again in a bit."
         )
-    return final_text or "Got your message — nothing to add right now."
+    return result.final_text or "Got your message — nothing to add right now."
 
 
 __all__ = [

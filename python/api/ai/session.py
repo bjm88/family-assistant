@@ -131,34 +131,48 @@ def ensure_active_session(
     return session, True
 
 
-def find_or_create_email_session(
+# ---------- per-thread sessions (email / sms / whatsapp / telegram) ---------
+#
+# Inbound messaging surfaces (Gmail, Twilio SMS, Twilio WhatsApp,
+# Telegram) all need the same find-or-create-or-reactivate logic
+# against ``LiveSession`` rows keyed on ``(family_id, source,
+# external_thread_id)``. The single :func:`_find_or_create_thread_session`
+# below is the implementation; the four named helpers are thin
+# wrappers so each call site reads naturally ("…sms_session…") and so
+# the surface-specific ``start_context`` defaults stay close to the
+# format the existing transcripts on disk already use.
+#
+# All four surfaces deliberately skip the ``close_stale_sessions``
+# sweep that the live-page path uses — a back-and-forth that takes a
+# week is still one conversation on these surfaces.
+
+
+def _find_or_create_thread_session(
     db: Session,
     *,
     family_id: int,
+    source: str,
     external_thread_id: str,
-    subject: Optional[str] = None,
+    start_context: str,
 ) -> Tuple[models.LiveSession, bool]:
-    """Return ``(session, created)`` for a Gmail thread.
+    """Common find-or-reactivate-or-create flow for a thread session.
 
-    Looks up the existing email-source session for the thread first
-    (so a multi-message conversation accretes into a single transcript)
-    and creates a new one when none exists. Email threads do NOT
-    auto-close after 30 minutes the way live sessions do — a back and
-    forth that takes a week is still one session — so we skip the idle
-    sweep entirely on this path.
+    Returns ``(session, created)``. If a row already exists for
+    ``(family_id, source, external_thread_id)``, bumps its
+    ``last_activity_at`` and reactivates it (clears ``ended_at`` /
+    ``end_reason``) so a new reply on a previously-ended thread
+    doesn't look orphaned in the history view.
     """
     existing = db.execute(
         select(models.LiveSession)
         .where(models.LiveSession.family_id == family_id)
-        .where(models.LiveSession.source == "email")
+        .where(models.LiveSession.source == source)
         .where(models.LiveSession.external_thread_id == external_thread_id)
         .order_by(models.LiveSession.started_at.desc())
         .limit(1)
     ).scalar_one_or_none()
     if existing is not None:
         existing.last_activity_at = _now()
-        # If the user re-opens an old, ended thread, reactivate it so
-        # the new reply doesn't look orphaned in the history view.
         if existing.ended_at is not None:
             existing.ended_at = None
             existing.end_reason = None
@@ -166,15 +180,32 @@ def find_or_create_email_session(
 
     session = models.LiveSession(
         family_id=family_id,
+        source=source,
+        external_thread_id=external_thread_id,
+        start_context=start_context,
+    )
+    db.add(session)
+    db.flush()
+    return session, True
+
+
+def find_or_create_email_session(
+    db: Session,
+    *,
+    family_id: int,
+    external_thread_id: str,
+    subject: Optional[str] = None,
+) -> Tuple[models.LiveSession, bool]:
+    """Return ``(session, created)`` for a Gmail thread."""
+    return _find_or_create_thread_session(
+        db,
+        family_id=family_id,
         source="email",
         external_thread_id=external_thread_id,
         start_context=(
             f"email_thread:{subject[:80]}" if subject else "email_thread"
         ),
     )
-    db.add(session)
-    db.flush()
-    return session, True
 
 
 def find_or_create_sms_session(
@@ -185,41 +216,18 @@ def find_or_create_sms_session(
 ) -> Tuple[models.LiveSession, bool]:
     """Return ``(session, created)`` for an inbound SMS thread.
 
-    Mirrors :func:`find_or_create_email_session` but keys on the
-    counterparty's E.164 phone number rather than a Gmail thread id.
-    SMS conversations are inherently one-on-one: every text from
-    ``+14155551234`` lands in the same session row + transcript so
-    Avi sees the whole back-and-forth on the next turn rather than
-    starting from scratch.
-
-    Like email threads, SMS sessions deliberately skip the live-page
-    idle sweep — a text exchange that takes a week is still one
-    session.
+    Keys on the counterparty's E.164 phone number. SMS conversations
+    are inherently one-on-one: every text from ``+14155551234`` lands
+    in the same session row + transcript so Avi sees the whole
+    back-and-forth on the next turn rather than starting from scratch.
     """
-    existing = db.execute(
-        select(models.LiveSession)
-        .where(models.LiveSession.family_id == family_id)
-        .where(models.LiveSession.source == "sms")
-        .where(models.LiveSession.external_thread_id == counterparty_phone)
-        .order_by(models.LiveSession.started_at.desc())
-        .limit(1)
-    ).scalar_one_or_none()
-    if existing is not None:
-        existing.last_activity_at = _now()
-        if existing.ended_at is not None:
-            existing.ended_at = None
-            existing.end_reason = None
-        return existing, False
-
-    session = models.LiveSession(
+    return _find_or_create_thread_session(
+        db,
         family_id=family_id,
         source="sms",
         external_thread_id=counterparty_phone,
         start_context=f"sms_thread:{counterparty_phone}",
     )
-    db.add(session)
-    db.flush()
-    return session, True
 
 
 def find_or_create_whatsapp_session(
@@ -230,9 +238,8 @@ def find_or_create_whatsapp_session(
 ) -> Tuple[models.LiveSession, bool]:
     """Return ``(session, created)`` for an inbound WhatsApp thread.
 
-    Mirrors :func:`find_or_create_sms_session` but namespaces the
-    session under ``source='whatsapp'`` so a single household member
-    who reaches Avi on both SMS and WhatsApp gets a separate
+    Namespaced under ``source='whatsapp'`` so a single household
+    member who reaches Avi on both SMS and WhatsApp gets a separate
     transcript per surface — they're distinct conversations with
     different reply-length conventions and different opt-in /
     opt-out semantics, and merging them would confuse the agent
@@ -241,35 +248,14 @@ def find_or_create_whatsapp_session(
     ``counterparty_phone`` is the bare E.164 phone number (no
     ``whatsapp:`` prefix); the prefix is stripped at the inbox
     boundary so this column stays comparable across surfaces.
-
-    Like SMS / email / Telegram threads, WhatsApp sessions skip the
-    live-page idle sweep — a back-and-forth that takes a week is
-    still one session.
     """
-    existing = db.execute(
-        select(models.LiveSession)
-        .where(models.LiveSession.family_id == family_id)
-        .where(models.LiveSession.source == "whatsapp")
-        .where(models.LiveSession.external_thread_id == counterparty_phone)
-        .order_by(models.LiveSession.started_at.desc())
-        .limit(1)
-    ).scalar_one_or_none()
-    if existing is not None:
-        existing.last_activity_at = _now()
-        if existing.ended_at is not None:
-            existing.ended_at = None
-            existing.end_reason = None
-        return existing, False
-
-    session = models.LiveSession(
+    return _find_or_create_thread_session(
+        db,
         family_id=family_id,
         source="whatsapp",
         external_thread_id=counterparty_phone,
         start_context=f"whatsapp_thread:{counterparty_phone}",
     )
-    db.add(session)
-    db.flush()
-    return session, True
 
 
 def find_or_create_telegram_session(
@@ -280,41 +266,19 @@ def find_or_create_telegram_session(
 ) -> Tuple[models.LiveSession, bool]:
     """Return ``(session, created)`` for an inbound Telegram chat.
 
-    Mirrors :func:`find_or_create_sms_session` but keys on the
-    Telegram numeric chat id (stringified to share the
+    Keys on the Telegram numeric chat id (stringified to share the
     ``external_thread_id`` column). For private chats the chat id
     equals the user's id, so every message from one human accretes
     into a single session row + transcript.
-
-    Like email and SMS threads, Telegram sessions deliberately skip
-    the live-page idle sweep — a back-and-forth that takes a week is
-    still one session.
     """
     key = str(chat_id)
-    existing = db.execute(
-        select(models.LiveSession)
-        .where(models.LiveSession.family_id == family_id)
-        .where(models.LiveSession.source == "telegram")
-        .where(models.LiveSession.external_thread_id == key)
-        .order_by(models.LiveSession.started_at.desc())
-        .limit(1)
-    ).scalar_one_or_none()
-    if existing is not None:
-        existing.last_activity_at = _now()
-        if existing.ended_at is not None:
-            existing.ended_at = None
-            existing.end_reason = None
-        return existing, False
-
-    session = models.LiveSession(
+    return _find_or_create_thread_session(
+        db,
         family_id=family_id,
         source="telegram",
         external_thread_id=key,
         start_context=f"telegram_thread:{key}",
     )
-    db.add(session)
-    db.flush()
-    return session, True
 
 
 def touch_session(

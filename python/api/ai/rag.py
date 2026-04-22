@@ -58,7 +58,6 @@ def build_person_context(
             db,
             requestor_person_id=requestor_person_id,
             subject_person_id=person.person_id,
-            family_id=person.family_id,
         ).allowed
 
     lines: List[str] = []
@@ -301,7 +300,6 @@ def build_family_overview(
                 db,
                 requestor_person_id=requestor_person_id,
                 subject_person_id=p.person_id,
-                family_id=family.family_id,
             )
             if decision.allowed:
                 accessible_subject_ids.add(p.person_id)

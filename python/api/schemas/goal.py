@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -36,3 +36,5 @@ class GoalRead(OrmModel):
     description: Optional[str]
     start_date: Optional[date]
     priority: GoalPriority
+    created_at: datetime
+    updated_at: datetime

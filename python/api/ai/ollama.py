@@ -34,6 +34,19 @@ class OllamaUnavailable(OllamaError):
     """Daemon isn't listening or the requested model isn't pulled."""
 
 
+class OllamaTimeout(OllamaError):
+    """Raised when the LLM doesn't respond within the per-call budget.
+
+    Subclasses :class:`OllamaError` so generic ``except OllamaError``
+    blocks (e.g. fast-ack) keep catching it, but is split out so the
+    agent loop can recognise *transient* read-timeouts and retry once
+    before failing the whole task. A naked ``httpx.ReadTimeout`` used
+    to escape :func:`chat_with_tools` and crash the agent loop with a
+    confusing httpcore stack trace; this typed exception lets the
+    loop emit a clean error step + auto-retry.
+    """
+
+
 def _base() -> str:
     return get_settings().AI_OLLAMA_HOST.rstrip("/")
 
@@ -396,12 +409,28 @@ async def chat_with_tools(
     if think is not None:
         payload["think"] = bool(think)
 
+    # Structured timeout: connect fast (Ollama is on localhost so anything
+    # >5 s usually means the daemon is dead), but allow the full per-turn
+    # budget for read/write since the actual inference is the slow part.
+    # Without an explicit ``connect`` cap a stuck DNS/TCP would burn the
+    # whole 90 s before failing.
+    request_timeout = httpx.Timeout(
+        connect=10.0, read=timeout_seconds, write=timeout_seconds, pool=5.0
+    )
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=request_timeout) as client:
             r = await client.post(f"{_base()}/api/chat", json=payload)
     except httpx.ConnectError as e:
         raise OllamaUnavailable(
             f"Ollama at {_base()} is not responding: {e}"
+        ) from e
+    except httpx.TimeoutException as e:
+        # Read/write timeout — the daemon accepted the request but the
+        # response stalled. Surface as a typed exception so the agent
+        # loop can retry once before failing the whole task.
+        raise OllamaTimeout(
+            f"Ollama {target_model!r} did not respond within "
+            f"{timeout_seconds:.0f}s ({type(e).__name__})."
         ) from e
 
     if r.status_code == 404:
@@ -576,6 +605,7 @@ def sync_health() -> Dict[str, object]:
 __all__ = [
     "ChatWithToolsResult",
     "OllamaError",
+    "OllamaTimeout",
     "OllamaUnavailable",
     "ToolCall",
     "chat_stream",

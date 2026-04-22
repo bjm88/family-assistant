@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, EmailStr, Field
@@ -35,3 +36,5 @@ class JobRead(OrmModel):
     role_title: Optional[str]
     work_email: Optional[str]
     description: Optional[str]
+    created_at: datetime
+    updated_at: datetime
