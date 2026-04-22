@@ -7,6 +7,7 @@ import type { Family } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 
 interface Form {
   family_name: string;
@@ -18,6 +19,7 @@ export default function FamilySettings() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const { data: family } = useQuery<Family>({
     queryKey: ["family", familyId],
     queryFn: () => api.get<Family>(`/api/families/${familyId}`),
@@ -104,13 +106,18 @@ export default function FamilySettings() {
           <button
             className="btn-destructive"
             disabled={del.isPending}
-            onClick={() => {
+            onClick={async () => {
               if (
-                confirm(
-                  "Delete this family and all its people, vehicles, policies, accounts, and documents?"
-                )
-              )
+                await confirm({
+                  title: `Delete ${family?.family_name ?? "this family"}?`,
+                  message:
+                    "Every person, pet, vehicle, residence, policy, account, document, task, and message in this family will be permanently deleted. This cannot be undone.",
+                  destructive: true,
+                  confirmLabel: "Delete family",
+                })
+              ) {
                 del.mutate();
+              }
             }}
           >
             Delete family

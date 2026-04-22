@@ -21,7 +21,7 @@ import type {
 } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
 import { FamilyTreeView } from "@/components/FamilyTreeView";
-import { AssistantAvatar } from "@/pages/AssistantPage";
+import { AssistantAvatar } from "@/components/AssistantAvatar";
 
 export default function FamilyDashboard() {
   const { familyId } = useParams();
@@ -55,6 +55,12 @@ export default function FamilyDashboard() {
   const dailyDrivers = (vehicles ?? []).filter(
     (v) => v.vehicle_type === "car" || v.vehicle_type === "truck"
   );
+  // Cache-key convention: ``PetsPage`` and ``ResidencesPage`` both
+  // normalize to ``Number(familyIdParam)`` (and document why in their
+  // own comments). Match that here or invalidations from those pages
+  // won't refresh the dashboard cards. The other dashboard queries
+  // above use raw ``familyId`` because their counterpart pages also
+  // use raw — the convention is per-resource, not app-wide.
   const { data: pets } = useQuery<Pet[]>({
     queryKey: ["pets", Number(familyId)],
     queryFn: () => api.get<Pet[]>(`/api/pets?family_id=${familyId}`),

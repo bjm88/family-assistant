@@ -141,6 +141,16 @@ const STATUS_OPTIONS: TaskStatus[] = [
   "done",
 ];
 
+// Single source of truth for the React Query cache key used by every
+// task list, mutation, and invalidation in this file (TasksPage,
+// MonitoringList, TaskDetailModal). Coercing through ``String(...)``
+// matters: ``familyId`` from ``useParams()`` is already a string in
+// the router, but accepting ``string | number | undefined`` lets
+// callers in other modules pass the raw param without ceremony.
+function tasksQueryKey(familyId: string | number | undefined) {
+  return ["tasks", String(familyId ?? "")] as const;
+}
+
 function formatPriority(p: TaskPriority): string {
   return PRIORITY_META[p].label;
 }
@@ -261,7 +271,7 @@ export default function TasksPage() {
     [people],
   );
 
-  const tasksKey = ["tasks", familyId] as const;
+  const tasksKey = tasksQueryKey(familyId);
   const { data: tasks, isLoading } = useQuery<Task[]>({
     queryKey: tasksKey,
     queryFn: () => api.get<Task[]>(`/api/tasks?family_id=${familyId}`),
@@ -337,7 +347,7 @@ export default function TasksPage() {
     },
     onError: (err: Error, _vars, ctx) => {
       if (ctx?.previous) qc.setQueryData(tasksKey, ctx.previous);
-      toast.error(err.message);
+      toast.error(`Could not update task status: ${err.message}`);
     },
     onSettled: () => qc.invalidateQueries({ queryKey: tasksKey }),
   });
@@ -358,7 +368,7 @@ export default function TasksPage() {
     },
     onError: (err: Error, _vars, ctx) => {
       if (ctx?.previous) qc.setQueryData(tasksKey, ctx.previous);
-      toast.error(err.message);
+      toast.error(`Could not delete task: ${err.message}`);
     },
     onSuccess: () => toast.success("Task deleted."),
     onSettled: () => qc.invalidateQueries({ queryKey: tasksKey }),
@@ -395,20 +405,20 @@ export default function TasksPage() {
         }
       />
 
-      {/* Tab strip — kanban vs monitoring */}
+      {/* Tab strip — TODOs vs Automated Monitoring */}
       <div className="mb-4 border-b border-border flex items-center gap-1">
         <TabButton
           active={tab === "todo"}
           onClick={() => setTab("todo")}
           icon={Layers}
-          label="Kanban"
+          label="TODOs"
           count={todoTotal}
         />
         <TabButton
           active={tab === "monitoring"}
           onClick={() => setTab("monitoring")}
           icon={Bot}
-          label="Monitoring"
+          label="Automated Monitoring"
           count={monitoringTotal}
           accent
         />
@@ -666,7 +676,7 @@ function MonitoringList({
 }: MonitoringListProps) {
   const qc = useQueryClient();
   const toast = useToast();
-  const tasksKey = ["tasks", String(familyId)] as const;
+  const tasksKey = tasksQueryKey(familyId);
 
   const togglePause = useMutation({
     mutationFn: ({
@@ -691,7 +701,7 @@ function MonitoringList({
     },
     onError: (err: Error, _vars, ctx) => {
       if (ctx?.previous) qc.setQueryData(tasksKey, ctx.previous);
-      toast.error(err.message);
+      toast.error(`Could not update monitoring: ${err.message}`);
     },
     onSettled: () => qc.invalidateQueries({ queryKey: tasksKey }),
   });
@@ -703,7 +713,8 @@ function MonitoringList({
       toast.success("Run kicked off in the background.");
       qc.invalidateQueries({ queryKey: tasksKey });
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not start run: ${err.message}`),
   });
 
   if (isLoading) {
@@ -1298,7 +1309,8 @@ function CreateTaskModal({
       reset();
       onCreated(t);
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not create task: ${err.message}`),
   });
 
   return (
@@ -1591,24 +1603,26 @@ function TaskDetailModal({
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["task", taskId] });
-    qc.invalidateQueries({ queryKey: ["tasks", String(familyId)] });
+    qc.invalidateQueries({ queryKey: tasksQueryKey(familyId) });
   };
 
   const patchTask = useMutation({
     mutationFn: (patch: Partial<TaskDetail>) =>
       api.patch<TaskDetail>(`/api/tasks/${taskId}`, patch),
     onSuccess: invalidate,
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not update task: ${err.message}`),
   });
 
   const deleteTask = useMutation({
     mutationFn: () => api.del(`/api/tasks/${taskId}`),
     onSuccess: () => {
       toast.success("Task deleted.");
-      qc.invalidateQueries({ queryKey: ["tasks", String(familyId)] });
+      qc.invalidateQueries({ queryKey: tasksQueryKey(familyId) });
       onClose();
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not delete task: ${err.message}`),
   });
 
   const addComment = useMutation({
@@ -1618,7 +1632,8 @@ function TaskDetailModal({
         author_kind: "person",
       }),
     onSuccess: invalidate,
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not add comment: ${err.message}`),
   });
 
   const addFollower = useMutation({
@@ -1627,14 +1642,16 @@ function TaskDetailModal({
         person_id,
       }),
     onSuccess: invalidate,
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not add follower: ${err.message}`),
   });
 
   const removeFollower = useMutation({
     mutationFn: (person_id: number) =>
       api.del(`/api/tasks/${taskId}/followers/${person_id}`),
     onSuccess: invalidate,
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove follower: ${err.message}`),
   });
 
   const uploadAttachment = useMutation({
@@ -1652,21 +1669,24 @@ function TaskDetailModal({
       if (fileRef.current) fileRef.current.value = "";
       invalidate();
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not upload attachment: ${err.message}`),
   });
 
   const removeAttachment = useMutation({
     mutationFn: (id: number) =>
       api.del(`/api/tasks/${taskId}/attachments/${id}`),
     onSuccess: invalidate,
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove attachment: ${err.message}`),
   });
 
   const updateSchedule = useMutation({
     mutationFn: (patch: { cron_schedule?: string | null; monitoring_paused?: boolean }) =>
       api.put<Task>(`/api/tasks/${taskId}/schedule`, patch),
     onSuccess: invalidate,
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not update schedule: ${err.message}`),
   });
 
   const runNow = useMutation({
@@ -1675,14 +1695,16 @@ function TaskDetailModal({
       toast.success("Run kicked off in the background.");
       invalidate();
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not start run: ${err.message}`),
   });
 
   const removeLink = useMutation({
     mutationFn: (linkId: number) =>
       api.del(`/api/tasks/${taskId}/links/${linkId}`),
     onSuccess: invalidate,
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove link: ${err.message}`),
   });
 
   const t = detailQuery.data;

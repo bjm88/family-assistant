@@ -18,6 +18,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 import { cleanPayload } from "@/lib/form";
 
 type ResidenceForm = {
@@ -37,6 +38,7 @@ export default function ResidencesPage() {
   const familyId = Number(familyIdParam);
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
   const { data: residences } = useQuery<Residence[]>({
@@ -137,10 +139,19 @@ export default function ResidencesPage() {
                     </span>
                     <button
                       className="text-destructive hover:text-destructive/80"
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
-                        if (confirm(`Delete ${r.label}?`))
+                        if (
+                          await confirm({
+                            title: `Delete ${r.label}?`,
+                            message:
+                              "The residence and all of its photos will be removed.",
+                            destructive: true,
+                            confirmLabel: "Delete residence",
+                          })
+                        ) {
                           del.mutate(r.residence_id);
+                        }
                       }}
                       aria-label="Delete residence"
                     >
@@ -392,6 +403,7 @@ function ResidenceModal({
 function ResidencePhotosSection({ residence }: { residence: Residence }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [open, setOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -439,7 +451,8 @@ function ResidencePhotosSection({ residence }: { residence: Residence }) {
       qc.invalidateQueries({ queryKey: ["residences", residence.family_id] });
       toast.success("Photo removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove photo: ${err.message}`),
   });
 
   return (
@@ -489,9 +502,17 @@ function ResidencePhotosSection({ residence }: { residence: Residence }) {
                 <button
                   type="button"
                   className="text-destructive hover:text-destructive/80 text-xs inline-flex items-center gap-1 self-start mt-auto"
-                  onClick={() => {
-                    if (confirm(`Delete "${p.title}"?`))
+                  onClick={async () => {
+                    if (
+                      await confirm({
+                        title: `Delete "${p.title}"?`,
+                        message: "The photo will be permanently removed.",
+                        destructive: true,
+                        confirmLabel: "Delete photo",
+                      })
+                    ) {
                       del.mutate(p.residence_photo_id);
+                    }
                   }}
                 >
                   <Trash2 className="h-3.5 w-3.5" /> Remove

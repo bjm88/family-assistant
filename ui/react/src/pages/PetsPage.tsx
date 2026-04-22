@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
-import { Image as ImageIcon, PawPrint, Pencil, Plus, Trash2, Upload } from "lucide-react";
+import { Image as ImageIcon, PawPrint, Plus, Trash2, Upload } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Pet, PetPhoto } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
@@ -10,6 +10,8 @@ import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
+import { RowActions } from "@/components/RowActions";
 import { cleanPayload } from "@/lib/form";
 import { PET_ANIMAL_TYPES } from "@/lib/enums";
 
@@ -37,6 +39,7 @@ export default function PetsPage() {
   const familyId = Number(familyIdParam);
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
   const { data: pets } = useQuery<Pet[]>({
@@ -109,27 +112,26 @@ export default function PetsPage() {
                     <td>{p.color ?? "—"}</td>
                     <td>{p.date_of_birth ?? "—"}</td>
                     <td className="text-right whitespace-nowrap">
-                      <button
-                        className="text-muted-foreground hover:text-foreground mr-3"
-                        onClick={(e) => {
+                      <RowActions
+                        entityName="pet"
+                        onEdit={(e) => {
                           e.stopPropagation();
                           setEditingId(p.pet_id);
                         }}
-                        aria-label="Edit pet"
-                      >
-                        <Pencil className="h-4 w-4" />
-                      </button>
-                      <button
-                        className="text-destructive hover:text-destructive/80"
-                        onClick={(e) => {
+                        onDelete={async (e) => {
                           e.stopPropagation();
-                          if (confirm(`Delete ${p.pet_name}?`))
+                          if (
+                            await confirm({
+                              title: `Delete ${p.pet_name}?`,
+                              message: `${p.pet_name}'s photos and notes will be permanently removed.`,
+                              destructive: true,
+                              confirmLabel: "Delete pet",
+                            })
+                          ) {
                             del.mutate(p.pet_id);
+                          }
                         }}
-                        aria-label="Delete pet"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
+                      />
                     </td>
                   </tr>
                 ))}
@@ -352,6 +354,7 @@ function PetModal({
 function PetPhotosSection({ pet }: { pet: Pet }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [open, setOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -391,7 +394,8 @@ function PetPhotosSection({ pet }: { pet: Pet }) {
       qc.invalidateQueries({ queryKey: ["pet-photos", pet.pet_id] });
       toast.success("Photo removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove photo: ${err.message}`),
   });
 
   return (
@@ -441,9 +445,17 @@ function PetPhotosSection({ pet }: { pet: Pet }) {
                 <button
                   type="button"
                   className="text-destructive hover:text-destructive/80 text-xs inline-flex items-center gap-1 self-start mt-auto"
-                  onClick={() => {
-                    if (confirm(`Delete "${p.title}"?`))
+                  onClick={async () => {
+                    if (
+                      await confirm({
+                        title: `Delete "${p.title}"?`,
+                        message: "The photo will be permanently removed.",
+                        destructive: true,
+                        confirmLabel: "Delete photo",
+                      })
+                    ) {
                       del.mutate(p.pet_photo_id);
+                    }
                   }}
                 >
                   <Trash2 className="h-3.5 w-3.5" /> Remove

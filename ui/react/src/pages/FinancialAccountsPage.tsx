@@ -10,6 +10,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 import { cleanPayload } from "@/lib/form";
 
 const ACCOUNT_TYPES = [
@@ -35,6 +36,7 @@ export default function FinancialAccountsPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [open, setOpen] = useState(false);
 
   const { data } = useQuery<FinancialAccount[]>({
@@ -95,6 +97,11 @@ export default function FinancialAccountsPage() {
           icon={Landmark}
           title="No accounts yet"
           description="Add your checking, savings, credit cards, and investment accounts."
+          action={
+            <button className="btn-primary" onClick={() => setOpen(true)}>
+              <Plus className="h-4 w-4" /> Add account
+            </button>
+          }
         />
       ) : (
         <div className="card">
@@ -140,9 +147,17 @@ export default function FinancialAccountsPage() {
                     <td className="text-right">
                       <button
                         className="text-destructive hover:text-destructive/80"
-                        onClick={() => {
-                          if (confirm("Delete this account?"))
+                        onClick={async () => {
+                          if (
+                            await confirm({
+                              title: "Delete this account?",
+                              message: `${a.institution_name}${a.account_nickname ? ` — ${a.account_nickname}` : ""} will be removed.`,
+                              destructive: true,
+                              confirmLabel: "Delete account",
+                            })
+                          ) {
                             del.mutate(a.financial_account_id);
+                          }
                         }}
                       >
                         <Trash2 className="h-4 w-4" />

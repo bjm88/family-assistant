@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
-import { Camera, Car, Pencil, Plus, Trash2, X } from "lucide-react";
+import { Camera, Car, Plus, X } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Person, Residence, Vehicle } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
@@ -10,6 +10,8 @@ import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
+import { RowActions } from "@/components/RowActions";
 import { EncryptedField } from "@/components/EncryptedField";
 import { cleanPayload } from "@/lib/form";
 import { VEHICLE_TYPES, VEHICLE_TYPE_LABELS } from "@/lib/enums";
@@ -118,6 +120,7 @@ export default function VehiclesPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   // null = closed, "new" = create mode, number = edit mode for that vehicle id.
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
@@ -247,27 +250,28 @@ export default function VehiclesPage() {
                       </td>
                       <td>{v.registration_expiration_date ?? "—"}</td>
                       <td className="text-right whitespace-nowrap">
-                        <button
-                          className="text-muted-foreground hover:text-foreground mr-3"
-                          onClick={(e) => {
+                        <RowActions
+                          entityName="vehicle"
+                          onEdit={(e) => {
                             e.stopPropagation();
                             setEditingId(v.vehicle_id);
                           }}
-                          aria-label="Edit vehicle"
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </button>
-                        <button
-                          className="text-destructive hover:text-destructive/80"
-                          onClick={(e) => {
+                          onDelete={async (e) => {
                             e.stopPropagation();
-                            if (confirm("Delete this vehicle?"))
+                            const label = `${v.year ?? ""} ${v.make} ${v.model}`.trim();
+                            if (
+                              await confirm({
+                                title: `Delete ${label}?`,
+                                message:
+                                  "The vehicle, its photos, and any insurance links will be removed.",
+                                destructive: true,
+                                confirmLabel: "Delete vehicle",
+                              })
+                            ) {
                               del.mutate(v.vehicle_id);
+                            }
                           }}
-                          aria-label="Delete vehicle"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        />
                       </td>
                     </tr>
                   );
@@ -578,6 +582,7 @@ function VehicleModal({
 function VehiclePhotoSection({ vehicle }: { vehicle: Vehicle }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const fileRef = useRef<HTMLInputElement>(null);
 
   const invalidate = () =>
@@ -654,8 +659,17 @@ function VehiclePhotoSection({ vehicle }: { vehicle: Vehicle }) {
             <button
               type="button"
               className="text-destructive hover:text-destructive/80 text-xs inline-flex items-center gap-1 self-start"
-              onClick={() => {
-                if (confirm("Remove vehicle photo?")) remove.mutate();
+              onClick={async () => {
+                if (
+                  await confirm({
+                    title: "Remove vehicle photo?",
+                    message: "The current photo is deleted; the vehicle stays.",
+                    destructive: true,
+                    confirmLabel: "Remove photo",
+                  })
+                ) {
+                  remove.mutate();
+                }
               }}
               disabled={remove.isPending}
             >

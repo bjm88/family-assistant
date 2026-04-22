@@ -21,6 +21,10 @@ import { api } from "@/lib/api";
 import type { Family } from "@/lib/types";
 import { cn } from "@/lib/cn";
 
+// Admin/CRUD nav. Tasks intentionally lives in the top assistant
+// cluster (alongside Live AI + Session history) because it's the
+// daily-driver surface for the agent's TODOs and Automated Monitoring,
+// not a static admin record like People or Vehicles.
 const NAV = [
   { to: "", label: "Overview", icon: Home, end: true },
   { to: "people", label: "People", icon: Users },
@@ -32,7 +36,6 @@ const NAV = [
   { to: "insurance", label: "Insurance", icon: ShieldCheck },
   { to: "finances", label: "Finances", icon: Landmark },
   { to: "documents", label: "Documents", icon: FileText },
-  { to: "tasks", label: "Tasks", icon: ListTodo },
   { to: "status", label: "System status", icon: Activity },
   { to: "settings", label: "Family settings", icon: Settings },
 ];
@@ -70,6 +73,20 @@ export default function Layout() {
           >
             <History className="h-4 w-4" />
             Session history
+          </NavLink>
+          <NavLink
+            to={`/admin/families/${familyId}/tasks`}
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2 rounded-md px-3 py-2 text-xs transition-colors",
+                isActive
+                  ? "bg-primary/10 text-primary font-medium"
+                  : "text-foreground/70 hover:bg-muted hover:text-foreground"
+              )
+            }
+          >
+            <ListTodo className="h-4 w-4" />
+            Tasks
           </NavLink>
         </div>
         <nav className="flex-1 p-3 space-y-1">

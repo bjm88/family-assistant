@@ -111,6 +111,27 @@ export interface LiveSessionDetail extends LiveSession {
   messages: LiveSessionMessage[];
 }
 
+// One row in the agent's plan/execute/observe transcript. The /chat
+// SSE stream emits these alongside text deltas; the chat bubble in
+// AiAssistantPage renders them as a small inline timeline so the
+// user can see Avi look up the recipient's email, draft the body,
+// send it, etc. Lives here in lib/types so the agent task / session
+// detail pages can reuse the shape without re-importing through the
+// AiAssistantPage module (which is the largest file in the app).
+export type AgentStepView = {
+  agent_step_id: number;
+  step_index: number;
+  step_type: "thinking" | "tool_call" | "tool_result" | "final" | "error";
+  tool_name?: string | null;
+  tool_input?: Record<string, unknown> | null;
+  tool_output?: unknown;
+  content?: string | null;
+  error?: string | null;
+  model?: string | null;
+  duration_ms?: number | null;
+  created_at?: string | null;
+};
+
 export interface Assistant {
   assistant_id: number;
   family_id: number;
@@ -147,21 +168,6 @@ export interface PersonRelationship {
   from_person_id: number;
   to_person_id: number;
   relationship_type: RelationshipType;
-  notes: string | null;
-}
-
-export interface Address {
-  address_id: number;
-  family_id: number;
-  person_id: number | null;
-  label: string;
-  street_line_1: string;
-  street_line_2: string | null;
-  city: string;
-  state_or_region: string | null;
-  postal_code: string | null;
-  country: string;
-  is_primary_residence: boolean;
   notes: string | null;
 }
 

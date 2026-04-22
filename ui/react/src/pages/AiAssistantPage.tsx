@@ -35,6 +35,7 @@ import {
 } from "lucide-react";
 import { api, resolveApiPath } from "@/lib/api";
 import type {
+  AgentStepView,
   Assistant,
   Family,
   LiveSession,
@@ -95,6 +96,12 @@ type TtsStatus = {
   initialized: boolean;
 };
 
+type RecognizeCandidate = {
+  person_id: number;
+  person_name: string | null;
+  similarity: number;
+};
+
 type RecognizeResponse = {
   matched: boolean;
   person_id: number | null;
@@ -102,31 +109,13 @@ type RecognizeResponse = {
   similarity: number | null;
   threshold: number;
   reason: string | null;
+  // Best person in the gallery for this frame even if below threshold,
+  // so the camera badge can show "almost recognized X" instead of going
+  // silent when the user is just under the cut-off.
+  top_candidate?: RecognizeCandidate | null;
 };
 
 type ChatRole = "user" | "assistant" | "system";
-// One row in the agent's plan/execute/observe transcript. The /chat
-// SSE stream emits these alongside text deltas; the chat bubble
-// renders them as a small inline timeline so the user can see Avi
-// look up the recipient's email, draft the body, send it, etc.
-export type AgentStepView = {
-  agent_step_id: number;
-  step_index: number;
-  step_type:
-    | "thinking"
-    | "tool_call"
-    | "tool_result"
-    | "final"
-    | "error";
-  tool_name?: string | null;
-  tool_input?: Record<string, unknown> | null;
-  tool_output?: unknown;
-  content?: string | null;
-  error?: string | null;
-  model?: string | null;
-  duration_ms?: number | null;
-  created_at?: string | null;
-};
 type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -151,6 +140,15 @@ type ChatMessage = {
 // no equivalent constant — it only calls the backend when a brand-new
 // face appears on camera.
 const FACE_RECOG_FALLBACK_INTERVAL_MS = 2500;
+
+// How often the unknown-track re-probe loop runs while the local
+// watcher is healthy. We keep this slower than the error-fallback
+// interval (above) because we only need to give borderline matches a
+// second chance — the optimization rationale for gating on track
+// births still holds. Picked at 8s so a stranger doesn't generate
+// constant backend load, while a near-miss family member gets ~7
+// retries per minute instead of waiting until they leave + return.
+const FACE_RECOG_UNKNOWN_RETRY_INTERVAL_MS = 8000;
 
 // After we greet someone, suppress re-greetings for this long so Avi
 // doesn't loop "Hi Sam!" every time they blink.
@@ -743,8 +741,12 @@ export default function AiAssistantPage() {
         <LiveSessionPill session={liveSession} familyId={familyId} />
       </header>
 
-      <main className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-6">
-        <div className="flex flex-col gap-6">
+      {/* Grid items default to ``align-items: stretch``, so giving the
+          right-hand cell ``min-h-0`` lets the chat panel match the
+          left column's natural height (Avi + camera) and scroll its
+          message list internally rather than push the row taller. */}
+      <main className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-6 lg:items-stretch">
+        <div className="flex flex-col gap-6 min-h-0">
           <AviStage
             assistant={assistant}
             assistantName={assistantName}
@@ -1395,6 +1397,24 @@ function LiveCameraPanel({
                 {Math.round((lastRecognition.similarity ?? 0) * 100)}%
               </span>
             )}
+            {lastRecognition &&
+              !lastRecognition.matched &&
+              lastRecognition.top_candidate && (
+                <span
+                  className="inline-flex items-center gap-1 bg-amber-500/90 text-white text-xs px-2 py-1 rounded-full"
+                  title={`Best guess was ${
+                    lastRecognition.top_candidate.person_name ?? "unknown"
+                  } at similarity ${lastRecognition.top_candidate.similarity}, threshold ${lastRecognition.threshold}. Re-enroll a current photo of them to lift the score.`}
+                >
+                  <User className="h-3 w-3" />
+                  Almost {lastRecognition.top_candidate.person_name} ·{" "}
+                  {Math.round(
+                    lastRecognition.top_candidate.similarity * 100
+                  )}
+                  % (need{" "}
+                  {Math.round(lastRecognition.threshold * 100)}%)
+                </span>
+              )}
           </div>
           <div className="absolute bottom-3 right-3">
             <button
@@ -1416,7 +1436,20 @@ function LiveCameraPanel({
         <div className="card-body py-2 px-4">
           <div className="text-xs text-muted-foreground">
             {cameraOn
-              ? "Watching for family members. I'll wave and say hi when I recognize someone."
+              ? lastRecognition?.reason === "no_enrolled_embeddings"
+                ? "No face embeddings yet. Click Re-enroll to build them from photos."
+                : lastRecognition?.reason === "no_face_in_frame"
+                ? "Camera is on, but I can't see a face yet — step closer or improve lighting."
+                : lastRecognition?.reason === "below_threshold" &&
+                  lastRecognition.top_candidate
+                ? `Almost recognized ${
+                    lastRecognition.top_candidate.person_name ?? "someone"
+                  } (${Math.round(
+                    lastRecognition.top_candidate.similarity * 100
+                  )}%). I need ${Math.round(
+                    lastRecognition.threshold * 100
+                  )}% to greet — try Re-enroll on a current photo.`
+                : "Watching for family members. I'll wave and say hi when I recognize someone."
               : "Camera paused — recognition is idle."}
           </div>
         </div>
@@ -1666,6 +1699,94 @@ function FaceRecognitionDriver({
       onStatusChange: handleStatusChange,
     },
   });
+
+  // ── Unknown-track re-probe: when the local watcher has identified
+  //   one or more faces but the backend said "below_threshold" /
+  //   "no_face_in_frame", we periodically re-run a whole-frame
+  //   recognize so a slight head-turn or lighting change can finally
+  //   cross the cosine-similarity bar. Without this, a borderline
+  //   match (say similarity 0.38, threshold 0.40) means the user is
+  //   never greeted for the entire duration of that track — they have
+  //   to physically leave the camera frame and come back. The loop
+  //   short-circuits the moment any track flips to "matched".
+  useEffect(() => {
+    if (!cameraOn) return;
+    if (watcherStatusInternal.kind !== "ready") return;
+    if (watcherStatusInternal.activeTrackCount === 0) return;
+
+    let cancelled = false;
+    let inflight = false;
+
+    const tick = async () => {
+      if (cancelled || inflight) return;
+      const states = [...trackStateRef.current.values()];
+      const hasUnknown = states.some((s) => s.kind === "unknown");
+      const hasMatched = states.some((s) => s.kind === "matched");
+      // If everyone in frame is already identified, there's nothing to
+      // gain from a whole-frame recognize — let the camera idle.
+      if (!hasUnknown || hasMatched) return;
+
+      const v = videoRef.current;
+      const c = canvasRef.current;
+      if (!v || !c || v.readyState < 2 || v.videoWidth === 0) return;
+      inflight = true;
+      try {
+        c.width = 640;
+        c.height = Math.round((640 * v.videoHeight) / v.videoWidth);
+        const ctx = c.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(v, 0, 0, c.width, c.height);
+        const blob: Blob | null = await new Promise((resolve) =>
+          c.toBlob(resolve, "image/jpeg", 0.8),
+        );
+        if (!blob || cancelled) return;
+        const result = await recognizeBlob(blob, null);
+        // On a successful match, mark every "unknown" track as matched
+        // so the next tick is a no-op (and so camera badges that
+        // depend on per-track state don't flicker between unknown and
+        // matched). We don't know which on-screen track is the matched
+        // person, so we mark them all — the worst case is one
+        // false-positive identity badge that resolves on the next
+        // /recognize.
+        if (result?.matched && result.person_id !== null) {
+          for (const [trackId, state] of trackStateRef.current.entries()) {
+            if (state.kind === "unknown") {
+              trackStateRef.current.set(trackId, {
+                kind: "matched",
+                personId: result.person_id,
+              });
+            }
+          }
+        } else {
+          for (const [trackId, state] of trackStateRef.current.entries()) {
+            if (state.kind === "unknown") {
+              trackStateRef.current.set(trackId, {
+                kind: "unknown",
+                lastCheckedAt: Date.now(),
+              });
+            }
+          }
+        }
+      } finally {
+        inflight = false;
+      }
+    };
+
+    const id = window.setInterval(
+      tick,
+      FACE_RECOG_UNKNOWN_RETRY_INTERVAL_MS,
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [
+    cameraOn,
+    watcherStatusInternal,
+    videoRef,
+    canvasRef,
+    recognizeBlob,
+  ]);
 
   // ── Fallback timer: only arms when the local watcher entered the
   //   error state. Runs the legacy whole-frame poll so the page
@@ -2551,8 +2672,14 @@ function ChatPanel({
   }, [llmStatus]);
 
   return (
-    <div className="card flex flex-col min-h-[600px]">
-      <div className="card-header">
+    // On large screens we fill the grid row (matching the left
+    // column's Avi + camera height) and let ``min-h-0`` give the
+    // messages area room to shrink so long chat threads scroll
+    // internally instead of pushing the row taller. On narrow
+    // screens the column stack has no parent to inherit from, so we
+    // fall back to a fixed floor.
+    <div className="card flex flex-col min-h-[500px] lg:min-h-0 lg:h-full">
+      <div className="card-header shrink-0">
         <div className="card-title flex items-center gap-2">
           <Bot className="h-4 w-4 text-primary" /> Chat with {assistantName}
         </div>
@@ -2561,7 +2688,10 @@ function ChatPanel({
 
       <div
         ref={messagesRef}
-        className="flex-1 overflow-y-auto px-4 py-3 space-y-3 bg-muted/30"
+        // ``min-h-0`` is the magic that lets ``flex-1`` actually shrink
+        // below its content's intrinsic size — otherwise long chat
+        // threads would push the panel taller than the row.
+        className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-3 bg-muted/30"
       >
         {messages.length === 0 && (
           <div className="text-sm text-muted-foreground h-full flex flex-col items-center justify-center text-center gap-2 pt-16">

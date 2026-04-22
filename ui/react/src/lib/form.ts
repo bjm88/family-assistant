@@ -51,3 +51,20 @@ export function cleanPayload<T extends Record<string, unknown>>(
 ): Partial<T> {
   return stripEmpty(coerceNumbers(obj, numericKeys));
 }
+
+/**
+ * PATCH-friendly variant of {@link stripEmpty}: convert empty-string
+ * values to ``null`` instead of dropping the key. Use this when the
+ * user is *editing* an existing record and a blanked-out field
+ * should clear the value on the backend (which a missing key would
+ * not). FastAPI accepts ``null`` for ``Optional[...]`` columns and
+ * unsets them, where an empty string would fail Pydantic validation
+ * for non-string types like ``date`` or ``int``.
+ */
+export function emptyToNull<T extends Record<string, unknown>>(obj: T): T {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    out[k] = v === "" ? null : v;
+  }
+  return out as T;
+}

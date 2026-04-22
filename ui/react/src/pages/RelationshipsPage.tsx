@@ -9,6 +9,7 @@ import { ProfileAvatar } from "@/components/ProfileAvatar";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 
 /**
  * The family tree is stored as atomic edges in `person_relationships`:
@@ -174,7 +175,8 @@ export default function RelationshipsPage() {
       setAddGroup(null);
       toast.success("Relationship added.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not add relationship: ${err.message}`),
   });
 
   const removeEdge = useMutation({
@@ -183,7 +185,8 @@ export default function RelationshipsPage() {
       qc.invalidateQueries({ queryKey: ["person-relationships", familyId] });
       toast.success("Relationship removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove relationship: ${err.message}`),
   });
 
   return (
@@ -337,6 +340,8 @@ function TreeRow({
   const edgeByPerson = new Map<number, PersonRelationship>();
   (edges ?? []).forEach((e) => edgeByPerson.set(e.person.person_id, e.edge));
 
+  const confirm = useConfirm();
+
   return (
     <div className="card">
       <div className="card-header">
@@ -392,10 +397,19 @@ function TreeRow({
                   {onRemove && edge && (
                     <button
                       className="text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
-                        if (confirm("Remove this relationship?"))
+                        if (
+                          await confirm({
+                            title: "Remove this relationship?",
+                            message:
+                              "The edge will be deleted. The two people stay; only the link between them goes away.",
+                            destructive: true,
+                            confirmLabel: "Remove",
+                          })
+                        ) {
                           onRemove(edge.person_relationship_id);
+                        }
                       }}
                       aria-label="remove relationship"
                     >

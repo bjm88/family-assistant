@@ -48,6 +48,20 @@ class EnrollResponse(BaseModel):
     results: List[EnrollResult]
 
 
+class RecognizeCandidate(BaseModel):
+    """A near-miss diagnostic — the best person in the gallery for this
+    frame, even if their similarity didn't beat ``threshold``.
+
+    Surfaced in the live camera UI so the user can see *why* a greeting
+    didn't fire (e.g. "Best guess: Ben at 0.34, threshold 0.40 — try
+    re-enrolling with a current photo").
+    """
+
+    person_id: int
+    person_name: Optional[str] = None
+    similarity: float
+
+
 class RecognizeResponse(BaseModel):
     matched: bool
     person_id: Optional[int] = None
@@ -55,6 +69,10 @@ class RecognizeResponse(BaseModel):
     similarity: Optional[float] = None
     threshold: float
     reason: Optional[str] = None
+    # Always populated when *any* face is detected and the gallery is
+    # non-empty, regardless of whether ``matched`` is True. Lets the UI
+    # show "almost recognized X (0.34)" instead of a silent no-op.
+    top_candidate: Optional[RecognizeCandidate] = None
 
 
 class FaceStatus(BaseModel):
@@ -248,6 +266,10 @@ def recognize(
     image_bytes = file.file.read()
     extracted = face_service.extract_embedding(image_bytes)
     if extracted is None:
+        logger.info(
+            "face.recognize family_id=%s matched=False reason=no_face_in_frame",
+            family_id,
+        )
         return RecognizeResponse(
             matched=False, threshold=threshold, reason="no_face_in_frame"
         )
@@ -255,24 +277,61 @@ def recognize(
 
     gallery = _load_gallery(db, family_id)
     if not gallery:
+        logger.info(
+            "face.recognize family_id=%s matched=False reason=no_enrolled_embeddings",
+            family_id,
+        )
         return RecognizeResponse(
             matched=False,
             threshold=threshold,
             reason="no_enrolled_embeddings",
         )
-    result = face_service.match(probe, gallery, threshold=threshold)
-    if result is None:
+
+    ranked = face_service.rank(probe, gallery)
+    top_candidate: Optional[RecognizeCandidate] = None
+    if ranked:
+        top_pid, top_sim = ranked[0]
+        top_person = db.get(models.Person, top_pid)
+        top_candidate = RecognizeCandidate(
+            person_id=top_pid,
+            person_name=_display_name(top_person) if top_person else None,
+            similarity=round(top_sim, 4),
+        )
+
+    if not ranked or ranked[0][1] < threshold:
+        # Log the near-miss so we can debug without spinning up the UI.
+        # ``ranked[:3]`` keeps the log line short while still showing
+        # whether the right person was even close.
+        if ranked:
+            preview = ", ".join(f"{pid}:{round(s, 3)}" for pid, s in ranked[:3])
+            logger.info(
+                "face.recognize family_id=%s matched=False reason=below_threshold "
+                "threshold=%.2f top=%s",
+                family_id,
+                threshold,
+                preview,
+            )
         return RecognizeResponse(
             matched=False,
             threshold=threshold,
             reason="below_threshold",
+            top_candidate=top_candidate,
         )
 
-    person = db.get(models.Person, result.person_id)
+    person_id, similarity = ranked[0]
+    person = db.get(models.Person, person_id)
+    logger.info(
+        "face.recognize family_id=%s matched=True person_id=%s similarity=%.3f threshold=%.2f",
+        family_id,
+        person_id,
+        similarity,
+        threshold,
+    )
     return RecognizeResponse(
         matched=True,
-        person_id=result.person_id,
+        person_id=person_id,
         person_name=_display_name(person) if person else None,
-        similarity=round(result.similarity, 4),
+        similarity=round(similarity, 4),
         threshold=threshold,
+        top_candidate=top_candidate,
     )

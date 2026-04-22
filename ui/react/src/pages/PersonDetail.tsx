@@ -27,13 +27,14 @@ import { Field } from "@/components/Field";
 import { Modal } from "@/components/Modal";
 import { ProfileAvatar } from "@/components/ProfileAvatar";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 import {
   GENDERS,
   GOAL_PRIORITIES,
   GOAL_PRIORITY_LABELS,
   PRIMARY_RELATIONSHIPS,
 } from "@/lib/enums";
-import { cleanPayload } from "@/lib/form";
+import { cleanPayload, emptyToNull } from "@/lib/form";
 
 const ID_TYPES = [
   "drivers_license",
@@ -75,6 +76,7 @@ export default function PersonDetail() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
 
   const { data: person } = useQuery<Person>({
     queryKey: ["person", personId],
@@ -104,12 +106,8 @@ export default function PersonDetail() {
   }, [person, reset]);
 
   const save = useMutation({
-    mutationFn: (v: PersonForm) => {
-      const body = Object.fromEntries(
-        Object.entries(v).map(([k, val]) => [k, val === "" ? null : val])
-      );
-      return api.patch<Person>(`/api/people/${personId}`, body);
-    },
+    mutationFn: (v: PersonForm) =>
+      api.patch<Person>(`/api/people/${personId}`, emptyToNull(v)),
     onSuccess: (p) => {
       qc.invalidateQueries({ queryKey: ["person", personId] });
       qc.invalidateQueries({ queryKey: ["people", familyId] });
@@ -323,8 +321,18 @@ export default function PersonDetail() {
                 <button
                   type="button"
                   className="btn-destructive"
-                  onClick={() => {
-                    if (confirm("Delete this person?")) del.mutate();
+                  onClick={async () => {
+                    if (
+                      await confirm({
+                        title: `Delete ${person?.first_name ?? "this person"}?`,
+                        message:
+                          "This will permanently remove the person and all of their photos, documents, jobs, goals, medical records, and identifiers. This cannot be undone.",
+                        destructive: true,
+                        confirmLabel: "Delete person",
+                      })
+                    ) {
+                      del.mutate();
+                    }
                   }}
                 >
                   <Trash2 className="h-4 w-4" />
@@ -380,6 +388,7 @@ export default function PersonDetail() {
 function PhotosSection({ personId }: { personId: number }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [open, setOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -420,7 +429,8 @@ function PhotosSection({ personId }: { personId: number }) {
       if (fileRef.current) fileRef.current.value = "";
       toast.success("Photo added.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not add photo: ${err.message}`),
   });
 
   const toggle = useMutation({
@@ -430,7 +440,8 @@ function PhotosSection({ personId }: { personId: number }) {
       }),
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["person-photos", personId] }),
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not update photo: ${err.message}`),
   });
 
   const del = useMutation({
@@ -439,7 +450,8 @@ function PhotosSection({ personId }: { personId: number }) {
       qc.invalidateQueries({ queryKey: ["person-photos", personId] });
       toast.success("Photo removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove photo: ${err.message}`),
   });
 
   return (
@@ -489,8 +501,18 @@ function PhotosSection({ personId }: { personId: number }) {
                   </label>
                   <button
                     className="text-destructive hover:text-destructive/80 text-xs inline-flex items-center gap-1 self-start"
-                    onClick={() => {
-                      if (confirm(`Delete "${p.title}"?`)) del.mutate(p.person_photo_id);
+                    onClick={async () => {
+                      if (
+                        await confirm({
+                          title: `Delete "${p.title}"?`,
+                          message:
+                            "The photo will be permanently removed. If it was used for face recognition, that embedding goes with it.",
+                          destructive: true,
+                          confirmLabel: "Delete photo",
+                        })
+                      ) {
+                        del.mutate(p.person_photo_id);
+                      }
                     }}
                   >
                     <Trash2 className="h-3.5 w-3.5" /> Remove
@@ -602,6 +624,7 @@ function identityDocToForm(d: IdentityDocument): IdentityDocForm {
 function IdentityDocumentsSection({ personId }: { personId: number }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   // null = modal closed, "new" = create mode, number = edit mode for that doc id.
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
@@ -622,7 +645,8 @@ function IdentityDocumentsSection({ personId }: { personId: number }) {
       qc.invalidateQueries({ queryKey: ["identity-documents", personId] });
       toast.success("Document removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove document: ${err.message}`),
   });
 
   return (
@@ -688,10 +712,19 @@ function IdentityDocumentsSection({ personId }: { personId: number }) {
                       <td className="text-right">
                         <button
                           className="text-destructive hover:text-destructive/80"
-                          onClick={(e) => {
+                          onClick={async (e) => {
                             e.stopPropagation();
-                            if (confirm("Delete this document record?"))
+                            if (
+                              await confirm({
+                                title: "Delete this document record?",
+                                message:
+                                  "The record and any uploaded scans (front/back) will be removed.",
+                                destructive: true,
+                                confirmLabel: "Delete document",
+                              })
+                            ) {
                               del.mutate(d.identity_document_id);
+                            }
                           }}
                         >
                           <Trash2 className="h-4 w-4" />
@@ -760,7 +793,8 @@ function IdentityDocumentModal({
       toast.success("Identity document added.");
       onClose();
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not add identity document: ${err.message}`),
   });
 
   const update = useMutation({
@@ -775,7 +809,8 @@ function IdentityDocumentModal({
       invalidate();
       toast.success("Identity document saved.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not save identity document: ${err.message}`),
   });
 
   const onSubmit = (v: IdentityDocForm) => {
@@ -939,6 +974,7 @@ function IdentityDocImageSlot({
 }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const inputRef = useRef<HTMLInputElement>(null);
   const storedPath =
     side === "front" ? doc.front_image_path : doc.back_image_path;
@@ -960,7 +996,10 @@ function IdentityDocImageSlot({
       toast.success(`${side === "front" ? "Front" : "Back"} image uploaded.`);
       if (inputRef.current) inputRef.current.value = "";
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(
+        `Could not upload ${side === "front" ? "front" : "back"} image: ${err.message}`
+      ),
   });
 
   const remove = useMutation({
@@ -972,7 +1011,10 @@ function IdentityDocImageSlot({
       invalidate();
       toast.success(`${side === "front" ? "Front" : "Back"} image removed.`);
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(
+        `Could not remove ${side === "front" ? "front" : "back"} image: ${err.message}`
+      ),
   });
 
   const label = side === "front" ? "Front" : "Back";
@@ -985,9 +1027,18 @@ function IdentityDocImageSlot({
           <button
             type="button"
             className="text-destructive hover:text-destructive/80 inline-flex items-center gap-1 text-xs"
-            onClick={() => {
-              if (confirm(`Remove ${label.toLowerCase()} image?`))
+            onClick={async () => {
+              if (
+                await confirm({
+                  title: `Remove ${label.toLowerCase()} image?`,
+                  message:
+                    "The scanned image is deleted; the document record itself stays.",
+                  destructive: true,
+                  confirmLabel: "Remove image",
+                })
+              ) {
                 remove.mutate();
+              }
             }}
             disabled={remove.isPending}
           >
@@ -1041,6 +1092,7 @@ function IdentityDocImageSlot({
 function SensitiveIdentifiersSection({ personId }: { personId: number }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [open, setOpen] = useState(false);
   const { data } = useQuery<SensitiveIdentifier[]>({
     queryKey: ["sensitive-identifiers", personId],
@@ -1058,7 +1110,8 @@ function SensitiveIdentifiersSection({ personId }: { personId: number }) {
       reset();
       toast.success("Identifier added.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not add identifier: ${err.message}`),
   });
   const del = useMutation({
     mutationFn: (id: number) => api.del(`/api/sensitive-identifiers/${id}`),
@@ -1066,7 +1119,8 @@ function SensitiveIdentifiersSection({ personId }: { personId: number }) {
       qc.invalidateQueries({ queryKey: ["sensitive-identifiers", personId] });
       toast.success("Identifier removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove identifier: ${err.message}`),
   });
   const { register, handleSubmit, reset } = useForm<Record<string, unknown>>();
 
@@ -1107,9 +1161,18 @@ function SensitiveIdentifiersSection({ personId }: { personId: number }) {
                   <td className="text-right">
                     <button
                       className="text-destructive hover:text-destructive/80"
-                      onClick={() => {
-                        if (confirm("Delete this identifier?"))
+                      onClick={async () => {
+                        if (
+                          await confirm({
+                            title: "Delete this identifier?",
+                            message:
+                              "Encrypted credentials cannot be recovered after deletion.",
+                            destructive: true,
+                            confirmLabel: "Delete identifier",
+                          })
+                        ) {
                           del.mutate(s.sensitive_identifier_id);
+                        }
                       }}
                     >
                       <Trash2 className="h-4 w-4" />
@@ -1190,6 +1253,7 @@ function SensitiveIdentifiersSection({ personId }: { personId: number }) {
 function GoalsSection({ personId }: { personId: number }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
   const { data: goals } = useQuery<Goal[]>({
@@ -1203,7 +1267,8 @@ function GoalsSection({ personId }: { personId: number }) {
       qc.invalidateQueries({ queryKey: ["goals", personId] });
       toast.success("Goal removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove goal: ${err.message}`),
   });
 
   const editingGoal =
@@ -1267,9 +1332,18 @@ function GoalsSection({ personId }: { personId: number }) {
                     </button>
                     <button
                       className="text-destructive hover:text-destructive/80"
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
-                        if (confirm("Delete this goal?")) del.mutate(g.goal_id);
+                        if (
+                          await confirm({
+                            title: "Delete this goal?",
+                            message: `"${g.goal_name}" will be permanently removed.`,
+                            destructive: true,
+                            confirmLabel: "Delete goal",
+                          })
+                        ) {
+                          del.mutate(g.goal_id);
+                        }
                       }}
                       aria-label="Delete goal"
                     >
@@ -1455,6 +1529,7 @@ function GoalModal({
 function MedicalConditionsSection({ personId }: { personId: number }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
   const { data: conditions } = useQuery<MedicalCondition[]>({
@@ -1471,7 +1546,8 @@ function MedicalConditionsSection({ personId }: { personId: number }) {
       qc.invalidateQueries({ queryKey: ["medical-conditions", personId] });
       toast.success("Condition removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove condition: ${err.message}`),
   });
 
   const editing =
@@ -1553,10 +1629,18 @@ function MedicalConditionsSection({ personId }: { personId: number }) {
                     </button>
                     <button
                       className="text-destructive hover:text-destructive/80"
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
-                        if (confirm("Delete this condition?"))
+                        if (
+                          await confirm({
+                            title: "Delete this condition?",
+                            message: `"${c.condition_name}" and any notes will be removed.`,
+                            destructive: true,
+                            confirmLabel: "Delete condition",
+                          })
+                        ) {
                           del.mutate(c.medical_condition_id);
+                        }
                       }}
                       aria-label="Delete condition"
                     >
@@ -1754,6 +1838,7 @@ function MedicalConditionModal({
 function MedicationsSection({ personId }: { personId: number }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
   const { data: meds } = useQuery<Medication[]>({
@@ -1768,7 +1853,8 @@ function MedicationsSection({ personId }: { personId: number }) {
       qc.invalidateQueries({ queryKey: ["medications", personId] });
       toast.success("Medication removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove medication: ${err.message}`),
   });
 
   const editing =
@@ -1854,10 +1940,18 @@ function MedicationsSection({ personId }: { personId: number }) {
                     </button>
                     <button
                       className="text-destructive hover:text-destructive/80"
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
-                        if (confirm("Delete this medication?"))
+                        if (
+                          await confirm({
+                            title: "Delete this medication?",
+                            message: `"${m.brand_name ?? m.generic_name ?? "This medication"}" and its dosage notes will be removed.`,
+                            destructive: true,
+                            confirmLabel: "Delete medication",
+                          })
+                        ) {
                           del.mutate(m.medication_id);
+                        }
                       }}
                       aria-label="Delete medication"
                     >
@@ -2074,6 +2168,7 @@ function MedicationModal({
 function PhysiciansSection({ personId }: { personId: number }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
   const { data: docs } = useQuery<Physician[]>({
@@ -2088,7 +2183,8 @@ function PhysiciansSection({ personId }: { personId: number }) {
       qc.invalidateQueries({ queryKey: ["physicians", personId] });
       toast.success("Physician removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove physician: ${err.message}`),
   });
 
   const editing =
@@ -2161,10 +2257,18 @@ function PhysiciansSection({ personId }: { personId: number }) {
                     </button>
                     <button
                       className="text-destructive hover:text-destructive/80"
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
-                        if (confirm("Delete this physician?"))
+                        if (
+                          await confirm({
+                            title: "Delete this physician?",
+                            message: `${d.physician_name}'s contact details will be removed from this person's record.`,
+                            destructive: true,
+                            confirmLabel: "Delete physician",
+                          })
+                        ) {
                           del.mutate(d.physician_id);
+                        }
                       }}
                       aria-label="Delete physician"
                     >
@@ -2371,6 +2475,7 @@ function PhysicianModal({
 function JobsSection({ personId }: { personId: number }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
   const { data: jobs } = useQuery<Job[]>({
@@ -2384,7 +2489,8 @@ function JobsSection({ personId }: { personId: number }) {
       qc.invalidateQueries({ queryKey: ["jobs", personId] });
       toast.success("Job removed.");
     },
-    onError: (err: Error) => toast.error(err.message),
+    onError: (err: Error) =>
+      toast.error(`Could not remove job: ${err.message}`),
   });
 
   const editing =
@@ -2460,9 +2566,18 @@ function JobsSection({ personId }: { personId: number }) {
                     </button>
                     <button
                       className="text-destructive hover:text-destructive/80"
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
-                        if (confirm("Delete this job?")) del.mutate(j.job_id);
+                        if (
+                          await confirm({
+                            title: "Delete this job?",
+                            message: `${j.role_title ?? "This role"} at ${j.company_name} will be removed.`,
+                            destructive: true,
+                            confirmLabel: "Delete job",
+                          })
+                        ) {
+                          del.mutate(j.job_id);
+                        }
                       }}
                       aria-label="Delete job"
                     >

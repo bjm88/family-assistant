@@ -249,26 +249,40 @@ def match(
 ) -> Optional[RecognitionResult]:
     """Best-match nearest neighbor in ``gallery`` above ``threshold``.
 
-    We collapse every enrolled photo of a given person down to one combined
-    score by taking the max similarity across that person's photos — the
-    intuition is "the best shot of them wins", which is robust to angle
-    variance in the enrolled gallery.
+    Thin wrapper kept for backward compatibility — most callers should use
+    :func:`rank` so they can also see the best candidate even when the
+    similarity falls just under the threshold (useful for diagnostics in
+    the live camera UI).
+    """
+    ranked = rank(probe, gallery)
+    if not ranked:
+        return None
+    top_pid, top_score = ranked[0]
+    if top_score < threshold:
+        return None
+    return RecognitionResult(person_id=top_pid, similarity=top_score)
+
+
+def rank(
+    probe: np.ndarray,
+    gallery: List[EnrolledFace],
+) -> List[Tuple[int, float]]:
+    """Return ``[(person_id, best_similarity), ...]`` sorted high → low.
+
+    We collapse every enrolled photo of a given person down to one
+    combined score by taking the max similarity across that person's
+    photos — the intuition is "the best shot of them wins", which is
+    robust to angle variance in the enrolled gallery. The full ranked
+    list lets callers expose "almost matched X" diagnostics rather than
+    just a binary matched / not-matched.
     """
     if not gallery:
-        return None
-    # Stack for a single vectorized dot product.
+        return []
     mat = np.stack([g.embedding for g in gallery], axis=0)  # (N, 512)
     sims = mat @ probe  # (N,)
-    # Per-person best score.
     best_by_person: dict[int, float] = {}
     for g, s in zip(gallery, sims):
         prev = best_by_person.get(g.person_id, -1.0)
         if s > prev:
             best_by_person[g.person_id] = float(s)
-    if not best_by_person:
-        return None
-    winner_pid = max(best_by_person, key=best_by_person.get)
-    winner_score = best_by_person[winner_pid]
-    if winner_score < threshold:
-        return None
-    return RecognitionResult(person_id=winner_pid, similarity=winner_score)
+    return sorted(best_by_person.items(), key=lambda kv: kv[1], reverse=True)

@@ -10,6 +10,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 
 const CATEGORIES = [
   "tax",
@@ -22,12 +23,26 @@ const CATEGORIES = [
   "receipt",
   "warranty",
   "other",
-];
+] as const;
+
+type DocumentCategory = (typeof CATEGORIES)[number];
+
+interface UploadForm {
+  title: string;
+  // Optional dropdowns / freeform fields. We keep ``person_id`` as a
+  // string here because react-hook-form binds <select value> to a
+  // string; it gets coerced to a number (or omitted) when we build
+  // the multipart form below.
+  document_category?: DocumentCategory | "";
+  person_id?: string;
+  notes?: string;
+}
 
 export default function DocumentsPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   const [open, setOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -43,7 +58,7 @@ export default function DocumentsPage() {
   const peopleById = new Map((people ?? []).map((p) => [p.person_id, p]));
 
   const upload = useMutation({
-    mutationFn: async (v: any) => {
+    mutationFn: async (v: UploadForm) => {
       const file: File | undefined = fileRef.current?.files?.[0];
       if (!file) throw new Error("Please choose a file.");
       const form = new FormData();
@@ -73,7 +88,7 @@ export default function DocumentsPage() {
     onError: (err: Error) => toast.error(`Could not remove document: ${err.message}`),
   });
 
-  const { register, handleSubmit, reset } = useForm<any>();
+  const { register, handleSubmit, reset } = useForm<UploadForm>();
 
   return (
     <div>
@@ -131,8 +146,17 @@ export default function DocumentsPage() {
                       </a>
                       <button
                         className="text-destructive hover:text-destructive/80"
-                        onClick={() => {
-                          if (confirm("Delete this document?")) del.mutate(d.document_id);
+                        onClick={async () => {
+                          if (
+                            await confirm({
+                              title: "Delete this document?",
+                              message: `"${d.title}" and the underlying file will be removed.`,
+                              destructive: true,
+                              confirmLabel: "Delete document",
+                            })
+                          ) {
+                            del.mutate(d.document_id);
+                          }
                         }}
                       >
                         <Trash2 className="h-4 w-4" />

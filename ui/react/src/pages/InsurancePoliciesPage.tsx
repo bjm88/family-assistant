@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
-import { Pencil, Plus, ShieldCheck, Trash2 } from "lucide-react";
+import { Plus, ShieldCheck } from "lucide-react";
 import { api } from "@/lib/api";
 import type { InsurancePolicy, Person, Vehicle } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
@@ -11,6 +11,8 @@ import { Modal } from "@/components/Modal";
 import { Field } from "@/components/Field";
 import { EncryptedField } from "@/components/EncryptedField";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
+import { RowActions } from "@/components/RowActions";
 import { stripEmpty } from "@/lib/form";
 
 const POLICY_TYPES = [
@@ -100,6 +102,7 @@ export default function InsurancePoliciesPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
   const toast = useToast();
+  const confirm = useConfirm();
   // null = closed, "new" = create, number = edit-that-policy-id.
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
 
@@ -198,27 +201,28 @@ export default function InsurancePoliciesPage() {
                     </td>
                     <td>{p.expiration_date ?? "—"}</td>
                     <td className="text-right whitespace-nowrap">
-                      <button
-                        className="text-muted-foreground hover:text-foreground mr-3"
-                        onClick={(e) => {
+                      <RowActions
+                        entityName="policy"
+                        onEdit={(e) => {
                           e.stopPropagation();
                           setEditingId(p.insurance_policy_id);
                         }}
-                        aria-label="Edit policy"
-                      >
-                        <Pencil className="h-4 w-4" />
-                      </button>
-                      <button
-                        className="text-destructive hover:text-destructive/80"
-                        onClick={(e) => {
+                        onDelete={async (e) => {
                           e.stopPropagation();
-                          if (confirm("Delete this policy?"))
+                          if (
+                            await confirm({
+                              title: "Delete this policy?",
+                              message: `${p.policy_type} policy with ${p.carrier_name}${
+                                p.plan_name ? ` (${p.plan_name})` : ""
+                              } will be removed.`,
+                              destructive: true,
+                              confirmLabel: "Delete policy",
+                            })
+                          ) {
                             del.mutate(p.insurance_policy_id);
+                          }
                         }}
-                        aria-label="Delete policy"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
+                      />
                     </td>
                   </tr>
                 ))}
