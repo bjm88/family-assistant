@@ -35,10 +35,28 @@ dependencies = [
 dev = [
     "ruff>=0.7.0",
 ]
+test = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Pytest is configured without `testpaths` so we don't lock the runner
+# at one directory; `pytest tests/integration`, `make test-integration`,
+# and bare `pytest` from the repo root all work. The project's
+# "ad-hoc only" integration-testing policy is enforced by the absence
+# of any automated runner (no CI step, no pre-commit hook), not by
+# making the tests hard to invoke.
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+filterwarnings = [
+    # Pydantic v1-style class-based Config in two routers; pre-existing,
+    # silenced so it doesn't drown real warnings.
+    "ignore::pydantic.PydanticDeprecatedSince20",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["python/api"]
