@@ -90,41 +90,16 @@ os.environ.setdefault("AI_WEB_SEARCH_SHORTCUT_ENABLED", "false")
 # ---------------------------------------------------------------------------
 
 import pytest  # noqa: E402
+from alembic import command as alembic_command  # noqa: E402
+from alembic.config import Config as AlembicConfig  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine, select, text  # noqa: E402
 from sqlalchemy.exc import OperationalError  # noqa: E402
 
 from api import models  # noqa: E402
 from api.config import get_settings  # noqa: E402
-from api.db import Base, SessionLocal, engine  # noqa: E402
+from api.db import SessionLocal, engine  # noqa: E402
 from api.main import create_app  # noqa: E402
-
-# The LLM schema-catalog view migration 0001 installs alongside the
-# tables. Some AI tools (sql_tool) read this view to discover schema;
-# we recreate it here so a fresh test DB is functionally equivalent to
-# a fully-migrated live DB without having to replay the migration
-# chain (which is currently broken from scratch — see comment in
-# _build_schema below).
-LLM_CATALOG_VIEW_SQL = """
-CREATE OR REPLACE VIEW llm_schema_catalog AS
-SELECT
-    c.table_schema              AS table_schema,
-    c.table_name                AS table_name,
-    obj_description(
-        (c.table_schema || '.' || c.table_name)::regclass, 'pg_class'
-    )                           AS table_description,
-    c.column_name               AS column_name,
-    c.data_type                 AS column_data_type,
-    c.is_nullable               AS column_is_nullable,
-    col_description(
-        (c.table_schema || '.' || c.table_name)::regclass,
-        c.ordinal_position
-    )                           AS column_description,
-    c.ordinal_position          AS column_ordinal_position
-FROM information_schema.columns c
-WHERE c.table_schema = 'public'
-ORDER BY c.table_name, c.ordinal_position;
-"""
 
 
 TEST_FAMILY_NAME = "__integration_test__"
@@ -194,25 +169,20 @@ def _ensure_test_db_exists(db_name: str) -> None:
 
 
 def _build_schema() -> None:
-    """Materialise every ORM table + the llm_schema_catalog view.
+    """Run the alembic chain to materialise the test DB schema.
 
-    .. note::
-       We deliberately do **not** run the alembic chain here. Migration
-       0001 uses ``Base.metadata.create_all()``, which writes whatever
-       shape the *current* ORM has — but several follow-up migrations
-       (e.g. 0002's rename of ``relationship_to_head_of_household``)
-       assume the *historical* shape and crash from a clean slate.
-       The live dev DB only works because it was created back when the
-       ORM matched 0001's snapshot. Replaying the chain is a separate
-       repair task; for the integration suite we want a DB that
-       matches the ORM exactly, which is what ``create_all`` gives us.
+    The migration chain was squashed to a single baseline (see
+    ``python/api/migrations/versions/0001_initial_schema.py``) so this
+    is now just ``alembic upgrade head`` — fully equivalent to how a
+    new prod DB is provisioned, which means the test harness exercises
+    the same migration path real environments use.
 
-    Idempotent: ``create_all`` is a no-op for tables that already exist,
-    and ``CREATE OR REPLACE VIEW`` is safe to re-run.
+    Idempotent: alembic skips revisions already recorded in
+    ``alembic_version``.
     """
-    Base.metadata.create_all(bind=engine)
-    with engine.begin() as conn:
-        conn.execute(text(LLM_CATALOG_VIEW_SQL))
+    alembic_cfg = AlembicConfig(str(REPO_ROOT / "alembic.ini"))
+    alembic_cfg.set_main_option("sqlalchemy.url", get_settings().database_url)
+    alembic_command.upgrade(alembic_cfg, "head")
 
 
 @pytest.fixture(scope="session", autouse=True)
