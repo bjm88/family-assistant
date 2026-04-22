@@ -164,51 +164,6 @@ when nobody is in front of the camera (or the same person has been
 sitting there for an hour), the InsightFace + ArcFace path on the
 Mac fires **zero** times instead of every 2.5 s.
 
-```mermaid
-sequenceDiagram
-    participant UI as "Live AI page (browser)"
-    participant MP as "MediaPipe BlazeFace<br/>(browser, WASM)"
-    participant Face as "/api/aiassistant/face"
-    participant Insight as "InsightFace (CoreML)"
-    participant Chat as "/api/aiassistant/chat (SSE)"
-    participant Agent as "ai/agent.py"
-    participant Tools as "ai/tools.py"
-    participant PG as Postgres
-    participant Ollama as "Ollama · gemma4:26b"
-    participant TTS as "ai/tts.py · Kokoro"
-
-    loop every 250ms while camera on
-        UI->>MP: detectForVideo(<video>)
-        MP-->>UI: bboxes + scores
-        Note over UI: IoU tracker updates; backend stays idle
-    end
-
-    alt new face track born
-        UI->>Face: POST /recognize (cropped JPEG, family_id)
-        Face->>Insight: extract_embedding()
-        Insight-->>Face: 512-d vector
-        Face->>PG: SELECT face_embeddings WHERE family_id=?
-        Face-->>UI: {matched, person_id, similarity}
-    end
-
-    alt new person recognized
-        UI->>Chat: POST /chat {greet, person_id}
-        Chat->>Agent: run_agent()
-        Agent->>PG: build RAG (person + goals + tree)
-        Agent->>Ollama: generate(system + history)
-        Ollama-->>Agent: tool_call(calendar_list_for_person)
-        Agent->>Tools: dispatch
-        Tools->>PG: scope check (authz)
-        Tools-->>Agent: tool_result
-        Agent->>Ollama: continue with tool_result
-        Ollama-->>Agent: final reply
-        Agent-->>Chat: SSE deltas → "Hi Sam! Big game tomorrow?"
-        Chat-->>UI: streamed bubble
-        UI->>TTS: POST /tts (text)
-        TTS-->>UI: WAV (cached or fresh)
-        UI->>UI: SVG mouth lip-sync to playback (amplitude-driven)
-    end
-```
 
 ## Key Technologies
 
