@@ -19,6 +19,11 @@ interface ToastItem {
 interface ToastApi {
   success: (message: string) => void;
   error: (message: string) => void;
+  // Short aliases — older callsites in AiAssistantPage destructure
+  // ``{ ok, err }`` from this hook. Keep them as thin pass-throughs so
+  // both naming conventions stay valid.
+  ok: (message: string) => void;
+  err: (message: string) => void;
 }
 
 const ToastCtx = createContext<ToastApi | null>(null);
@@ -47,9 +52,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [remove]
   );
 
+  const success = (m: string) => push("success", m);
+  const error = (m: string) => push("error", m);
   const api: ToastApi = {
-    success: (m) => push("success", m),
-    error: (m) => push("error", m),
+    success,
+    error,
+    ok: success,
+    err: error,
   };
 
   return (

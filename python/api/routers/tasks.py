@@ -44,6 +44,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     status,
 )
@@ -52,6 +53,12 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .. import models, schemas, storage
+from ..auth import (
+    CurrentUser,
+    require_admin,
+    require_family_member,
+    require_user,
+)
 from ..config import get_settings
 from ..db import get_db
 from ..services import cron_helpers
@@ -147,6 +154,51 @@ def _get_task_or_404(db: Session, task_id: int) -> models.Task:
     return task
 
 
+def _member_can_see_task(
+    db: Session, task: models.Task, user: CurrentUser
+) -> bool:
+    """Member visibility rule: creator OR assignee OR explicit follower.
+
+    Admins always see every task; this helper is only meaningful for
+    role=member. Cross-family access is rejected even if the user
+    happens to be a creator/assignee/follower (defence in depth — the
+    schema doesn't enforce that ``created_by_person_id`` lives in the
+    same family as ``family_id``, so we double-check).
+    """
+    if user.is_admin:
+        return True
+    if user.family_id != task.family_id or user.person_id is None:
+        return False
+    if task.created_by_person_id == user.person_id:
+        return True
+    if task.assigned_to_person_id == user.person_id:
+        return True
+    is_follower = (
+        db.query(models.TaskFollower)
+        .filter(
+            models.TaskFollower.task_id == task.task_id,
+            models.TaskFollower.person_id == user.person_id,
+        )
+        .first()
+        is not None
+    )
+    return is_follower
+
+
+def _require_visible_task(
+    db: Session, task_id: int, user: CurrentUser
+) -> models.Task:
+    """Load a task and 404 if the current user can't see it.
+
+    404 (not 403) so a member probing for arbitrary task IDs can't
+    distinguish "doesn't exist" from "exists but you're not a follower".
+    """
+    task = _get_task_or_404(db, task_id)
+    if not _member_can_see_task(db, task, user):
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
 def _resolve_family_timezone(db: Session, family_id: int) -> str:
     """Look up the family's IANA timezone, falling back to ET."""
     fam = db.get(models.Family, family_id)
@@ -220,6 +272,7 @@ def _maybe_kick_off_first_run(task: models.Task) -> None:
 
 @router.get("", response_model=List[schemas.TaskRead])
 def list_tasks(
+    request: Request,
     family_id: int = Query(..., description="Scope to this family."),
     status_filter: Optional[schemas.TaskStatus] = Query(
         None,
@@ -275,7 +328,23 @@ def list_tasks(
     priority so a stale 'urgent' that's already closed doesn't crowd
     the active items.
     """
+    user = require_family_member(family_id, request)
     stmt = select(models.Task).where(models.Task.family_id == family_id)
+    if not user.is_admin and user.person_id is not None:
+        # Members see only tasks they're personally involved in.
+        # Use a single OR over creator / assignee / follower so the
+        # query plan stays one index-per-leg + a small EXISTS for the
+        # follower table; significantly cheaper than a UNION.
+        stmt = stmt.where(
+            or_(
+                models.Task.created_by_person_id == user.person_id,
+                models.Task.assigned_to_person_id == user.person_id,
+                select(models.TaskFollower.task_follower_id)
+                .where(models.TaskFollower.task_id == models.Task.task_id)
+                .where(models.TaskFollower.person_id == user.person_id)
+                .exists(),
+            )
+        )
 
     if status_filter is not None:
         stmt = stmt.where(models.Task.status == status_filter)
@@ -394,10 +463,18 @@ def list_tasks(
 
 @router.post("", response_model=schemas.TaskRead, status_code=status.HTTP_201_CREATED)
 def create_task(
-    payload: schemas.TaskCreate, db: Session = Depends(get_db)
+    payload: schemas.TaskCreate,
+    request: Request,
+    db: Session = Depends(get_db),
 ) -> schemas.TaskRead:
+    user = require_family_member(payload.family_id, request)
     if db.get(models.Family, payload.family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
+
+    # Members can't impersonate other people. Force the creator to be
+    # themselves regardless of what the client sent.
+    if not user.is_admin and user.person_id is not None:
+        payload.created_by_person_id = user.person_id
 
     if (
         payload.created_by_person_id is not None
@@ -486,7 +563,11 @@ def create_task(
 
 
 @router.get("/{task_id}", response_model=schemas.TaskDetail)
-def get_task(task_id: int, db: Session = Depends(get_db)) -> schemas.TaskDetail:
+def get_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
+) -> schemas.TaskDetail:
     task = (
         db.query(models.Task)
         .options(
@@ -499,6 +580,8 @@ def get_task(task_id: int, db: Session = Depends(get_db)) -> schemas.TaskDetail:
         .first()
     )
     if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not _member_can_see_task(db, task, user):
         raise HTTPException(status_code=404, detail="Task not found")
     return schemas.TaskDetail(
         **_serialize_task(
@@ -527,9 +610,25 @@ def update_task(
     task_id: int,
     payload: schemas.TaskUpdate,
     db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ) -> schemas.TaskRead:
-    task = _get_task_or_404(db, task_id)
+    task = _require_visible_task(db, task_id, user)
     changes = payload.model_dump(exclude_unset=True)
+
+    # Members can update visible tasks but cannot reassign ownership
+    # or change identity-shaping fields. Silently drop those keys
+    # rather than 403'ing — the UI hides the controls anyway and we
+    # don't want a clumsy client to dead-end on a partial save.
+    if not user.is_admin:
+        for forbidden in (
+            "assigned_to_person_id",
+            "created_by_person_id",
+            "owner_kind",
+            "task_kind",
+            "monitoring_paused",
+            "cron_schedule",
+        ):
+            changes.pop(forbidden, None)
 
     if "assigned_to_person_id" in changes and changes["assigned_to_person_id"] is not None:
         if db.get(models.Person, changes["assigned_to_person_id"]) is None:
@@ -584,7 +683,11 @@ def update_task(
     return _serialize_task(task, **counts)
 
 
-@router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{task_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_task(task_id: int, db: Session = Depends(get_db)) -> None:
     task = _get_task_or_404(db, task_id)
     # Clean up attachment files on disk before the cascade deletes the
@@ -638,8 +741,14 @@ def add_comment(
     task_id: int,
     payload: schemas.TaskCommentCreate,
     db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ) -> models.TaskComment:
-    task = _get_task_or_404(db, task_id)
+    task = _require_visible_task(db, task_id, user)
+    # Members can only post AS themselves. Force author_person_id
+    # to their own person row regardless of what the client sent.
+    if not user.is_admin and user.person_id is not None:
+        payload.author_kind = "person"
+        payload.author_person_id = user.person_id
     if (
         payload.author_kind == "person"
         and payload.author_person_id is not None
@@ -665,6 +774,7 @@ def add_comment(
 @router.delete(
     "/{task_id}/comments/{comment_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
 )
 def delete_comment(
     task_id: int, comment_id: int, db: Session = Depends(get_db)
@@ -684,6 +794,7 @@ def delete_comment(
     "/{task_id}/followers",
     response_model=schemas.TaskFollowerRead,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
 )
 def add_follower(
     task_id: int,
@@ -719,6 +830,7 @@ def add_follower(
 @router.delete(
     "/{task_id}/followers/{person_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
 )
 def remove_follower(
     task_id: int, person_id: int, db: Session = Depends(get_db)
@@ -749,8 +861,12 @@ def upload_attachment(
     uploaded_by_person_id: Optional[int] = Form(None),
     caption: Optional[str] = Form(None),
     db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ) -> models.TaskAttachment:
-    task = _get_task_or_404(db, task_id)
+    task = _require_visible_task(db, task_id, user)
+    # Members can only attach AS themselves.
+    if not user.is_admin and user.person_id is not None:
+        uploaded_by_person_id = user.person_id
     if (
         uploaded_by_person_id is not None
         and db.get(models.Person, uploaded_by_person_id) is None
@@ -783,8 +899,12 @@ def upload_attachment(
 
 @router.get("/{task_id}/attachments/{attachment_id}/download")
 def download_attachment(
-    task_id: int, attachment_id: int, db: Session = Depends(get_db)
+    task_id: int,
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ):
+    _require_visible_task(db, task_id, user)
     att = db.get(models.TaskAttachment, attachment_id)
     if att is None or att.task_id != task_id:
         raise HTTPException(status_code=404, detail="Attachment not found")
@@ -804,6 +924,7 @@ def download_attachment(
 @router.delete(
     "/{task_id}/attachments/{attachment_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
 )
 def delete_attachment(
     task_id: int, attachment_id: int, db: Session = Depends(get_db)
@@ -820,7 +941,11 @@ def delete_attachment(
 # ---------------------------------------------------------------------------
 
 
-@router.put("/{task_id}/schedule", response_model=schemas.TaskRead)
+@router.put(
+    "/{task_id}/schedule",
+    response_model=schemas.TaskRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_schedule(
     task_id: int,
     payload: schemas.TaskScheduleUpdate,
@@ -875,6 +1000,7 @@ def update_schedule(
     "/{task_id}/run-now",
     response_model=schemas.TaskRead,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_admin)],
 )
 def run_now(task_id: int, db: Session = Depends(get_db)) -> schemas.TaskRead:
     """Fire a monitoring run for this task right now, in the background.
@@ -922,6 +1048,7 @@ def run_now(task_id: int, db: Session = Depends(get_db)) -> schemas.TaskRead:
     "/{task_id}/links",
     response_model=schemas.TaskLinkRead,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
 )
 def add_link(
     task_id: int,
@@ -969,6 +1096,7 @@ def add_link(
 @router.delete(
     "/{task_id}/links/{link_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
 )
 def delete_link(
     task_id: int, link_id: int, db: Session = Depends(get_db)

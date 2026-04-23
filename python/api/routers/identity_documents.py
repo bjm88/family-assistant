@@ -15,9 +15,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import crypto, models, schemas, storage
+from ..auth import require_admin
 from ..db import get_db
 
-router = APIRouter(prefix="/identity-documents", tags=["identity_documents"])
+# Admin-only — passports, driver's licenses, scanned ID images.
+router = APIRouter(
+    prefix="/identity-documents",
+    tags=["identity_documents"],
+    dependencies=[Depends(require_admin)],
+)
 
 Side = Literal["front", "back"]
 

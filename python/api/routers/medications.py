@@ -19,10 +19,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..auth import require_admin
 from ..db import get_db
 
 
-router = APIRouter(prefix="/medications", tags=["medications"])
+router = APIRouter(
+    prefix="/medications",
+    tags=["medications"],
+    dependencies=[Depends(require_admin)],
+)
 
 _FAR_PAST = _date_cls(1, 1, 1)
 

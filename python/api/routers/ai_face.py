@@ -14,13 +14,14 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models, storage
 from ..ai import face as face_service
+from ..auth import require_family_member, require_family_member_from_request
 from ..config import get_settings
 from ..db import get_db
 
@@ -110,7 +111,11 @@ def _load_gallery(db: Session, family_id: int) -> List[face_service.EnrolledFace
 # ---------- Status --------------------------------------------------------
 
 
-@router.get("/status", response_model=FaceStatus)
+@router.get(
+    "/status",
+    response_model=FaceStatus,
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def status(
     family_id: int,
     db: Session = Depends(get_db),
@@ -132,7 +137,11 @@ def status(
 # ---------- Enroll --------------------------------------------------------
 
 
-@router.post("/enroll", response_model=EnrollResponse)
+@router.post(
+    "/enroll",
+    response_model=EnrollResponse,
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def enroll_family(
     family_id: int,
     db: Session = Depends(get_db),
@@ -235,7 +244,10 @@ def enroll_family(
     )
 
 
-@router.delete("/enroll")
+@router.delete(
+    "/enroll",
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def clear_enrollments(
     family_id: int,
     db: Session = Depends(get_db),
@@ -255,10 +267,15 @@ def clear_enrollments(
 
 @router.post("/recognize", response_model=RecognizeResponse)
 def recognize(
+    request: Request,
     family_id: int = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> RecognizeResponse:
+    # ``family_id`` arrives as a multipart form field, which the
+    # ``require_family_member_from_request`` dependency can't see
+    # (it only inspects path/query). Do the membership check by hand.
+    require_family_member(family_id, request)
     if db.get(models.Family, family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
 

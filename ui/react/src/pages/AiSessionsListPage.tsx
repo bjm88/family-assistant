@@ -13,6 +13,7 @@ import {
 import { api } from "@/lib/api";
 import type { Family, LiveSession } from "@/lib/types";
 import { cn } from "@/lib/cn";
+import { UserPill } from "@/components/UserPill";
 
 /**
  * Session history list for a family.
@@ -52,27 +53,31 @@ export default function AiSessionsListPage() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-background to-muted">
       <header className="border-b border-border bg-white">
-        <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
+        <div className="max-w-5xl mx-auto px-3 sm:px-6 py-3 sm:py-4 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0 flex-1">
             <Link
               to={`/aiassistant/${familyId}`}
-              className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
+              className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1 shrink-0"
+              aria-label="Back to live"
+              title="Back to live"
             >
-              <ArrowLeft className="h-4 w-4" /> Back to live
+              <ArrowLeft className="h-4 w-4" />
+              <span className="hidden sm:inline">Back to live</span>
             </Link>
-            <div>
-              <div className="text-xs text-muted-foreground uppercase tracking-wide">
+            <div className="min-w-0">
+              <div className="text-[10px] sm:text-xs text-muted-foreground uppercase tracking-wide truncate">
                 {family?.family_name ?? "—"} · Session history
               </div>
-              <div className="font-semibold text-lg">
+              <div className="font-semibold text-base sm:text-lg truncate">
                 Past conversations with Avi
               </div>
             </div>
           </div>
+          <UserPill compact className="shrink-0" />
         </div>
       </header>
 
-      <main className="max-w-5xl mx-auto p-6">
+      <main className="max-w-5xl mx-auto p-3 sm:p-6">
         {isLoading ? (
           <div className="text-sm text-muted-foreground">Loading sessions…</div>
         ) : !sessions || sessions.length === 0 ? (

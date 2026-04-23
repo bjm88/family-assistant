@@ -226,7 +226,7 @@ function StepCard({ step }: { step: AgentStep }) {
           </pre>
         </details>
       )}
-      {step.tool_output && (
+      {step.tool_output != null && (
         <details className="text-xs">
           <summary className="cursor-pointer text-muted-foreground">
             Output

@@ -7,12 +7,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import crypto, models, schemas, storage
+from ..auth import require_admin, require_family_member_from_request
 from ..db import get_db
 
 router = APIRouter(prefix="/vehicles", tags=["vehicles"])
 
 
-@router.get("", response_model=List[schemas.VehicleRead])
+@router.get(
+    "",
+    response_model=List[schemas.VehicleRead],
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def list_vehicles(
     family_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
@@ -23,7 +28,12 @@ def list_vehicles(
     return list(db.execute(stmt).scalars())
 
 
-@router.post("", response_model=schemas.VehicleRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=schemas.VehicleRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
+)
 def create_vehicle(payload: schemas.VehicleCreate, db: Session = Depends(get_db)) -> models.Vehicle:
     if db.get(models.Family, payload.family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
@@ -47,7 +57,11 @@ def create_vehicle(payload: schemas.VehicleCreate, db: Session = Depends(get_db)
     return v
 
 
-@router.patch("/{vehicle_id}", response_model=schemas.VehicleRead)
+@router.patch(
+    "/{vehicle_id}",
+    response_model=schemas.VehicleRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_vehicle(
     vehicle_id: int,
     payload: schemas.VehicleUpdate,
@@ -80,7 +94,11 @@ def update_vehicle(
     return v
 
 
-@router.delete("/{vehicle_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{vehicle_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_vehicle(vehicle_id: int, db: Session = Depends(get_db)) -> None:
     v = db.get(models.Vehicle, vehicle_id)
     if v is None:
@@ -89,7 +107,11 @@ def delete_vehicle(vehicle_id: int, db: Session = Depends(get_db)) -> None:
     db.delete(v)
 
 
-@router.post("/{vehicle_id}/profile-photo", response_model=schemas.VehicleRead)
+@router.post(
+    "/{vehicle_id}/profile-photo",
+    response_model=schemas.VehicleRead,
+    dependencies=[Depends(require_admin)],
+)
 def upload_vehicle_profile_photo(
     vehicle_id: int,
     file: UploadFile = File(...),
@@ -113,6 +135,7 @@ def upload_vehicle_profile_photo(
 @router.delete(
     "/{vehicle_id}/profile-photo",
     response_model=schemas.VehicleRead,
+    dependencies=[Depends(require_admin)],
 )
 def delete_vehicle_profile_photo(
     vehicle_id: int,

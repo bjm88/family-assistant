@@ -16,10 +16,18 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
 
 from .. import models
+from ..auth import require_admin
 from ..db import get_db
 
 
-router = APIRouter(prefix="/aiassistant/tasks", tags=["agent_tasks"])
+# Agent audit trail — admin only. The agent runs in Avi's voice, but
+# the step replay can include cross-family context, so members never
+# see this surface.
+router = APIRouter(
+    prefix="/aiassistant/tasks",
+    tags=["agent_tasks"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 # ---------------------------------------------------------------------------

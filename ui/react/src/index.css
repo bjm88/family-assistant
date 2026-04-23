@@ -118,3 +118,10 @@ body {
     @apply hover:bg-muted/60 transition-colors;
   }
 }
+
+/* Hide the native scrollbar on horizontally-scrolling status rows
+   (Live AI badge strip on mobile). The strip is still scrollable via
+   touch/trackpad, we just don't want a 16-px-tall bar living below
+   the badges. */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }

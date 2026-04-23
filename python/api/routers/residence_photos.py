@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, storage
+from ..auth import CurrentUser, require_admin, require_user
 from ..db import get_db
 
 router = APIRouter(prefix="/residence-photos", tags=["residence_photos"])
@@ -25,7 +26,17 @@ router = APIRouter(prefix="/residence-photos", tags=["residence_photos"])
 def list_residence_photos(
     residence_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ) -> List[models.ResidencePhoto]:
+    if not user.is_admin:
+        if residence_id is None:
+            raise HTTPException(
+                status_code=403,
+                detail="residence_id is required for non-admin users.",
+            )
+        residence = db.get(models.Residence, residence_id)
+        if residence is None or residence.family_id != user.family_id:
+            raise HTTPException(status_code=404, detail="Residence not found")
     stmt = select(models.ResidencePhoto).order_by(
         models.ResidencePhoto.created_at.desc()
     )
@@ -38,6 +49,7 @@ def list_residence_photos(
     "",
     response_model=schemas.ResidencePhotoRead,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
 )
 def upload_residence_photo(
     residence_id: int = Form(...),
@@ -75,7 +87,11 @@ def upload_residence_photo(
     return photo
 
 
-@router.patch("/{residence_photo_id}", response_model=schemas.ResidencePhotoRead)
+@router.patch(
+    "/{residence_photo_id}",
+    response_model=schemas.ResidencePhotoRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_residence_photo(
     residence_photo_id: int,
     payload: schemas.ResidencePhotoUpdate,
@@ -91,7 +107,11 @@ def update_residence_photo(
     return photo
 
 
-@router.delete("/{residence_photo_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{residence_photo_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_residence_photo(
     residence_photo_id: int, db: Session = Depends(get_db)
 ) -> None:

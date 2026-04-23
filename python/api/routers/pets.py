@@ -7,12 +7,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..auth import require_admin, require_family_member_from_request
 from ..db import get_db
 
 router = APIRouter(prefix="/pets", tags=["pets"])
 
 
-@router.get("", response_model=List[schemas.PetRead])
+@router.get(
+    "",
+    response_model=List[schemas.PetRead],
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def list_pets(
     family_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
@@ -24,7 +29,10 @@ def list_pets(
 
 
 @router.post(
-    "", response_model=schemas.PetRead, status_code=status.HTTP_201_CREATED
+    "",
+    response_model=schemas.PetRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
 )
 def create_pet(payload: schemas.PetCreate, db: Session = Depends(get_db)) -> models.Pet:
     if db.get(models.Family, payload.family_id) is None:
@@ -36,7 +44,11 @@ def create_pet(payload: schemas.PetCreate, db: Session = Depends(get_db)) -> mod
     return pet
 
 
-@router.patch("/{pet_id}", response_model=schemas.PetRead)
+@router.patch(
+    "/{pet_id}",
+    response_model=schemas.PetRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_pet(
     pet_id: int,
     payload: schemas.PetUpdate,
@@ -52,7 +64,11 @@ def update_pet(
     return pet
 
 
-@router.delete("/{pet_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{pet_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_pet(pet_id: int, db: Session = Depends(get_db)) -> None:
     pet = db.get(models.Pet, pet_id)
     if pet is None:

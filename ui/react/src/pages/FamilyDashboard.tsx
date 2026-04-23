@@ -1,12 +1,16 @@
+import type { ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Bot,
   Building2,
   Car,
+  History,
   Home,
+  ListTodo,
   Network,
   PawPrint,
+  Sparkles,
   Star,
 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -22,10 +26,12 @@ import type {
 import { PageHeader } from "@/components/PageHeader";
 import { FamilyTreeView } from "@/components/FamilyTreeView";
 import { AssistantAvatar } from "@/components/AssistantAvatar";
+import { useAuth } from "@/lib/auth";
 
 export default function FamilyDashboard() {
   const { familyId } = useParams();
   const navigate = useNavigate();
+  const { isAdmin } = useAuth();
   const { data: family } = useQuery<Family>({
     queryKey: ["family", familyId],
     queryFn: () => api.get<Family>(`/api/families/${familyId}`),
@@ -71,12 +77,26 @@ export default function FamilyDashboard() {
       api.get<Residence[]>(`/api/residences?family_id=${familyId}`),
   });
 
+  // Members get a read-only Overview: same cards, no drill-in links,
+  // no "Edit →" / "Manage →" pills, no click-to-navigate. The tree is
+  // still rendered (it's the most-asked-for "show me my family" view)
+  // but clicking a node is a no-op for members rather than bouncing
+  // them to the Relationships page they can't access.
+  const description = isAdmin
+    ? "A quick glance at everything we know about your household."
+    : "A quick glance at your household, plus quick links to Avi, your session history, and the tasks you're on.";
+
   return (
     <div>
       <PageHeader
         title={family?.family_name ?? "Family"}
-        description="A quick glance at everything we know about your household."
+        description={description}
       />
+
+      {/* Member-only hero: three big CTAs for the daily-driver surfaces
+          (Live, Session history, Tasks). Admins get the same trio from
+          the sidebar — they don't need a second row of buttons here. */}
+      {!isAdmin && familyId && <MemberHero familyId={familyId} />}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="card lg:col-span-2">
@@ -86,50 +106,49 @@ export default function FamilyDashboard() {
                 <Network className="h-4 w-4 text-primary" /> Family tree
               </div>
               <div className="text-xs text-muted-foreground mt-0.5">
-                Generated from people and the relationships you've wired up.
-                Click anyone to jump to the Relationships page.
+                {isAdmin
+                  ? "Generated from people and the relationships you've wired up. Click anyone to jump to the Relationships page."
+                  : "Generated from people and the relationships in your household."}
               </div>
             </div>
-            <Link
-              to={`/admin/families/${familyId}/relationships`}
-              className="text-xs text-primary hover:underline"
-            >
-              Edit →
-            </Link>
+            {isAdmin && (
+              <Link
+                to={`/admin/families/${familyId}/relationships`}
+                className="text-xs text-primary hover:underline"
+              >
+                Edit →
+              </Link>
+            )}
           </div>
           <div className="card-body">
             {people && (
               <FamilyTreeView
                 people={people}
                 edges={edges ?? []}
-                onSelect={(personId) =>
-                  navigate(
-                    `/admin/families/${familyId}/relationships?focus=${personId}`
-                  )
+                onSelect={
+                  isAdmin
+                    ? (personId) =>
+                        navigate(
+                          `/admin/families/${familyId}/relationships?focus=${personId}`
+                        )
+                    : undefined
                 }
               />
             )}
           </div>
         </div>
 
-        {/* Two CTAs on this card: clicking the body opens the
-            assistant editor; the corner pill goes straight to the
-            live page. We can't nest `<Link>` inside `<Link>` (DOM
-            spec forbids `<a>` inside `<a>`), so the outer container
-            is a `<div>` that navigates programmatically and the pill
-            is a real `<Link>` with stopPropagation so the body click
-            doesn't also fire. */}
-        <div
-          role="link"
-          tabIndex={0}
-          onClick={() => navigate(`/admin/families/${familyId}/assistant`)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              navigate(`/admin/families/${familyId}/assistant`);
-            }
-          }}
-          className="card hover:shadow-md transition-shadow self-start cursor-pointer"
+        {/* Two CTAs on this card for admins (open editor + go live).
+            Members get the static info card and the live-chat pill only —
+            no drill-in to the assistant editor. */}
+        <DashboardCard
+          interactive={isAdmin}
+          onActivate={
+            isAdmin
+              ? () => navigate(`/admin/families/${familyId}/assistant`)
+              : undefined
+          }
+          className="self-start"
         >
           <div className="card-header">
             <div className="card-title flex items-center gap-2">
@@ -155,7 +174,7 @@ export default function FamilyDashboard() {
                     </div>
                   )}
                 </div>
-                {assistant.avatar_generation_note && (
+                {assistant.avatar_generation_note && isAdmin && (
                   <div className="text-[11px] text-destructive">
                     avatar needs regeneration
                   </div>
@@ -167,18 +186,21 @@ export default function FamilyDashboard() {
                   <Bot className="h-12 w-12" />
                 </div>
                 <div className="text-sm text-muted-foreground">
-                  No assistant yet. Click to create one.
+                  {isAdmin
+                    ? "No assistant yet. Click to create one."
+                    : "No assistant yet."}
                 </div>
               </>
             )}
           </div>
-        </div>
+        </DashboardCard>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
-        <Link
+        <DashboardLinkCard
           to={`/admin/families/${familyId}/pets`}
-          className="card hover:shadow-md transition-shadow self-start"
+          interactive={isAdmin}
+          className="self-start"
         >
           <div className="card-header">
             <div className="card-title flex items-center gap-2">
@@ -187,13 +209,15 @@ export default function FamilyDashboard() {
                 <span className="badge ml-1">{pets.length}</span>
               )}
             </div>
-            <span className="text-xs text-primary hover:underline">Manage →</span>
+            {isAdmin && (
+              <span className="text-xs text-primary hover:underline">Manage →</span>
+            )}
           </div>
           <div className="card-body">
             {!pets || pets.length === 0 ? (
               <div className="text-sm text-muted-foreground flex items-center gap-2">
                 <PawPrint className="h-4 w-4" />
-                No pets yet. Click to add one.
+                {isAdmin ? "No pets yet. Click to add one." : "No pets on file."}
               </div>
             ) : (
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
@@ -224,11 +248,12 @@ export default function FamilyDashboard() {
               </div>
             )}
           </div>
-        </Link>
+        </DashboardLinkCard>
 
-        <Link
+        <DashboardLinkCard
           to={`/admin/families/${familyId}/residences`}
-          className="card hover:shadow-md transition-shadow self-start"
+          interactive={isAdmin}
+          className="self-start"
         >
           <div className="card-header">
             <div className="card-title flex items-center gap-2">
@@ -237,13 +262,17 @@ export default function FamilyDashboard() {
                 <span className="badge ml-1">{residences.length}</span>
               )}
             </div>
-            <span className="text-xs text-primary hover:underline">Manage →</span>
+            {isAdmin && (
+              <span className="text-xs text-primary hover:underline">Manage →</span>
+            )}
           </div>
           <div className="card-body">
             {!residences || residences.length === 0 ? (
               <div className="text-sm text-muted-foreground flex items-center gap-2">
                 <Home className="h-4 w-4" />
-                No residences yet. Click to add one.
+                {isAdmin
+                  ? "No residences yet. Click to add one."
+                  : "No residences on file."}
               </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -284,13 +313,14 @@ export default function FamilyDashboard() {
               </div>
             )}
           </div>
-        </Link>
+        </DashboardLinkCard>
       </div>
 
       <div className="mt-6">
-        <Link
+        <DashboardLinkCard
           to={`/admin/families/${familyId}/vehicles`}
-          className="card hover:shadow-md transition-shadow block"
+          interactive={isAdmin}
+          className="block"
         >
           <div className="card-header">
             <div className="card-title flex items-center gap-2">
@@ -299,14 +329,17 @@ export default function FamilyDashboard() {
                 <span className="badge ml-1">{dailyDrivers.length}</span>
               )}
             </div>
-            <span className="text-xs text-primary hover:underline">Manage →</span>
+            {isAdmin && (
+              <span className="text-xs text-primary hover:underline">Manage →</span>
+            )}
           </div>
           <div className="card-body">
             {dailyDrivers.length === 0 ? (
               <div className="text-sm text-muted-foreground flex items-center gap-2">
                 <Car className="h-4 w-4" />
-                No cars or trucks yet. Click to add the daily-driver fleet —
-                boats, ATVs, and other vehicles live on the full Vehicles page.
+                {isAdmin
+                  ? "No cars or trucks yet. Click to add the daily-driver fleet — boats, ATVs, and other vehicles live on the full Vehicles page."
+                  : "No cars or trucks on file."}
               </div>
             ) : (
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
@@ -342,7 +375,7 @@ export default function FamilyDashboard() {
               </div>
             )}
           </div>
-        </Link>
+        </DashboardLinkCard>
       </div>
 
       {family?.head_of_household_notes && (
@@ -356,5 +389,129 @@ export default function FamilyDashboard() {
         </div>
       )}
     </div>
+  );
+}
+
+// Three large tiles that give a family member one-tap access to the
+// surfaces they actually use: start a live conversation with Avi, pull
+// up past session transcripts, or jump to their task list. The sidebar
+// has the same three links for keyboard-driven navigation, but most
+// family members will reach the Overview from their phone and tap a
+// tile — this row is the single biggest cue that the app is theirs to
+// use, not just theirs to look at.
+function MemberHero({ familyId }: { familyId: string }) {
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+      <Link
+        to={`/aiassistant/${familyId}`}
+        className="card hover:shadow-md transition-shadow bg-primary text-primary-foreground border-primary"
+      >
+        <div className="card-body flex items-start gap-3">
+          <div className="rounded-lg bg-primary-foreground/10 p-2 shrink-0">
+            <Sparkles className="h-5 w-5" />
+          </div>
+          <div className="min-w-0">
+            <div className="font-semibold">Chat with Avi</div>
+            <div className="text-xs opacity-90 mt-0.5">
+              Live voice + text. Ask anything.
+            </div>
+          </div>
+        </div>
+      </Link>
+      <Link
+        to={`/aiassistant/${familyId}/sessions`}
+        className="card hover:shadow-md transition-shadow"
+      >
+        <div className="card-body flex items-start gap-3">
+          <div className="rounded-lg bg-primary/10 p-2 text-primary shrink-0">
+            <History className="h-5 w-5" />
+          </div>
+          <div className="min-w-0">
+            <div className="font-semibold">Past conversations</div>
+            <div className="text-xs text-muted-foreground mt-0.5">
+              Every session you've been in with Avi.
+            </div>
+          </div>
+        </div>
+      </Link>
+      <Link
+        to={`/admin/families/${familyId}/tasks`}
+        className="card hover:shadow-md transition-shadow"
+      >
+        <div className="card-body flex items-start gap-3">
+          <div className="rounded-lg bg-primary/10 p-2 text-primary shrink-0">
+            <ListTodo className="h-5 w-5" />
+          </div>
+          <div className="min-w-0">
+            <div className="font-semibold">My tasks</div>
+            <div className="text-xs text-muted-foreground mt-0.5">
+              Things you own, were assigned, or follow.
+            </div>
+          </div>
+        </div>
+      </Link>
+    </div>
+  );
+}
+
+// Wrapper that flips between an interactive admin card (clickable, with
+// hover shadow + keyboard handler for the assistant card) and a plain
+// static container for members. Keeps the JSX above unchanged structure.
+function DashboardCard({
+  children,
+  interactive,
+  onActivate,
+  className,
+}: {
+  children: ReactNode;
+  interactive: boolean;
+  onActivate?: () => void;
+  className?: string;
+}) {
+  if (!interactive) {
+    return <div className={`card ${className ?? ""}`}>{children}</div>;
+  }
+  return (
+    <div
+      role="link"
+      tabIndex={0}
+      onClick={onActivate}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onActivate?.();
+        }
+      }}
+      className={`card hover:shadow-md transition-shadow cursor-pointer ${className ?? ""}`}
+    >
+      {children}
+    </div>
+  );
+}
+
+// Same idea for cards that wrap a `<Link>` instead of programmatic
+// navigation: render a real link for admins, a static `<div>` for
+// members so there's nothing to click.
+function DashboardLinkCard({
+  children,
+  to,
+  interactive,
+  className,
+}: {
+  children: ReactNode;
+  to: string;
+  interactive: boolean;
+  className?: string;
+}) {
+  if (!interactive) {
+    return <div className={`card ${className ?? ""}`}>{children}</div>;
+  }
+  return (
+    <Link
+      to={to}
+      className={`card hover:shadow-md transition-shadow ${className ?? ""}`}
+    >
+      {children}
+    </Link>
   );
 }

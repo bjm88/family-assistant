@@ -14,15 +14,22 @@ slowest probe rather than the sum.
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from ..auth import require_admin
 from ..services.system_status import (
     SystemStatusReport,
     gather_status_report,
 )
 
 
-router = APIRouter(prefix="/status", tags=["status"])
+# Status reveals internal infra (Postgres + Ollama + ngrok + LLM
+# heartbeats). Admin-only — members never see this surface.
+router = APIRouter(
+    prefix="/status",
+    tags=["status"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 @router.get(

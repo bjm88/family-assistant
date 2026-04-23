@@ -7,9 +7,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import crypto, models, schemas
+from ..auth import require_admin
 from ..db import get_db
 
-router = APIRouter(prefix="/sensitive-identifiers", tags=["sensitive_identifiers"])
+# Admin-only — encrypted SSNs / account numbers / VINs. Members never
+# see this surface, even on their own profile.
+router = APIRouter(
+    prefix="/sensitive-identifiers",
+    tags=["sensitive_identifiers"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 @router.get("", response_model=List[schemas.SensitiveIdentifierRead])

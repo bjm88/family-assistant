@@ -558,6 +558,89 @@ unverified apps; the app owner can always click "Advanced → Go to
 3. Disconnect + reconnect from the admin UI. The new refresh token
    issued under Production status is good indefinitely.
 
+### 6c. Authentication (browser sign-in)
+
+The HTTP surface is **locked down** behind Google sign-in. Anonymous
+visitors only see the marketing landing page and the legal docs;
+everything under `/admin/*`, `/aiassistant/*`, and the entire JSON API
+requires a valid session cookie. Two roles:
+
+| Role | Source of truth | What they can do |
+| --- | --- | --- |
+| **Admin** | Email is in `ADMIN_EMAILS` (comma-separated, lowercased) | Full CRUD across every family — same UI you've always used |
+| **Family member** | Email matches a `people.email_address` row (case-insensitive) and is *not* in `ADMIN_EMAILS` | Read-only Overview for their family, the Live AI page, their session history, and the Tasks board filtered to ones they created / are assigned to / follow |
+
+Anyone whose email is on neither list gets bounced from the OAuth
+callback with a friendly "this account is not authorised" message; the
+session cookie is never minted.
+
+**Setup steps** (the secrets section in `.env` already has placeholders;
+fill them in once):
+
+1. **Add the admin emails** to `.env`:
+
+   ```ini
+   ADMIN_EMAILS="you@gmail.com,partner@gmail.com"
+   ```
+
+2. **Generate a session signing key.** Treat it like
+   `FA_ENCRYPTION_KEY` — never commit, rotate to log everyone out:
+
+   ```bash
+   python -c "import secrets; print(secrets.token_urlsafe(48))"
+   ```
+
+   Paste into `.env` as `SESSION_SECRET_KEY`.
+
+3. **Create a SECOND Google OAuth client** specifically for browser
+   logins. The one from §6b belongs to *Avi* (Gmail + Calendar
+   scopes) — never reuse it for human sign-in. At
+   <https://console.cloud.google.com/apis/credentials> →
+   *Create credentials → OAuth client ID*:
+   - Application type = **Web application**
+   - Name = e.g. `Family Assistant Login`
+   - Authorized redirect URIs (add **both** so localhost dev and the
+     public ngrok tunnel both work):
+     - `http://localhost:8000/api/auth/google/callback`
+     - `https://avi-maisano.ngrok.app/api/auth/google/callback`
+   - Scopes are the non-sensitive trio (`openid email profile`) so
+     no Google verification review is required — the consent screen
+     stays usable in "Testing" mode forever for these scopes.
+
+   Copy the credentials into `.env`:
+
+   ```ini
+   USER_LOGIN_GOOGLE_CLIENT_ID=<paste>.apps.googleusercontent.com
+   USER_LOGIN_GOOGLE_CLIENT_SECRET=<paste>
+   USER_LOGIN_GOOGLE_REDIRECT_URI=http://localhost:8000/api/auth/google/callback
+   PUBLIC_BASE_URL=https://avi-maisano.ngrok.app
+   ```
+
+   `PUBLIC_BASE_URL` is the canonical origin the SPA is served from.
+   The cookie's `Secure` flag is set automatically when it starts
+   with `https://` (so localhost dev over plain http still works
+   while the ngrok-served deployment gets the Secure flag).
+
+4. **Add a family member.** Open **People** → either edit an existing
+   row or create a new one and put their personal Gmail in
+   `email_address`. That's the entire opt-in: as soon as the row
+   exists, that email can sign in and lands on their family's
+   read-only Overview. Removing the email (or deleting the row) revokes
+   their access on the next request — identity is derived live, no
+   user table to keep in sync.
+
+5. **Restart the API** so the new env vars take effect, then visit
+   <http://localhost:5173/login>. Click *Sign in with Google* and
+   you'll be redirected back to your role-appropriate landing page
+   (admins → families list; members → their family Overview).
+
+**Public allowlist.** These routes deliberately stay open so external
+systems can hit them without a cookie: `/`, `/legal/*`, `/api/health`,
+`/api/auth/*`, `/api/sms/twilio/inbound` (Twilio's own signature is
+the gate), and `/api/admin/google/oauth/callback` (Avi's Gmail/Calendar
+callback — Google has to be able to reach it). Everything else returns
+401 unless a valid `fa_session` cookie is presented.
+
 ### 7. Run database migrations
 
 ```bash
@@ -786,7 +869,7 @@ curl -s http://localhost:8000/api/aiassistant/status | python3 -m json.tool
   legitimate plaintext cases.
 - **Email / research / spreadsheet automations**: delegated to Claude
   Code via tool invocations from the assistant.
-- **Multi-user auth / per-person access policies.** Today the app
-  assumes local single-machine trust; the `/api/admin/*` vs
-  `/api/aiassistant/*` split is already in place to guard them
-  separately.
+- **Per-person access policies for sensitive tools.** Browser sign-in
+  + role-based gating shipped (see §6c); the next layer is finer-grain
+  policies on which family members can ask Avi to reveal which
+  encrypted columns or send mail on their behalf.

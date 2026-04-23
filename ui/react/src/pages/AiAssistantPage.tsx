@@ -42,6 +42,8 @@ import type {
   LiveSessionDetail,
 } from "@/lib/types";
 import { useToast } from "@/components/Toast";
+import { UserPill } from "@/components/UserPill";
+import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/cn";
 import SpeakingMouth from "./SpeakingMouth";
 import {
@@ -573,6 +575,7 @@ function useLiveSession(familyId: number) {
 export default function AiAssistantPage() {
   const { familyId: familyIdParam } = useParams();
   const familyId = Number(familyIdParam);
+  const { isAdmin } = useAuth();
 
   const { data: family } = useQuery<Family>({
     queryKey: ["family", familyIdParam],
@@ -703,52 +706,69 @@ export default function AiAssistantPage() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-background to-muted">
       <header className="border-b border-border bg-white">
-        <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-4">
+        {/* Top row: back link, family + assistant title, UserPill.
+            Padding shrinks on mobile so the title + user pill fit on
+            phones without the pill scrolling off the right edge. */}
+        <div className="max-w-7xl mx-auto px-3 sm:px-6 py-3 sm:py-4 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0 flex-1">
             <Link
               to={`/admin/families/${familyId}`}
-              className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
+              className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1 shrink-0"
+              aria-label="Back to overview"
+              title="Back to overview"
             >
-              <ArrowLeft className="h-4 w-4" /> Back to admin
+              <ArrowLeft className="h-4 w-4" />
+              <span className="hidden sm:inline">Back to overview</span>
             </Link>
-            <div>
-              <div className="text-xs text-muted-foreground uppercase tracking-wide">
+            <div className="min-w-0">
+              <div className="text-[10px] sm:text-xs text-muted-foreground uppercase tracking-wide truncate">
                 {family?.family_name ?? "—"} · Live Assistant
               </div>
-              <div className="font-semibold text-lg flex items-center gap-2">
-                <Bot className="h-5 w-5 text-primary" /> {assistantName}
+              <div className="font-semibold text-base sm:text-lg flex items-center gap-2 min-w-0">
+                <Bot className="h-5 w-5 text-primary shrink-0" />
+                <span className="truncate">{assistantName}</span>
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setSpeakerOn((s) => !s)}
-              className={cn(
-                "inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs border",
-                speakerOn
-                  ? "bg-primary/10 text-primary border-primary/30 hover:bg-primary/20"
-                  : "bg-muted text-muted-foreground border-border hover:bg-muted/70"
-              )}
-              title={
-                speakerOn
-                  ? "Avi speaks out loud. Click to mute."
-                  : "Avi is muted. Click to enable voice."
-              }
-            >
-              {speakerOn ? (
-                <Volume2 className="h-3.5 w-3.5" />
-              ) : (
-                <VolumeX className="h-3.5 w-3.5" />
-              )}
-              {speakerOn ? "Voice on" : "Voice off"}
-            </button>
+          <UserPill compact className="shrink-0" />
+        </div>
+        {/* Secondary row: voice toggle + status badges. On phones it
+            scrolls horizontally so the badges can keep their fixed
+            widths instead of forcing the page to grow. */}
+        <div className="max-w-7xl mx-auto px-3 sm:px-6 pb-2 flex items-center gap-2 overflow-x-auto no-scrollbar">
+          <button
+            onClick={() => setSpeakerOn((s) => !s)}
+            className={cn(
+              "inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs border shrink-0",
+              speakerOn
+                ? "bg-primary/10 text-primary border-primary/30 hover:bg-primary/20"
+                : "bg-muted text-muted-foreground border-border hover:bg-muted/70"
+            )}
+            title={
+              speakerOn
+                ? "Avi speaks out loud. Click to mute."
+                : "Avi is muted. Click to enable voice."
+            }
+          >
+            {speakerOn ? (
+              <Volume2 className="h-3.5 w-3.5" />
+            ) : (
+              <VolumeX className="h-3.5 w-3.5" />
+            )}
+            {speakerOn ? "Voice on" : "Voice off"}
+          </button>
+          {/* Operational diagnostics (Ollama health, face embedding
+              count, TTS engine, "Re-enroll faces" admin tool). They're
+              busy and only meaningful to maintainers, so members get
+              the cleaner header. */}
+          {isAdmin && (
             <StatusBadges
               llm={llmStatus}
               face={faceStatus}
               tts={ttsStatus}
               familyId={familyId}
             />
-          </div>
+          )}
         </div>
         <LiveSessionPill session={liveSession} familyId={familyId} />
       </header>
@@ -757,7 +777,7 @@ export default function AiAssistantPage() {
           right-hand cell ``min-h-0`` lets the chat panel match the
           left column's natural height (Avi + camera) and scroll its
           message list internally rather than push the row taller. */}
-      <main className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-6 lg:items-stretch">
+      <main className="max-w-7xl mx-auto p-3 sm:p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-4 sm:gap-6 lg:items-stretch">
         <div className="flex flex-col gap-6 min-h-0">
           <AviStage
             assistant={assistant}

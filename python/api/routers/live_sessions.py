@@ -23,12 +23,18 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..ai import session as live_session
+from ..auth import (
+    CurrentUser,
+    require_family_member,
+    require_family_member_from_request,
+    require_user,
+)
 from ..db import get_db
 
 logger = logging.getLogger(__name__)
@@ -53,8 +59,10 @@ def _require_session(
 @router.post("/ensure-active", response_model=schemas.LiveSessionRead)
 def ensure_active(
     payload: schemas.EnsureActiveSessionRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> dict:
+    require_family_member(payload.family_id, request)
     if db.get(models.Family, payload.family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
     session, created = live_session.ensure_active_session(
@@ -77,7 +85,11 @@ def ensure_active(
     return live_session.session_header_dict(db, session)
 
 
-@router.get("/active", response_model=Optional[schemas.LiveSessionRead])
+@router.get(
+    "/active",
+    response_model=Optional[schemas.LiveSessionRead],
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def active_session(
     family_id: int = Query(...),
     db: Session = Depends(get_db),
@@ -103,6 +115,7 @@ def active_session(
 
 @router.get("", response_model=List[schemas.LiveSessionRead])
 def list_sessions(
+    request: Request,
     family_id: int = Query(...),
     limit: int = Query(50, ge=1, le=200),
     include_active: bool = Query(True),
@@ -110,7 +123,12 @@ def list_sessions(
 ) -> List[dict]:
     """History list (newest first). Closes stale sessions so the list
     reflects an accurate active/ended state.
+
+    For non-admin members the result is automatically narrowed to
+    sessions they actually participated in (any surface — live face
+    rec, SMS, email, Telegram all upsert participants the same way).
     """
+    user = require_family_member(family_id, request)
     if db.get(models.Family, family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
     live_session.close_stale_sessions(db, family_id=family_id)
@@ -123,6 +141,23 @@ def list_sessions(
     )
     if not include_active:
         stmt = stmt.where(models.LiveSession.ended_at.is_not(None))
+    if not user.is_admin and user.person_id is not None:
+        # Members see only sessions where they appear as a
+        # participant. Use a correlated EXISTS so the LIMIT still
+        # applies cleanly (a JOIN + DISTINCT would interact poorly
+        # with ORDER BY started_at DESC LIMIT N when a session
+        # has multiple participant rows).
+        stmt = stmt.where(
+            select(models.LiveSessionParticipant.live_session_participant_id)
+            .where(
+                models.LiveSessionParticipant.live_session_id
+                == models.LiveSession.live_session_id
+            )
+            .where(
+                models.LiveSessionParticipant.person_id == user.person_id
+            )
+            .exists()
+        )
     rows = list(db.execute(stmt).scalars())
     return [live_session.session_header_dict(db, s) for s in rows]
 
@@ -131,8 +166,30 @@ def list_sessions(
 def get_session(
     live_session_id: int,
     db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ) -> dict:
     session = _require_session(db, live_session_id)
+    if not user.is_admin:
+        # Wrong family or not a participant → pretend the session
+        # doesn't exist (404, never 403) so members can't probe for
+        # IDs that belong to other families or sessions they weren't
+        # in.
+        if user.family_id != session.family_id:
+            raise HTTPException(status_code=404, detail="Live session not found")
+        if user.person_id is None:
+            raise HTTPException(status_code=404, detail="Live session not found")
+        is_participant = (
+            db.query(models.LiveSessionParticipant)
+            .filter(
+                models.LiveSessionParticipant.live_session_id
+                == session.live_session_id,
+                models.LiveSessionParticipant.person_id == user.person_id,
+            )
+            .first()
+            is not None
+        )
+        if not is_participant:
+            raise HTTPException(status_code=404, detail="Live session not found")
     participants = list(session.participants)
     messages = list(session.messages)
     header = live_session.session_header_dict(
@@ -154,9 +211,11 @@ def get_session(
 def end(
     live_session_id: int,
     payload: schemas.EndSessionRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> dict:
     session = _require_session(db, live_session_id)
+    require_family_member(session.family_id, request)
     live_session.end_session(db, session, reason=payload.end_reason)
     db.flush()
     db.refresh(session)

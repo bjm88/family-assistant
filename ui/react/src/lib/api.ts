@@ -12,6 +12,7 @@ const PASSTHROUGH_ROOTS = [
   "/api/aiassistant/",
   "/api/media/",
   "/api/health",
+  "/api/auth/",
 ];
 
 export function resolveApiPath(path: string): string {
@@ -42,13 +43,32 @@ async function request<T>(
     headers.set("Content-Type", "application/json");
   }
   const resolved = resolveApiPath(path);
-  const res = await fetch(resolved, { ...init, headers });
+  const res = await fetch(resolved, { ...init, headers, credentials: "same-origin" });
   if (!res.ok) {
     let body: unknown = null;
     try {
       body = await res.json();
     } catch {
       /* noop */
+    }
+    // Global 401 handling: if the backend says "login required" the
+    // user's cookie is gone (expired, never set, or revoked) and there's
+    // nothing the calling component can usefully do about it. Bounce to
+    // /login with a `next` param so we can return them to where they
+    // were after sign-in. Skip when we're already on /login (avoid an
+    // infinite reload loop) and when the request itself is the auth
+    // probe (`/api/auth/me`) — that one is allowed to 401 silently so
+    // the AuthProvider can render the login page.
+    if (
+      res.status === 401 &&
+      typeof window !== "undefined" &&
+      window.location.pathname !== "/login" &&
+      !path.startsWith("/api/auth/")
+    ) {
+      const next = encodeURIComponent(
+        window.location.pathname + window.location.search
+      );
+      window.location.href = `/login?next=${next}`;
     }
     const message = formatErrorMessage(res.status, path, body);
     throw new ApiError(res.status, message, body);

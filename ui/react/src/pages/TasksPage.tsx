@@ -52,6 +52,7 @@ import { Field } from "@/components/Field";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useToast } from "@/components/Toast";
 import { cn } from "@/lib/cn";
+import { useAuth } from "@/lib/auth";
 
 // ---------------------------------------------------------------------------
 // Static metadata: kanban columns + priority palette
@@ -239,6 +240,7 @@ export default function TasksPage() {
   const { familyId } = useParams();
   const qc = useQueryClient();
   const toast = useToast();
+  const { isAdmin } = useAuth();
 
   // Top-level tab — kanban (human todos) vs. monitoring (Avi-owned
   // standing jobs). Persisted only in component state so a hard
@@ -398,10 +400,16 @@ export default function TasksPage() {
             : "Standing investigations Avi runs on a cron schedule. Edit the cadence, pause / resume, or click 'Run now' to refresh the latest findings on demand."
         }
         actions={
-          <button className="btn-primary" onClick={() => setCreateOpen(true)}>
-            <Plus className="h-4 w-4" />
-            {tab === "todo" ? "New task" : "New monitor"}
-          </button>
+          // Members can technically create tasks via the API, but the
+          // overview-style UX for non-admins intentionally hides the
+          // create affordances — they live the kanban as a read/comment
+          // surface for tasks they're already part of.
+          isAdmin ? (
+            <button className="btn-primary" onClick={() => setCreateOpen(true)}>
+              <Plus className="h-4 w-4" />
+              {tab === "todo" ? "New task" : "New monitor"}
+            </button>
+          ) : null
         }
       />
 
@@ -488,14 +496,20 @@ export default function TasksPage() {
             <EmptyState
               icon={ListTodo}
               title="No tasks yet"
-              description="Create one here, or just ask Avi: 'Add a task to fix the gate this weekend.'"
+              description={
+                isAdmin
+                  ? "Create one here, or just ask Avi: 'Add a task to fix the gate this weekend.'"
+                  : "You're not on any tasks yet. Ask Avi to add you, or chat with an admin."
+              }
               action={
-                <button
-                  className="btn-primary"
-                  onClick={() => setCreateOpen(true)}
-                >
-                  <Plus className="h-4 w-4" /> New task
-                </button>
+                isAdmin ? (
+                  <button
+                    className="btn-primary"
+                    onClick={() => setCreateOpen(true)}
+                  >
+                    <Plus className="h-4 w-4" /> New task
+                  </button>
+                ) : undefined
               }
             />
           ) : (
@@ -676,6 +690,7 @@ function MonitoringList({
 }: MonitoringListProps) {
   const qc = useQueryClient();
   const toast = useToast();
+  const { isAdmin } = useAuth();
   const tasksKey = tasksQueryKey(familyId);
 
   const togglePause = useMutation({
@@ -736,9 +751,11 @@ function MonitoringList({
           "or just ask Avi to monitor something."
         }
         action={
-          <button className="btn-primary" onClick={onCreate}>
-            <Plus className="h-4 w-4" /> New monitoring task
-          </button>
+          isAdmin ? (
+            <button className="btn-primary" onClick={onCreate}>
+              <Plus className="h-4 w-4" /> New monitoring task
+            </button>
+          ) : undefined
         }
       />
     );
@@ -847,8 +864,13 @@ function MonitoringRow({
               </div>
             )}
           </button>
+          {/* Action toolbar. On touch devices (no hover) we keep it
+              visible at all times — the previous ``opacity-0 group-hover``
+              pattern hid Pause / Run / Delete behind a hover state phones
+              can't trigger. ``sm:`` and up keeps the original reveal-on-
+              hover behaviour so desktop cards stay tidy. */}
           <div
-            className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
+            className="flex items-center gap-1 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
             onClick={(e) => e.stopPropagation()}
           >
             <button
@@ -1190,9 +1212,12 @@ function KanbanCard({
       )}
 
       {/* Hover toolbar: Complete + Delete. Stops click from bubbling
-          so it doesn't open the detail modal. */}
+          so it doesn't open the detail modal.
+          On touch devices (no real hover) we keep it visible at all
+          times so members can actually tap Complete; ``sm:`` and up
+          restores the desktop "appears on hover" effect. */}
       <div
-        className="mt-2 flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
+        className="mt-2 flex items-center justify-end gap-1 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
         onClick={(e) => e.stopPropagation()}
       >
         {isDone ? (
@@ -1594,6 +1619,7 @@ function TaskDetailModal({
 }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const { isAdmin } = useAuth();
   const fileRef = useRef<HTMLInputElement>(null);
 
   const detailQuery = useQuery<TaskDetail>({
@@ -1864,26 +1890,35 @@ function TaskDetailModal({
                 </select>
               </Field>
               <Field label="Owner" htmlFor="owner-edit">
-                <select
-                  id="owner-edit"
-                  className="input"
-                  value={t.assigned_to_person_id ?? ""}
-                  onChange={(e) =>
-                    patchTask.mutate({
-                      assigned_to_person_id: e.target.value
-                        ? Number(e.target.value)
-                        : null,
-                    })
-                  }
-                >
-                  <option value="">— Unassigned</option>
-                  {people.map((p) => (
-                    <option key={p.person_id} value={p.person_id}>
-                      {p.preferred_name ||
-                        `${p.first_name} ${p.last_name}`.trim()}
-                    </option>
-                  ))}
-                </select>
+                {isAdmin ? (
+                  <select
+                    id="owner-edit"
+                    className="input"
+                    value={t.assigned_to_person_id ?? ""}
+                    onChange={(e) =>
+                      patchTask.mutate({
+                        assigned_to_person_id: e.target.value
+                          ? Number(e.target.value)
+                          : null,
+                      })
+                    }
+                  >
+                    <option value="">— Unassigned</option>
+                    {people.map((p) => (
+                      <option key={p.person_id} value={p.person_id}>
+                        {p.preferred_name ||
+                          `${p.first_name} ${p.last_name}`.trim()}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  // Members can't reassign — show the owner as static text.
+                  <div className="input bg-muted/30 cursor-default">
+                    {t.assigned_to_person_id != null
+                      ? personLabel(peopleById, t.assigned_to_person_id)
+                      : "— Unassigned"}
+                  </div>
+                )}
               </Field>
               <Field label="Desired end" htmlFor="desired-edit">
                 <input
@@ -1954,45 +1989,51 @@ function TaskDetailModal({
                   className="badge bg-blue-50 text-blue-700 border-blue-200 inline-flex items-center gap-1"
                 >
                   {personLabel(peopleById, f.person_id)}
-                  <button
-                    className="hover:text-destructive"
-                    onClick={() => removeFollower.mutate(f.person_id)}
-                    aria-label="Remove follower"
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
+                  {isAdmin && (
+                    <button
+                      className="hover:text-destructive"
+                      onClick={() => removeFollower.mutate(f.person_id)}
+                      aria-label="Remove follower"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
                 </span>
               ))}
-              <select
-                className="input max-w-[200px]"
-                value={followerToAdd}
-                onChange={(e) => setFollowerToAdd(e.target.value)}
-              >
-                <option value="">Add follower…</option>
-                {people
-                  .filter(
-                    (p) =>
-                      p.person_id !== t.created_by_person_id &&
-                      p.person_id !== t.assigned_to_person_id &&
-                      !t.followers.some((f) => f.person_id === p.person_id),
-                  )
-                  .map((p) => (
-                    <option key={p.person_id} value={p.person_id}>
-                      {p.preferred_name ||
-                        `${p.first_name} ${p.last_name}`.trim()}
-                    </option>
-                  ))}
-              </select>
-              {followerToAdd && (
-                <button
-                  className="btn-secondary"
-                  onClick={() => {
-                    addFollower.mutate(Number(followerToAdd));
-                    setFollowerToAdd("");
-                  }}
-                >
-                  Add
-                </button>
+              {isAdmin && (
+                <>
+                  <select
+                    className="input max-w-[200px]"
+                    value={followerToAdd}
+                    onChange={(e) => setFollowerToAdd(e.target.value)}
+                  >
+                    <option value="">Add follower…</option>
+                    {people
+                      .filter(
+                        (p) =>
+                          p.person_id !== t.created_by_person_id &&
+                          p.person_id !== t.assigned_to_person_id &&
+                          !t.followers.some((f) => f.person_id === p.person_id),
+                      )
+                      .map((p) => (
+                        <option key={p.person_id} value={p.person_id}>
+                          {p.preferred_name ||
+                            `${p.first_name} ${p.last_name}`.trim()}
+                        </option>
+                      ))}
+                  </select>
+                  {followerToAdd && (
+                    <button
+                      className="btn-secondary"
+                      onClick={() => {
+                        addFollower.mutate(Number(followerToAdd));
+                        setFollowerToAdd("");
+                      }}
+                    >
+                      Add
+                    </button>
+                  )}
+                </>
               )}
             </div>
           </section>

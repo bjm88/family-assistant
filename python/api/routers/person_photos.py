@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from .. import models, schemas, storage
 from ..ai.enrollment import enroll_photo, remove_photo_enrollment
+from ..auth import CurrentUser, require_admin, require_user
 from ..db import get_db
 
 router = APIRouter(prefix="/person-photos", tags=["person_photos"])
@@ -27,14 +28,31 @@ router = APIRouter(prefix="/person-photos", tags=["person_photos"])
 def list_person_photos(
     person_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ) -> List[models.PersonPhoto]:
+    # Members must scope by person_id, and the person must live in
+    # their family. Admins may enumerate freely.
+    if not user.is_admin:
+        if person_id is None:
+            raise HTTPException(
+                status_code=403,
+                detail="person_id is required for non-admin users.",
+            )
+        person = db.get(models.Person, person_id)
+        if person is None or person.family_id != user.family_id:
+            raise HTTPException(status_code=404, detail="Person not found")
     stmt = select(models.PersonPhoto).order_by(models.PersonPhoto.created_at.desc())
     if person_id is not None:
         stmt = stmt.where(models.PersonPhoto.person_id == person_id)
     return list(db.execute(stmt).scalars())
 
 
-@router.post("", response_model=schemas.PersonPhotoRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=schemas.PersonPhotoRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
+)
 def upload_person_photo(
     background: BackgroundTasks,
     person_id: int = Form(...),
@@ -82,7 +100,11 @@ def upload_person_photo(
     return photo
 
 
-@router.patch("/{person_photo_id}", response_model=schemas.PersonPhotoRead)
+@router.patch(
+    "/{person_photo_id}",
+    response_model=schemas.PersonPhotoRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_person_photo(
     person_photo_id: int,
     payload: schemas.PersonPhotoUpdate,
@@ -120,7 +142,11 @@ def update_person_photo(
     return photo
 
 
-@router.delete("/{person_photo_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{person_photo_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_person_photo(person_photo_id: int, db: Session = Depends(get_db)) -> None:
     photo = db.get(models.PersonPhoto, person_photo_id)
     if photo is None:

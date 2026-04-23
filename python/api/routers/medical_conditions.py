@@ -16,10 +16,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..auth import require_admin
 from ..db import get_db
 
 
-router = APIRouter(prefix="/medical-conditions", tags=["medical-conditions"])
+router = APIRouter(
+    prefix="/medical-conditions",
+    tags=["medical-conditions"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 # Sentinel used so rows with no start_date sort *after* dated rows

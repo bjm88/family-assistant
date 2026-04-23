@@ -1,7 +1,11 @@
 import type { ReactNode } from "react";
 
 interface FieldProps {
-  label: string;
+  // Optional so consumers that supply their own inline label (e.g. a
+  // checkbox row whose <label> wraps the input) can use Field purely
+  // for layout/error/hint plumbing without rendering a duplicate
+  // header label above their content.
+  label?: string;
   htmlFor?: string;
   error?: string;
   hint?: string;
@@ -11,9 +15,11 @@ interface FieldProps {
 export function Field({ label, htmlFor, error, hint, children }: FieldProps) {
   return (
     <div>
-      <label className="label" htmlFor={htmlFor}>
-        {label}
-      </label>
+      {label ? (
+        <label className="label" htmlFor={htmlFor}>
+          {label}
+        </label>
+      ) : null}
       {children}
       {hint && !error && (
         <div className="text-xs text-muted-foreground mt-1">{hint}</div>

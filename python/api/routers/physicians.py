@@ -9,10 +9,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..auth import require_admin
 from ..db import get_db
 
 
-router = APIRouter(prefix="/physicians", tags=["physicians"])
+router = APIRouter(
+    prefix="/physicians",
+    tags=["physicians"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 @router.get("", response_model=List[schemas.PhysicianRead])

@@ -19,14 +19,22 @@
 #      explicitly unloaded the agents): fall back to the legacy
 #      ``stop.sh --force`` then ``start.sh`` flow.
 #
+# Before kickstarting any service we run ``scripts/deploy.sh --build``
+# so a "restart" is also a *full refresh*: Python deps (uv sync), npm
+# deps, Alembic migrations, and a fresh production React bundle in
+# ``ui/react/dist/`` (which the FastAPI backend serves to the public
+# ngrok tunnel via ``api.routers.spa``). Skip with ``--no-deploy`` when
+# you only need to recycle a process and know nothing on disk changed.
+#
 # Pass-through arguments let you restart a single service:
 #
-#   scripts/restart.sh                  # backend + frontend
-#   scripts/restart.sh backend          # backend only
-#   scripts/restart.sh frontend         # frontend only
-#   scripts/restart.sh ngrok            # ngrok tunnel only
+#   scripts/restart.sh                  # deploy --build + restart backend+frontend
+#   scripts/restart.sh backend          # deploy --build + restart backend only
+#   scripts/restart.sh frontend         # deploy --build + restart frontend only
+#   scripts/restart.sh ngrok            # deploy --build + restart ngrok only
 #   scripts/restart.sh backend ngrok    # mix and match
 #   scripts/restart.sh all              # explicit equivalent of no args
+#   scripts/restart.sh --no-deploy      # just kickstart (no install/build/migrate)
 #
 # Exit non-zero if a kickstarted service fails its health probe within 30 s
 # (the agent log is tailed to stderr so you don't have to dig for it).
@@ -42,16 +50,19 @@ source "${_SELF_DIR}/lib/common.sh"
 # Argument parsing
 # ----------------------------------------------------------------------------
 TARGETS=()
+DEPLOY=1
 for arg in "$@"; do
     case "${arg}" in
         backend|frontend|ngrok|all) TARGETS+=("${arg}") ;;
+        --no-deploy|--skip-deploy) DEPLOY=0 ;;
         -h|--help)
-            sed -n '4,33p' "$0"
+            sed -n '4,42p' "$0"
             exit 0
             ;;
         *)
             log_error "Unknown argument: ${arg}"
             log_error "Valid targets: backend, frontend, ngrok, all"
+            log_error "Valid flags  : --no-deploy"
             exit 2
             ;;
     esac
@@ -290,6 +301,32 @@ restart_service() {
 # ----------------------------------------------------------------------------
 log_step "family-assistant · restart (${TARGETS[*]})"
 log_info "Project root: ${PROJECT_ROOT}"
+
+# ---- Full-refresh step ------------------------------------------------------
+# Re-run the deploy pipeline before kickstarting anything. ``deploy.sh
+# --build`` is idempotent and fast on a clean tree (uv sync + npm
+# install short-circuit, alembic upgrade is a no-op when at head, and
+# vite build takes ~1 s) but it's the only thing that updates the
+# production React bundle in ``ui/react/dist/`` — which the FastAPI
+# backend now serves to ngrok visitors via ``api.routers.spa``. Without
+# this step, public users would see a stale shell after every code
+# change while the local Vite dev server (port 5173) silently kept
+# pace. Pass --no-deploy to opt out for fast process recycles.
+if [[ "${DEPLOY}" -eq 1 ]]; then
+    log_step "Refreshing dependencies + production bundle (deploy.sh --build)"
+    if ! "${_SELF_DIR}/deploy.sh" --build; then
+        log_error "deploy.sh --build failed — see output above."
+        log_error "Re-run with --no-deploy to skip this step (e.g. when offline"
+        log_error "or your DB isn't reachable for migrations)."
+        exit 1
+    fi
+    echo ""
+else
+    log_warn "Skipping deploy refresh (--no-deploy)"
+    log_warn "  ui/react/dist/ may be stale — public ngrok visitors will see"
+    log_warn "  whatever bundle was last built. Run 'cd ui/react && npm run build'"
+    log_warn "  manually (or drop --no-deploy) when shipping React changes."
+fi
 
 # Heads-up if the user has agents installed but is restarting a target that
 # isn't covered. Saves them a round-trip when "restart.sh frontend" doesn't

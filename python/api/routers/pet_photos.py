@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, storage
+from ..auth import CurrentUser, require_admin, require_user
 from ..db import get_db
 
 router = APIRouter(prefix="/pet-photos", tags=["pet_photos"])
@@ -25,7 +26,17 @@ router = APIRouter(prefix="/pet-photos", tags=["pet_photos"])
 def list_pet_photos(
     pet_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ) -> List[models.PetPhoto]:
+    if not user.is_admin:
+        if pet_id is None:
+            raise HTTPException(
+                status_code=403,
+                detail="pet_id is required for non-admin users.",
+            )
+        pet = db.get(models.Pet, pet_id)
+        if pet is None or pet.family_id != user.family_id:
+            raise HTTPException(status_code=404, detail="Pet not found")
     stmt = select(models.PetPhoto).order_by(models.PetPhoto.created_at.desc())
     if pet_id is not None:
         stmt = stmt.where(models.PetPhoto.pet_id == pet_id)
@@ -33,7 +44,10 @@ def list_pet_photos(
 
 
 @router.post(
-    "", response_model=schemas.PetPhotoRead, status_code=status.HTTP_201_CREATED
+    "",
+    response_model=schemas.PetPhotoRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
 )
 def upload_pet_photo(
     pet_id: int = Form(...),
@@ -66,7 +80,11 @@ def upload_pet_photo(
     return photo
 
 
-@router.patch("/{pet_photo_id}", response_model=schemas.PetPhotoRead)
+@router.patch(
+    "/{pet_photo_id}",
+    response_model=schemas.PetPhotoRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_pet_photo(
     pet_photo_id: int,
     payload: schemas.PetPhotoUpdate,
@@ -82,7 +100,11 @@ def update_pet_photo(
     return photo
 
 
-@router.delete("/{pet_photo_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{pet_photo_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_pet_photo(pet_photo_id: int, db: Session = Depends(get_db)) -> None:
     photo = db.get(models.PetPhoto, pet_photo_id)
     if photo is None:

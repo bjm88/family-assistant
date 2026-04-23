@@ -19,12 +19,17 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..auth import (
+    CurrentUser,
+    require_family_member,
+    require_user,
+)
 from ..ai import agent as agent_loop
 from ..ai import assistants as _assistants
 from ..ai import chat_prompts
@@ -218,7 +223,7 @@ def _shortcut_stream_response(
 
 
 @router.get("/status", response_model=StatusResponse)
-async def status() -> StatusResponse:
+async def status(_: CurrentUser = Depends(require_user)) -> StatusResponse:
     info = await ollama.health()
     return StatusResponse(**info)  # type: ignore[arg-type]
 
@@ -244,7 +249,7 @@ class WarmupResponse(BaseModel):
 
 
 @router.post("/warmup", response_model=WarmupResponse)
-async def warmup() -> WarmupResponse:
+async def warmup(_: CurrentUser = Depends(require_user)) -> WarmupResponse:
     """Pre-load both Gemma models on demand from the live page.
 
     The lifespan startup task already warms the models when the
@@ -290,7 +295,11 @@ def _display_name(person: models.Person) -> str:
 
 
 @router.post("/greet", response_model=GreetResponse)
-async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetResponse:
+async def greet(
+    payload: GreetRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> GreetResponse:
     """Instant, no-LLM greeting so Avi can *start talking* within a few
     hundred milliseconds of spotting a face. The contextual question
     ("how's your diet going?") comes from ``/followup`` and is spoken
@@ -310,6 +319,7 @@ async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetRe
     * on a successful greeting we log an assistant-role
       :class:`LiveSessionMessage` so the history view is complete.
     """
+    require_family_member(payload.family_id, request)
     person = db.get(models.Person, payload.person_id)
     if person is None or person.family_id != payload.family_id:
         raise HTTPException(status_code=404, detail="Person not found in this family")
@@ -444,12 +454,15 @@ async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetRe
 
 @router.post("/followup", response_model=FollowupResponse)
 async def followup(
-    payload: FollowupRequest, db: Session = Depends(get_db)
+    payload: FollowupRequest,
+    request: Request,
+    db: Session = Depends(get_db),
 ) -> FollowupResponse:
     """LLM-generated, one-sentence follow-up aimed at the person's most
     salient goal (or a generic "how are you?" when they haven't set one).
     Runs asynchronously while the instant greeting is already playing.
     """
+    require_family_member(payload.family_id, request)
     person = db.get(models.Person, payload.person_id)
     if person is None or person.family_id != payload.family_id:
         raise HTTPException(status_code=404, detail="Person not found in this family")
@@ -637,13 +650,18 @@ class SqlResponse(BaseModel):
 
 
 @router.post("/sql", response_model=SqlResponse)
-def run_sql(payload: SqlRequest, db: Session = Depends(get_db)) -> SqlResponse:
+def run_sql(
+    payload: SqlRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> SqlResponse:
     """Execute a sandboxed read-only SELECT.
 
     Used by the chat planner under the hood and exposed directly so
     operators can poke at the schema with the same allow-list /
     timeouts the LLM operates under.
     """
+    require_family_member(payload.family_id, request)
     if db.get(models.Family, payload.family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
     try:
@@ -662,7 +680,11 @@ def run_sql(payload: SqlRequest, db: Session = Depends(get_db)) -> SqlResponse:
 
 
 @router.post("/chat")
-async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+async def chat(
+    payload: ChatRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
     """Streaming chat endpoint, driven by the AI agent loop.
 
     Each invocation creates one ``agent_tasks`` row + N ``agent_steps``
@@ -692,8 +714,16 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
     ``meta.kind="live_fast_ack"`` so the History view can replay it
     in order.
     """
+    user = require_family_member(payload.family_id, request)
     if db.get(models.Family, payload.family_id) is None:
         raise HTTPException(status_code=404, detail="Family not found")
+
+    # Members can't impersonate other people on the live chat — pin
+    # ``recognized_person_id`` to the logged-in user's own person row
+    # so RAG / transcript / agent context all match the human at
+    # the keyboard. Admins keep the spoofing power for testing.
+    if not user.is_admin and user.person_id is not None:
+        payload.recognized_person_id = user.person_id
 
     # ---------- Fast-path web-search shortcut ---------------------------
     #

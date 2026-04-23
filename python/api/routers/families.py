@@ -7,12 +7,17 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..auth import require_admin, require_family_member_from_request
 from ..db import get_db
 
 router = APIRouter(prefix="/families", tags=["families"])
 
 
-@router.get("", response_model=List[schemas.FamilySummary])
+@router.get(
+    "",
+    response_model=List[schemas.FamilySummary],
+    dependencies=[Depends(require_admin)],
+)
 def list_families(db: Session = Depends(get_db)) -> List[schemas.FamilySummary]:
     rows = db.execute(
         select(
@@ -40,7 +45,12 @@ def list_families(db: Session = Depends(get_db)) -> List[schemas.FamilySummary]:
     return summaries
 
 
-@router.post("", response_model=schemas.FamilyRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=schemas.FamilyRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
+)
 def create_family(payload: schemas.FamilyCreate, db: Session = Depends(get_db)) -> models.Family:
     family = models.Family(**payload.model_dump(exclude_none=True))
     db.add(family)
@@ -49,7 +59,11 @@ def create_family(payload: schemas.FamilyCreate, db: Session = Depends(get_db)) 
     return family
 
 
-@router.get("/{family_id}", response_model=schemas.FamilyRead)
+@router.get(
+    "/{family_id}",
+    response_model=schemas.FamilyRead,
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def get_family(family_id: int, db: Session = Depends(get_db)) -> models.Family:
     family = db.get(models.Family, family_id)
     if family is None:
@@ -57,7 +71,11 @@ def get_family(family_id: int, db: Session = Depends(get_db)) -> models.Family:
     return family
 
 
-@router.patch("/{family_id}", response_model=schemas.FamilyRead)
+@router.patch(
+    "/{family_id}",
+    response_model=schemas.FamilyRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_family(
     family_id: int,
     payload: schemas.FamilyUpdate,
@@ -73,7 +91,11 @@ def update_family(
     return family
 
 
-@router.delete("/{family_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{family_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_family(family_id: int, db: Session = Depends(get_db)) -> None:
     family = db.get(models.Family, family_id)
     if family is None:

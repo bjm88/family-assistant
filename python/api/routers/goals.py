@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..auth import CurrentUser, require_admin, require_user
 from ..db import get_db
 
 router = APIRouter(prefix="/goals", tags=["goals"])
@@ -20,7 +21,21 @@ _PRIORITY_ORDER = {"urgent": 0, "semi_urgent": 1, "normal": 2, "low": 3}
 def list_goals(
     person_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ) -> List[models.Goal]:
+    # Members can only enumerate goals for their own household, and
+    # only when they pin the request to a specific person they're
+    # allowed to see. The unscoped "all goals everywhere" mode is
+    # admin-only.
+    if not user.is_admin:
+        if person_id is None:
+            raise HTTPException(
+                status_code=403,
+                detail="person_id is required for non-admin users.",
+            )
+        person = db.get(models.Person, person_id)
+        if person is None or person.family_id != user.family_id:
+            raise HTTPException(status_code=404, detail="Person not found")
     stmt = select(models.Goal)
     if person_id is not None:
         stmt = stmt.where(models.Goal.person_id == person_id)
@@ -36,7 +51,10 @@ def list_goals(
 
 
 @router.post(
-    "", response_model=schemas.GoalRead, status_code=status.HTTP_201_CREATED
+    "",
+    response_model=schemas.GoalRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
 )
 def create_goal(
     payload: schemas.GoalCreate, db: Session = Depends(get_db)
@@ -50,7 +68,11 @@ def create_goal(
     return goal
 
 
-@router.patch("/{goal_id}", response_model=schemas.GoalRead)
+@router.patch(
+    "/{goal_id}",
+    response_model=schemas.GoalRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_goal(
     goal_id: int,
     payload: schemas.GoalUpdate,
@@ -66,7 +88,11 @@ def update_goal(
     return goal
 
 
-@router.delete("/{goal_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{goal_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_goal(goal_id: int, db: Session = Depends(get_db)) -> None:
     goal = db.get(models.Goal, goal_id)
     if goal is None:

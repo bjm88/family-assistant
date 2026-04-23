@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..auth import require_admin, require_family_member_from_request
 from ..db import get_db
 
 router = APIRouter(prefix="/person-relationships", tags=["person_relationships"])
@@ -36,7 +37,11 @@ def _require_same_family(db: Session, a_id: int, b_id: int) -> None:
         )
 
 
-@router.get("", response_model=List[schemas.PersonRelationshipRead])
+@router.get(
+    "",
+    response_model=List[schemas.PersonRelationshipRead],
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def list_person_relationships(
     family_id: Optional[int] = Query(None),
     person_id: Optional[int] = Query(None),
@@ -62,6 +67,7 @@ def list_person_relationships(
     "",
     response_model=List[schemas.PersonRelationshipRead],
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
 )
 def create_person_relationship(
     payload: schemas.PersonRelationshipCreate,
@@ -118,7 +124,9 @@ def create_person_relationship(
 
 
 @router.delete(
-    "/{person_relationship_id}", status_code=status.HTTP_204_NO_CONTENT
+    "/{person_relationship_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
 )
 def delete_person_relationship(
     person_relationship_id: int, db: Session = Depends(get_db)

@@ -57,6 +57,53 @@
         text-decoration: underline;
       }
 
+      /* ───── top bar ───── */
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        background: var(--bg);
+        border-bottom: 1px solid var(--rule);
+        backdrop-filter: saturate(180%) blur(6px);
+      }
+      .topbar-inner {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 10px 24px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .topbar-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 600;
+        color: var(--fg);
+      }
+      .topbar-brand img {
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        object-fit: cover;
+      }
+      .topbar-spacer {
+        flex: 1;
+      }
+      .topbar-signin {
+        display: inline-block;
+        padding: 6px 14px;
+        border-radius: 8px;
+        font-weight: 600;
+        font-size: 14px;
+        background: var(--accent);
+        color: #fff;
+      }
+      .topbar-signin:hover {
+        text-decoration: none;
+        filter: brightness(1.05);
+      }
+
       /* ───── hero ───── */
       .hero {
         position: relative;
@@ -279,6 +326,17 @@
     </style>
   </head>
   <body>
+    <div class="topbar">
+      <div class="topbar-inner">
+        <a class="topbar-brand" href="/">
+          <img src="/landing/avi.png" alt="" aria-hidden="true" />
+          <span>Avi</span>
+        </a>
+        <div class="topbar-spacer" aria-hidden="true"></div>
+        <a class="topbar-signin" href="/login">Sign in</a>
+      </div>
+    </div>
+
     <header class="hero">
       <div class="hero-inner">
         <div>
@@ -292,10 +350,11 @@
             Telegram.
           </p>
           <div class="cta-row">
-            <a class="btn btn-primary" href="mailto:benjamin.maisano@gmail.com"
+            <a class="btn btn-primary" href="/login">Sign in</a>
+            <a class="btn btn-secondary" href="#features">See what Avi can do</a>
+            <a class="btn btn-secondary" href="mailto:benjamin.maisano@gmail.com"
               >Get in touch</a
             >
-            <a class="btn btn-secondary" href="#features">See what Avi can do</a>
           </div>
         </div>
         <img
@@ -523,6 +582,7 @@
           operated by Benjamin Maisano.
         </div>
         <nav>
+          <a href="/login">Sign in</a>
           <a href="/legal/privacy-policy">Privacy Policy</a>
           <a href="/legal/terms-of-service">Terms of Service</a>
           <a href="mailto:benjamin.maisano@gmail.com">Contact</a>

@@ -7,9 +7,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import crypto, models, schemas
+from ..auth import require_admin
 from ..db import get_db
 
-router = APIRouter(prefix="/insurance-policies", tags=["insurance_policies"])
+router = APIRouter(
+    prefix="/insurance-policies",
+    tags=["insurance_policies"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 def _to_read(policy: models.InsurancePolicy) -> schemas.InsurancePolicyRead:

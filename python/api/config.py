@@ -44,6 +44,55 @@ class Settings(BaseSettings):
     FA_STORAGE_ROOT: str = "./resources/family"
     FA_CORS_ORIGINS: str = "http://localhost:5173"
 
+    # ---- Authentication / authorization --------------------------------
+    # Comma-separated list of email addresses with full admin access to
+    # the app (every CRUD page, every family). Anything NOT in this list
+    # falls through to ``people.email_address`` matching: a Google login
+    # whose verified email matches a Person row gets the "member" role
+    # scoped to that person's family. An email matching neither gets
+    # rejected at the OAuth callback with no cookie set.
+    ADMIN_EMAILS: str = ""
+
+    # Browser-login Google OAuth client. Distinct from the existing
+    # GOOGLE_OAUTH_CLIENT_ID/SECRET above (which are Avi's Gmail +
+    # Calendar grant) so the user-login flow can request only the
+    # non-sensitive openid+email+profile scopes — no Gmail send, no
+    # Calendar write — and so revoking one credential set doesn't
+    # disconnect Avi's mailbox by accident. Create a second
+    # "Web application" OAuth client in Google Cloud Console with
+    # redirect URI USER_LOGIN_GOOGLE_REDIRECT_URI.
+    USER_LOGIN_GOOGLE_CLIENT_ID: Optional[str] = None
+    USER_LOGIN_GOOGLE_CLIENT_SECRET: Optional[str] = None
+    USER_LOGIN_GOOGLE_REDIRECT_URI: str = (
+        "http://localhost:8000/api/auth/google/callback"
+    )
+
+    # 32-byte (or longer) random secret used to HMAC-sign the session
+    # cookie payload. Generate with::
+    #
+    #     python -c "import secrets; print(secrets.token_urlsafe(48))"
+    #
+    # If you rotate this everyone is logged out (existing cookies fail
+    # signature verification). Empty = the auth module hard-fails on
+    # first sign attempt, so set this before booting with auth in
+    # front of the app.
+    SESSION_SECRET_KEY: str = ""
+    # Cookie name used for the signed session payload. Mostly cosmetic
+    # — change only if it collides with another app on the same host.
+    SESSION_COOKIE_NAME: str = "fa_session"
+    # How long a cookie stays valid before the user is forced back
+    # through the Google consent screen. Sliding refresh: every
+    # authenticated request mints a fresh cookie with a new exp, so
+    # an actively-using member effectively never gets logged out.
+    SESSION_LIFETIME_DAYS: int = 30
+    # Public origin the app is reachable from (used to flip the
+    # ``Secure`` cookie attribute on automatically when serving over
+    # HTTPS via ngrok). Leave at the localhost default for pure
+    # local-dev. The OAuth redirect URI itself is configured
+    # separately via USER_LOGIN_GOOGLE_REDIRECT_URI so it matches
+    # what's registered with Google exactly.
+    PUBLIC_BASE_URL: str = "http://localhost:8000"
+
     # Third-party model providers. These are unprefixed because they are
     # shared with other experiments in the same repo.
     GEMINI_API_KEY: Optional[str] = None
@@ -450,6 +499,15 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> List[str]:
         return [o.strip() for o in self.FA_CORS_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def admin_emails(self) -> set[str]:
+        """Lower-cased set of admin email addresses for fast membership tests."""
+        return {
+            e.strip().lower()
+            for e in self.ADMIN_EMAILS.split(",")
+            if e.strip()
+        }
 
     @field_validator("FA_ENCRYPTION_KEY")
     @classmethod

@@ -7,6 +7,12 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..auth import (
+    CurrentUser,
+    require_admin,
+    require_family_member_from_request,
+    require_user,
+)
 from ..db import get_db
 
 router = APIRouter(prefix="/residences", tags=["residences"])
@@ -27,7 +33,11 @@ def _unset_other_primaries(
     db.execute(stmt)
 
 
-@router.get("", response_model=List[schemas.ResidenceRead])
+@router.get(
+    "",
+    response_model=List[schemas.ResidenceRead],
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def list_residences(
     family_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
@@ -42,15 +52,24 @@ def list_residences(
 
 
 @router.get("/{residence_id}", response_model=schemas.ResidenceRead)
-def get_residence(residence_id: int, db: Session = Depends(get_db)) -> models.Residence:
+def get_residence(
+    residence_id: int,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
+) -> models.Residence:
     residence = db.get(models.Residence, residence_id)
     if residence is None:
+        raise HTTPException(status_code=404, detail="Residence not found")
+    if not user.is_admin and user.family_id != residence.family_id:
         raise HTTPException(status_code=404, detail="Residence not found")
     return residence
 
 
 @router.post(
-    "", response_model=schemas.ResidenceRead, status_code=status.HTTP_201_CREATED
+    "",
+    response_model=schemas.ResidenceRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
 )
 def create_residence(
     payload: schemas.ResidenceCreate, db: Session = Depends(get_db)
@@ -71,7 +90,11 @@ def create_residence(
     return residence
 
 
-@router.patch("/{residence_id}", response_model=schemas.ResidenceRead)
+@router.patch(
+    "/{residence_id}",
+    response_model=schemas.ResidenceRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_residence(
     residence_id: int,
     payload: schemas.ResidenceUpdate,
@@ -95,7 +118,11 @@ def update_residence(
     return residence
 
 
-@router.delete("/{residence_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{residence_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_residence(residence_id: int, db: Session = Depends(get_db)) -> None:
     residence = db.get(models.Residence, residence_id)
     if residence is None:

@@ -20,6 +20,7 @@ import type {
   LiveSessionMessage,
 } from "@/lib/types";
 import { cn } from "@/lib/cn";
+import { UserPill } from "@/components/UserPill";
 
 /**
  * Session detail — full participant roster + message transcript.
@@ -70,13 +71,16 @@ export default function AiSessionDetailPage() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-background to-muted">
       <header className="border-b border-border bg-white">
-        <div className="max-w-4xl mx-auto px-6 py-4 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-4 min-w-0">
+        <div className="max-w-4xl mx-auto px-3 sm:px-6 py-3 sm:py-4 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0 flex-1">
             <Link
               to={`/aiassistant/${familyId}/sessions`}
               className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1 shrink-0"
+              aria-label="All sessions"
+              title="All sessions"
             >
-              <ArrowLeft className="h-4 w-4" /> All sessions
+              <ArrowLeft className="h-4 w-4" />
+              <span className="hidden sm:inline">All sessions</span>
             </Link>
             <div className="min-w-0">
               <div className="text-xs text-muted-foreground uppercase tracking-wide truncate">
@@ -131,20 +135,23 @@ export default function AiSessionDetailPage() {
               </div>
             </div>
           </div>
-          {session?.is_active && (
-            <button
-              onClick={() => endMut.mutate()}
-              disabled={endMut.isPending}
-              className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 hover:bg-amber-100 disabled:opacity-60"
-            >
-              <Square className="h-3.5 w-3.5" />
-              End session
-            </button>
-          )}
+          <div className="flex items-center gap-2 shrink-0">
+            {session?.is_active && (
+              <button
+                onClick={() => endMut.mutate()}
+                disabled={endMut.isPending}
+                className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 hover:bg-amber-100 disabled:opacity-60"
+              >
+                <Square className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">End session</span>
+              </button>
+            )}
+            <UserPill compact />
+          </div>
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto p-6 space-y-6">
+      <main className="max-w-4xl mx-auto p-3 sm:p-6 space-y-6">
         {isLoading || !session ? (
           <div className="text-sm text-muted-foreground">
             Loading transcript…

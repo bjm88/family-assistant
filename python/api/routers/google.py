@@ -27,6 +27,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..auth import require_admin
 from ..config import get_settings
 from ..db import get_db
 from ..integrations import google_oauth as oauth_lib
@@ -145,7 +146,11 @@ def _status_for(
     )
 
 
-@router.get("/status", response_model=GoogleStatus)
+@router.get(
+    "/status",
+    response_model=GoogleStatus,
+    dependencies=[Depends(require_admin)],
+)
 def google_status(
     assistant_id: int = Query(...),
     db: Session = Depends(get_db),
@@ -157,7 +162,11 @@ def google_status(
     return _status_for(row, assistant)
 
 
-@router.delete("/credentials", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/credentials",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def disconnect(
     assistant_id: int = Query(...),
     db: Session = Depends(get_db),
@@ -173,7 +182,7 @@ def disconnect(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/oauth/start")
+@router.get("/oauth/start", dependencies=[Depends(require_admin)])
 def oauth_start(
     assistant_id: int = Query(...),
     db: Session = Depends(get_db),
@@ -208,6 +217,10 @@ def oauth_start(
     return RedirectResponse(auth_url, status_code=302)
 
 
+# NOTE: this endpoint is intentionally NOT admin-gated. Google's
+# servers hit it directly with the auth code, so cookie-based auth
+# can't apply. The CSRF defence is the unguessable ``state`` token
+# we minted in /oauth/start and stashed via ``oauth_lib.consume_pending``.
 @router.get("/oauth/callback")
 def oauth_callback(
     request: Request,
@@ -320,7 +333,11 @@ class TestEmailResponse(BaseModel):
     granted_email: str
 
 
-@router.post("/test/send-email", response_model=TestEmailResponse)
+@router.post(
+    "/test/send-email",
+    response_model=TestEmailResponse,
+    dependencies=[Depends(require_admin)],
+)
 def test_send_email(
     payload: TestEmailRequest, db: Session = Depends(get_db)
 ) -> TestEmailResponse:
@@ -363,7 +380,11 @@ class UpcomingEventsResponse(BaseModel):
     events: list[UpcomingEvent]
 
 
-@router.get("/test/upcoming-events", response_model=UpcomingEventsResponse)
+@router.get(
+    "/test/upcoming-events",
+    response_model=UpcomingEventsResponse,
+    dependencies=[Depends(require_admin)],
+)
 def test_upcoming_events(
     assistant_id: int = Query(...),
     hours: int = Query(72, ge=1, le=720),
@@ -433,7 +454,11 @@ def _classify_role(role: str) -> tuple[bool, bool]:
     return can_read_events, can_write
 
 
-@router.get("/test/calendars", response_model=VisibleCalendarsResponse)
+@router.get(
+    "/test/calendars",
+    response_model=VisibleCalendarsResponse,
+    dependencies=[Depends(require_admin)],
+)
 def test_visible_calendars(
     assistant_id: int = Query(...),
     db: Session = Depends(get_db),

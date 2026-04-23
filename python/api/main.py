@@ -30,6 +30,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .ai import ollama as ai_ollama
+from .auth import (
+    cookie_attrs,
+    sign_session,
+    verify_session,
+)
 from .config import get_settings
 from .services import email_inbox, monitoring_scheduler, telegram_inbox
 
@@ -55,6 +60,7 @@ from .routers import (
     ai_face,
     ai_tts,
     assistants,
+    auth as auth_router,
     documents,
     families,
     financial_accounts,
@@ -79,6 +85,7 @@ from .routers import (
     residences,
     sensitive_identifiers,
     sms_webhook,
+    spa,
     status,
     tasks,
     vehicles,
@@ -195,6 +202,57 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # ---- Cookie-based session middleware -----------------------------------
+    # Parses the signed-cookie session payload on every request and
+    # stashes a CurrentUser (or None for guests) on ``request.state.user``
+    # so the FastAPI ``Depends(require_*)`` factories in :mod:`api.auth`
+    # can do their work without re-parsing on each call. Also implements
+    # *sliding refresh*: every authenticated 2xx response gets a
+    # freshly-minted cookie with ``exp = now + SESSION_LIFETIME_DAYS`` so
+    # an actively-used session effectively never expires. This middleware
+    # never short-circuits — authorization is per-route, so the public
+    # allowlist (/, /legal/*, /api/health, /api/auth/*, the Twilio
+    # webhook, and Avi's Gmail-OAuth callback) needs no special-casing.
+    @app.middleware("http")
+    async def session_cookie_middleware(request, call_next):  # type: ignore[no-untyped-def]
+        cookie_name = settings.SESSION_COOKIE_NAME
+        raw_cookie = request.cookies.get(cookie_name) if cookie_name else None
+        user = verify_session(raw_cookie) if raw_cookie else None
+        request.state.user = user
+        response = await call_next(request)
+        # Sliding refresh — only on success and only when the user was
+        # already logged in. Skips writes to the OAuth callback (it
+        # sets its own cookie) and the logout route (it explicitly
+        # clears ours).
+        if (
+            user is not None
+            and 200 <= response.status_code < 400
+            and request.url.path != "/api/auth/logout"
+            and request.url.path != "/api/auth/google/callback"
+        ):
+            try:
+                fresh = sign_session(
+                    email=user.email,
+                    role=user.role,
+                    person_id=user.person_id,
+                    family_id=user.family_id,
+                )
+                attrs = cookie_attrs()
+                response.set_cookie(
+                    key=attrs["key"],
+                    value=fresh,
+                    httponly=attrs["httponly"],
+                    secure=attrs["secure"],
+                    samesite=attrs["samesite"],
+                    path=attrs["path"],
+                    max_age=settings.SESSION_LIFETIME_DAYS * 24 * 60 * 60,
+                )
+            except Exception:  # noqa: BLE001 — sliding refresh must never break a response
+                logging.getLogger(__name__).exception(
+                    "Sliding session refresh failed"
+                )
+        return response
+
     admin_routers = [
         families.router,
         assistants.router,
@@ -224,6 +282,10 @@ def create_app() -> FastAPI:
         app.include_router(r, prefix=ADMIN_PREFIX)
 
     app.include_router(media.router, prefix="/api")
+    # Browser-login OAuth flow — entirely public (anonymous browsers
+    # become authenticated browsers here). Per-route guards in
+    # :mod:`api.auth` protect everything else.
+    app.include_router(auth_router.router, prefix="/api")
     # Twilio inbound webhook — public (no admin auth) so Twilio can hit it.
     # Signature verification (X-Twilio-Signature) is enforced inside the
     # handler whenever TWILIO_AUTH_TOKEN is configured.
@@ -249,6 +311,14 @@ def create_app() -> FastAPI:
     @app.get("/api/health", tags=["health"])
     def health() -> dict:
         return {"status": "ok"}
+
+    # Production React SPA — serves /admin/*, /aiassistant/*, /login,
+    # /families/* (legacy redirect target), plus /assets/* and
+    # /mediapipe/* from ui/react/dist/. Registered LAST so explicit
+    # /api/*, /legal/*, and the landing root keep matching first.
+    # Without this the public ngrok tunnel returns 404 for every
+    # client-side route the SPA owns.
+    app.include_router(spa.router)
 
     return app
 

@@ -44,6 +44,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, storage
+from ..auth import (
+    CurrentUser,
+    require_admin,
+    require_family_member_from_request,
+    require_user,
+)
 from ..config import get_settings
 from ..db import get_db
 from ..integrations.gemini import GeminiClient, GeminiError, GeminiUnavailable
@@ -232,7 +238,11 @@ def _summarize_exception(exc: Exception) -> str:
     return message if len(message) <= 500 else message[:497] + "..."
 
 
-@router.get("", response_model=List[schemas.AssistantRead])
+@router.get(
+    "",
+    response_model=List[schemas.AssistantRead],
+    dependencies=[Depends(require_family_member_from_request)],
+)
 def list_assistants(
     family_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
@@ -246,16 +256,25 @@ def list_assistants(
 
 @router.get("/{assistant_id}", response_model=schemas.AssistantRead)
 def get_assistant(
-    assistant_id: int, db: Session = Depends(get_db)
+    assistant_id: int,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_user),
 ) -> Dict[str, Any]:
     assistant = db.get(models.Assistant, assistant_id)
     if assistant is None:
+        raise HTTPException(status_code=404, detail="Assistant not found")
+    if not user.is_admin and user.family_id != assistant.family_id:
+        # Pretend it doesn't exist to avoid leaking the existence of
+        # other families' assistants.
         raise HTTPException(status_code=404, detail="Assistant not found")
     return _to_read_dict(assistant)
 
 
 @router.post(
-    "", response_model=schemas.AssistantRead, status_code=status.HTTP_201_CREATED
+    "",
+    response_model=schemas.AssistantRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
 )
 def create_assistant(
     payload: schemas.AssistantCreate,
@@ -287,7 +306,11 @@ def create_assistant(
     return _to_read_dict(assistant)
 
 
-@router.patch("/{assistant_id}", response_model=schemas.AssistantRead)
+@router.patch(
+    "/{assistant_id}",
+    response_model=schemas.AssistantRead,
+    dependencies=[Depends(require_admin)],
+)
 def update_assistant(
     assistant_id: int,
     payload: schemas.AssistantUpdate,
@@ -317,7 +340,9 @@ def update_assistant(
 
 
 @router.post(
-    "/{assistant_id}/regenerate-avatar", response_model=schemas.AssistantRead
+    "/{assistant_id}/regenerate-avatar",
+    response_model=schemas.AssistantRead,
+    dependencies=[Depends(require_admin)],
 )
 def regenerate_avatar(
     assistant_id: int, db: Session = Depends(get_db)
@@ -335,7 +360,9 @@ def regenerate_avatar(
 
 
 @router.post(
-    "/{assistant_id}/upload-avatar", response_model=schemas.AssistantRead
+    "/{assistant_id}/upload-avatar",
+    response_model=schemas.AssistantRead,
+    dependencies=[Depends(require_admin)],
 )
 def upload_avatar(
     assistant_id: int,
@@ -389,7 +416,11 @@ def upload_avatar(
     return _to_read_dict(assistant)
 
 
-@router.delete("/{assistant_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{assistant_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
 def delete_assistant(assistant_id: int, db: Session = Depends(get_db)) -> None:
     assistant = db.get(models.Assistant, assistant_id)
     if assistant is None:
