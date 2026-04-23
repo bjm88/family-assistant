@@ -27,13 +27,15 @@ parallel (or one is restarted mid-tick).
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -204,3 +206,102 @@ class EmailInboxMessage(Base, TimestampMixin):
     person: Mapped[Optional["Person"]] = relationship()  # noqa: F821
     live_session: Mapped[Optional["LiveSession"]] = relationship()  # noqa: F821
     agent_task: Mapped[Optional["AgentTask"]] = relationship()  # noqa: F821
+    attachments: Mapped[List["EmailInboxAttachment"]] = relationship(
+        back_populates="message",
+        cascade="all, delete-orphan",
+        order_by="EmailInboxAttachment.media_index",
+    )
+
+
+class EmailInboxAttachment(Base, TimestampMixin):
+    """One file attached to an inbound email, copied off Gmail onto local storage.
+
+    The Gmail API returns attachment payloads in two shapes — small files
+    (< ~5 MB) come back inline in ``body.data`` on the part, larger ones
+    only carry an ``attachmentId`` and require a follow-up
+    ``users.messages.attachments.get`` call. Either way we end up with
+    raw bytes that we persist to ``family_<id>/email/<message_id>/`` via
+    :func:`storage.save_message_attachment`. The on-disk path lands in
+    :attr:`stored_path` (relative to ``FA_STORAGE_ROOT``) so the file can
+    be re-served, re-described, or migrated with the rest of the family
+    archive.
+
+    The vision adapter result (image caption, PDF/DOCX text) is **not**
+    cached on this row — it is rendered into the user message we hand to
+    the agent and into the live-session transcript at ingest time, which
+    is the only place the description is needed downstream. If we ever
+    want re-replay we can add ``description_text`` and ``description_meta``
+    columns later without touching this model.
+    """
+
+    __tablename__ = "email_inbox_attachments"
+    __table_args__ = (
+        UniqueConstraint(
+            "email_inbox_message_id",
+            "media_index",
+            name="uq_email_inbox_attachment_slot",
+        ),
+        {
+            "comment": (
+                "Files attached to an inbound email, downloaded from "
+                "Gmail and stored locally so Avi has a permanent copy "
+                "and can run the multimodal vision/text-extraction "
+                "pipeline on them."
+            )
+        },
+    )
+
+    email_inbox_attachment_id: Mapped[int] = mapped_column(
+        primary_key=True, autoincrement=True
+    )
+    email_inbox_message_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "email_inbox_messages.email_inbox_message_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    media_index: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment=(
+            "1-based index within the parent email. Matches the order "
+            "the parts were walked in, so 'Attachment 1' in the agent "
+            "prompt always refers to media_index=1 here."
+        ),
+    )
+    gmail_attachment_id: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment=(
+            "Gmail's attachmentId for this part. Stored for forensics; "
+            "the actual bytes are already on disk so we never have to "
+            "re-fetch unless explicitly asked. Typed as TEXT because "
+            "Gmail's tokens are opaque URL-safe base64 with no "
+            "documented upper bound — they regularly exceed 255 chars "
+            "and have been observed past 1 KB."
+        ),
+    )
+    filename: Mapped[Optional[str]] = mapped_column(
+        String(512),
+        nullable=True,
+        comment=(
+            "Original filename from the Content-Disposition header. May "
+            "be NULL for inline images that came in without a name."
+        ),
+    )
+    mime_type: Mapped[str] = mapped_column(
+        String(120),
+        nullable=False,
+    )
+    file_size_bytes: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+    stored_path: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="Path relative to FA_STORAGE_ROOT.",
+    )
+
+    message: Mapped["EmailInboxMessage"] = relationship(back_populates="attachments")

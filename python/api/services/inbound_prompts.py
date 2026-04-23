@@ -109,6 +109,22 @@ def build_inbound_system_prompt(
         "Sensitive columns are encrypted; use the *_last_four helpers.\n\n"
         + schema_catalog.dump_text(db)
     )
+    parts.append(
+        "--- Handling attached files ---\n"
+        "When a [Attachment N: …] block appears in the user's message "
+        "the file has already been saved on the server and (when it's "
+        "an image or readable document) summarised inline for you — "
+        "treat that summary as your view of the file. If the user is "
+        "ALSO asking you to track or remember it (e.g. 'make a task to "
+        "review this property, details attached', 'save this receipt to "
+        "the warranty task', 'add this to the camp signup'), call "
+        "`task_attach_message_attachment` with the matching "
+        "`media_index` AFTER you've created or located the task. Pass "
+        "`media_index=0` to attach every file from this message in one "
+        "shot. The user can SEE the chip on the kanban card, so always "
+        "confirm in your reply which file(s) you attached and to which "
+        "task."
+    )
     parts.append(how_to_reply)
     return prompts.with_safety("\n\n".join(parts))
 

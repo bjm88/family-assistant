@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from .... import models
+from .... import models, storage
 from ....config import get_settings
 from ....services import cron_helpers
 from .._registry import ToolContext, ToolError
@@ -1050,4 +1050,179 @@ async def handle_task_attach_link(
         "summary": link.summary,
         "added_by_kind": link.added_by_kind,
         "already_attached": False,
+    }
+
+
+# ---- task_attach_message_attachment -----------------------------------
+
+
+TASK_ATTACH_MESSAGE_ATTACHMENT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {
+            "type": "integer",
+            "description": (
+                "tasks.task_id of the kanban task to attach the file to. "
+                "Typically the id you just got back from task_create on "
+                "this same turn."
+            ),
+        },
+        "media_index": {
+            "type": "integer",
+            "description": (
+                "1-based index of the inbound attachment to copy onto "
+                "the task. Matches the 'Attachment N:' label in the "
+                "user message you were just shown — e.g. media_index=1 "
+                "for 'Attachment 1: house.pdf'. Use media_index=0 to "
+                "attach EVERY inbound attachment from this message."
+            ),
+            "minimum": 0,
+        },
+        "caption": {
+            "type": ["string", "null"],
+            "description": (
+                "Optional one-line note to display next to the file on "
+                "the kanban card, e.g. 'Listing PDF the user texted in.' "
+                "Defaults to a short auto-generated provenance line so "
+                "the household always knows which message a file came "
+                "from."
+            ),
+        },
+    },
+    "required": ["task_id", "media_index"],
+}
+
+
+def _kind_for_mime(mime: Optional[str]) -> str:
+    """Pick a coarse :data:`models.TASK_ATTACHMENT_KINDS` label.
+
+    Mirrors the same logic the upload route in :mod:`api.routers.tasks`
+    uses so a file the agent attaches renders identically to one a
+    person uploaded through the UI.
+    """
+    if not mime:
+        return "document"
+    if mime.startswith("image/"):
+        return "photo"
+    if mime == "application/pdf":
+        return "pdf"
+    return "document"
+
+
+async def handle_task_attach_message_attachment(
+    ctx: ToolContext,
+    task_id: int,
+    media_index: int,
+    caption: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Copy one inbound message attachment onto a kanban task.
+
+    Designed for the conversational pattern *"make a task to review
+    this property — details attached as a PDF"*. The inbound
+    pipeline already saved every attachment under
+    ``family_<id>/<channel>/<message_id>/`` and described it for the
+    prompt; this tool just promotes the relevant file(s) into the
+    task's own storage directory and writes a
+    :class:`models.TaskAttachment` row so the kanban UI renders the
+    same chip a person upload would create.
+
+    Bytes are *copied* (not symlinked) into
+    ``family_<id>/tasks/task_<id>/`` so the user can later delete the
+    original inbound row without the task losing its attachment, and
+    so the task's own ``rm -rf`` clean-up rule keeps working.
+
+    ``media_index=0`` is a convenience: attach every inbound
+    attachment from this message in one tool call. Otherwise the
+    1-based index must match the ``Attachment N:`` label the agent
+    saw in the user message.
+    """
+    task = ctx.db.get(models.Task, int(task_id))
+    if task is None or task.family_id != ctx.family_id:
+        raise ToolError(f"No task with id={task_id} in this family.")
+
+    refs = list(ctx.inbound_attachments or [])
+    if not refs:
+        raise ToolError(
+            "No attachments arrived with this message — nothing to "
+            "attach. Ask the user to resend with the file included."
+        )
+
+    if int(media_index) == 0:
+        targets = refs
+    else:
+        targets = [r for r in refs if r.media_index == int(media_index)]
+        if not targets:
+            available = ", ".join(str(r.media_index) for r in refs)
+            raise ToolError(
+                f"This message has no Attachment {media_index}. "
+                f"Available media_index values: {available}."
+            )
+
+    settings = get_settings()
+    storage_root = settings.storage_root
+    created: List[Dict[str, Any]] = []
+
+    for ref in targets:
+        # ``storage_root / ref.stored_path`` directly — we trust this
+        # path because it was produced by ``storage.save_message_*``
+        # earlier in the same request, so no traversal check is
+        # needed and the macOS /private/var resolve quirk that bites
+        # ``storage.absolute_path`` is sidestepped.
+        src = storage_root / ref.stored_path
+        if not src.exists() or not src.is_file():
+            raise ToolError(
+                f"Inbound attachment {ref.media_index} ({ref.filename}) "
+                f"is no longer on disk at {ref.stored_path}; cannot "
+                "promote it to the task."
+            )
+
+        with open(src, "rb") as fh:
+            rel_path, size, mime = storage.save_task_attachment(
+                task.family_id,
+                task.task_id,
+                fh,
+                ref.filename or f"attachment-{ref.media_index}.bin",
+            )
+
+        # Prefer the original mime over the freshly-guessed one — the
+        # inbound channel already verified it via Content-Type, while
+        # ``mimetypes.guess_type`` can lie for sniffed images.
+        effective_mime = ref.mime_type or mime
+
+        cap = caption or (
+            f"Forwarded from inbound {ref.channel} message "
+            f"(attachment {ref.media_index})."
+        )
+
+        attachment = models.TaskAttachment(
+            task_id=task.task_id,
+            uploaded_by_person_id=ctx.person_id,
+            attachment_kind=_kind_for_mime(effective_mime),
+            stored_file_path=rel_path,
+            original_file_name=ref.filename or f"attachment-{ref.media_index}.bin",
+            mime_type=effective_mime,
+            file_size_bytes=size,
+            caption=cap,
+            created_at=datetime.now(timezone.utc),
+        )
+        ctx.db.add(attachment)
+        ctx.db.flush()
+        ctx.db.refresh(attachment)
+        created.append(
+            {
+                "task_attachment_id": attachment.task_attachment_id,
+                "task_id": attachment.task_id,
+                "media_index": ref.media_index,
+                "original_file_name": attachment.original_file_name,
+                "mime_type": attachment.mime_type,
+                "file_size_bytes": attachment.file_size_bytes,
+                "attachment_kind": attachment.attachment_kind,
+                "caption": attachment.caption,
+            }
+        )
+
+    return {
+        "task_id": task.task_id,
+        "attachments": created,
+        "n_attached": len(created),
     }

@@ -241,30 +241,76 @@ def save_task_attachment(
     return str(dest_path.relative_to(root)), size, mime or "application/octet-stream"
 
 
+def save_message_attachment(
+    *,
+    family_id: int,
+    channel: str,
+    message_id: int | str,
+    file_bytes: bytes,
+    extension: str = "",
+    original_filename: str | None = None,
+) -> Tuple[str, int]:
+    """Persist an inbound message attachment under a per-channel layout.
+
+    All inbound surfaces (SMS, WhatsApp, Telegram, email, live chat)
+    converge on this helper so the on-disk layout is uniform::
+
+        family_<id>/<channel>/<message_id>/<uuid>.<ext>
+
+    The ``channel`` token is whatever string the caller wants to show
+    up in the path — typical values are ``"sms"``, ``"whatsapp"``,
+    ``"telegram"``, ``"email"``, ``"live"``. Keeping the message id
+    in the path means a single ``rm -rf`` of the parent directory
+    cleans up every attachment for a deleted inbound row in one shot.
+
+    The extension is derived from ``original_filename`` first (so a
+    ``photo.HEIC`` keeps its HEIC suffix in storage) and falls back to
+    the explicit ``extension`` arg only if the filename lookup
+    yielded nothing. The on-disk basename is a fresh UUID so two
+    inbound messages can ship ``photo.jpg`` without colliding.
+
+    Returns ``(relative_path_under_storage_root, size_bytes)``.
+    """
+    safe_channel = (channel or "msg").strip().lower().replace("/", "_") or "msg"
+    root = get_settings().storage_root
+    dest_dir = _ensure_dir(
+        root / f"family_{family_id}" / safe_channel / str(message_id)
+    )
+    ext = ""
+    if original_filename:
+        ext = _ext_from_filename(original_filename)
+    if not ext:
+        if extension and not extension.startswith("."):
+            ext = f".{extension}"
+        else:
+            ext = extension or ".bin"
+    filename = f"{uuid.uuid4().hex}{ext}"
+    dest_path = dest_dir / filename
+    with open(dest_path, "wb") as out:
+        out.write(file_bytes)
+    return str(dest_path.relative_to(root)), len(file_bytes)
+
+
 def save_sms_attachment(
     family_id: int,
     sms_inbox_message_id: int,
     file_bytes: bytes,
     extension: str,
 ) -> Tuple[str, int]:
-    """Persist an MMS media file. Returns ``(relative_path, size_bytes)``.
+    """Backwards-compat shim around :func:`save_message_attachment`.
 
-    Files land under ``family_<id>/sms/<sms_inbox_message_id>/`` so a
-    single ``rm -rf`` of the deleted SMS row's directory cleans up all
-    of its media in one shot. The caller already knows the MIME type
-    (from Twilio's MediaContentType<i>), we only need the extension to
-    keep on-disk filenames human-recognisable.
+    Existing callers pass an extension only (no original filename); we
+    forward to the unified helper with ``channel="sms"`` so the
+    on-disk layout (``family_<id>/sms/<msg_id>/<uuid>.<ext>``) is
+    unchanged.
     """
-    root = get_settings().storage_root
-    dest_dir = _ensure_dir(
-        root / f"family_{family_id}" / "sms" / str(sms_inbox_message_id)
+    return save_message_attachment(
+        family_id=family_id,
+        channel="sms",
+        message_id=sms_inbox_message_id,
+        file_bytes=file_bytes,
+        extension=extension,
     )
-    safe_ext = extension if extension.startswith(".") else f".{extension or 'bin'}"
-    filename = f"{uuid.uuid4().hex}{safe_ext}"
-    dest_path = dest_dir / filename
-    with open(dest_path, "wb") as out:
-        out.write(file_bytes)
-    return str(dest_path.relative_to(root)), len(file_bytes)
 
 
 def save_telegram_attachment(
@@ -273,24 +319,17 @@ def save_telegram_attachment(
     file_bytes: bytes,
     extension: str,
 ) -> Tuple[str, int]:
-    """Persist a Telegram media file. Returns ``(relative_path, size_bytes)``.
+    """Backwards-compat shim around :func:`save_message_attachment`.
 
-    Files land under ``family_<id>/telegram/<telegram_inbox_message_id>/``
-    so a single ``rm -rf`` of the deleted Telegram row's directory
-    cleans up all of its media in one shot. Caller already knows the
-    MIME type (from the Bot API), we only need the extension to keep
-    on-disk filenames human-recognisable.
+    Layout stays ``family_<id>/telegram/<msg_id>/<uuid>.<ext>``.
     """
-    root = get_settings().storage_root
-    dest_dir = _ensure_dir(
-        root / f"family_{family_id}" / "telegram" / str(telegram_inbox_message_id)
+    return save_message_attachment(
+        family_id=family_id,
+        channel="telegram",
+        message_id=telegram_inbox_message_id,
+        file_bytes=file_bytes,
+        extension=extension,
     )
-    safe_ext = extension if extension.startswith(".") else f".{extension or 'bin'}"
-    filename = f"{uuid.uuid4().hex}{safe_ext}"
-    dest_path = dest_dir / filename
-    with open(dest_path, "wb") as out:
-        out.write(file_bytes)
-    return str(dest_path.relative_to(root)), len(file_bytes)
 
 
 def absolute_path(relative_path: str) -> Path:

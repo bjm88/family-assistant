@@ -45,6 +45,37 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class InboundAttachmentRef:
+    """Pointer to one file that arrived with the current inbound message.
+
+    Each inbound surface (email, SMS / WhatsApp, Telegram, future live
+    chat) builds one of these per attachment it persisted before
+    handing off to the agent loop, then stuffs the list onto
+    :class:`ToolContext`. Tools that need to act on "the file the user
+    just sent" — currently only ``task_attach_message_attachment`` —
+    look it up by ``media_index`` (the same 1-based index that already
+    appears in the rendered ``[Attachment N: …]`` block in the user
+    message), copy the bytes out via :attr:`stored_path`, and stop.
+
+    ``stored_path`` is relative to ``FA_STORAGE_ROOT`` and is the
+    durable copy on disk — these refs intentionally do NOT carry the
+    inbox-table primary key because for email the attachment row
+    isn't inserted until after the agent loop completes, and we want
+    every channel to use the same handle.
+    """
+
+    media_index: int
+    filename: str
+    mime_type: Optional[str]
+    size_bytes: Optional[int]
+    stored_path: str
+    # ``"email" | "sms" | "whatsapp" | "telegram" | "live"`` — purely
+    # for log lines and provenance in TaskAttachment.caption. The tool
+    # works the same regardless of channel.
+    channel: str = "msg"
+
+
 @dataclass
 class ToolContext:
     """Per-call execution context handed to every tool handler."""
@@ -53,6 +84,11 @@ class ToolContext:
     family_id: int
     assistant_id: Optional[int] = None
     person_id: Optional[int] = None  # who is talking, when known
+    # Files attached to the inbound message that triggered this agent
+    # turn. Populated by the inbound-channel services (email_inbox,
+    # sms_inbox, telegram_inbox); empty list otherwise. Tools that
+    # want to act on "the PDF the user just sent" read this.
+    inbound_attachments: List["InboundAttachmentRef"] = field(default_factory=list)
 
 
 @dataclass
@@ -187,6 +223,13 @@ class ToolRegistry:
                 error=f"Tool {name!r} missing required argument(s): {missing}",
             )
 
+        arg_keys = sorted(arguments.keys())
+        logger.info(
+            "[tool] %s start args=[%s] timeout=%.0fs",
+            name,
+            ",".join(arg_keys),
+            tool.timeout_seconds,
+        )
         started = time.monotonic()
         try:
             result_value = await asyncio.wait_for(
@@ -194,21 +237,35 @@ class ToolRegistry:
                 timeout=tool.timeout_seconds,
             )
         except asyncio.TimeoutError:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "[tool] %s timeout after %dms (limit=%.0fs)",
+                name,
+                duration_ms,
+                tool.timeout_seconds,
+            )
             return ToolResult(
                 ok=False,
                 error=(
                     f"Tool {name!r} timed out after {tool.timeout_seconds:.0f}s"
                 ),
-                duration_ms=int((time.monotonic() - started) * 1000),
+                duration_ms=duration_ms,
             )
         except ToolError as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            logger.info(
+                "[tool] %s error duration_ms=%d msg=%s",
+                name,
+                duration_ms,
+                exc,
+            )
             return ToolResult(
                 ok=False,
                 error=str(exc),
-                duration_ms=int((time.monotonic() - started) * 1000),
+                duration_ms=duration_ms,
             )
         except Exception as exc:  # noqa: BLE001 - bubble as structured error
-            logger.exception("Tool %r crashed", name)
+            logger.exception("[tool] %s crashed", name)
             return ToolResult(
                 ok=False,
                 error=f"{type(exc).__name__}: {exc}",
@@ -218,11 +275,22 @@ class ToolRegistry:
         duration_ms = int((time.monotonic() - started) * 1000)
         if isinstance(result_value, ToolResult):
             result_value.duration_ms = result_value.duration_ms or duration_ms
+            logger.info(
+                "[tool] %s done ok=%s duration_ms=%d summary=%s",
+                name,
+                result_value.ok,
+                result_value.duration_ms,
+                (result_value.summary or "")[:120],
+            )
             return result_value
+        logger.info(
+            "[tool] %s done ok=True duration_ms=%d", name, duration_ms
+        )
         return ToolResult(ok=True, output=result_value, duration_ms=duration_ms)
 
 
 __all__ = [
+    "InboundAttachmentRef",
     "Tool",
     "ToolContext",
     "ToolError",

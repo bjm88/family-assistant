@@ -498,6 +498,38 @@ def build_default_registry() -> ToolRegistry:
     )
     reg.register(
         Tool(
+            name="task_attach_message_attachment",
+            label="Attach the file the user just sent to a task",
+            description=(
+                "Promote one of the attachments on the CURRENT inbound "
+                "message (email / SMS / WhatsApp / Telegram) onto a "
+                "kanban task. Use this whenever the user sends a file "
+                "AND asks you to track or remember it — e.g. 'make a "
+                "task to review this property, details attached', "
+                "'save this receipt to the warranty task', 'add this "
+                "PDF to the camp signup task'. The attachment shows up "
+                "as the same chip a person upload would create, and "
+                "the bytes are copied into the task's own storage so "
+                "the user can later delete the original message "
+                "without losing the file. ``media_index`` matches the "
+                "1-based 'Attachment N:' label that appears in the "
+                "user message you were shown — pass 0 to attach every "
+                "attachment from this message in one call. Only works "
+                "for attachments on THIS turn; cannot reach back to "
+                "earlier messages."
+            ),
+            parameters=_tasks.TASK_ATTACH_MESSAGE_ATTACHMENT_SCHEMA,
+            handler=_tasks.handle_task_attach_message_attachment,
+            timeout_seconds=15.0,
+            examples=(
+                "Make a task to review this house, details attached as a PDF.",
+                "Save the photo I just sent to the broken-fence task.",
+                "Attach all of these to the camp registration task.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
             name="web_search",
             label="Search the web",
             description=(

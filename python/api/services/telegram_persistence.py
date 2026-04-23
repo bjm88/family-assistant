@@ -27,6 +27,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, storage
+from ..ai import vision
 from ..config import get_settings
 from ..integrations import telegram
 
@@ -103,20 +104,29 @@ def persist_attachments(
     db: Session,
     audit: models.TelegramInboxMessage,
     inbound: telegram.InboundTelegramMessage,
-) -> List[dict]:
-    """Download every Telegram media file and write attachment rows.
+) -> tuple[List[dict], List[vision.RenderableAttachment], int]:
+    """Download Telegram media, persist rows, and run the vision pipeline.
 
-    Returns a list of ``{media_index, kind, mime_type, stored_path,
-    file_size_bytes}`` dicts so the caller can mention them in the
-    transcript meta. Failures on one media file don't block the
-    others — we log and keep going so a transient Bot API hiccup
-    doesn't drop the whole reply.
+    Returns a 3-tuple of:
+
+    1. ``meta`` — small ``{media_index, kind, mime_type, stored_path,
+       file_size_bytes}`` dicts for the transcript ``meta`` blob.
+    2. ``rendered`` — :class:`vision.RenderableAttachment` per
+       attachment we analysed (in order), suitable for
+       :func:`vision.render_attachments_for_prompt`.
+    3. ``over_cap`` — count of attachments stored on disk but skipped
+       past ``AI_ATTACHMENT_MAX_PER_MESSAGE``.
+
+    Failures on one media file don't block the others — we log and
+    keep going so a transient Bot API hiccup doesn't drop the whole
+    reply.
     """
     if not inbound.attachments or audit.family_id is None:
-        return []
+        return [], [], 0
     settings = get_settings()
     bot_token = settings.TELEGRAM_BOT_TOKEN or ""
-    out: List[dict] = []
+    meta: List[dict] = []
+    inputs: List[vision.AttachmentInput] = []
     for ref in inbound.attachments:
         try:
             blob = telegram.download_file(
@@ -149,25 +159,50 @@ def persist_attachments(
             stored_path=rel_path,
         )
         db.add(att)
-        out.append(
+        synthetic_name = (
+            f"{ref.kind}-{ref.media_index}"
+            f"{telegram.extension_for_mime(blob.mime_type) or ''}"
+        )
+        meta.append(
             {
                 "media_index": ref.media_index,
                 "kind": ref.kind,
                 "mime_type": blob.mime_type,
                 "stored_path": rel_path,
                 "file_size_bytes": size,
+                "filename": synthetic_name,
             }
         )
-    if out:
+        inputs.append(
+            vision.AttachmentInput(
+                index=ref.media_index,
+                path=settings.storage_root / rel_path,
+                filename=synthetic_name,
+                mime_type=blob.mime_type,
+                size_bytes=size,
+            )
+        )
+    if meta:
         db.flush()
-    return out
+    rendered, over_cap = vision.describe_many(
+        inputs, max_to_describe=settings.AI_ATTACHMENT_MAX_PER_MESSAGE
+    )
+    return meta, rendered, over_cap
 
 
 def format_inbound_for_log(
     inbound: telegram.InboundTelegramMessage,
     attachments: List[dict],
+    *,
+    attachment_block: str = "",
 ) -> str:
-    """Render an inbound Telegram message so it reads naturally in history."""
+    """Render an inbound Telegram message so it reads naturally in history.
+
+    ``attachment_block`` is the rendered, captioned list from the
+    vision pipeline; falls back to a one-line ``[attachment N: …]``
+    summary when no captions are available so the transcript is never
+    silent about media.
+    """
     sender_label = (
         inbound.sender_display_name
         or (f"@{inbound.from_username}" if inbound.from_username else None)
@@ -179,7 +214,10 @@ def format_inbound_for_log(
         "",
         inbound.body or "(no text)",
     ]
-    if attachments:
+    if attachment_block:
+        lines.append("")
+        lines.append(attachment_block)
+    elif attachments:
         lines.append("")
         for att in attachments:
             lines.append(
@@ -190,9 +228,17 @@ def format_inbound_for_log(
 
 
 def format_user_message_for_agent(
-    inbound: telegram.InboundTelegramMessage, person: models.Person
+    inbound: telegram.InboundTelegramMessage,
+    person: models.Person,
+    *,
+    attachment_block: str = "",
 ) -> str:
-    """Wrap the Telegram message so the agent knows the surface."""
+    """Wrap the Telegram message so the agent knows the surface.
+
+    The optional ``attachment_block`` is the captioned list from the
+    vision pipeline, appended verbatim so the text-only Gemma model
+    can reason about images and PDFs.
+    """
     name = (
         person.preferred_name
         or person.first_name
@@ -204,10 +250,13 @@ def format_user_message_for_agent(
     if inbound.num_media:
         kinds = ", ".join(a.kind for a in inbound.attachments)
         media_hint = f" (with {inbound.num_media} attached: {kinds})"
-    return (
+    base = (
         f"[Telegram message from {name}{handle_hint}{media_hint}]\n\n"
         f"{(inbound.body or '').strip() or '(no text)'}"
     )
+    if attachment_block:
+        return f"{base}\n\n{attachment_block}"
+    return base
 
 
 __all__ = [

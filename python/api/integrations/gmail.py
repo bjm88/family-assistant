@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
@@ -170,10 +171,20 @@ def list_unread_inbox_message_ids(
 
 
 def fetch_message(creds: Credentials, message_id: str) -> "FetchedMessage":
-    """Fetch a single message, decode the plain-text body, parse headers."""
+    """Fetch a single message, decode the plain-text body, walk attachments.
+
+    Attachments come back inline (in ``body.data``) for small parts and
+    via a separate ``users.messages.attachments.get`` call for larger
+    ones (Gmail's threshold is ~5 MB but it isn't documented as a hard
+    number). We resolve both here so the caller gets a flat list of
+    :class:`FetchedAttachment` with ``data`` already populated. Failure
+    on any single attachment is logged and skipped — a busted PDF must
+    never drop the rest of the message.
+    """
+    service = _service(creds)
     try:
         raw = (
-            _service(creds)
+            service
             .users()
             .messages()
             .get(userId="me", id=message_id, format="full")
@@ -188,6 +199,9 @@ def fetch_message(creds: Credentials, message_id: str) -> "FetchedMessage":
     }
     sender_name, sender_email = parseaddr(headers.get("from", ""))
     body_text = _extract_plain_text(raw.get("payload") or {})
+    attachments = _collect_attachments(
+        service, message_id=message_id, payload=raw.get("payload") or {}
+    )
     received_at: Optional[datetime] = None
     if raw.get("internalDate"):
         try:
@@ -212,6 +226,7 @@ def fetch_message(creds: Credentials, message_id: str) -> "FetchedMessage":
         auto_submitted_header=headers.get("auto-submitted"),
         received_at=received_at,
         label_ids=list(raw.get("labelIds") or []),
+        attachments=attachments,
     )
 
 
@@ -238,6 +253,25 @@ def mark_message_read(creds: Credentials, message_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class FetchedAttachment:
+    """One attachment extracted from a Gmail message.
+
+    ``data`` is the raw decoded bytes — always populated, even when
+    Gmail required a follow-up ``attachments.get`` call. ``filename``
+    comes from the part's Content-Disposition header (Gmail surfaces
+    it as ``filename`` on the body); inline images sometimes lack one,
+    in which case we fall back to ``"attachment-<index>"`` upstream.
+    """
+
+    media_index: int
+    filename: Optional[str]
+    mime_type: str
+    size_bytes: int
+    gmail_attachment_id: Optional[str]
+    data: bytes
+
+
 class FetchedMessage:
     """Plain-data container for a parsed Gmail message.
 
@@ -260,6 +294,7 @@ class FetchedMessage:
         "auto_submitted_header",
         "received_at",
         "label_ids",
+        "attachments",
     )
 
     def __init__(
@@ -278,6 +313,7 @@ class FetchedMessage:
         auto_submitted_header: Optional[str],
         received_at: Optional[datetime],
         label_ids: List[str],
+        attachments: Optional[List[FetchedAttachment]] = None,
     ) -> None:
         self.message_id = message_id
         self.thread_id = thread_id
@@ -292,6 +328,11 @@ class FetchedMessage:
         self.auto_submitted_header = auto_submitted_header
         self.received_at = received_at
         self.label_ids = label_ids
+        self.attachments: List[FetchedAttachment] = list(attachments or [])
+
+    @property
+    def num_media(self) -> int:
+        return len(self.attachments)
 
 
 def _extract_plain_text(payload: dict, _depth: int = 0) -> str:
@@ -332,6 +373,102 @@ def _extract_plain_text(payload: dict, _depth: int = 0) -> str:
     if mime_type.startswith("text/html") and data:
         return _strip_html(_b64url_decode(data))
     return ""
+
+
+def _collect_attachments(
+    service, *, message_id: str, payload: dict
+) -> List[FetchedAttachment]:
+    """Walk the payload tree and pull every non-text attachment as bytes.
+
+    Gmail signals an attachment in two ways:
+
+    1. The part has a ``filename`` (anything ending up as a real file
+       in a normal mail client). This is the ground truth — we use it
+       even when the MIME type is also text/* (e.g. an attached .txt
+       log file the user does want analysed).
+    2. The MIME type does not start with ``text/`` AND it is not a
+       ``multipart/*`` container. This catches inline images that came
+       in with no Content-Disposition header, which is common from
+       phone mail clients.
+
+    Each match is decoded right here — ``body.data`` is base64url'd
+    when the file is small, otherwise we pull the bytes via
+    ``users.messages.attachments.get(id=…)``. Failures on a single
+    attachment are logged and skipped so the rest of the message still
+    flows through.
+    """
+    out: List[FetchedAttachment] = []
+    counter = [0]  # mutable so the recursive walker can bump it
+
+    def visit(part: dict) -> None:
+        mime_type = (part.get("mimeType") or "").lower()
+        filename = part.get("filename") or None
+        body = part.get("body") or {}
+        sub_parts = part.get("parts") or []
+
+        is_attachment_part = bool(filename) or (
+            not mime_type.startswith("text/")
+            and not mime_type.startswith("multipart/")
+            and (body.get("data") or body.get("attachmentId"))
+        )
+
+        if is_attachment_part:
+            counter[0] += 1
+            idx = counter[0]
+            try:
+                data = _decode_part_data(
+                    service,
+                    message_id=message_id,
+                    body=body,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Gmail attachment fetch failed message=%s part_idx=%s "
+                    "filename=%r mime=%s: %s",
+                    message_id, idx, filename, mime_type, exc,
+                )
+                return
+            if not data:
+                return
+            out.append(
+                FetchedAttachment(
+                    media_index=idx,
+                    filename=filename,
+                    mime_type=mime_type or "application/octet-stream",
+                    size_bytes=len(data),
+                    gmail_attachment_id=body.get("attachmentId"),
+                    data=data,
+                )
+            )
+            return
+
+        for sub in sub_parts:
+            visit(sub)
+
+    visit(payload)
+    return out
+
+
+def _decode_part_data(service, *, message_id: str, body: dict) -> bytes:
+    """Return the raw bytes for a part body, fetching via the API if needed."""
+    inline = body.get("data")
+    if inline:
+        return base64.urlsafe_b64decode(inline.encode("utf-8"))
+    attachment_id = body.get("attachmentId")
+    if not attachment_id:
+        return b""
+    resp = (
+        service
+        .users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=message_id, id=attachment_id)
+        .execute()
+    )
+    enc = resp.get("data") or ""
+    if not enc:
+        return b""
+    return base64.urlsafe_b64decode(enc.encode("utf-8"))
 
 
 def _b64url_decode(data: str) -> str:
@@ -375,6 +512,7 @@ def _summarise_http_error(exc: HttpError) -> str:
 __all__ = [
     "GmailSendError",
     "GmailReadError",
+    "FetchedAttachment",
     "FetchedMessage",
     "send_email",
     "send_reply",

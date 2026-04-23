@@ -29,6 +29,12 @@ dependencies = [
     "google-api-python-client>=2.194.0",
     "croniter>=6.2.2",
     "cron-descriptor>=2.0.8",
+    # Inbound attachment text extraction. Pillow is already pulled in
+    # above for image work; pypdf handles PDFs (pure-Python, no native
+    # deps) and python-docx covers Word .docx (XML-only — old binary
+    # .doc files are out of scope per spec).
+    "pypdf>=5.1.0",
+    "python-docx>=1.1.2",
 ]
 
 [dependency-groups]

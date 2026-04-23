@@ -292,17 +292,30 @@ def build_family_overview(
     """
     # Pre-compute who the speaker is allowed to see in detail. When
     # requestor is None this stays empty and the access lookup short-
-    # circuits below.
+    # circuits below. We pass ``audit_log=False`` so we don't spam one
+    # INFO line per family member every chat turn — a single SUMMARY
+    # line is emitted below covering the whole sweep, while the
+    # per-decision detail is still available at DEBUG.
     accessible_subject_ids: set[int] = set()
+    denied_subject_ids: set[int] = set()
     if requestor_person_id is not None and family.people:
         for p in family.people:
             decision = authz.can_access_sensitive(
                 db,
                 requestor_person_id=requestor_person_id,
                 subject_person_id=p.person_id,
+                audit_log=False,
             )
             if decision.allowed:
                 accessible_subject_ids.add(p.person_id)
+            else:
+                denied_subject_ids.add(p.person_id)
+        authz.log_scope_summary(
+            scope="sensitive",
+            requestor_person_id=requestor_person_id,
+            allowed_subject_ids=accessible_subject_ids,
+            denied_subject_ids=denied_subject_ids,
+        )
 
     def _can_see(subject_person_id: Optional[int]) -> bool:
         if requestor_person_id is None:

@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import httpx
@@ -189,24 +190,24 @@ async def classify(message: str) -> bool:
         )
     except asyncio.TimeoutError:
         logger.info(
-            "web_search_shortcut: classifier exceeded %.1fs — defaulting to AGENT",
+            "[shortcut] classifier exceeded %.1fs — defaulting to AGENT",
             settings.AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S,
         )
         return False
     except OllamaUnavailable as exc:
         # Fast model not pulled, Ollama down, etc. The heavy path can
         # still run via its own model; just skip the shortcut.
-        logger.debug("web_search_shortcut: %s — skipping shortcut", exc)
+        logger.debug("[shortcut] %s — skipping shortcut", exc)
         return False
     except OllamaError as exc:
         logger.warning(
-            "web_search_shortcut: classifier Ollama error %s — falling through",
+            "[shortcut] classifier Ollama error %s — falling through",
             exc,
         )
         return False
     except Exception:  # noqa: BLE001 - never crash the inbound
         logger.exception(
-            "web_search_shortcut: classifier crashed — falling through"
+            "[shortcut] classifier crashed — falling through"
         )
         return False
 
@@ -220,7 +221,7 @@ async def classify(message: str) -> bool:
     decision = decision.split()[0] if decision else ""
     is_web = decision == "WEB"
     logger.info(
-        "web_search_shortcut: classifier decision=%r (raw=%r) for %r",
+        "[shortcut] classify decision=%s (raw=%r) for %r",
         "WEB" if is_web else "AGENT",
         raw[:40] if raw else "",
         text[:80],
@@ -244,19 +245,32 @@ async def run(message: str) -> Optional[str]:
     text = (message or "").strip()
     if not text:
         return None
+    logger.info(
+        "[shortcut] run start path=gemini_grounded prompt_chars=%d",
+        len(text),
+    )
+    started = time.monotonic()
     try:
-        return await web_search.grounded_chat_answer(text)
+        answer = await web_search.grounded_chat_answer(text)
+        logger.info(
+            "[shortcut] run done path=gemini_grounded duration_ms=%d "
+            "answer_chars=%d",
+            int((time.monotonic() - started) * 1000),
+            len(answer or ""),
+        )
+        return answer
     except web_search.SearchUnavailable as exc:
         logger.info(
-            "web_search_shortcut: Gemini grounded answer unavailable (%s) — "
+            "[shortcut] run unavailable duration_ms=%d reason=%s — "
             "falling through to heavy agent",
+            int((time.monotonic() - started) * 1000),
             exc,
         )
         return None
     except Exception:  # noqa: BLE001 - last-ditch safety
         logger.exception(
-            "web_search_shortcut: unexpected error in grounded_chat_answer — "
-            "falling through to heavy agent"
+            "[shortcut] run crashed in grounded_chat_answer — falling "
+            "through to heavy agent"
         )
         return None
 
@@ -284,6 +298,9 @@ async def try_shortcut(message: str) -> Optional[str]:
     """
     settings = get_settings()
     if not settings.AI_WEB_SEARCH_SHORTCUT_ENABLED:
+        logger.debug(
+            "[shortcut] disabled by AI_WEB_SEARCH_SHORTCUT_ENABLED=false"
+        )
         return None
 
     try:
@@ -293,7 +310,7 @@ async def try_shortcut(message: str) -> Optional[str]:
         return await run(message)
     except Exception:  # noqa: BLE001 - shortcut must never break the caller
         logger.exception(
-            "web_search_shortcut: try_shortcut crashed — falling through"
+            "[shortcut] try_shortcut crashed — falling through"
         )
         return None
 
@@ -314,6 +331,9 @@ def try_shortcut_sync(message: str) -> Optional[str]:
         return None
     settings = get_settings()
     if not settings.AI_WEB_SEARCH_SHORTCUT_ENABLED:
+        logger.debug(
+            "[shortcut] disabled by AI_WEB_SEARCH_SHORTCUT_ENABLED=false"
+        )
         return None
 
     loop = asyncio.new_event_loop()
@@ -321,7 +341,7 @@ def try_shortcut_sync(message: str) -> Optional[str]:
         return loop.run_until_complete(try_shortcut(message))
     except Exception:  # noqa: BLE001 - shortcut never breaks the inbound
         logger.exception(
-            "web_search_shortcut: try_shortcut_sync crashed — falling through"
+            "[shortcut] try_shortcut_sync crashed — falling through"
         )
         return None
     finally:

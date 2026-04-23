@@ -38,6 +38,7 @@ from ._default_registry import (
     detect_capabilities,
 )
 from ._registry import (
+    InboundAttachmentRef,
     Tool,
     ToolContext,
     ToolError,
@@ -50,6 +51,7 @@ from .handlers.web import handle_web_search as _handle_web_search
 
 
 __all__ = [
+    "InboundAttachmentRef",
     "Tool",
     "ToolContext",
     "ToolError",

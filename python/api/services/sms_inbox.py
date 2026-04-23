@@ -75,6 +75,7 @@ from ..ai import assistants as _assistants
 from ..ai import ollama
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
+from ..ai import vision
 from ..ai import web_search_shortcut
 from ..config import Settings, get_settings
 from ..db import SessionLocal
@@ -329,12 +330,19 @@ def process_inbound_sms(
     )
 
     # ---- Download MMS / WhatsApp media (if any) and persist + log --
-    attachments_meta = _persist_attachments(db, audit, inbound)
+    attachments_meta, rendered_attachments, over_cap = _persist_attachments(
+        db, audit, inbound
+    )
+    attachment_block = vision.render_attachments_for_prompt(
+        rendered_attachments, extras_omitted=over_cap
+    )
     if attachments_meta:
         db.commit()
 
     # ---- Log inbound to the transcript ------------------------------
-    inbound_text = _format_inbound_for_log(inbound, attachments_meta)
+    inbound_text = _format_inbound_for_log(
+        inbound, attachments_meta, attachment_block=attachment_block
+    )
     live_session.log_message(
         db,
         session,
@@ -371,7 +379,9 @@ def process_inbound_sms(
     audit.agent_task_id = task.agent_task_id
     db.commit()
 
-    user_message = _format_user_message_for_agent(inbound, person, chan)
+    user_message = _format_user_message_for_agent(
+        inbound, person, chan, attachment_block=attachment_block
+    )
 
     # ---- Fast-path web-search shortcut ----------------------------
     # Skip the heavy agent entirely when the lightweight Gemma
@@ -389,16 +399,27 @@ def process_inbound_sms(
     )
     if shortcut_text:
         logger.info(
-            "%s inbox: web-search shortcut handled sid=%s task=%s "
-            "(skipping heavy agent).",
-            chan.label,
+            "[orch] surface=%s path=web_shortcut sid=%s task=%s "
+            "person_id=%s reply_chars=%d (skipping heavy agent)",
+            chan.label.lower(),
             inbound.message_sid,
             task.agent_task_id,
+            person.person_id,
+            len(shortcut_text),
         )
         final_text = shortcut_text
         shortcut_used = True
 
     if not shortcut_used:
+        logger.info(
+            "[orch] surface=%s path=heavy_agent sid=%s task=%s "
+            "person_id=%s n_attachments=%d",
+            chan.label.lower(),
+            inbound.message_sid,
+            task.agent_task_id,
+            person.person_id,
+            inbound.num_media,
+        )
         system_prompt = _build_sms_system_prompt(
             db,
             family_id=person.family_id,
@@ -425,6 +446,17 @@ def process_inbound_sms(
                 system_prompt=system_prompt,
                 history=[],
                 user_message=user_message,
+                inbound_attachments=[
+                    agent_tools.InboundAttachmentRef(
+                        media_index=m["media_index"],
+                        filename=m["filename"],
+                        mime_type=m.get("mime_type"),
+                        size_bytes=m.get("file_size_bytes"),
+                        stored_path=m["stored_path"],
+                        channel=chan.label.lower(),
+                    )
+                    for m in attachments_meta
+                ],
             )
         except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
             logger.exception(
@@ -593,18 +625,27 @@ def _persist_attachments(
     db: Session,
     audit: models.SmsInboxMessage,
     inbound: twilio_sms.InboundSms,
-) -> List[dict]:
-    """Download every MMS media file and write SmsInboxAttachment rows.
+) -> tuple[List[dict], List[vision.RenderableAttachment], int]:
+    """Download MMS media, persist rows, and run the vision pipeline.
 
-    Returns a list of ``{index, mime_type, stored_path, file_size_bytes}``
-    dicts so the caller can mention them in the transcript meta.
-    Failures on one media file don't block the others — we log and
-    keep going so a busted CDN URL doesn't drop the whole reply.
+    Returns a 3-tuple of:
+
+    1. ``meta`` — small ``{index, mime_type, stored_path, file_size_bytes}``
+       dicts for the transcript ``meta`` blob.
+    2. ``rendered`` — :class:`vision.RenderableAttachment` per
+       attachment we analysed (in order), suitable for
+       :func:`vision.render_attachments_for_prompt`.
+    3. ``over_cap`` — count of attachments stored on disk but not
+       analysed because we hit ``AI_ATTACHMENT_MAX_PER_MESSAGE``.
+
+    Failures on a single media file don't block the others — we log
+    and keep going so a busted CDN URL doesn't drop the whole reply.
     """
     if not inbound.media or audit.family_id is None:
-        return []
+        return [], [], 0
     settings = get_settings()
-    out: List[dict] = []
+    meta: List[dict] = []
+    inputs: List[vision.AttachmentInput] = []
     for index, url, _hint_mime in inbound.media:
         try:
             blob = twilio_sms.download_media(
@@ -636,30 +677,58 @@ def _persist_attachments(
             stored_path=rel_path,
         )
         db.add(att)
-        out.append(
+        # Synthetic filename — Twilio doesn't surface the original.
+        synthetic_name = f"attachment-{index}{twilio_sms.extension_for_mime(blob.mime_type) or ''}"
+        meta.append(
             {
                 "media_index": index,
                 "mime_type": blob.mime_type,
                 "stored_path": rel_path,
                 "file_size_bytes": size,
+                "filename": synthetic_name,
             }
         )
-    if out:
+        inputs.append(
+            vision.AttachmentInput(
+                index=index,
+                path=settings.storage_root / rel_path,
+                filename=synthetic_name,
+                mime_type=blob.mime_type,
+                size_bytes=size,
+            )
+        )
+    if meta:
         db.flush()
-    return out
+    rendered, over_cap = vision.describe_many(
+        inputs, max_to_describe=settings.AI_ATTACHMENT_MAX_PER_MESSAGE
+    )
+    return meta, rendered, over_cap
 
 
 def _format_inbound_for_log(
-    inbound: twilio_sms.InboundSms, attachments: List[dict]
+    inbound: twilio_sms.InboundSms,
+    attachments: List[dict],
+    *,
+    attachment_block: str = "",
 ) -> str:
-    """Render an inbound SMS so it reads naturally in the history view."""
+    """Render an inbound SMS so it reads naturally in the history view.
+
+    ``attachment_block`` is the rendered, captioned list from the
+    vision pipeline; falls back to a one-line ``[attachment N: …]``
+    summary built from the persisted metadata when no captions are
+    available (e.g. ``AI_VISION_ENABLED=false``), so the transcript
+    is never silent about media.
+    """
     lines = [
         f"From: {inbound.from_phone}",
         f"To: {inbound.to_phone}",
         "",
         inbound.body or "(no body)",
     ]
-    if attachments:
+    if attachment_block:
+        lines.append("")
+        lines.append(attachment_block)
+    elif attachments:
         lines.append("")
         for att in attachments:
             lines.append(
@@ -673,13 +742,17 @@ def _format_user_message_for_agent(
     inbound: twilio_sms.InboundSms,
     person: models.Person,
     chan: _ChannelConfig,
+    *,
+    attachment_block: str = "",
 ) -> str:
     """Wrap the inbound so the agent knows what surface this came through.
 
     Tagging the surface in the user-message header lets the agent
     instinctively right-size its reply (a one-line SMS reply vs. a
     chat-style WhatsApp reply) without us having to pile every nuance
-    into the system prompt.
+    into the system prompt. The optional ``attachment_block`` is the
+    captioned list from the vision pipeline, appended verbatim so the
+    text-only Gemma model can reason about images and PDFs.
     """
     name = person.preferred_name or person.first_name or inbound.from_phone
     media_hint = ""
@@ -689,10 +762,13 @@ def _format_user_message_for_agent(
             f"{'image' if inbound.num_media == 1 else 'images'})"
         )
     surface = "Text message" if chan.channel == "sms" else "WhatsApp message"
-    return (
+    base = (
         f"[{surface} from {name} <{inbound.from_phone}>{media_hint}]\n\n"
         f"{(inbound.body or '').strip() or '(no body)'}"
     )
+    if attachment_block:
+        return f"{base}\n\n{attachment_block}"
+    return base
 
 
 def _build_sms_system_prompt(
@@ -776,6 +852,7 @@ def _run_agent_to_completion(
     system_prompt: str,
     history: List[dict],
     user_message: str,
+    inbound_attachments: Optional[List[agent_tools.InboundAttachmentRef]] = None,
 ) -> str:
     """Drain the async agent generator and return the final reply text.
 
@@ -796,6 +873,9 @@ def _run_agent_to_completion(
         user_message=user_message,
         registry=registry,
         capabilities=capabilities,
+        extra_run_kwargs={
+            "inbound_attachments": list(inbound_attachments or []),
+        },
     )
 
     if result.error_text and not result.final_text:

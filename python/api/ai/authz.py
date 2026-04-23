@@ -132,6 +132,7 @@ def can_see_calendar_details(
     *,
     requestor_person_id: Optional[int],
     subject_person_id: int,
+    audit_log: bool = True,
 ) -> AccessDecision:
     """Decide whether ``requestor`` may see ``subject``'s calendar EVENT detail.
 
@@ -153,52 +154,12 @@ def can_see_calendar_details(
     confidential business detail (interview slots, performance
     reviews, layoffs) that even a parent shouldn't see by default.
     """
-    if requestor_person_id is None:
-        decision = AccessDecision(False, "anonymous", None, subject_person_id)
-        _log(decision, scope="cal_detail")
-        return decision
-
-    if requestor_person_id == subject_person_id:
-        decision = AccessDecision(
-            True, "self", requestor_person_id, subject_person_id
-        )
-        _log(decision, scope="cal_detail")
-        return decision
-
-    subject = db.get(models.Person, subject_person_id)
-    if subject is None:
-        decision = AccessDecision(
-            False, "unknown_subject", requestor_person_id, subject_person_id
-        )
-        _log(decision, scope="cal_detail")
-        return decision
-
-    requestor = db.get(models.Person, requestor_person_id)
-    if requestor is None:
-        decision = AccessDecision(
-            False, "unknown_subject", requestor_person_id, subject_person_id
-        )
-        _log(decision, scope="cal_detail")
-        return decision
-
-    if requestor.family_id != subject.family_id:
-        decision = AccessDecision(
-            False, "cross_family", requestor_person_id, subject_person_id
-        )
-        _log(decision, scope="cal_detail")
-        return decision
-
-    if _is_spouse(db, requestor_person_id, subject_person_id):
-        decision = AccessDecision(
-            True, "spouse", requestor_person_id, subject_person_id
-        )
-        _log(decision, scope="cal_detail")
-        return decision
-
-    decision = AccessDecision(
-        False, "unauthorized", requestor_person_id, subject_person_id
+    decision = _decide_calendar(
+        db,
+        requestor_person_id=requestor_person_id,
+        subject_person_id=subject_person_id,
     )
-    _log(decision, scope="cal_detail")
+    _log(decision, scope="cal_detail", enabled=audit_log)
     return decision
 
 
@@ -207,71 +168,106 @@ def can_access_sensitive(
     *,
     requestor_person_id: Optional[int],
     subject_person_id: int,
+    audit_log: bool = True,
 ) -> AccessDecision:
     """Decide whether ``requestor`` may see ``subject``'s sensitive data.
 
-    Cross-family access is refused as a belt-and-suspenders check
-    (see ``cross_family`` branch below): even if a relationship row
-    somehow links two people in different families, this function
-    denies. Privacy is per-household.
-    """
-    # Anonymous speaker — face/email lookup didn't identify anyone.
-    if requestor_person_id is None:
-        decision = AccessDecision(False, "anonymous", None, subject_person_id)
-        _log(decision)
-        return decision
+    Cross-family access is refused as a belt-and-suspenders check (see
+    ``cross_family`` branch below): even if a relationship row somehow
+    links two people in different families, this function denies.
+    Privacy is per-household.
 
+    ``audit_log``
+        When ``True`` (default), a stable INFO line is emitted per call
+        so audits can answer "did Avi reveal Ben's SSN to Lori?".
+        Bulk callers (e.g. the family-overview RAG builder, which runs
+        this once per person to pre-compute the speaker's access set)
+        should pass ``False`` to keep the noise out of the log and
+        emit a single summary line of their own instead.
+    """
+    decision = _decide_sensitive(
+        db,
+        requestor_person_id=requestor_person_id,
+        subject_person_id=subject_person_id,
+    )
+    _log(decision, enabled=audit_log)
+    return decision
+
+
+def _decide_calendar(
+    db: Session,
+    *,
+    requestor_person_id: Optional[int],
+    subject_person_id: int,
+) -> AccessDecision:
+    """Pure decision function for calendar-detail access — no logging."""
+    if requestor_person_id is None:
+        return AccessDecision(False, "anonymous", None, subject_person_id)
     if requestor_person_id == subject_person_id:
-        decision = AccessDecision(
+        return AccessDecision(
             True, "self", requestor_person_id, subject_person_id
         )
-        _log(decision)
-        return decision
-
     subject = db.get(models.Person, subject_person_id)
     if subject is None:
-        decision = AccessDecision(
+        return AccessDecision(
             False, "unknown_subject", requestor_person_id, subject_person_id
         )
-        _log(decision)
-        return decision
-
     requestor = db.get(models.Person, requestor_person_id)
     if requestor is None:
-        decision = AccessDecision(
+        return AccessDecision(
             False, "unknown_subject", requestor_person_id, subject_person_id
         )
-        _log(decision)
-        return decision
-
-    # Cross-family belt-and-suspenders. Even if a relationship row
-    # somehow links them, refuse: privacy is per-household.
     if requestor.family_id != subject.family_id:
-        decision = AccessDecision(
+        return AccessDecision(
             False, "cross_family", requestor_person_id, subject_person_id
         )
-        _log(decision)
-        return decision
-
     if _is_spouse(db, requestor_person_id, subject_person_id):
-        decision = AccessDecision(
+        return AccessDecision(
             True, "spouse", requestor_person_id, subject_person_id
         )
-        _log(decision)
-        return decision
-
-    if _is_direct_parent(db, requestor_person_id, subject_person_id):
-        decision = AccessDecision(
-            True, "parent", requestor_person_id, subject_person_id
-        )
-        _log(decision)
-        return decision
-
-    decision = AccessDecision(
+    return AccessDecision(
         False, "unauthorized", requestor_person_id, subject_person_id
     )
-    _log(decision)
-    return decision
+
+
+def _decide_sensitive(
+    db: Session,
+    *,
+    requestor_person_id: Optional[int],
+    subject_person_id: int,
+) -> AccessDecision:
+    """Pure decision function for sensitive-data access — no logging."""
+    if requestor_person_id is None:
+        return AccessDecision(False, "anonymous", None, subject_person_id)
+    if requestor_person_id == subject_person_id:
+        return AccessDecision(
+            True, "self", requestor_person_id, subject_person_id
+        )
+    subject = db.get(models.Person, subject_person_id)
+    if subject is None:
+        return AccessDecision(
+            False, "unknown_subject", requestor_person_id, subject_person_id
+        )
+    requestor = db.get(models.Person, requestor_person_id)
+    if requestor is None:
+        return AccessDecision(
+            False, "unknown_subject", requestor_person_id, subject_person_id
+        )
+    if requestor.family_id != subject.family_id:
+        return AccessDecision(
+            False, "cross_family", requestor_person_id, subject_person_id
+        )
+    if _is_spouse(db, requestor_person_id, subject_person_id):
+        return AccessDecision(
+            True, "spouse", requestor_person_id, subject_person_id
+        )
+    if _is_direct_parent(db, requestor_person_id, subject_person_id):
+        return AccessDecision(
+            True, "parent", requestor_person_id, subject_person_id
+        )
+    return AccessDecision(
+        False, "unauthorized", requestor_person_id, subject_person_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -508,21 +504,68 @@ def _names_for(db: Session, ids: Iterable[int]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def _log(decision: AccessDecision, *, scope: str = "sensitive") -> None:
+def _log(
+    decision: AccessDecision,
+    *,
+    scope: str = "sensitive",
+    enabled: bool = True,
+) -> None:
     """One stable line per decision so audits are easy to grep.
 
     ``scope`` distinguishes the sensitive-data check from the
     calendar-detail check so a future audit can answer "did anyone
     other than Ben himself see Ben's work calendar this week?".
+
+    ``enabled``
+        When the caller is in a hot loop (e.g. computing the speaker
+        scope across every household member) and will emit its own
+        summary line, it can pass ``enabled=False`` to demote each
+        per-decision line from INFO to DEBUG. The audit signal is
+        preserved at DEBUG for anyone who wants to crank logging up.
     """
     verb = "ALLOW" if decision.allowed else "DENY "
-    logger.info(
+    level = logging.INFO if enabled else logging.DEBUG
+    if not logger.isEnabledFor(level):
+        return
+    logger.log(
+        level,
         "[authz] %s scope=%s requestor=%s subject=%s reason=%s",
         verb,
         scope,
         decision.requestor_person_id,
         decision.subject_person_id,
         decision.label,
+    )
+
+
+def log_scope_summary(
+    *,
+    scope: str,
+    requestor_person_id: Optional[int],
+    allowed_subject_ids: Iterable[int],
+    denied_subject_ids: Iterable[int],
+) -> None:
+    """One INFO line summarizing a bulk authz sweep.
+
+    Bulk callers (currently :func:`build_family_overview`) iterate
+    ``can_access_sensitive`` across every person in the household to
+    build the speaker's access set. Logging each per-call decision at
+    INFO produced 14+ lines per chat turn; we now silence those calls
+    and emit this single line instead so the audit story is "speaker
+    X could see N people in detail and was denied M". Per-call detail
+    is still available at DEBUG.
+    """
+    allowed = sorted({int(x) for x in allowed_subject_ids if x is not None})
+    denied = sorted({int(x) for x in denied_subject_ids if x is not None})
+    logger.info(
+        "[authz] SUMMARY scope=%s requestor=%s allowed=%d denied=%d "
+        "allowed_ids=%s denied_ids=%s",
+        scope,
+        requestor_person_id,
+        len(allowed),
+        len(denied),
+        allowed,
+        denied,
     )
 
 
@@ -536,6 +579,7 @@ __all__ = [
     "build_speaker_scope",
     "can_access_sensitive",
     "can_see_calendar_details",
+    "log_scope_summary",
     "redact_row",
     "redact_rows",
     "render_speaker_scope_block",

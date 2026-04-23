@@ -179,11 +179,13 @@ class Settings(BaseSettings):
     # replies via the agent loop. Set OFF to disable Avi's email
     # autopilot entirely (the OAuth connection itself remains intact).
     AI_EMAIL_INBOX_ENABLED: bool = True
-    # Polling cadence in seconds. Gmail's per-user quota is generous so
-    # 30-60 s feels responsive without being noisy. Set very high (e.g.
-    # 3600) to effectively disable while keeping the option to bump it
-    # down without a restart in the future.
-    AI_EMAIL_INBOX_POLL_SECONDS: int = 60
+    # Polling cadence in seconds. Email is treated as a low-urgency
+    # async surface (people don't expect sub-minute replies), so we
+    # default to 30 minutes to keep Gmail API quota usage minimal and
+    # avoid noisy "tick" log lines. Drop to 60-120 s temporarily when
+    # actively testing inbound flows; bump higher (e.g. 3600) to
+    # effectively pause the surface without losing the OAuth grant.
+    AI_EMAIL_INBOX_POLL_SECONDS: int = 30 * 60
     # Max unread messages fetched per poll cycle. Keeps a backlog from
     # spawning dozens of agent runs at once if a flood arrives.
     AI_EMAIL_INBOX_MAX_PER_TICK: int = 5
@@ -372,6 +374,32 @@ class Settings(BaseSettings):
     # load. Going over should be RARE — if you see it firing often,
     # the lifespan warmup isn't running or `keep_alive` got cleared.
     AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S: float = 2.5
+
+    # ---- Inbound attachments (vision adapter) --------------------------
+    # Master switch for the multi-channel attachment pipeline. When OFF
+    # inbound images / PDFs / DOCX still get downloaded and stored, but
+    # the agent prompt only sees the filename — no Gemini Vision call,
+    # no PDF/DOCX text extraction. Useful kill-switch if Gemini quota
+    # runs out or you're auditing model spend.
+    AI_VISION_ENABLED: bool = True
+    # Gemini model used to caption inbound images. Vision-capable text
+    # models work here; ``gemini-2.5-flash`` is the cheapest sweet
+    # spot (~1-2 s / image, generous free tier). Override to
+    # ``gemini-2.5-pro`` only if you want richer captions and don't
+    # mind the latency hit.
+    AI_VISION_MODEL: str = "gemini-2.5-flash"
+    # Hard upper bound on a single attachment's size, in bytes. Anything
+    # bigger is stored on disk but skipped for analysis (we don't want
+    # to hand a 50 MB JPEG to Gemini, and a 200-page PDF will hit the
+    # context limit anyway). 20 MB matches the largest practical email
+    # attachment most providers will accept.
+    AI_ATTACHMENT_MAX_BYTES: int = 20 * 1024 * 1024
+    # Per-message cap on the number of attachments we describe. Beyond
+    # this we still persist them and drop a one-line ``[+N more
+    # attachments not analysed]`` note into the prompt so the agent
+    # stays aware. Prevents an inbound with 30 photos from spending 60 s
+    # on Gemini Vision calls before the agent even starts.
+    AI_ATTACHMENT_MAX_PER_MESSAGE: int = 6
 
     @property
     def database_url(self) -> str:

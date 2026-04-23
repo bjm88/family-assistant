@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import List
 
 from sqlalchemy.orm import Session
@@ -65,8 +66,15 @@ async def plan_queries(
     # never want to burn a 26B-parameter pass on it. The fallback
     # wrapper auto-routes to the main chat model when the fast tag
     # isn't pulled (yet), so a missing model doesn't break chat.
+    logger.info(
+        "[planner] start family_id=%s model=%s user_chars=%d",
+        family_id,
+        ollama.fast_model(),
+        len(last_user_message or ""),
+    )
+    started = time.monotonic()
     try:
-        raw, _ = await ollama.generate_with_fallback(
+        raw, model_used = await ollama.generate_with_fallback(
             prompt,
             primary_model=ollama.fast_model(),
             system=prompts.with_safety(
@@ -76,11 +84,23 @@ async def plan_queries(
             max_tokens=400,
         )
     except ollama.OllamaError as e:
-        logger.warning("Planner call failed: %s", e)
+        logger.warning(
+            "[planner] failed family_id=%s duration_ms=%d error=%s",
+            family_id,
+            int((time.monotonic() - started) * 1000),
+            e,
+        )
         return []
 
-    queries = parse_planner_output(raw)
-    return queries[:3]
+    queries = parse_planner_output(raw)[:3]
+    logger.info(
+        "[planner] done family_id=%s model=%s duration_ms=%d n_queries=%d",
+        family_id,
+        model_used,
+        int((time.monotonic() - started) * 1000),
+        len(queries),
+    )
+    return queries
 
 
 def parse_planner_output(raw: str) -> List[str]:

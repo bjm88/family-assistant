@@ -20,6 +20,7 @@ version.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Union
 
@@ -113,10 +114,21 @@ class GeminiClient:
             max_output_tokens=max_output_tokens,
             system_instruction=system_instruction,
         )
+        call_started = time.monotonic()
         resp = self._client.models.generate_content(
             model=self.text_model, contents=prompt, config=config
         )
         text = getattr(resp, "text", None)
+        duration_ms = int((time.monotonic() - call_started) * 1000)
+        logger.info(
+            "[gemini] generate_text done model=%s duration_ms=%d "
+            "prompt_chars=%d out_chars=%d temp=%.2f",
+            self.text_model,
+            duration_ms,
+            len(prompt),
+            len(text or ""),
+            temperature,
+        )
         if not text:
             raise GeminiError("Gemini returned an empty text response.")
         return text

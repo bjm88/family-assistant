@@ -685,9 +685,12 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
         )
         if shortcut_text:
             logger.info(
-                "Live chat: web-search shortcut handled this turn "
-                "(family_id=%s, message=%r); skipping heavy agent.",
+                "[orch] surface=live_chat path=web_shortcut "
+                "family_id=%s session=%s reply_chars=%d msg=%r "
+                "(skipping heavy agent)",
                 payload.family_id,
+                payload.live_session_id,
+                len(shortcut_text),
                 latest_user_for_shortcut[:80],
             )
             return _shortcut_stream_response(
@@ -741,9 +744,11 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
                 planner_queries = []
             if planner_queries:
                 logger.info(
-                    "RAG planner ran %d query/queries for family_id=%s: %s",
-                    len(planner_queries),
+                    "[orch] surface=live_chat path=rag_planner+heavy_agent "
+                    "family_id=%s session=%s n_planner_queries=%d queries=%s",
                     payload.family_id,
+                    payload.live_session_id,
+                    len(planner_queries),
                     [q[:80] for q in planner_queries],
                 )
                 live_data_block = (
@@ -817,6 +822,17 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> Streaming
     )
     db.commit()
     task_id = task_row.agent_task_id
+    logger.info(
+        "[orch] surface=live_chat path=heavy_agent_with_ack_race "
+        "family_id=%s session=%s task=%s person_id=%s history_msgs=%d "
+        "rag_planner=%s",
+        payload.family_id,
+        payload.live_session_id,
+        task_id,
+        payload.recognized_person_id,
+        len(payload.messages),
+        bool(live_data_block),
+    )
 
     # Best display-name for the speaker so the fast-ack prompt can
     # personalise (*"Looking up your calendar..."*) when known. None

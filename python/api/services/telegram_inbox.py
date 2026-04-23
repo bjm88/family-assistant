@@ -69,6 +69,7 @@ from ..ai import fast_ack
 from ..ai import ollama
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
+from ..ai import vision
 from ..ai import web_search_shortcut
 from ..config import get_settings
 from ..db import SessionLocal
@@ -404,12 +405,19 @@ def process_inbound_update(
     )
 
     # ---- Download attachments (if any) and persist + log ------------
-    attachments_meta = _persist_attachments(db, audit, inbound)
+    attachments_meta, rendered_attachments, over_cap = _persist_attachments(
+        db, audit, inbound
+    )
+    attachment_block = vision.render_attachments_for_prompt(
+        rendered_attachments, extras_omitted=over_cap
+    )
     if attachments_meta:
         db.commit()
 
     # ---- Log inbound to the transcript ------------------------------
-    inbound_text = _format_inbound_for_log(inbound, attachments_meta)
+    inbound_text = _format_inbound_for_log(
+        inbound, attachments_meta, attachment_block=attachment_block
+    )
     live_session.log_message(
         db,
         session,
@@ -447,7 +455,9 @@ def process_inbound_update(
     audit.agent_task_id = task.agent_task_id
     db.commit()
 
-    user_message = _format_user_message_for_agent(inbound, person)
+    user_message = _format_user_message_for_agent(
+        inbound, person, attachment_block=attachment_block
+    )
     assistant_id_for_family = _assistant_id_for_family(db, person.family_id)
 
     # ---- Fast-path web-search shortcut -----------------------------
@@ -465,16 +475,25 @@ def process_inbound_update(
     )
     if shortcut_text:
         logger.info(
-            "Telegram inbox: web-search shortcut handled "
-            "update_id=%s task=%s (skipping heavy agent + ack race).",
+            "[orch] surface=telegram path=web_shortcut update_id=%s task=%s "
+            "person_id=%s reply_chars=%d (skipping heavy agent + ack race)",
             inbound.update_id,
             task.agent_task_id,
+            person.person_id,
+            len(shortcut_text),
         )
         final_text = shortcut_text
         agent_failed = False
         ack_sent_message_id: Optional[int] = None
         shortcut_used = True
     else:
+        logger.info(
+            "[orch] surface=telegram path=heavy_agent_with_ack_race "
+            "update_id=%s task=%s person_id=%s",
+            inbound.update_id,
+            task.agent_task_id,
+            person.person_id,
+        )
         system_prompt = _build_telegram_system_prompt(
             db,
             family_id=person.family_id,
@@ -504,6 +523,17 @@ def process_inbound_update(
             user_message=user_message,
             session=session,
             audit=audit,
+            inbound_attachments=[
+                agent_tools.InboundAttachmentRef(
+                    media_index=m["media_index"],
+                    filename=m["filename"],
+                    mime_type=m.get("mime_type"),
+                    size_bytes=m.get("file_size_bytes"),
+                    stored_path=m["stored_path"],
+                    channel="telegram",
+                )
+                for m in attachments_meta
+            ],
         )
         shortcut_used = False
 
@@ -2160,6 +2190,7 @@ def _run_agent_with_fast_ack(
     user_message: str,
     session: models.LiveSession,
     audit: models.TelegramInboxMessage,
+    inbound_attachments: Optional[List[agent_tools.InboundAttachmentRef]] = None,
 ) -> Tuple[str, bool, Optional[int]]:
     """Race the heavy agent against the fast-ack threshold.
 
@@ -2201,6 +2232,7 @@ def _run_agent_with_fast_ack(
             system_prompt=system_prompt,
             history=[],
             user_message=user_message,
+            inbound_attachments=list(inbound_attachments or []),
         )
 
     future = background_agent.submit(_heavy)
@@ -2319,6 +2351,7 @@ def _run_agent_to_completion(
     system_prompt: str,
     history: List[dict],
     user_message: str,
+    inbound_attachments: Optional[List[agent_tools.InboundAttachmentRef]] = None,
 ) -> str:
     """Drain the async agent generator and return the final reply text.
 
@@ -2339,6 +2372,9 @@ def _run_agent_to_completion(
         user_message=user_message,
         registry=registry,
         capabilities=capabilities,
+        extra_run_kwargs={
+            "inbound_attachments": list(inbound_attachments or []),
+        },
     )
 
     if result.error_text and not result.final_text:

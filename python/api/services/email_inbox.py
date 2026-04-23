@@ -53,12 +53,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .. import models
+from .. import models, storage
 from ..ai import agent as agent_loop
 from ..ai import agent_drain
 from ..ai import ollama
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
+from ..ai import vision
 from ..ai import web_search_shortcut
 from ..config import get_settings
 from ..db import SessionLocal
@@ -243,6 +244,48 @@ def process_assistant_inbox(
                 creds=creds,
                 gmail_message_id=message_id,
             )
+        except gmail.GmailReadError as exc:
+            # Common race: between ``list_unread`` and ``fetch_message``
+            # the user (or another mail client) deleted, archived, or
+            # moved the message. Gmail returns 404 and there is nothing
+            # we can do, but it is NOT an Avi-side failure — log a
+            # one-line INFO and record a clean audit row so the same id
+            # never re-enters the loop.
+            text = str(exc)
+            if "HTTP 404" in text or "not found" in text.lower():
+                logger.info(
+                    "Email inbox: message %s vanished before we could "
+                    "fetch it (likely deleted/moved by the user); "
+                    "skipping. assistant_id=%s",
+                    message_id,
+                    assistant_id,
+                )
+                try:
+                    _record_failure(
+                        db,
+                        assistant_id=assistant_id,
+                        gmail_message_id=message_id,
+                        reason="Gmail 404 on fetch — message no longer exists.",
+                    )
+                except Exception:  # noqa: BLE001
+                    db.rollback()
+                continue
+            # Other Gmail read errors (5xx, auth, quota) ARE worth a
+            # full traceback so we can investigate.
+            logger.exception(
+                "Email inbox: Gmail read failed for message %s assistant_id=%s",
+                message_id,
+                assistant_id,
+            )
+            try:
+                _record_failure(
+                    db,
+                    assistant_id=assistant_id,
+                    gmail_message_id=message_id,
+                    reason=text,
+                )
+            except Exception:  # noqa: BLE001
+                db.rollback()
         except Exception as exc:  # noqa: BLE001 - per-message isolation
             logger.exception(
                 "Email inbox: failed to handle message %s for assistant_id=%s",
@@ -393,7 +436,27 @@ def _handle_one_message(
     )
     live_session.upsert_participant(db, session, person_id=person.person_id)
 
-    inbound_text = _format_inbound_for_log(msg)
+    # Save attachment bytes to local storage and run the vision /
+    # text-extraction pipeline IN MEMORY before any DB writes for the
+    # attachments themselves — that way the inbound transcript and the
+    # agent prompt both see the same captioned block, and we still
+    # link the attachment rows to ``email_inbox_messages`` (FK target)
+    # only after the final audit insert at the end of this function.
+    # Failures here never propagate; ``_persist_and_describe_email_attachments``
+    # logs and returns an empty list so a single busted PDF cannot
+    # drop the rest of the message.
+    persisted_attachments, rendered_attachments, over_cap = (
+        _persist_and_describe_email_attachments(
+            family_id=family_id,
+            gmail_message_id=msg.message_id,
+            attachments=msg.attachments,
+        )
+    )
+    attachment_block = vision.render_attachments_for_prompt(
+        rendered_attachments, extras_omitted=over_cap
+    )
+
+    inbound_text = _format_inbound_for_log(msg, attachment_block=attachment_block)
     live_session.log_message(
         db,
         session,
@@ -405,6 +468,7 @@ def _handle_one_message(
             "gmail_message_id": msg.message_id,
             "subject": msg.subject,
             "sender_email": msg.sender_email,
+            "num_attachments": len(msg.attachments),
         },
     )
 
@@ -421,7 +485,9 @@ def _handle_one_message(
     )
     db.commit()
 
-    user_message = _format_user_message_for_agent(msg, person)
+    user_message = _format_user_message_for_agent(
+        msg, person, attachment_block=attachment_block
+    )
     history: List[dict] = []  # email is one-shot per turn, no in-memory history
 
     # ---- Fast-path web-search shortcut --------------------------------
@@ -440,15 +506,25 @@ def _handle_one_message(
     )
     if shortcut_text:
         logger.info(
-            "Email inbox: web-search shortcut handled message_id=%s "
-            "task=%s (skipping heavy agent).",
+            "[orch] surface=email path=web_shortcut message_id=%s task=%s "
+            "person_id=%s reply_chars=%d (skipping heavy agent)",
             msg.message_id,
             task.agent_task_id,
+            person.person_id,
+            len(shortcut_text),
         )
         final_text = shortcut_text
         shortcut_used = True
 
     if not shortcut_used:
+        logger.info(
+            "[orch] surface=email path=heavy_agent message_id=%s task=%s "
+            "person_id=%s n_attachments=%d",
+            msg.message_id,
+            task.agent_task_id,
+            person.person_id,
+            len(msg.attachments),
+        )
         system_prompt = _build_email_system_prompt(
             db,
             family_id=family_id,
@@ -474,6 +550,17 @@ def _handle_one_message(
                 system_prompt=system_prompt,
                 history=history,
                 user_message=user_message,
+                inbound_attachments=[
+                    agent_tools.InboundAttachmentRef(
+                        media_index=p["media_index"],
+                        filename=p["filename"],
+                        mime_type=p.get("mime_type"),
+                        size_bytes=p.get("file_size_bytes"),
+                        stored_path=p["stored_path"],
+                        channel="email",
+                    )
+                    for p in persisted_attachments
+                ],
             )
         except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
             logger.exception(
@@ -537,7 +624,7 @@ def _handle_one_message(
         status_reason = "Web-search shortcut handled (skipped heavy agent)."
     else:
         status_reason = None
-    _save_audit(
+    audit_row = _save_audit(
         db,
         **common_audit,
         person_id=person.person_id,
@@ -547,6 +634,18 @@ def _handle_one_message(
         agent_task_id=task.agent_task_id,
         live_session_id=session.live_session_id,
     )
+
+    # Now that the audit row exists, attach the persisted attachment
+    # rows to it. Done after the audit insert (rather than before)
+    # because the FK target only exists at this point — keeps the
+    # whole pipeline single-pass and free of transient/intermediate
+    # statuses on ``email_inbox_messages``.
+    if persisted_attachments:
+        _record_email_attachment_rows(
+            db,
+            email_inbox_message_id=audit_row.email_inbox_message_id,
+            persisted=persisted_attachments,
+        )
 
     _safe_mark_read(creds, gmail_message_id)
 
@@ -645,7 +744,9 @@ def _save_audit(db: Session, **kwargs) -> models.EmailInboxMessage:
     return row
 
 
-def _format_inbound_for_log(msg: gmail.FetchedMessage) -> str:
+def _format_inbound_for_log(
+    msg: gmail.FetchedMessage, *, attachment_block: str = ""
+) -> str:
     """Render the email so it's readable when replayed in the history view."""
     bits = [
         f"Subject: {msg.subject or '(no subject)'}",
@@ -653,19 +754,150 @@ def _format_inbound_for_log(msg: gmail.FetchedMessage) -> str:
         "",
         msg.body_text or "(no body)",
     ]
+    if attachment_block:
+        bits.append("")
+        bits.append(attachment_block)
     return "\n".join(bits)
 
 
 def _format_user_message_for_agent(
-    msg: gmail.FetchedMessage, person: models.Person
+    msg: gmail.FetchedMessage,
+    person: models.Person,
+    *,
+    attachment_block: str = "",
 ) -> str:
-    """Wrap the email so the agent knows what surface this came through."""
+    """Wrap the email so the agent knows what surface this came through.
+
+    The optional ``attachment_block`` is the rendered, captioned list
+    produced by :func:`vision.render_attachments_for_prompt`; appending
+    it here is what lets the local Gemma model "see" image / PDF /
+    DOCX content even though Ollama itself is text-only.
+    """
     name = person.preferred_name or person.first_name or msg.sender_email
-    return (
+    base = (
         f"[Email from {name} <{msg.sender_email}>]\n"
         f"Subject: {msg.subject or '(no subject)'}\n\n"
         f"{(msg.body_text or '').strip() or '(no body)'}"
     )
+    if attachment_block:
+        return f"{base}\n\n{attachment_block}"
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Attachment persistence + analysis
+# ---------------------------------------------------------------------------
+
+
+def _persist_and_describe_email_attachments(
+    *,
+    family_id: int,
+    gmail_message_id: str,
+    attachments: List[gmail.FetchedAttachment],
+) -> tuple[
+    List[dict],
+    List[vision.RenderableAttachment],
+    int,
+]:
+    """Save attachment bytes to disk and run the vision pipeline.
+
+    Returns a 3-tuple of:
+
+    1. ``persisted`` — a list of dicts with the fields needed to insert
+       :class:`models.EmailInboxAttachment` rows once the parent
+       ``email_inbox_messages`` row exists. Kept dict-shaped (rather
+       than partially-built ORM objects) so we don't have to thread a
+       DB session through this function.
+    2. ``rendered`` — :class:`vision.RenderableAttachment` per
+       attachment we actually analysed, in the same order.
+    3. ``over_cap`` — the count of attachments that were saved to disk
+       but skipped past the analysis cap, suitable to pass through to
+       :func:`vision.render_attachments_for_prompt`.
+    """
+    if not attachments:
+        return [], [], 0
+
+    settings = get_settings()
+    persisted: List[dict] = []
+    inputs: List[vision.AttachmentInput] = []
+
+    for att in attachments:
+        # Choose a safe filename even when Gmail didn't supply one (some
+        # phone clients omit Content-Disposition for inline images).
+        safe_name = att.filename or f"attachment-{att.media_index}"
+        try:
+            rel_path, size_bytes = storage.save_message_attachment(
+                family_id=family_id,
+                channel="email",
+                message_id=gmail_message_id,
+                file_bytes=att.data,
+                original_filename=safe_name,
+            )
+        except Exception:  # noqa: BLE001 - one bad attachment must not drop the rest
+            logger.exception(
+                "Email inbox: storing attachment failed message=%s idx=%s",
+                gmail_message_id,
+                att.media_index,
+            )
+            continue
+
+        persisted.append(
+            {
+                "media_index": att.media_index,
+                "gmail_attachment_id": att.gmail_attachment_id,
+                "filename": safe_name,
+                "mime_type": att.mime_type or "application/octet-stream",
+                "file_size_bytes": size_bytes,
+                "stored_path": rel_path,
+            }
+        )
+
+        # Build the AttachmentInput by joining storage_root + rel_path
+        # directly. We bypass ``storage.absolute_path`` (which exists
+        # for *user-supplied* paths — defends against ``..`` traversal)
+        # because we just wrote this file ourselves and already trust
+        # the path. Going through the validator caused spurious
+        # ``Refusing to serve path outside of FA_STORAGE_ROOT`` errors
+        # on macOS where ``/var`` symlinks to ``/private/var``.
+        absolute = settings.storage_root / rel_path
+        inputs.append(
+            vision.AttachmentInput(
+                index=att.media_index,
+                path=absolute,
+                filename=safe_name,
+                mime_type=att.mime_type,
+                size_bytes=size_bytes,
+            )
+        )
+
+    rendered, over_cap = vision.describe_many(
+        inputs, max_to_describe=settings.AI_ATTACHMENT_MAX_PER_MESSAGE
+    )
+    return persisted, rendered, over_cap
+
+
+def _record_email_attachment_rows(
+    db: Session,
+    *,
+    email_inbox_message_id: int,
+    persisted: List[dict],
+) -> None:
+    """Insert ``email_inbox_attachments`` rows for an already-saved message."""
+    for row in persisted:
+        db.add(
+            models.EmailInboxAttachment(
+                email_inbox_message_id=email_inbox_message_id,
+                **row,
+            )
+        )
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        logger.warning(
+            "Email inbox: attachment rows already present for message_id=%s",
+            email_inbox_message_id,
+        )
 
 
 def _build_email_system_prompt(
@@ -719,6 +951,7 @@ def _run_agent_to_completion(
     system_prompt: str,
     history: List[dict],
     user_message: str,
+    inbound_attachments: Optional[List[agent_tools.InboundAttachmentRef]] = None,
 ) -> str:
     """Drain the async agent generator and return the final reply text.
 
@@ -745,6 +978,9 @@ def _run_agent_to_completion(
         user_message=user_message,
         registry=registry,
         capabilities=capabilities,
+        extra_run_kwargs={
+            "inbound_attachments": list(inbound_attachments or []),
+        },
     )
 
     if result.error_text and not result.final_text:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 
@@ -258,6 +259,7 @@ async def generate(
     if system:
         payload["system"] = system
 
+    call_started = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(f"{_base()}/api/generate", json=payload)
@@ -276,7 +278,19 @@ async def generate(
             f"Ollama returned {r.status_code}: {r.text[:400]}"
         )
     data = r.json()
-    return (data.get("response") or "").strip()
+    text_out = (data.get("response") or "").strip()
+    duration_ms = int((time.monotonic() - call_started) * 1000)
+    logger.info(
+        "[ollama] generate done model=%s duration_ms=%d "
+        "prompt_chars=%d out_chars=%d max_tokens=%d temp=%.2f",
+        target_model,
+        duration_ms,
+        len(prompt),
+        len(text_out),
+        max_tokens,
+        temperature,
+    )
+    return text_out
 
 
 async def chat_stream(
@@ -296,13 +310,23 @@ async def chat_stream(
             continue
         ollama_messages.append({"role": role, "content": content})
 
+    target_model = _model()
     payload = {
-        "model": _model(),
+        "model": target_model,
         "messages": ollama_messages,
         "stream": True,
         "options": {"temperature": temperature},
     }
 
+    logger.info(
+        "[ollama] chat_stream start model=%s msgs=%d sys_chars=%d temp=%.2f",
+        target_model,
+        len(messages),
+        len(system) if system else 0,
+        temperature,
+    )
+    call_started = time.monotonic()
+    total_chars = 0
     try:
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(
@@ -310,8 +334,8 @@ async def chat_stream(
             ) as r:
                 if r.status_code == 404:
                     raise OllamaUnavailable(
-                        f"Model '{_model()}' is not pulled. "
-                        f"Run `ollama pull {_model()}`."
+                        f"Model '{target_model}' is not pulled. "
+                        f"Run `ollama pull {target_model}`."
                     )
                 if r.status_code >= 400:
                     body = await r.aread()
@@ -329,6 +353,7 @@ async def chat_stream(
                     msg = obj.get("message") or {}
                     chunk = msg.get("content") or ""
                     if chunk:
+                        total_chars += len(chunk)
                         yield chunk
                     if obj.get("done"):
                         break
@@ -336,6 +361,13 @@ async def chat_stream(
         raise OllamaUnavailable(
             f"Ollama at {_base()} is not responding: {e}"
         ) from e
+    finally:
+        logger.info(
+            "[ollama] chat_stream done model=%s duration_ms=%d out_chars=%d",
+            target_model,
+            int((time.monotonic() - call_started) * 1000),
+            total_chars,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +441,18 @@ async def chat_with_tools(
     if think is not None:
         payload["think"] = bool(think)
 
+    logger.info(
+        "[ollama] chat_with_tools start model=%s msgs=%d sys_chars=%d "
+        "tools=%d temp=%.2f think=%s timeout=%.0fs",
+        target_model,
+        len(messages),
+        len(system) if system else 0,
+        len(tools),
+        temperature,
+        think,
+        timeout_seconds,
+    )
+
     # Structured timeout: connect fast (Ollama is on localhost so anything
     # >5 s usually means the daemon is dead), but allow the full per-turn
     # budget for read/write since the actual inference is the slow part.
@@ -417,6 +461,7 @@ async def chat_with_tools(
     request_timeout = httpx.Timeout(
         connect=10.0, read=timeout_seconds, write=timeout_seconds, pool=5.0
     )
+    call_started = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=request_timeout) as client:
             r = await client.post(f"{_base()}/api/chat", json=payload)
@@ -475,6 +520,20 @@ async def chat_with_tools(
             calls = recovered
             # Strip the JSON tool-call block from the user-visible content.
             content = ""
+
+    duration_ms = int((time.monotonic() - call_started) * 1000)
+    eval_count = data.get("eval_count")
+    prompt_eval_count = data.get("prompt_eval_count")
+    logger.info(
+        "[ollama] chat_with_tools done model=%s duration_ms=%d "
+        "tool_calls=%d content_chars=%d prompt_tokens=%s out_tokens=%s",
+        target_model,
+        duration_ms,
+        len(calls),
+        len(content),
+        prompt_eval_count,
+        eval_count,
+    )
 
     return ChatWithToolsResult(
         content=content,

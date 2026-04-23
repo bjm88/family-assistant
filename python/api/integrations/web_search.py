@@ -647,7 +647,30 @@ async def search(query: str, *, limit: Optional[int] = None) -> SearchResponse:
         )
     settings = get_settings()
     n = limit if limit is not None else settings.AI_WEB_SEARCH_DEFAULT_LIMIT
-    return await provider.search(query, limit=n)
+    logger.info(
+        "[web_search] start provider=%s limit=%d query=%r",
+        provider.name,
+        n,
+        query[:100],
+    )
+    started = time.monotonic()
+    try:
+        result = await provider.search(query, limit=n)
+        logger.info(
+            "[web_search] done provider=%s duration_ms=%d n_results=%d",
+            provider.name,
+            int((time.monotonic() - started) * 1000),
+            len(result.results),
+        )
+        return result
+    except Exception as exc:
+        logger.warning(
+            "[web_search] failed provider=%s duration_ms=%d error=%s",
+            provider.name,
+            int((time.monotonic() - started) * 1000),
+            exc,
+        )
+        raise
 
 
 async def grounded_chat_answer(

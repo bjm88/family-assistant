@@ -205,23 +205,30 @@ def generate_contextual_ack_sync(
         text = _run_async(_call())
     except asyncio.TimeoutError:
         logger.debug(
-            "fast_ack: e2b call exceeded %.1fs timeout — skipping ack",
+            "[fast_ack] e2b call exceeded %.1fs timeout — skipping ack",
             cap,
         )
         return None
     except OllamaUnavailable as exc:
         # Fast model isn't pulled, or Ollama itself is down. Expected
         # in dev / fresh installs; never bubble up.
-        logger.debug("fast_ack: %s — skipping ack", exc)
+        logger.debug("[fast_ack] %s — skipping ack", exc)
         return None
     except OllamaError as exc:
-        logger.warning("fast_ack: Ollama error %s — skipping ack", exc)
+        logger.warning("[fast_ack] Ollama error %s — skipping ack", exc)
         return None
     except Exception:  # noqa: BLE001 - last-resort safety
-        logger.exception("fast_ack: unexpected error — skipping ack")
+        logger.exception("[fast_ack] unexpected error — skipping ack")
         return None
 
-    return _clean_ack_text(text)
+    cleaned = _clean_ack_text(text)
+    logger.info(
+        "[fast_ack] sync done surface=%s model=%s ack_chars=%d",
+        surface,
+        fast_model(),
+        len(cleaned or ""),
+    )
+    return cleaned
 
 
 async def generate_contextual_ack_async(
@@ -273,21 +280,28 @@ async def generate_contextual_ack_async(
         )
     except asyncio.TimeoutError:
         logger.debug(
-            "fast_ack: e2b call exceeded %.1fs timeout — skipping ack",
+            "[fast_ack] e2b call exceeded %.1fs timeout — skipping ack",
             cap,
         )
         return None
     except OllamaUnavailable as exc:
-        logger.debug("fast_ack: %s — skipping ack", exc)
+        logger.debug("[fast_ack] %s — skipping ack", exc)
         return None
     except OllamaError as exc:
-        logger.warning("fast_ack: Ollama error %s — skipping ack", exc)
+        logger.warning("[fast_ack] Ollama error %s — skipping ack", exc)
         return None
     except Exception:  # noqa: BLE001 - last-resort safety
-        logger.exception("fast_ack: unexpected error — skipping ack")
+        logger.exception("[fast_ack] unexpected error — skipping ack")
         return None
 
-    return _clean_ack_text(text)
+    cleaned = _clean_ack_text(text)
+    logger.info(
+        "[fast_ack] async done surface=%s model=%s ack_chars=%d",
+        surface,
+        fast_model(),
+        len(cleaned or ""),
+    )
+    return cleaned
 
 
 async def _chat_oneshot(

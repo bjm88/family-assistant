@@ -172,6 +172,7 @@ async def run_agent(
     max_steps: int = DEFAULT_MAX_STEPS,
     model_override: Optional[str] = None,
     think: Optional[bool] = None,
+    inbound_attachments: Optional[List[tools.InboundAttachmentRef]] = None,
 ) -> AsyncIterator[AgentEvent]:
     """Drive a single agent task to completion, yielding SSE events.
 
@@ -183,11 +184,20 @@ async def run_agent(
     started = time.monotonic()
     available_tools = registry.to_ollama_tools(capabilities)
     tool_names_for_log = [t["function"]["name"] for t in available_tools]
+    primary_model_for_log = model_override or ollama._model()
     logger.info(
-        "Agent task %s starting: family_id=%s tools=%s",
+        "[agent] task=%s starting family_id=%s person_id=%s assistant_id=%s "
+        "model=%s think=%s max_steps=%s tools=%d inbound_attachments=%d (%s)",
         task_id,
         family_id,
-        tool_names_for_log,
+        person_id,
+        assistant_id,
+        primary_model_for_log,
+        think,
+        max_steps,
+        len(tool_names_for_log),
+        len(inbound_attachments or []),
+        ",".join(tool_names_for_log),
     )
 
     try:
@@ -219,6 +229,7 @@ async def run_agent(
             family_id=family_id,
             assistant_id=assistant_id,
             person_id=person_id,
+            inbound_attachments=list(inbound_attachments or []),
         )
 
         messages: List[Dict[str, Any]] = [
@@ -343,6 +354,16 @@ async def run_agent(
 
             # ---- Tool calls path -----------------------------------------
             if turn.tool_calls:
+                logger.info(
+                    "[agent] task=%s cycle=%d decision=tool_calls model=%s "
+                    "duration_ms=%d n_calls=%d tools=[%s]",
+                    task_id,
+                    cycle,
+                    turn.model,
+                    cycle_ms,
+                    len(turn.tool_calls),
+                    ",".join(c.name for c in turn.tool_calls),
+                )
                 # First record what the model decided to do (one row per call).
                 for call in turn.tool_calls:
                     step = _append_step(
@@ -416,6 +437,15 @@ async def run_agent(
 
             # ---- Final answer path ---------------------------------------
             final_text = turn.content or ""
+            logger.info(
+                "[agent] task=%s cycle=%d decision=final model=%s "
+                "duration_ms=%d reply_chars=%d",
+                task_id,
+                cycle,
+                turn.model,
+                cycle_ms,
+                len(final_text),
+            )
             step = _append_step(
                 db,
                 task,
@@ -439,6 +469,11 @@ async def run_agent(
             error_msg = (
                 f"Agent did not converge within {max_steps} steps."
             )
+            logger.warning(
+                "[agent] task=%s exhausted max_steps=%d without final answer",
+                task_id,
+                max_steps,
+            )
             step = _append_step(
                 db,
                 task,
@@ -461,6 +496,13 @@ async def run_agent(
             status="succeeded",
             summary=final_text or "(no response)",
             started=started,
+        )
+        logger.info(
+            "[agent] task=%s completed cycles=%d total_ms=%d reply_chars=%d",
+            task_id,
+            step_index,
+            task.duration_ms or int((time.monotonic() - started) * 1000),
+            len(final_text),
         )
         yield AgentEvent(
             type="task_completed",
