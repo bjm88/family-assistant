@@ -103,6 +103,46 @@ port_for() {
     esac
 }
 
+# is_descendant_of <pid> <ancestor> [max_depth=6]
+#   Return 0 iff <pid>'s parent chain contains <ancestor> within
+#   <max_depth> hops. Used by the orphan sweeper so we don't accidentally
+#   kill a worker that's a *grandchild* of the launchd-managed process.
+#
+#   Why this matters: when uvicorn is launched with --reload, the
+#   process tree is THREE levels deep, not two:
+#
+#     launchd-managed (uv shim, ppid=1)         ← launchctl reports this PID
+#       └─ uvicorn parent (the reloader)
+#            └─ uvicorn worker (multiprocessing fork)   ← also binds :8000
+#
+#   The naive "ppid == managed_pid" check skipped the reloader but
+#   tagged the worker as an orphan and tried to SIGTERM/SIGKILL it,
+#   which (a) raced launchd's own restart, (b) triggered scary
+#   "still running — something's wrong" errors, and (c) was just
+#   plain wrong. Walk up the chain instead.
+is_descendant_of() {
+    local pid="$1"
+    local ancestor="$2"
+    local max_depth="${3:-6}"
+
+    [[ -z "${pid}" || -z "${ancestor}" ]] && return 1
+
+    local depth=0
+    local cur="${pid}"
+    while (( depth < max_depth )); do
+        local ppid
+        ppid="$(ps -o ppid= -p "${cur}" 2>/dev/null | tr -d ' ' || true)"
+        # Reached init (1), kernel (0), or an unreadable PID — stop.
+        [[ -z "${ppid}" || "${ppid}" == "0" || "${ppid}" == "1" ]] && return 1
+        if [[ "${ppid}" == "${ancestor}" ]]; then
+            return 0
+        fi
+        cur="${ppid}"
+        ((depth++))
+    done
+    return 1
+}
+
 # sweep_pre_launchd_orphans <short> <port>
 #   Kill anything listening on <port> that isn't the launchd-managed
 #   process. Targets the specific failure mode where the user ran
@@ -134,12 +174,12 @@ sweep_pre_launchd_orphans() {
         if [[ -n "${managed_pid}" && "${pid}" == "${managed_pid}" ]]; then
             continue
         fi
-        # Also skip launchd's child's worker children (e.g. uvicorn's
-        # multiprocessing fork). They share the inherited socket and
-        # will exit when the parent does, so don't double-kill.
-        local ppid
-        ppid="$(ps -o ppid= -p "${pid}" 2>/dev/null | tr -d ' ' || true)"
-        if [[ -n "${managed_pid}" && "${ppid}" == "${managed_pid}" ]]; then
+        # Also skip *any* descendant of launchd's managed PID (uvicorn
+        # reloader child, its multiprocessing worker grand-child, etc.).
+        # They share the inherited socket and will exit when the agent
+        # is kickstarted — double-killing them just races launchd.
+        if [[ -n "${managed_pid}" ]] \
+            && is_descendant_of "${pid}" "${managed_pid}"; then
             continue
         fi
         local cmd

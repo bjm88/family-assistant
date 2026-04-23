@@ -304,8 +304,32 @@ export function useLocalFaceWatcher({
     const scratchCanvas = document.createElement("canvas");
     let detector: FaceDetector | null = null;
 
-    const setStatus = (s: LocalFaceWatcherStatus) =>
+    // Dedupe status emissions — without this we publish a fresh
+    // {kind:"ready",activeTrackCount:N} object on every 250ms tick,
+    // which made every consumer that listed the status in a
+    // useEffect dep array tear down + rebuild on every tick. The
+    // FaceRecognitionDriver's 8-second "unknown track retry"
+    // timer was the casualty: its effect re-mounted at 4 Hz and
+    // never let the 8 s setInterval fire, so a face that came in
+    // as `no_face_in_frame` on its first /recognize was never
+    // re-probed and the user was silently never greeted.
+    let lastStatus: LocalFaceWatcherStatus | null = null;
+    const setStatus = (s: LocalFaceWatcherStatus) => {
+      if (
+        lastStatus &&
+        lastStatus.kind === s.kind &&
+        (s.kind !== "ready" ||
+          (lastStatus as { activeTrackCount: number }).activeTrackCount ===
+            s.activeTrackCount) &&
+        (s.kind !== "error" ||
+          (lastStatus as { reason: string }).reason ===
+            (s as { reason: string }).reason)
+      ) {
+        return;
+      }
+      lastStatus = s;
       cbRef.current.onStatusChange?.(s);
+    };
 
     const tick = async () => {
       if (cancelled || !detector) return;

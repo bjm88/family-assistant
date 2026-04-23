@@ -162,6 +162,23 @@ class Settings(BaseSettings):
     # the live page. Override via env when testing: AI_LIVE_SESSION_IDLE_MINUTES=2
     AI_LIVE_SESSION_IDLE_MINUTES: int = 30
 
+    # Seconds-window the /greet endpoint uses to decide whether the
+    # speaker is "already mid-conversation" with Avi. If the most recent
+    # chat-kind transcript message in the same live session is OLDER
+    # than this many seconds, a fresh face-rec event re-greets the
+    # person normally; if it's NEWER, the greeting is suppressed (a
+    # sudden "Hi Ben!" mid-typing is jarring). Set to 0 to fully
+    # disable the recent-activity suppression — every fresh face-rec
+    # event greets, modulo the per-participant ``greeted_already``
+    # flag.
+    #
+    # Background: when this was a boolean "any chat history at all"
+    # check, a single chat exchange would silently kill all face-rec
+    # greetings for the entire 30-minute idle window of the session.
+    # The recent-window approach matches the intent ("don't interrupt
+    # the user") without permanently muting greetings.
+    AI_GREET_SUPPRESS_RECENT_CHAT_SECONDS: int = 120
+
     # Dynamic-SQL planner. When true the chat endpoint makes a quick
     # non-streaming LLM call before each message asking which SELECT
     # queries (if any) to run for additional context. With a 26B model

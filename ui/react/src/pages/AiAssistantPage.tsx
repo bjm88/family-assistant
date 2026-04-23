@@ -150,6 +150,18 @@ const FACE_RECOG_FALLBACK_INTERVAL_MS = 2500;
 // retries per minute instead of waiting until they leave + return.
 const FACE_RECOG_UNKNOWN_RETRY_INTERVAL_MS = 8000;
 
+// When the per-track POST returns "no_face_in_frame" or
+// "below_threshold" — typically because MediaPipe gave us a tight
+// crop that InsightFace's own detector couldn't lock onto — fire
+// ONE whole-frame recognize this many ms later, instead of waiting
+// for the next FACE_RECOG_UNKNOWN_RETRY_INTERVAL_MS tick. Without
+// this, the worst-case greet latency for a known family member
+// is ~8 s + backend round trip; with it the worst-case drops to
+// roughly 1 s + 2 backend round trips. The 400 ms breathing room
+// lets the user settle into frame (lighting / pose) so we don't
+// burn the second round trip on essentially the same image.
+const FACE_RECOG_FIRST_MISS_RETRY_DELAY_MS = 400;
+
 // After we greet someone, suppress re-greetings for this long so Avi
 // doesn't loop "Hi Sam!" every time they blink.
 const GREETING_SUPPRESSION_MS = 90_000;
@@ -1314,6 +1326,75 @@ function LiveCameraPanel({
   // ("Local: 1 face") or the fallback path ("Backend-only").
   const [watcherStatus, setWatcherStatus] =
     useState<LocalFaceWatcherStatus>({ kind: "loading" });
+  // Manual "Identify me" button state — separate from the
+  // background recognition loop so the button can show a spinner
+  // independent of any in-flight automatic /recognize.
+  const [forceCheckInflight, setForceCheckInflight] = useState(false);
+  const [forceCheckError, setForceCheckError] = useState<string | null>(null);
+
+  // Manual override: snapshot the whole video frame and POST it to
+  // /face/recognize directly. Bypasses both the local MediaPipe
+  // detector AND the FaceRecognitionDriver's per-person 90s
+  // greet-suppression — the user explicitly asked, so honour it.
+  //
+  // Why this exists: when MediaPipe finds a face but its tight crop
+  // doesn't contain enough of the surrounding region for InsightFace's
+  // detector to lock on, /recognize comes back as `no_face_in_frame`
+  // and the user is silently never greeted. The whole-frame retry
+  // does eventually fire, but giving the user a one-click escape
+  // hatch is faster and a great debugging aid (the badge + caption
+  // immediately reveal whether the issue is "no face in frame",
+  // "below threshold", or "matched but greet was suppressed").
+  const handleForceRecognize = useCallback(async () => {
+    if (forceCheckInflight) return;
+    const v = videoRef.current;
+    const c = canvasRef.current;
+    if (!v || !c || v.readyState < 2 || v.videoWidth === 0) {
+      setForceCheckError("Camera isn't ready yet — wait a second and retry.");
+      return;
+    }
+    setForceCheckInflight(true);
+    setForceCheckError(null);
+    try {
+      c.width = 640;
+      c.height = Math.round((640 * v.videoHeight) / v.videoWidth);
+      const ctx = c.getContext("2d");
+      if (!ctx) throw new Error("Could not get canvas context");
+      ctx.drawImage(v, 0, 0, c.width, c.height);
+      const blob: Blob | null = await new Promise((resolve) =>
+        c.toBlob(resolve, "image/jpeg", 0.85),
+      );
+      if (!blob) throw new Error("Could not capture a frame");
+      const form = new FormData();
+      form.append("family_id", String(familyId));
+      form.append("file", blob, "manual-frame.jpg");
+      const result = await api.upload<RecognizeResponse>(
+        "/api/aiassistant/face/recognize",
+        form,
+      );
+      setLastRecognition(result);
+      if (result.matched && result.person_id !== null) {
+        // Bypass the per-person 90s suppression intentionally — the
+        // user clicked the button, they want the greeting. ChatPanel
+        // listens on this event and POSTs /greet, which still enforces
+        // server-side "greet once per session" via greeted_already.
+        window.dispatchEvent(
+          new CustomEvent("avi:greet", {
+            detail: {
+              person_id: result.person_id,
+              person_name: result.person_name,
+            },
+          }),
+        );
+      }
+    } catch (e) {
+      setForceCheckError(
+        e instanceof Error ? e.message : "Recognize call failed",
+      );
+    } finally {
+      setForceCheckInflight(false);
+    }
+  }, [familyId, forceCheckInflight]);
 
   // Mount / unmount the getUserMedia stream.
   useEffect(() => {
@@ -1416,7 +1497,18 @@ function LiveCameraPanel({
                 </span>
               )}
           </div>
-          <div className="absolute bottom-3 right-3">
+          <div className="absolute bottom-3 right-3 flex items-center gap-2">
+            {cameraOn && !cameraError && (
+              <button
+                className="inline-flex items-center gap-1 bg-white/90 hover:bg-white disabled:opacity-60 disabled:cursor-not-allowed text-foreground text-xs px-3 py-1.5 rounded-full shadow"
+                onClick={handleForceRecognize}
+                disabled={forceCheckInflight}
+                title="Send the current camera frame straight to the backend recognizer. Use when the local detector has found a face but Avi hasn't greeted you."
+              >
+                <User className="h-3.5 w-3.5" />
+                {forceCheckInflight ? "Identifying…" : "Identify me"}
+              </button>
+            )}
             <button
               className="inline-flex items-center gap-1 bg-white/90 hover:bg-white text-foreground text-xs px-3 py-1.5 rounded-full shadow"
               onClick={() => setCameraOn((c) => !c)}
@@ -1435,11 +1527,13 @@ function LiveCameraPanel({
         </div>
         <div className="card-body py-2 px-4">
           <div className="text-xs text-muted-foreground">
-            {cameraOn
+            {forceCheckError
+              ? `Identify request failed: ${forceCheckError}`
+              : cameraOn
               ? lastRecognition?.reason === "no_enrolled_embeddings"
                 ? "No face embeddings yet. Click Re-enroll to build them from photos."
                 : lastRecognition?.reason === "no_face_in_frame"
-                ? "Camera is on, but I can't see a face yet — step closer or improve lighting."
+                ? "Camera is on, but I can't see a face yet — step closer, improve lighting, or click Identify me to send this exact frame."
                 : lastRecognition?.reason === "below_threshold" &&
                   lastRecognition.top_candidate
                 ? `Almost recognized ${
@@ -1448,7 +1542,7 @@ function LiveCameraPanel({
                     lastRecognition.top_candidate.similarity * 100
                   )}%). I need ${Math.round(
                     lastRecognition.threshold * 100
-                  )}% to greet — try Re-enroll on a current photo.`
+                  )}% to greet — try Re-enroll on a current photo, or Identify me to retry now.`
                 : "Watching for family members. I'll wave and say hi when I recognize someone."
               : "Camera paused — recognition is idle."}
           </div>
@@ -1646,6 +1740,78 @@ function FaceRecognitionDriver({
     | { kind: "unknown"; lastCheckedAt: number };
   const trackStateRef = useRef<Map<number, TrackRecState>>(new Map());
 
+  // Mutex for whole-frame recognize calls — shared by both the 8 s
+  // interval below AND the immediate first-miss kick from
+  // handleTrackAppeared, so the two paths can never overlap and
+  // double-bill the backend on a borderline frame.
+  const wholeFrameInflightRef = useRef(false);
+
+  // Snapshot the live <video> at 640px wide, JPEG-encode it, and POST
+  // to /face/recognize. On a successful match, mark every currently-
+  // unknown track as matched (we don't know which on-screen face the
+  // backend identified, so we mark them all — worst case is one
+  // false-positive identity badge that resolves on the next frame).
+  // Returns void; results are wired through `recognizeBlob` which
+  // dispatches `avi:greet` as a side-effect on a positive match.
+  //
+  // Used by:
+  //   1. The 8 s interval below — long-tail "still here, still
+  //      borderline, try again" loop.
+  //   2. handleTrackAppeared, fired ~400 ms after a per-track POST
+  //      came back unknown — the fast path that gets the user
+  //      greeted in ~1.5 s instead of ~8 s when MediaPipe's tight
+  //      crop wasn't enough for InsightFace's detector.
+  const runWholeFrameRecognize = useCallback(async () => {
+    if (wholeFrameInflightRef.current) return;
+    const states = [...trackStateRef.current.values()];
+    const hasUnknown = states.some((s) => s.kind === "unknown");
+    const hasMatched = states.some((s) => s.kind === "matched");
+    // If everyone in frame is already identified, there's nothing to
+    // gain from a whole-frame recognize — let the camera idle. (The
+    // `hasMatched` short-circuit is a known limitation in multi-
+    // person frames; preserving the v1 behavior for now.)
+    if (!hasUnknown || hasMatched) return;
+
+    const v = videoRef.current;
+    const c = canvasRef.current;
+    if (!v || !c || v.readyState < 2 || v.videoWidth === 0) return;
+
+    wholeFrameInflightRef.current = true;
+    try {
+      c.width = 640;
+      c.height = Math.round((640 * v.videoHeight) / v.videoWidth);
+      const ctx = c.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(v, 0, 0, c.width, c.height);
+      const blob: Blob | null = await new Promise((resolve) =>
+        c.toBlob(resolve, "image/jpeg", 0.8),
+      );
+      if (!blob) return;
+      const result = await recognizeBlob(blob, null);
+      if (result?.matched && result.person_id !== null) {
+        for (const [trackId, state] of trackStateRef.current.entries()) {
+          if (state.kind === "unknown") {
+            trackStateRef.current.set(trackId, {
+              kind: "matched",
+              personId: result.person_id,
+            });
+          }
+        }
+      } else {
+        for (const [trackId, state] of trackStateRef.current.entries()) {
+          if (state.kind === "unknown") {
+            trackStateRef.current.set(trackId, {
+              kind: "unknown",
+              lastCheckedAt: Date.now(),
+            });
+          }
+        }
+      }
+    } finally {
+      wholeFrameInflightRef.current = false;
+    }
+  }, [recognizeBlob, videoRef, canvasRef]);
+
   const handleTrackAppeared = useCallback(
     async (track: LocalTrack, blob: Blob) => {
       trackStateRef.current.set(track.id, { kind: "pending" });
@@ -1664,15 +1830,18 @@ function FaceRecognitionDriver({
           kind: "unknown",
           lastCheckedAt: Date.now(),
         });
-        // We *could* re-probe the same track on a slow cadence to
-        // catch a person who got enrolled in another tab between
-        // their birth and now. That'd require either a richer
-        // watcher hook (re-emit on cooldown) or a peer timer here;
-        // skipped in v1 because most households don't expect
-        // strangers in front of the live page.
+        // Fast path for the common "MediaPipe crop was too tight"
+        // failure mode: kick a single whole-frame recognize ~400 ms
+        // from now. Without this the only retry is the 8 s interval
+        // below, so a known family member who fails the first crop
+        // waits the full 8 s for their greeting. The wholeFrameInflightRef
+        // mutex prevents this from racing the interval tick.
+        window.setTimeout(() => {
+          void runWholeFrameRecognize();
+        }, FACE_RECOG_FIRST_MISS_RETRY_DELAY_MS);
       }
     },
-    [recognizeBlob],
+    [recognizeBlob, runWholeFrameRecognize],
   );
 
   const handleTrackLost = useCallback(
@@ -1709,91 +1878,35 @@ function FaceRecognitionDriver({
   //   never greeted for the entire duration of that track — they have
   //   to physically leave the camera frame and come back. The loop
   //   short-circuits the moment any track flips to "matched".
+  //
+  // The deps below are STABLE PRIMITIVES, not the whole status
+  // object, so this effect doesn't churn on every detect tick.
+  // Even with the watcher itself now de-duping status emissions,
+  // depending on a derived boolean keeps the contract single-sourced
+  // here — anyone wiring a new status field can't accidentally
+  // bring back the "8s timer reset every 250ms" regression.
+  const watcherReady = watcherStatusInternal.kind === "ready";
+  const watcherHasTracks =
+    watcherStatusInternal.kind === "ready" &&
+    watcherStatusInternal.activeTrackCount > 0;
   useEffect(() => {
     if (!cameraOn) return;
-    if (watcherStatusInternal.kind !== "ready") return;
-    if (watcherStatusInternal.activeTrackCount === 0) return;
-
-    let cancelled = false;
-    let inflight = false;
-
-    const tick = async () => {
-      if (cancelled || inflight) return;
-      const states = [...trackStateRef.current.values()];
-      const hasUnknown = states.some((s) => s.kind === "unknown");
-      const hasMatched = states.some((s) => s.kind === "matched");
-      // If everyone in frame is already identified, there's nothing to
-      // gain from a whole-frame recognize — let the camera idle.
-      if (!hasUnknown || hasMatched) return;
-
-      const v = videoRef.current;
-      const c = canvasRef.current;
-      if (!v || !c || v.readyState < 2 || v.videoWidth === 0) return;
-      inflight = true;
-      try {
-        c.width = 640;
-        c.height = Math.round((640 * v.videoHeight) / v.videoWidth);
-        const ctx = c.getContext("2d");
-        if (!ctx) return;
-        ctx.drawImage(v, 0, 0, c.width, c.height);
-        const blob: Blob | null = await new Promise((resolve) =>
-          c.toBlob(resolve, "image/jpeg", 0.8),
-        );
-        if (!blob || cancelled) return;
-        const result = await recognizeBlob(blob, null);
-        // On a successful match, mark every "unknown" track as matched
-        // so the next tick is a no-op (and so camera badges that
-        // depend on per-track state don't flicker between unknown and
-        // matched). We don't know which on-screen track is the matched
-        // person, so we mark them all — the worst case is one
-        // false-positive identity badge that resolves on the next
-        // /recognize.
-        if (result?.matched && result.person_id !== null) {
-          for (const [trackId, state] of trackStateRef.current.entries()) {
-            if (state.kind === "unknown") {
-              trackStateRef.current.set(trackId, {
-                kind: "matched",
-                personId: result.person_id,
-              });
-            }
-          }
-        } else {
-          for (const [trackId, state] of trackStateRef.current.entries()) {
-            if (state.kind === "unknown") {
-              trackStateRef.current.set(trackId, {
-                kind: "unknown",
-                lastCheckedAt: Date.now(),
-              });
-            }
-          }
-        }
-      } finally {
-        inflight = false;
-      }
-    };
-
+    if (!watcherReady) return;
+    if (!watcherHasTracks) return;
     const id = window.setInterval(
-      tick,
+      () => void runWholeFrameRecognize(),
       FACE_RECOG_UNKNOWN_RETRY_INTERVAL_MS,
     );
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [
-    cameraOn,
-    watcherStatusInternal,
-    videoRef,
-    canvasRef,
-    recognizeBlob,
-  ]);
+    return () => window.clearInterval(id);
+  }, [cameraOn, watcherReady, watcherHasTracks, runWholeFrameRecognize]);
 
   // ── Fallback timer: only arms when the local watcher entered the
   //   error state. Runs the legacy whole-frame poll so the page
   //   keeps recognizing people even if MediaPipe is unavailable.
+  const watcherErrored = watcherStatusInternal.kind === "error";
   useEffect(() => {
     if (!cameraOn) return;
-    if (watcherStatusInternal.kind !== "error") return;
+    if (!watcherErrored) return;
 
     let cancelled = false;
     let inflight = false;
@@ -1828,7 +1941,7 @@ function FaceRecognitionDriver({
     };
   }, [
     cameraOn,
-    watcherStatusInternal,
+    watcherErrored,
     videoRef,
     canvasRef,
     recognizeBlob,

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -335,28 +336,56 @@ async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetRe
         db, session, person_id=person.person_id
     )
 
-    # If the user is already mid-conversation in this session — e.g.
-    # they were typing chat messages for a few minutes and only just
-    # now glanced at the camera — a sudden "Hi Ben!" is jarring. Mark
-    # them greeted silently and stay quiet. We use the same atomic
-    # CAS so concurrent /greet calls still resolve to a single
-    # winner; only the caller that flipped False→True needs to do
-    # any work, and even that work becomes a no-op return here.
-    has_chat_history = (
-        db.query(models.LiveSessionMessage)
-        .filter(
-            models.LiveSessionMessage.live_session_id == session.live_session_id,
-            models.LiveSessionMessage.role.in_(("user", "assistant")),
-        )
-        .filter(
-            (models.LiveSessionMessage.meta.is_(None))
-            | (models.LiveSessionMessage.meta["kind"].as_string() == "chat")
-        )
-        .first()
-        is not None
+    # If the user is RECENTLY mid-conversation — i.e. typed something
+    # to Avi within the last `AI_GREET_SUPPRESS_RECENT_CHAT_SECONDS`
+    # — a sudden "Hi Ben!" is jarring. Mark them greeted silently and
+    # stay quiet. We use the same atomic CAS so concurrent /greet
+    # calls still resolve to a single winner; only the caller that
+    # flipped False→True needs to do any work, and even that work
+    # becomes a no-op return here.
+    #
+    # The check is *time-windowed* rather than "any chat history
+    # ever". A live session can stay open for 30 minutes of idle
+    # time (see AI_LIVE_SESSION_IDLE_MINUTES); without the window
+    # bound, one chat message would silently kill every subsequent
+    # face-rec greeting for the rest of that 30-minute window —
+    # including after the user wandered away from the camera and
+    # came back, or refreshed the page mid-session. That regression
+    # was the bug behind the "live page stopped greeting me again"
+    # report on 2026-04-20; integration test
+    # ``test_face_greet.py::test_greet_after_old_chat_does_not_skip``
+    # locks the new behaviour in.
+    suppress_seconds = int(
+        get_settings().AI_GREET_SUPPRESS_RECENT_CHAT_SECONDS
     )
-    if has_chat_history:
+    has_recent_chat = False
+    if suppress_seconds > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=suppress_seconds)
+        has_recent_chat = (
+            db.query(models.LiveSessionMessage)
+            .filter(
+                models.LiveSessionMessage.live_session_id
+                == session.live_session_id,
+                models.LiveSessionMessage.role.in_(("user", "assistant")),
+                models.LiveSessionMessage.created_at >= cutoff,
+            )
+            .filter(
+                (models.LiveSessionMessage.meta.is_(None))
+                | (models.LiveSessionMessage.meta["kind"].as_string() == "chat")
+            )
+            .first()
+            is not None
+        )
+    if has_recent_chat:
         live_session.mark_greeted(db, participant)
+        logger.info(
+            "[greet] suppressed family=%s person=%s session=%s "
+            "reason=session_already_active window_s=%d",
+            payload.family_id,
+            payload.person_id,
+            session.live_session_id,
+            suppress_seconds,
+        )
         return GreetResponse(
             family_id=payload.family_id,
             person_id=payload.person_id,
@@ -393,6 +422,13 @@ async def greet(payload: GreetRequest, db: Session = Depends(get_db)) -> GreetRe
             "person_id": person.person_id,
             "used_model": "template",
         },
+    )
+    logger.info(
+        "[greet] sent family=%s person=%s session=%s text_chars=%d",
+        payload.family_id,
+        payload.person_id,
+        session.live_session_id,
+        len(greeting),
     )
     return GreetResponse(
         family_id=payload.family_id,

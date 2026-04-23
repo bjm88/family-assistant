@@ -80,7 +80,17 @@ def close_stale_sessions(
 def get_active_session(
     db: Session, family_id: int
 ) -> Optional[models.LiveSession]:
-    """Return the currently-active session for a family, if any.
+    """Return the currently-active **live-page** session for a family.
+
+    Filters on ``source='live'`` deliberately — the inbound thread
+    surfaces (email, sms, whatsapp, telegram) also persist into
+    ``live_sessions`` (so transcripts share one table), but those
+    aren't the live camera-page session and would confuse callers
+    that want "the session backing /aiassistant/<family>". Without
+    this filter, an active WhatsApp thread for the family would be
+    returned by ``/sessions/active`` and crash response serialization
+    against the ``LiveSessionSource`` Literal in the rare case where
+    a new source value gets added without updating the schema.
 
     Does *not* sweep stale sessions — callers that need a guaranteed-
     fresh read should use :func:`ensure_active_session` instead.
@@ -88,6 +98,7 @@ def get_active_session(
     return db.execute(
         select(models.LiveSession)
         .where(models.LiveSession.family_id == family_id)
+        .where(models.LiveSession.source == "live")
         .where(models.LiveSession.ended_at.is_(None))
         .order_by(models.LiveSession.started_at.desc())
         .limit(1)
@@ -114,10 +125,12 @@ def ensure_active_session(
     restarts.
     """
     close_stale_sessions(db, family_id=family_id)
+    # `get_active_session` already filters to source='live', so the
+    # email/sms/whatsapp/telegram thread sessions (which use their
+    # own find-or-create helpers keyed on external_thread_id) can
+    # never accidentally be returned here as the live-page session.
     existing = get_active_session(db, family_id)
-    # Only reuse a session when it's a live one — email threads have
-    # their own lookup path keyed on the thread id.
-    if existing is not None and existing.source == "live":
+    if existing is not None:
         existing.last_activity_at = _now()
         return existing, False
 

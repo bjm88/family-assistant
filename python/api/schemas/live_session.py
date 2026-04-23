@@ -23,7 +23,12 @@ from ._base import OrmModel
 
 LiveSessionMessageRole = Literal["user", "assistant", "system"]
 LiveSessionEndReason = Literal["timeout", "manual", "superseded"]
-LiveSessionSource = Literal["live", "email", "sms"]
+# Inbound surfaces all share the LiveSession table so transcripts and
+# session bookkeeping live in one place. Keep this Literal in sync
+# with `find_or_create_*_session` helpers in `api.ai.session` —
+# omitting a value here means /sessions/active and history endpoints
+# will 500 on any session created by that surface.
+LiveSessionSource = Literal["live", "email", "sms", "whatsapp", "telegram"]
 
 
 # ---- nested components -----------------------------------------------------
