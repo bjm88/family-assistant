@@ -72,9 +72,10 @@ async def handle_reveal_sensitive(
     deny — is logged via :mod:`ai.authz` so a future audit can answer
     "did Avi ever read Sarah's SSN, and who asked?".
     """
-    if ctx.person_id is None:
-        # An anonymous speaker can never decrypt anything. We refuse
-        # without even leaking which subject was queried.
+    if ctx.person_id is None and not ctx.is_admin:
+        # An anonymous speaker (no identified person AND not admin)
+        # can never decrypt anything. We refuse without even leaking
+        # which subject was queried.
         raise ToolError(
             "I can't reveal sensitive identifiers without first "
             "knowing who is asking. Please greet me on camera (or "
@@ -85,13 +86,29 @@ async def handle_reveal_sensitive(
         ctx.db,
         requestor_person_id=ctx.person_id,
         subject_person_id=int(person_id),
+        requestor_is_admin=ctx.is_admin,
     )
     if not decision.allowed:
+        # Rule #3: when the speaker is NOT self / spouse / direct
+        # parent, we still want a warm, helpful response — not a
+        # stonewall. The error string below is what the LLM sees as
+        # tool output; phrase it as a coaching note so the model
+        # composes a friendly reply that pivots to public info
+        # (name, age, role, interests) instead of refusing flat.
         raise ToolError(
-            "I can't share that — household privacy rules only let a "
-            "person see their own sensitive identifiers, plus those of "
-            "their spouse and direct children. Please ask the person "
-            "themselves (or one of their parents) for it."
+            "Don't share this encrypted identifier — the speaker isn't "
+            "the subject, their spouse, or a direct parent of the "
+            "subject, so household privacy rules keep this field "
+            "private. BUT keep the conversation warm: respond in one "
+            "or two friendly sentences that (a) acknowledge the "
+            "request without sounding bureaucratic and (b) offer the "
+            "public info you DO have about that person from the "
+            "household-context block (their name, age, role in the "
+            "family, hobbies / interests, what they're working on). "
+            "Do NOT lecture about privacy rules; do NOT mention "
+            "'household privacy gate' or quote this message verbatim. "
+            "Suggest they ask the person themselves, their spouse, or "
+            "a parent if they truly need the encrypted value."
         )
 
     rows = (
@@ -343,7 +360,7 @@ async def handle_reveal_secret(
             + "."
         )
 
-    if ctx.person_id is None:
+    if ctx.person_id is None and not ctx.is_admin:
         raise ToolError(
             "I can't reveal that without first knowing who is asking. "
             "Please greet me on camera (or email me from your "
@@ -386,7 +403,12 @@ async def handle_reveal_secret(
     decision_label: Optional[str] = None
     allowed = False
 
-    if candidate_subject_ids:
+    if ctx.is_admin:
+        # Operator override — admins bypass the household
+        # relationship gate. Audit log records ``label='admin'``.
+        allowed = True
+        decision_label = "admin"
+    elif candidate_subject_ids:
         # Standard subject-based check. Speaker passes if they can
         # access ANY one of the candidate subjects (covers joint
         # accounts and shared insurance policies).
@@ -405,7 +427,11 @@ async def handle_reveal_secret(
         # primary_driver assigned). Allow any identified family member
         # of the same household to read it. We still audit-log so the
         # decision is recoverable.
-        speaker = ctx.db.get(models.Person, int(ctx.person_id))
+        speaker = (
+            ctx.db.get(models.Person, int(ctx.person_id))
+            if ctx.person_id is not None
+            else None
+        )
         if (
             speaker is not None
             and family_id is not None
@@ -424,11 +450,26 @@ async def handle_reveal_secret(
         )
 
     if not allowed:
+        # Rule #3: same friendly-pivot guidance as
+        # handle_reveal_sensitive — keep the conversation warm,
+        # answer with the public facts (make / model / nickname /
+        # institution / policy type / etc.) we DO have for this
+        # record, and only suggest who to ask for the encrypted
+        # value rather than refusing flat.
         raise ToolError(
-            "I can't share that — household privacy rules only let a "
-            "person see their own sensitive details, plus those of "
-            "their spouse and direct children. Please ask the person "
-            "themselves (or one of their parents) for it."
+            "Don't share this encrypted value — the speaker isn't the "
+            "subject, their spouse, or a direct parent of the "
+            "subject, so household privacy rules keep this field "
+            "private. BUT keep the conversation warm: answer in one "
+            "or two friendly sentences that (a) acknowledge the "
+            "request without sounding bureaucratic and (b) share the "
+            "public info you DO have for this record from the "
+            "household-context block (vehicle make/model/nickname, "
+            "policy type/carrier, account institution/nickname, etc.) "
+            "plus the matching `_last_four` helper if it's there. "
+            "Do NOT lecture about privacy rules or quote this message "
+            "verbatim. Suggest they ask the subject, their spouse, or "
+            "a parent if they truly need the encrypted value."
         )
 
     if not ciphertext:

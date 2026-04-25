@@ -422,6 +422,40 @@ class Settings(BaseSettings):
     # via the tool args; this is just what it gets when it doesn't ask.
     AI_WEB_SEARCH_DEFAULT_LIMIT: int = 5
 
+    # ---- Fine-tuned family-Q&A shortcut --------------------------------
+    # When ON, every inbound user message is routed through a lightweight
+    # classifier call to decide whether it can be answered by the
+    # fine-tuned fast model alone (schema-aware, SQL-capable, trained
+    # on Avi's voice) instead of the heavyweight agent loop. This is
+    # the primary latency win for routine family questions: a ~1-3 s
+    # answer from the custom model vs. 10-20 s from the 26B agent with
+    # its fast-ack race. The heavy agent remains the escalation path
+    # for anything the classifier rejects — multi-tool flows, inbound
+    # attachments, web research, sensitive actions.
+    #
+    # See scripts/ai_training/ for the pipeline that produces the
+    # custom model; AI_FAMILY_QA_MODEL is the Ollama tag that pipeline
+    # registers (e.g. ``family-fast:latest``).
+    AI_FAMILY_QA_SHORTCUT_ENABLED: bool = False
+    # Ollama tag of the fine-tuned model. Empty = the feature is
+    # implicitly disabled even when ENABLED=true (so you can flip the
+    # env var on early, then only the presence of a registered tag
+    # activates the path). After running
+    # ``scripts/ai_training/3_fine_tune.sh`` set this to whatever the
+    # script printed — typically ``<ollama_tag_base>:latest`` from
+    # config.yaml.
+    AI_FAMILY_QA_MODEL: str = ""
+    # Hard cap on the classifier call. Matches the web-search
+    # classifier's timeout — a warm lightweight model should answer
+    # in 200-500 ms; this is the cold-load safety net.
+    AI_FAMILY_QA_CLASSIFIER_TIMEOUT_S: float = 2.5
+    # Hard cap on the fine-tuned model's chat response. At Q4_K_M on
+    # a Mac Studio a 4B fine-tuned Gemma should stream its full reply
+    # in 1-4 s warm; 15 s gives a cold path comfortable headroom
+    # before we fall back to the heavy agent. Must be > than
+    # AI_FAST_ACK_AFTER_SECONDS so the shortcut can beat the race.
+    AI_FAMILY_QA_ANSWER_TIMEOUT_S: float = 15.0
+
     # Fast-path web-search shortcut. When enabled, every inbound user
     # message is first run through the lightweight Gemma classifier
     # (``api.ai.web_search_shortcut``); if it decides the message is

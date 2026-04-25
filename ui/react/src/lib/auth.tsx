@@ -80,8 +80,50 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         await queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY });
       },
       logout: async () => {
-        await api.post("/api/auth/logout");
-        queryClient.setQueryData(ME_QUERY_KEY, null);
+        // 1. Tell the backend to drop the session cookie.
+        try {
+          await api.post("/api/auth/logout");
+        } catch {
+          // Even if the backend call fails (offline, expired session)
+          // we still want the local UI to forget everything — fall
+          // through to the cache wipe + hard reload below.
+        }
+        // 2. Wipe ALL TanStack Query caches. Without this, when the
+        //    next user logs in, any queryKey that's not user-scoped
+        //    (e.g. ['family', familyId], ['ai-sessions-list', familyId])
+        //    would still serve user A's data to user B for one render
+        //    cycle before refetching. Clearing forces every component
+        //    to re-fetch on mount with the new cookie.
+        queryClient.clear();
+        // 3. Drop any client-side personalisation that's persisted in
+        //    web storage (per-tab AND per-origin). Today this is only
+        //    a couple of avi:* feature flags, but explicitly clearing
+        //    EVERYTHING on logout means a future widget that caches a
+        //    family-id, person-id, draft message, etc. can't accidentally
+        //    leak from user A → user B on a shared device.
+        if (typeof window !== "undefined") {
+          try {
+            window.localStorage.clear();
+          } catch {
+            /* private mode etc. — ignore */
+          }
+          try {
+            window.sessionStorage.clear();
+          } catch {
+            /* noop */
+          }
+        }
+        // 4. Hard navigation to /login so EVERY in-memory state
+        //    (component state, refs, intervals, websockets, the
+        //    AuthProvider itself, the QueryClient instance, every
+        //    page's local useState) is destroyed and recreated. This
+        //    is the same posture as the global 401 handler in
+        //    lib/api.ts — uniformity matters: a session that expires
+        //    mid-session should reset the UI exactly the same way a
+        //    deliberate "Sign out" click does.
+        if (typeof window !== "undefined") {
+          window.location.assign("/login");
+        }
       },
     };
   }, [query.data, query.isLoading, queryClient]);

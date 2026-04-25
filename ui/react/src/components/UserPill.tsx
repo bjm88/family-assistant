@@ -1,5 +1,4 @@
 import { LogOut } from "lucide-react";
-import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/components/Toast";
 import { cn } from "@/lib/cn";
@@ -30,19 +29,21 @@ interface UserPillProps {
  */
 export function UserPill({ compact = false, className }: UserPillProps) {
   const { user, isAdmin, logout } = useAuth();
-  const navigate = useNavigate();
   const toast = useToast();
 
   if (!user) return null;
 
+  // ``logout`` does its own hard navigation to /login (window.location
+  // .assign) so the entire SPA — every component, ref, interval, query
+  // cache — is recreated for the next user. We don't add a soft
+  // ``navigate('/login')`` here because that would race the hard reload
+  // and occasionally show a flash of the previous user's screen.
   const handleLogout = async () => {
     try {
       await logout();
     } catch (err) {
       toast.error(`Sign out failed: ${(err as Error).message}`);
-      return;
     }
-    navigate("/login", { replace: true });
   };
 
   return (

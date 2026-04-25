@@ -84,6 +84,15 @@ class ToolContext:
     family_id: int
     assistant_id: Optional[int] = None
     person_id: Optional[int] = None  # who is talking, when known
+    # Operator override — set when the speaker is an admin (Avi
+    # logged in as the assistant, ``ADMIN_EMAILS`` operators). Tools
+    # that gate on the household relationship matrix
+    # (``reveal_sensitive_identifier``, ``reveal_secret``, etc.)
+    # treat this as a bypass: every household member is in scope and
+    # the audit log records ``label='admin'``. Anonymous /
+    # unidentified speakers (``person_id=None``) without admin still
+    # get the same refusal they got before.
+    is_admin: bool = False
     # Files attached to the inbound message that triggered this agent
     # turn. Populated by the inbound-channel services (email_inbox,
     # sms_inbox, telegram_inbox); empty list otherwise. Tools that

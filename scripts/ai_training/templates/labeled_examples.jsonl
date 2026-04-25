@@ -1,0 +1,351 @@
+// ============================================================================
+// labeled_examples.jsonl — YOUR hand-curated gold training data.
+// ============================================================================
+//
+// THIS IS THE FILE TO EDIT when you want to teach the fine-tuned model
+// "good" behaviour. Every row here is treated as authoritative — the
+// dataset builder caps it at 2000 (vs 300-3000 for synthetic buckets)
+// and the cap is intentionally generous because you reviewed each row.
+//
+// ----------------------------------------------------------------------------
+// SCHEMA — one JSON object per non-comment, non-blank line.
+// ----------------------------------------------------------------------------
+//
+// {
+//   "user":     "<the inbound user message>",                  // REQUIRED
+//   "decision": "FAMILY" | "HEAVY" |
+//               "GEMINI_WEB_API" | "CALENDAR_API",              // REQUIRED
+//   "response": "<assistant reply>",                           // REQUIRED for
+//                                                              //   FAMILY and
+//                                                              //   CALENDAR_API,
+//                                                              //   OPTIONAL
+//                                                              //   otherwise
+//   "category": "recall" | "smalltalk" | "sql" | "schema" |
+//               "sensitive" | "web_search" | "monitor" |
+//               "email" | "task_add" | "goal_add" | "calendar"
+//               | "action" | ... ,                            // OPTIONAL — stats
+//   "notes":    "<your scratch comment>"                      // OPTIONAL — ignored
+// }
+//
+// Decision semantics — the fast model owns three answer paths
+// (FAMILY, GEMINI_WEB_API, CALENDAR_API) and defers everything else:
+//
+//   FAMILY          → fast model answers directly from RAG (any basic
+//                     query about household state — people, goals,
+//                     vehicles, insurance, medications, sensitive
+//                     identifiers for the verified speaker, etc.).
+//                     `response` is the gold answer. Sensitive
+//                     identifiers (SSNs, passport numbers, passwords)
+//                     ARE in scope — speakers reach this path only
+//                     after face recognition (`recognized_person_id`
+//                     is set) and the RAG block already includes
+//                     verified-recall fields for the speaker.
+//
+//   GEMINI_WEB_API  → fast model defers to the web-search/Gemini
+//                     grounded path (current time, weather, math the
+//                     model shouldn't memorise, stock prices, sports
+//                     scores, news, world facts). In production these
+//                     are caught upstream by `web_search_shortcut`
+//                     BEFORE the fast model runs — labeling here is a
+//                     safety-net fallback so the model defers cleanly
+//                     if anything ever slips through.
+//
+//   CALENDAR_API    → fast model handles calendar reads (free/busy,
+//                     summarise a day, find a free block) AND simple
+//                     writes (add a hold, block off time, move an
+//                     existing event) directly via the calendar tool.
+//                     `response` shows the gold SHAPE of the answer
+//                     or confirmation (with placeholder times); at
+//                     inference time the live calendar data flows in.
+//                     Anything that needs to coordinate with an
+//                     EXTERNAL party — "schedule the vet appointment",
+//                     "book a haircut" — stays HEAVY because it needs
+//                     email/booking on top of the calendar write.
+//
+//   HEAVY           → the fast model does NOT attempt this; it hands
+//                     off to the full agent. Use for tool-driven asks
+//                     (email, task/goal create), attachment analysis,
+//                     research that needs a long-running monitoring
+//                     job, and external-coordination scheduling. If
+//                     you supply `response`, that exact phrasing is
+//                     used; otherwise the builder synthesises a
+//                     canonical handoff.
+//
+// ----------------------------------------------------------------------------
+// HOW THIS IS USED
+// ----------------------------------------------------------------------------
+//
+// `2_build_sft_dataset.py` reads this file and produces (user, assistant)
+// pairs in the `labeled` bucket. FAMILY and CALENDAR_API rows train the
+// model to answer directly; HEAVY and GEMINI_WEB_API rows train it to
+// defer (with a class-specific phrasing). Together they shape BOTH the
+// routing behaviour AND the answer quality of the fine-tuned model in
+// a single supervised pass.
+//
+// You can also use this file as a regression test: after a fine-tune,
+// pipe each row's `user` into `ollama run <new-tag>` and diff the actual
+// reply against `response`. (Helper script TBD.)
+//
+// ----------------------------------------------------------------------------
+// FORMAT NOTES
+// ----------------------------------------------------------------------------
+//
+// * Comment lines (starting with //) and blank lines are skipped.
+// * Each example must be ONE line of valid JSON. (The builder will
+//   refuse to start if any non-comment line fails to parse, with the
+//   line number printed.)
+// * JSON requires double quotes — use \" to escape inside strings.
+// * Order doesn't matter; the builder shuffles before split.
+// * Names below are placeholders — adjust to your actual family before
+//   the first fine-tune so the model learns specifics that match the
+//   RAG context it will see at inference time.
+//
+// ============================================================================
+// FAMILY — recall (the bread and butter, ~70% of expected production traffic)
+// ============================================================================
+{"user": "who lives here?", "decision": "FAMILY", "response": "This is the Maisano family. There are five of you in my notes — Ben and Sara with your three kids, Mia, Theo, and Ellie.", "category": "recall"}
+{"user": "what are sara's goals right now?", "decision": "FAMILY", "response": "Sara has two active goals. The urgent one is finishing her half-marathon training plan, and she's also working on picking up conversational Spanish.", "category": "recall"}
+{"user": "what's theo's top goal?", "decision": "FAMILY", "response": "Theo's top goal is getting on the travel soccer team this spring.", "category": "recall"}
+{"user": "any urgent goals right now?", "decision": "FAMILY", "response": "One — Sara's half-marathon training plan. Everyone else is on semi-urgent or normal-priority goals.", "category": "recall"}
+{"user": "when does the subaru registration expire?", "decision": "FAMILY", "response": "The Subaru's registration is good through March 14 next year.", "category": "recall"}
+{"user": "what cars do we have?", "decision": "FAMILY", "response": "Two. A 2019 Subaru Outback and a 2022 Tesla Model Y.", "category": "recall"}
+{"user": "do we have homeowners insurance?", "decision": "FAMILY", "response": "Yes — a homeowners policy with Liberty Mutual. The policy number ends in 4823 and it renews October 12.", "category": "recall"}
+{"user": "who's on the auto policy?", "decision": "FAMILY", "response": "Ben and Sara are both listed drivers on the Progressive auto policy.", "category": "recall"}
+{"user": "remind me who theo's doctor is", "decision": "FAMILY", "response": "Theo sees Dr. Amanda Chen at Cascade Pediatrics. Her main line is 206-555-0142.", "category": "recall"}
+{"user": "how old are the kids?", "decision": "FAMILY", "response": "Mia is 11, Theo is 8, and Ellie is 5.", "category": "recall"}
+{"user": "any pets?", "decision": "FAMILY", "response": "Two. A golden retriever named Juno, and a black cat named Miso.", "category": "recall"}
+{"user": "what's on the todo list?", "decision": "FAMILY", "response": "Three open tasks. The soonest is \"book Juno's vet checkup\" — due this Friday. The other two are \"plan Ellie's birthday\" and \"file home warranty claim for the dishwasher.\"", "category": "recall"}
+{"user": "show me every medication anyone takes", "decision": "FAMILY", "response": "Sara's on levothyroxine daily. Ben takes atorvastatin at night. Mia has an EpiPen for peanuts — emergency only. The other two kids aren't on anything recorded.", "category": "recall"}
+{"user": "what's mia allergic to?", "decision": "FAMILY", "response": "Peanuts — she has an EpiPen in her backpack and one at home.", "category": "recall"}
+{"user": "what's the address of our main house?", "decision": "FAMILY", "response": "124 Cedar Lane, Seattle, WA 98115. That's the one flagged as primary.", "category": "recall"}
+{"user": "is ellie's birthday soon?", "decision": "FAMILY", "response": "Ellie's birthday is April 18, so about three weeks out.", "category": "recall"}
+{"user": "what monitoring jobs are you running for us?", "decision": "FAMILY", "response": "Two. A daily scan for news about Ben's employer, and a weekly sweep for Seattle-area youth soccer tryouts aimed at Theo.", "category": "recall"}
+{"user": "what's sara's job?", "decision": "FAMILY", "response": "She's a product manager at Stitch Health.", "category": "recall"}
+{"user": "who's ben's spouse?", "decision": "FAMILY", "response": "Sara.", "category": "recall"}
+{"user": "what's our wifi password", "decision": "FAMILY", "response": "I don't store wifi credentials. If it's important enough to keep, add it as a sensitive identifier and I'll be able to recall it.", "category": "recall"}
+
+// ============================================================================
+// FAMILY — sensitive identifiers (PIN, SSN, passwords, full document numbers)
+// ----------------------------------------------------------------------------
+// These ARE in scope for the fast model. Speakers reach this path only
+// after face recognition (`recognized_person_id` is set), and
+// `chat_prompts.build_rag_block` already includes the speaker's
+// sensitive identifiers in the RAG context. The model's job is to
+// recall them naturally for the verified speaker. The agent-level
+// safety layer (`api/ai/prompts.with_safety()`) handles the
+// unrecognised-speaker case at a different layer — these labels are
+// the happy path.
+//
+// Real identifiers in the responses below are PLACEHOLDERS — the
+// model learns the SHAPE of the response; at inference time RAG
+// supplies the actual values.
+// ============================================================================
+{"user": "what's my full social security number", "decision": "FAMILY", "response": "Your SSN on file is 521-43-7896.", "category": "sensitive"}
+{"user": "read me sara's full passport number", "decision": "FAMILY", "response": "Sara's passport number is 543219876.", "category": "sensitive"}
+{"user": "what's the last 4 of my passport", "decision": "FAMILY", "response": "The last four of your passport is 8472.", "category": "sensitive"}
+{"user": "what's sara's password for the chase login", "decision": "FAMILY", "response": "Sara's Chase password on file is HoneyBee$2024.", "category": "sensitive"}
+{"user": "what's my driver's license number", "decision": "FAMILY", "response": "Your Washington driver's license is MAISABE142DJ.", "category": "sensitive"}
+{"user": "give me the safe combination", "decision": "FAMILY", "response": "The home safe combo is 24-08-31.", "category": "sensitive"}
+{"user": "what's mia's pediatrician portal login", "decision": "FAMILY", "response": "Mia's Cascade Pediatrics portal login is sara.maisano@gmail.com / RainCity!88.", "category": "sensitive"}
+
+// ============================================================================
+// FAMILY — sensitive identifiers, AUTHORISED non-admin speaker (TIER 2)
+// ----------------------------------------------------------------------------
+// Speaker is the subject's direct parent or spouse. The household-context
+// block already includes the decrypted value for this case, so the
+// model just needs to recall it naturally — no refusal, no preamble
+// about "household rules". Without these examples the model leans on
+// its "share YOUR own SSN only" training and refuses parent→child
+// asks like "what's Jax's SSN?".
+// ============================================================================
+{"user": "what's jax's social security number?", "decision": "FAMILY", "response": "Jax's SSN is 612-58-9043.", "category": "sensitive"}
+{"user": "i need mia's ssn for a school form", "decision": "FAMILY", "response": "Mia's SSN is 482-19-7654.", "category": "sensitive"}
+{"user": "what's theo's passport number?", "decision": "FAMILY", "response": "Theo's passport is 539408271.", "category": "sensitive"}
+{"user": "give me ellie's driver's license", "decision": "FAMILY", "response": "Ellie's Washington driver's license is MAISAEL094PJ.", "category": "sensitive"}
+{"user": "what's sara's checking account number?", "decision": "FAMILY", "response": "Sara's Chase checking ends in 7732 — full number 5481007732.", "category": "sensitive"}
+
+// ============================================================================
+// FAMILY — sensitive identifiers, ADMIN / OPERATOR mode (TIER 1)
+// ----------------------------------------------------------------------------
+// When the speaker scope block at the top of the system prompt says
+// "ADMIN / OPERATOR MODE — NO PRIVACY GATE APPLIES" the household
+// privacy gate is OFF. Every household member's identifiers are in
+// the RAG block; share them verbatim. Refusing here is a bug. The
+// "[admin mode]" prefix in the user message is a training-only
+// marker so the fine-tune sees the trigger pattern alongside the
+// gold answer — at inference time the trigger is the system-prompt
+// scope block, not the user message itself.
+// ============================================================================
+{"user": "[admin mode] what's jax's full social security number?", "decision": "FAMILY", "response": "Jax's SSN is 612-58-9043.", "category": "sensitive"}
+{"user": "[admin mode] read me sara's passport number", "decision": "FAMILY", "response": "Sara's passport number is 543219876.", "category": "sensitive"}
+{"user": "[admin mode] what's the full vin on the subaru?", "decision": "FAMILY", "response": "The Subaru's VIN is 4S4BSAFC8K3398217.", "category": "sensitive"}
+{"user": "[admin mode] give me ben's bank account number", "decision": "FAMILY", "response": "Ben's Chase checking account number is 5479820013.", "category": "sensitive"}
+{"user": "[admin mode] what's the full homeowners policy number?", "decision": "FAMILY", "response": "The Liberty Mutual homeowners policy number is HO-298471-4823.", "category": "sensitive"}
+
+// ============================================================================
+// FAMILY — sensitive identifiers, UNAUTHORISED speaker (TIER 3)
+// ----------------------------------------------------------------------------
+// Speaker isn't the subject, their spouse, or a direct parent. We do
+// NOT share the encrypted value, but we keep the conversation warm:
+// pivot to public info from the RAG block (name, age, role, hobbies)
+// and offer to refer them to someone who CAN see it. NO bureaucratic
+// "household privacy rules" lecture. The RAG block in production
+// will NOT contain the encrypted value for these turns (the backend
+// already redacted it before the prompt was built), so there's no
+// leak risk — the example just shapes the style of the reply.
+// ============================================================================
+{"user": "what's grandma's social security number?", "decision": "FAMILY", "response": "I can't share that one — Grandma Linda's the only one who'd hand out her own SSN, or her spouse. She's 71 and still teaching her watercolor class on Tuesdays if you want to give her a ring.", "category": "sensitive"}
+{"user": "what's my brother-in-law's bank account?", "decision": "FAMILY", "response": "That one stays with him and his spouse. Mark's the brother-in-law — works in landscape design, into trail running. Want his number so you can ask directly?", "category": "sensitive"}
+{"user": "what's uncle dave's vin?", "decision": "FAMILY", "response": "Don't have the full VIN to share, but Uncle Dave drives the silver 2018 Tacoma — plate ends in 7K2P if that helps. He'd know the rest.", "category": "sensitive"}
+
+// ============================================================================
+// FAMILY — smalltalk + acknowledgments (keep replies tight, in voice)
+// ============================================================================
+{"user": "hey", "decision": "FAMILY", "response": "Hey. What's up?", "category": "smalltalk"}
+{"user": "thanks", "decision": "FAMILY", "response": "Anytime.", "category": "smalltalk"}
+{"user": "ok cool", "decision": "FAMILY", "response": "Cool. Anything else?", "category": "smalltalk"}
+{"user": "nah we're good", "decision": "FAMILY", "response": "Alright. Ping me if you need anything.", "category": "smalltalk"}
+{"user": "got it", "decision": "FAMILY", "response": "Cool.", "category": "smalltalk"}
+{"user": "good morning", "decision": "FAMILY", "response": "Morning. What do you need?", "category": "smalltalk"}
+
+// ============================================================================
+// FAMILY — schema / SQL knowledge (when the user asks about app internals)
+// ============================================================================
+{"user": "where does the goals table live?", "decision": "FAMILY", "response": "In the goals table, linked to people by person_id. Each row has a goal_name, a priority (urgent, semi_urgent, normal, or low), and a free-text description.", "category": "schema"}
+{"user": "what column stores the last four of a vehicle's plate?", "decision": "FAMILY", "response": "vehicles.license_plate_last_four. The full plate is encrypted so it's only ever queried by the last-four.", "category": "schema"}
+{"user": "what's in the identity_documents table?", "decision": "FAMILY", "response": "Passports, driver licenses, and other ID docs. Document numbers are encrypted at rest — the plaintext last_four is what queries filter on.", "category": "schema"}
+{"user": "how do i find whose car that is", "decision": "FAMILY", "response": "Query vehicles by license_plate_last_four filtered to your family_id. The full plate is encrypted at rest.", "category": "sql"}
+{"user": "list all the people in the family", "decision": "FAMILY", "response": "SELECT first_name, preferred_name, primary_family_relationship FROM people WHERE family_id = :family_id ORDER BY date_of_birth NULLS LAST;", "category": "sql"}
+{"user": "show me a query to count active goals per person", "decision": "FAMILY", "response": "SELECT p.first_name, COUNT(g.id) AS open_goals FROM people p LEFT JOIN goals g ON g.person_id = p.id WHERE p.family_id = :family_id GROUP BY p.id ORDER BY open_goals DESC;", "category": "sql"}
+
+// ============================================================================
+// FAMILY — light "I don't know" replies that DON'T need escalation
+// ============================================================================
+{"user": "what do we have for lunch today?", "decision": "FAMILY", "response": "I don't track meals, so I can't answer that from my notes. Want me to look at the shared calendar in case someone added lunch plans?", "category": "recall"}
+
+// ============================================================================
+// GEMINI_WEB_API — anything that needs live web data, math, or world facts
+// ----------------------------------------------------------------------------
+// In production these are caught upstream by the web-search shortcut.
+// The labels here are the safety-net fallback: if the upstream classifier
+// ever misses one, the fine-tuned model defers cleanly instead of
+// hallucinating an answer.
+// ============================================================================
+{"user": "what time is it", "decision": "GEMINI_WEB_API", "response": "Let me check — pulling current time from the web.", "category": "web_search"}
+{"user": "what's the date today", "decision": "GEMINI_WEB_API", "response": "Looking that up — one sec.", "category": "web_search"}
+{"user": "what's the weather tomorrow", "decision": "GEMINI_WEB_API", "response": "I don't have weather built in — checking the web for tomorrow's forecast.", "category": "web_search"}
+{"user": "what's the square root of 8281", "decision": "GEMINI_WEB_API", "response": "Let me check — that's a math lookup.", "category": "web_search"}
+{"user": "what's 17% of 24,500?", "decision": "GEMINI_WEB_API", "response": "One sec — running that through the calculator.", "category": "web_search"}
+{"user": "what's the stock price of tesla?", "decision": "GEMINI_WEB_API", "response": "Pulling the current TSLA price from the web.", "category": "web_search"}
+{"user": "how much is bitcoin right now", "decision": "GEMINI_WEB_API", "response": "Checking the live BTC price.", "category": "web_search"}
+{"user": "did the seahawks win last night", "decision": "GEMINI_WEB_API", "response": "Looking up last night's score.", "category": "web_search"}
+{"user": "what's the news today", "decision": "GEMINI_WEB_API", "response": "Pulling today's headlines from the web.", "category": "web_search"}
+{"user": "convert 2 cups of flour to grams", "decision": "GEMINI_WEB_API", "response": "Let me check — that's a quick conversion.", "category": "web_search"}
+{"user": "what's the capital of slovenia", "decision": "GEMINI_WEB_API", "response": "Looking that up — one sec.", "category": "web_search"}
+
+// ============================================================================
+// HEAVY — research that should spawn an automated MONITORING TASK
+// ----------------------------------------------------------------------------
+// These are the "ongoing tracking" asks. The phrasing trains the
+// fast model to (a) escalate and (b) tell the user explicitly that a
+// monitoring job will be set up — not just a one-off answer.
+// ============================================================================
+{"user": "research the best summer camps for theo", "decision": "HEAVY", "response": "I'll have the agent set up a monitoring task to research summer camps for Theo and check back as new options post.", "category": "monitor"}
+{"user": "find homeowners insurance quotes nearby", "decision": "HEAVY", "response": "I'll have the agent spin up a monitoring task to track local homeowners quotes and surface options as they come in.", "category": "monitor"}
+{"user": "compare three minivans for a family of 5", "decision": "HEAVY", "response": "I'll hand this to the agent — it'll create a monitoring task to compare minivans and report back with the top three.", "category": "monitor"}
+{"user": "keep an eye on travel soccer tryouts in the area", "decision": "HEAVY", "response": "Got it — the agent will create a recurring monitoring task to scan for Seattle-area soccer tryouts.", "category": "monitor"}
+{"user": "watch for any news about my employer", "decision": "HEAVY", "response": "Setting that up as a daily monitoring task — handing off to the agent.", "category": "monitor"}
+{"user": "look for new pediatric dentists nearby with good reviews", "decision": "HEAVY", "response": "I'll have the agent set up a monitoring task to look for highly-rated pediatric dentists in the area.", "category": "monitor"}
+{"user": "set up a daily monitoring job for new soccer tryouts", "decision": "HEAVY", "response": "Monitoring jobs are configured through the agent — handing off so it can create that for you.", "category": "monitor"}
+
+// ============================================================================
+// HEAVY — email actions
+// ============================================================================
+{"user": "send a summary of our insurance policies to ben", "decision": "HEAVY", "response": "That needs the email tool — handing this to the full agent.", "category": "email"}
+{"user": "send an email to my wife", "decision": "HEAVY", "response": "Email goes through the agent — passing it over.", "category": "email"}
+{"user": "email john to remind him about our lunch meeting", "decision": "HEAVY", "response": "I'll have the agent draft and send John a reminder about your lunch meeting.", "category": "email"}
+{"user": "email jackson to remind him about searching for a job", "decision": "HEAVY", "response": "I'll have the agent send Jackson a nudge about his job search.", "category": "email"}
+{"user": "email the kids' teachers about spring break travel", "decision": "HEAVY", "response": "Handing that to the agent — it'll draft an email to each teacher about spring break.", "category": "email"}
+{"user": "text sara that I'll be late", "decision": "HEAVY", "response": "Texting goes through the agent's messaging tool — passing it over.", "category": "email"}
+{"user": "reply to that email from the contractor", "decision": "HEAVY", "response": "Replies need the email tool — handing this to the agent.", "category": "email"}
+
+// ============================================================================
+// HEAVY — task creation (anything that adds a row to the tasks table)
+// ============================================================================
+{"user": "add a task to file the warranty claim", "decision": "HEAVY", "response": "I'll have the agent add a task to file the warranty claim.", "category": "task_add"}
+{"user": "add a task to research mac studio AI training", "decision": "HEAVY", "response": "I'll have the agent add a task to research Mac Studio AI training.", "category": "task_add"}
+{"user": "remind me to call the plumber tomorrow", "decision": "HEAVY", "response": "Adding a reminder task for tomorrow — handing to the agent.", "category": "task_add"}
+{"user": "create a task for sara to renew her passport", "decision": "HEAVY", "response": "I'll have the agent create a task assigned to Sara to renew her passport.", "category": "task_add"}
+{"user": "add finishing the basement to the to-do list", "decision": "HEAVY", "response": "Adding \"finish the basement\" to your tasks — passing to the agent.", "category": "task_add"}
+
+// ============================================================================
+// HEAVY — goal creation (the goals table — distinct from generic tasks)
+// ============================================================================
+{"user": "add a goal for nahla to read two books during summer", "decision": "HEAVY", "response": "I'll have the agent add a goal for Nahla: read two books over the summer.", "category": "goal_add"}
+{"user": "set a new goal for mia to learn to swim freestyle", "decision": "HEAVY", "response": "Adding that as a new goal for Mia — handing to the agent.", "category": "goal_add"}
+{"user": "add a family goal to take a national park trip this year", "decision": "HEAVY", "response": "I'll have the agent add a family-level goal for a national park trip this year.", "category": "goal_add"}
+{"user": "give theo a goal of practicing piano 3 times a week", "decision": "HEAVY", "response": "I'll have the agent set that as a recurring goal for Theo.", "category": "goal_add"}
+{"user": "make 'finish thesis draft' an urgent goal for sara", "decision": "HEAVY", "response": "Adding that as an urgent goal for Sara — passing to the agent.", "category": "goal_add"}
+
+// ============================================================================
+// CALENDAR_API — fast model handles reads + simple writes directly
+// ----------------------------------------------------------------------------
+// Calendar is a fast-tier shortcut alongside RAG and Gemini web search.
+// `response` shows the gold SHAPE of the answer/confirmation with
+// placeholder times — at inference time real calendar data flows in
+// (free/busy lookup or write confirmation from the calendar tool).
+//
+// Anything that needs EXTERNAL coordination on top of the calendar write
+// (e.g. booking with the vet, the dentist, a contractor) stays HEAVY —
+// see the example at the end of this section.
+// ============================================================================
+{"user": "what scheduling times do I have available next thursday", "decision": "CALENDAR_API", "response": "Next Thursday you've got 9 to 10:30 AM, 12 to 1:30 PM, and 3 to 5:30 PM open.", "category": "calendar"}
+{"user": "what's on my calendar tomorrow", "decision": "CALENDAR_API", "response": "Tomorrow: 9 AM standup, 11 AM dentist for Theo, 6:30 PM family dinner. Otherwise clear.", "category": "calendar"}
+{"user": "do I have any doctor appointments coming up?", "decision": "CALENDAR_API", "response": "Two on the books — Theo's dentist tomorrow at 11, and Sara's annual physical March 28.", "category": "calendar"}
+{"user": "when is my next free 2-hour block this week", "decision": "CALENDAR_API", "response": "Wednesday afternoon — 2 to 4 PM is wide open.", "category": "calendar"}
+{"user": "am I free friday morning", "decision": "CALENDAR_API", "response": "Friday morning is clear until 11:30 — you've got the dentist then.", "category": "calendar"}
+{"user": "what's next on my schedule", "decision": "CALENDAR_API", "response": "Your next event is the 2 PM call with the contractor.", "category": "calendar"}
+{"user": "add a calendar hold next friday at 2pm ET for driving paisley to her friends house", "decision": "CALENDAR_API", "response": "Done — held next Friday 2 to 3 PM ET on your calendar for driving Paisley to her friend's house.", "category": "calendar"}
+{"user": "block off saturday morning for soccer practice", "decision": "CALENDAR_API", "response": "Done — Saturday 9 AM to noon is now blocked for soccer practice.", "category": "calendar"}
+{"user": "put a hold tomorrow at 10am for an hour", "decision": "CALENDAR_API", "response": "Done — held 10 to 11 AM tomorrow.", "category": "calendar"}
+{"user": "move my 3pm to 4pm tomorrow", "decision": "CALENDAR_API", "response": "Done — moved tomorrow's 3 PM event to 4 PM.", "category": "calendar"}
+{"user": "cancel the 11am tomorrow", "decision": "CALENDAR_API", "response": "Done — cancelled tomorrow's 11 AM.", "category": "calendar"}
+// External coordination required → stays HEAVY (agent emails/books the
+// vet, then writes the calendar entry from the confirmed time).
+{"user": "schedule juno's vet appointment for next thursday", "decision": "HEAVY", "response": "I'll have the agent reach out to the vet to book Thursday and then drop the confirmed time on your calendar.", "category": "calendar"}
+
+// ============================================================================
+// HEAVY — attachment analysis
+// ============================================================================
+{"user": "analyze this PDF for me", "decision": "HEAVY", "response": "Attachments are handled by the full agent, not me. One second.", "category": "attachment"}
+{"user": "what does this photo show?", "decision": "HEAVY", "response": "I can't see images directly. The agent handles attachments — one second.", "category": "attachment"}
+{"user": "summarize this 30-page PDF", "decision": "HEAVY", "response": "That's too large for me — routing to the full agent.", "category": "attachment"}
+{"user": "extract the line items from this receipt", "decision": "HEAVY", "category": "attachment"}
+
+// ============================================================================
+// FAMILY — integration awareness (what does the agent actually CALL?)
+// ----------------------------------------------------------------------------
+// These are recall questions about the app's own integration surface —
+// "what tool sends my texts?", "can you talk to telegram?". Auto-
+// generated rows from the integrations bucket cover the obvious shape
+// ("What does the agent use Gmail for?"); the rows below capture the
+// natural phrasings users actually type.
+// ============================================================================
+{"user": "what do you use to send emails", "decision": "FAMILY", "response": "Gmail. The agent sends mail through your connected Google account and reads incoming mail from registered family members.", "category": "integration"}
+{"user": "how do you send me a text", "decision": "FAMILY", "response": "Through Twilio — same adapter handles SMS, MMS, and WhatsApp.", "category": "integration"}
+{"user": "do you support telegram", "decision": "FAMILY", "response": "Yes — there's a Telegram bot wired up that long-polls the Bot API for messages.", "category": "integration"}
+{"user": "can you see my calendar", "decision": "FAMILY", "response": "Yes — through the Google Calendar API. I can see my own calendar and any household calendar a member has shared with me.", "category": "integration"}
+{"user": "what integrations do you have", "decision": "FAMILY", "response": "Gmail, Twilio (SMS / MMS / WhatsApp), Telegram, Google Calendar, Google OAuth, Gemini (image gen + multimodal + grounded search), pluggable web search (Gemini default, Brave / Tavily optional), and a DoorBird gate adapter (currently dormant).", "category": "integration"}
+{"user": "do you do web search", "decision": "FAMILY", "response": "Yes — through the web-search interface. The default provider is Gemini's grounded google_search, with Brave and Tavily as drop-in alternatives.", "category": "integration"}
+{"user": "can you open the gate", "decision": "FAMILY", "response": "There's a DoorBird adapter wired up but it's currently dormant — DoorBird's cloud API isn't open to general developers, so the integration only works on LAN once the device firmware exposes it.", "category": "integration"}
+
+// ============================================================================
+// HEAVY — physical-world / IoT actions
+// ----------------------------------------------------------------------------
+// "Open the gate" intentionally lives in the integration section above
+// (FAMILY) because the DoorBird cloud adapter is dormant — the honest
+// answer is "I can't right now and here's why", not "I'll hand off".
+// Once a working IoT path lands, add command-style rows back here.
+// ============================================================================
+{"user": "turn on the porch light", "decision": "HEAVY", "category": "action"}
+{"user": "lock the front door", "decision": "HEAVY", "category": "action"}

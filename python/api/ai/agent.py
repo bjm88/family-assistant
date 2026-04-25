@@ -173,6 +173,7 @@ async def run_agent(
     model_override: Optional[str] = None,
     think: Optional[bool] = None,
     inbound_attachments: Optional[List[tools.InboundAttachmentRef]] = None,
+    requestor_is_admin: bool = False,
 ) -> AsyncIterator[AgentEvent]:
     """Drive a single agent task to completion, yielding SSE events.
 
@@ -229,6 +230,7 @@ async def run_agent(
             family_id=family_id,
             assistant_id=assistant_id,
             person_id=person_id,
+            is_admin=requestor_is_admin,
             inbound_attachments=list(inbound_attachments or []),
         )
 

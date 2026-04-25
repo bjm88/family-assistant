@@ -132,6 +132,7 @@ def can_see_calendar_details(
     *,
     requestor_person_id: Optional[int],
     subject_person_id: int,
+    requestor_is_admin: bool = False,
     audit_log: bool = True,
 ) -> AccessDecision:
     """Decide whether ``requestor`` may see ``subject``'s calendar EVENT detail.
@@ -153,7 +154,20 @@ def can_see_calendar_details(
     here because adults' work calendars frequently contain
     confidential business detail (interview slots, performance
     reviews, layoffs) that even a parent shouldn't see by default.
+
+    ``requestor_is_admin``
+        Operator override — Avi (logged in as the assistant) and any
+        ``ADMIN_EMAILS`` operator bypass the relationship gate. This
+        is the same posture as the admin REST endpoints, which let
+        admins read every household. Audit log line still records
+        ``label='admin'`` so the bypass is recoverable.
     """
+    if requestor_is_admin:
+        decision = AccessDecision(
+            True, "admin", requestor_person_id, subject_person_id
+        )
+        _log(decision, scope="cal_detail", enabled=audit_log)
+        return decision
     decision = _decide_calendar(
         db,
         requestor_person_id=requestor_person_id,
@@ -168,6 +182,7 @@ def can_access_sensitive(
     *,
     requestor_person_id: Optional[int],
     subject_person_id: int,
+    requestor_is_admin: bool = False,
     audit_log: bool = True,
 ) -> AccessDecision:
     """Decide whether ``requestor`` may see ``subject``'s sensitive data.
@@ -177,6 +192,15 @@ def can_access_sensitive(
     links two people in different families, this function denies.
     Privacy is per-household.
 
+    ``requestor_is_admin``
+        Operator override — when ``True`` the household relationship
+        gate is bypassed entirely and access is granted. Used for the
+        AI-as-operator path (Avi logged in as the assistant) and the
+        ``ADMIN_EMAILS`` operators (e.g. the head of household when
+        debugging). Cross-family is still allowed for admins because
+        admins legitimately operate across families in this app.
+        Audit log records ``label='admin'``.
+
     ``audit_log``
         When ``True`` (default), a stable INFO line is emitted per call
         so audits can answer "did Avi reveal Ben's SSN to Lori?".
@@ -185,6 +209,12 @@ def can_access_sensitive(
         should pass ``False`` to keep the noise out of the log and
         emit a single summary line of their own instead.
     """
+    if requestor_is_admin:
+        decision = AccessDecision(
+            True, "admin", requestor_person_id, subject_person_id
+        )
+        _log(decision, enabled=audit_log)
+        return decision
     decision = _decide_sensitive(
         db,
         requestor_person_id=requestor_person_id,
@@ -283,6 +313,12 @@ class SpeakerScope:
     family members it may discuss in detail vs. only by name. The
     technical sanitiser still enforces the rules on its own — this is
     purely for response quality.
+
+    ``is_admin`` is set when the requester is operating in admin /
+    operator mode (Avi logged in as the assistant, an
+    ``ADMIN_EMAILS`` operator). The system-prompt block tells the LLM
+    "no relationship gate applies — any field on any family member is
+    fair game", and the RAG builder treats every person as accessible.
     """
 
     speaker_person_id: Optional[int]
@@ -290,17 +326,67 @@ class SpeakerScope:
     spouse_names: List[str]
     children_names: List[str]
     can_access_subject_ids: frozenset[int]  # includes self
+    is_admin: bool = False
 
 
 def build_speaker_scope(
-    db: Session, *, speaker_person_id: Optional[int]
+    db: Session,
+    *,
+    speaker_person_id: Optional[int],
+    family_id: Optional[int] = None,
+    requestor_is_admin: bool = False,
 ) -> SpeakerScope:
+    """Build the speaker's access window.
+
+    When ``requestor_is_admin`` is set, the speaker is treated as an
+    operator with full access. ``family_id`` is used (if given) to
+    pre-compute ``can_access_subject_ids`` as "every person in the
+    family" so the RAG redactor sees no one as off-limits.
+    """
+    if requestor_is_admin:
+        # Operator path — pre-resolve every person_id in the family
+        # so the RAG block never redacts anything for the admin.
+        accessible_for_admin: set[int] = set()
+        if family_id is not None:
+            rows = db.execute(
+                select(models.Person.person_id).where(
+                    models.Person.family_id == family_id
+                )
+            ).all()
+            accessible_for_admin = {int(r[0]) for r in rows}
+
+        # If the admin has ALSO been recognised as a specific person
+        # (face-rec on the live page, etc.) we still surface their
+        # name in the prompt — useful so the LLM can address them
+        # personally — but the gate is wide open regardless.
+        speaker_name: Optional[str] = None
+        if speaker_person_id is not None:
+            speaker = db.get(models.Person, speaker_person_id)
+            if speaker is not None:
+                speaker_name = (
+                    speaker.preferred_name
+                    or speaker.first_name
+                    or f"Person {speaker.person_id}"
+                )
+                accessible_for_admin.add(int(speaker_person_id))
+
+        return SpeakerScope(
+            speaker_person_id=speaker_person_id,
+            speaker_name=speaker_name,
+            spouse_names=[],
+            children_names=[],
+            can_access_subject_ids=frozenset(accessible_for_admin),
+            is_admin=True,
+        )
+
     if speaker_person_id is None:
-        return SpeakerScope(None, None, [], [], frozenset())
+        return SpeakerScope(None, None, [], [], frozenset(), False)
 
     speaker = db.get(models.Person, speaker_person_id)
     if speaker is None:
-        return SpeakerScope(speaker_person_id, None, [], [], frozenset())
+        return SpeakerScope(
+            speaker_person_id, None, [], [], frozenset(), False
+        )
 
     spouse_ids = _spouse_ids_of(db, speaker_person_id)
     child_ids = _direct_child_ids_of(db, speaker_person_id)
@@ -320,11 +406,52 @@ def build_speaker_scope(
         spouse_names=spouse_names,
         children_names=child_names,
         can_access_subject_ids=frozenset(accessible),
+        is_admin=False,
     )
 
 
 def render_speaker_scope_block(scope: SpeakerScope) -> str:
     """Format a :class:`SpeakerScope` for embedding in the system prompt."""
+    if scope.is_admin:
+        # Operator / admin path: no household privacy gate, the LLM
+        # may share any sensitive field present in the RAG block. We
+        # still emit the speaker name when known so Avi can address
+        # the admin by name. The wording is intentionally emphatic
+        # because small local models otherwise default to "share only
+        # YOUR own identifier" behaviour they were trained on, even
+        # when the RAG block contains every household member's full
+        # sensitive data.
+        addressed_as = (
+            f" You are talking to {scope.speaker_name} (the household admin)."
+            if scope.speaker_name
+            else ""
+        )
+        return (
+            "--- Speaker identity & privacy scope ---\n"
+            "**ADMIN / OPERATOR MODE — NO PRIVACY GATE APPLIES.**"
+            f"{addressed_as} The speaker is a household admin / "
+            "operator and has UNLIMITED access to every family "
+            "member's data. The household relationship-based privacy "
+            "gate (self / spouse / direct parent) does NOT apply to "
+            "this conversation. Every person's full sensitive data — "
+            "SSN / tax IDs, identity document numbers (driver's "
+            "license, passport), financial account & routing numbers, "
+            "insurance policy numbers, vehicle VIN / plate, medical "
+            "conditions, medications, physicians, personal notes — "
+            "may be shared verbatim whenever asked. Any value present "
+            "in the household-context block below has ALREADY been "
+            "authorised for this speaker; quote it directly. If the "
+            "value is missing from the context block, call the "
+            "appropriate reveal tool (reveal_sensitive_identifier or "
+            "reveal_secret) — both honour admin mode and will return "
+            "the plaintext. **Do NOT refuse on privacy / "
+            "household-rules grounds in this mode under any "
+            "circumstance.** Refusing an admin's question with "
+            "\"I can't share that\" is a bug. The only refusals "
+            "still appropriate are the global safety bans (no "
+            "self-harm assistance, no illegal activity, etc.)."
+        )
+
     if scope.speaker_person_id is None or scope.speaker_name is None:
         return (
             "--- Speaker identity & privacy scope ---\n"
@@ -360,7 +487,12 @@ def render_speaker_scope_block(scope: SpeakerScope) -> str:
         "ALSO redacts those fields automatically — if you see "
         f"{REDACTED_PLACEHOLDER!r} in tool output, that is the "
         "system telling you the speaker is not allowed to read that "
-        "field, and you must not try to work around it."
+        "field, and you must not try to work around it. Conversely: "
+        "any sensitive value (full SSN, account number, etc.) that "
+        "DOES appear in the household-context block below has "
+        "already been authorised for this speaker by the privacy "
+        "gate — share it verbatim when asked, you do not need to "
+        "call a reveal tool to confirm."
     )
 
 

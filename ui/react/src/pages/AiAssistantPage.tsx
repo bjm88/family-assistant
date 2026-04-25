@@ -44,6 +44,7 @@ import type {
 import { useToast } from "@/components/Toast";
 import { UserPill } from "@/components/UserPill";
 import { useAuth } from "@/lib/auth";
+import { useIsMobile } from "@/lib/useIsMobile";
 import { cn } from "@/lib/cn";
 import SpeakingMouth from "./SpeakingMouth";
 import {
@@ -226,7 +227,19 @@ type AudioQueueHandle = {
   skipCurrent: () => void;
 };
 
-function useAudioQueue(muted: boolean): AudioQueueHandle {
+function useAudioQueue(
+  muted: boolean,
+  // When true, skip the WebAudio analyser + 60 Hz rAF amplitude loop
+  // entirely. Mobile browsers (iOS Safari especially) get unhappy
+  // when an `<audio>` element is teed through ``createMediaElement
+  // Source`` *and* the page is also driving the microphone via
+  // SpeechRecognition — symptoms range from stuttering playback to
+  // the audio element silently dropping its stream and having to
+  // be re-initialised. The cosmetic glow / mouth-amplitude effects
+  // aren't worth the regression on a phone, so we just play the
+  // bare audio element and leave ``amplitude`` at 0.
+  skipAnalyser = false,
+): AudioQueueHandle {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const queueRef = useRef<
     Array<{
@@ -274,6 +287,7 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
   }, []);
 
   const ensureAnalyser = useCallback(() => {
+    if (skipAnalyser) return null;
     if (analyserRef.current) return analyserRef.current;
     const audio = audioRef.current;
     if (!audio) return null;
@@ -297,7 +311,7 @@ function useAudioQueue(muted: boolean): AudioQueueHandle {
       console.debug("Avi: analyser init failed (animations will be silent)", e);
       return null;
     }
-  }, []);
+  }, [skipAnalyser]);
 
   const startAmplitudeLoop = useCallback(() => {
     const analyser = analyserRef.current;
@@ -576,6 +590,10 @@ export default function AiAssistantPage() {
   const { familyId: familyIdParam } = useParams();
   const familyId = Number(familyIdParam);
   const { isAdmin } = useAuth();
+  // Drives both the "voice / mic default OFF" UX policy AND the
+  // mobile-only audio-pipeline simplifications (no WebAudio analyser,
+  // no rAF amplitude loop). See useIsMobile + useAudioQueue.
+  const isMobile = useIsMobile();
 
   const { data: family } = useQuery<Family>({
     queryKey: ["family", familyIdParam],
@@ -651,15 +669,27 @@ export default function AiAssistantPage() {
     };
   }, []);
 
-  // Speaker toggle — persisted across reloads so a family keeps their
-  // chosen default. Start muted until the user clicks once, to stay on
-  // the right side of browser autoplay policies.
-  // Speaker (Avi's voice playback). We intentionally do NOT seed this
-  // from localStorage — the family expects "Voice on" every time they
-  // open the page, and a stale "0" from a previous testing session was
-  // silently muting Avi on reload. The toggle still works mid-session
-  // for a deliberate "shh"; it just doesn't survive a refresh.
-  const [speakerOn, setSpeakerOn] = useState<boolean>(true);
+  // Speaker (Avi's voice playback).
+  //
+  // Defaults are PLATFORM-AWARE, not persisted:
+  //
+  //   * Desktop  → ON. The family's home setup is a kitchen iMac with
+  //                speakers — they expect to walk up and hear Avi greet
+  //                them without clicking anything.
+  //   * Mobile   → OFF. Phones are used in quiet/private contexts
+  //                (bed, couch, school pickup line) where blasting
+  //                "Hi Sam!" is the wrong default. Also mitigates the
+  //                mobile-only TTS jitter where iOS' audio routing
+  //                kept restarting the clip when SpeechRecognition
+  //                also wanted the audio session.
+  //
+  // We deliberately do NOT seed from localStorage in either case — a
+  // stale "0" from a previous testing session was silently muting
+  // Avi on reload, and on a freshly-opened tab the platform-aware
+  // default is what the user actually wants. The toggle still works
+  // mid-session for a deliberate "shh" / "talk to me"; it just
+  // doesn't survive a refresh.
+  const [speakerOn, setSpeakerOn] = useState<boolean>(!isMobile);
 
   // The page used to support a second "advanced" rendering mode that
   // mounted a rigged Live2D character. It was pulled because the basic
@@ -670,7 +700,7 @@ export default function AiAssistantPage() {
     localStorage.removeItem("avi:animationMode");
   }, []);
 
-  const audio = useAudioQueue(!speakerOn);
+  const audio = useAudioQueue(!speakerOn, isMobile);
 
   // Gender hint used to pick Kokoro's voice pack. Falls back to female
   // if the admin didn't set a gender on the assistant.
@@ -778,13 +808,14 @@ export default function AiAssistantPage() {
           left column's natural height (Avi + camera) and scroll its
           message list internally rather than push the row taller. */}
       <main className="max-w-7xl mx-auto p-3 sm:p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-4 sm:gap-6 lg:items-stretch">
-        <div className="flex flex-col gap-6 min-h-0">
+        <div className="flex flex-col gap-3 sm:gap-6 min-h-0">
           <AviStage
             assistant={assistant}
             assistantName={assistantName}
             isSpeaking={audio.isSpeaking}
             isWaving={isWaving}
             amplitude={audio.amplitude}
+            isMobile={isMobile}
           />
           <LiveCameraPanel familyId={familyId} liveSessionId={liveSessionId} />
         </div>
@@ -795,6 +826,7 @@ export default function AiAssistantPage() {
           audio={audio}
           voiceGender={voiceGender}
           liveSessionId={liveSessionId}
+          isMobile={isMobile}
         />
       </main>
     </div>
@@ -815,12 +847,17 @@ function AviStage({
   isSpeaking,
   isWaving,
   amplitude,
+  isMobile,
 }: {
   assistant: Assistant | undefined;
   assistantName: string;
   isSpeaking: boolean;
   isWaving: boolean;
   amplitude: number;
+  // On mobile we collapse Avi into a short banner (~120px tall) so the
+  // camera + chat both stay visible above the fold. On desktop we keep
+  // the cinematic 5:3 portrait stage.
+  isMobile: boolean;
 }) {
   // Clamp + ease the raw RMS so the glow doesn't feel jittery.
   const amp = Math.min(1, Math.max(0, amplitude));
@@ -834,7 +871,12 @@ function AviStage({
         className={cn(
           "relative flex items-center justify-center",
           "bg-gradient-to-br from-indigo-50 via-background to-fuchsia-50",
-          "aspect-[16/10] lg:aspect-[5/3]"
+          // Mobile: a slim banner so the camera + chat both stay
+          // on screen without scrolling. Desktop: the original
+          // cinematic stage.
+          isMobile
+            ? "h-[140px]"
+            : "aspect-[16/10] lg:aspect-[5/3]"
         )}
       >
         {/* Ambient background glow — keeps the stage feeling "alive"
@@ -883,14 +925,16 @@ function AviStage({
             isSpeaking={isSpeaking}
             isWaving={isWaving}
             amplitude={amp}
+            isMobile={isMobile}
           />
         </div>
 
         {/* Gemini-generated portrait badge, top-right. Admin can open
             the assistant edit page to regenerate the image; on this
             live page it just sits as a small reminder of the canonical
-            avatar source. */}
-        {hasImage && (
+            avatar source. Hidden on mobile — the banner is too short
+            to fit two avatar circles without overlap. */}
+        {hasImage && !isMobile && (
           <div className="absolute top-4 right-4 z-20">
             <div
               className="rounded-full overflow-hidden border-2 border-white shadow-lg bg-white/80 backdrop-blur"
@@ -906,21 +950,40 @@ function AviStage({
           </div>
         )}
 
-        {/* Bottom caption */}
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20">
-          <div className="inline-flex items-center gap-2 bg-white/90 backdrop-blur px-4 py-1.5 rounded-full shadow-sm text-sm">
-            <Bot className="h-4 w-4 text-primary" />
-            <span className="font-semibold">{assistantName}</span>
-            <span
+        {/* Bottom caption — desktop centres a chip; mobile pins a
+            compact name + status to the right of the small avatar so
+            the banner doesn't waste vertical space stacking the two. */}
+        {isMobile ? (
+          <div className="absolute inset-y-0 right-3 z-20 flex flex-col justify-center gap-0.5 text-right">
+            <div className="font-semibold text-sm flex items-center justify-end gap-1.5">
+              <Bot className="h-4 w-4 text-primary" />
+              {assistantName}
+            </div>
+            <div
               className={cn(
-                "text-xs transition-colors",
+                "text-[11px] transition-colors",
                 isSpeaking ? "text-primary" : "text-muted-foreground"
               )}
             >
               {isSpeaking ? "speaking…" : "listening"}
-            </span>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20">
+            <div className="inline-flex items-center gap-2 bg-white/90 backdrop-blur px-4 py-1.5 rounded-full shadow-sm text-sm">
+              <Bot className="h-4 w-4 text-primary" />
+              <span className="font-semibold">{assistantName}</span>
+              <span
+                className={cn(
+                  "text-xs transition-colors",
+                  isSpeaking ? "text-primary" : "text-muted-foreground"
+                )}
+              >
+                {isSpeaking ? "speaking…" : "listening"}
+              </span>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -939,20 +1002,28 @@ function StaticAvatarFallback({
   isSpeaking,
   isWaving,
   amplitude,
+  isMobile,
 }: {
   assistant: Assistant | undefined;
   assistantName: string;
   isSpeaking: boolean;
   isWaving: boolean;
   amplitude: number;
+  isMobile: boolean;
 }) {
   const amp = amplitude;
   const hasImage = !!assistant?.profile_image_path;
+  // Mobile: ~110 px (fits the 140 px banner). Desktop: original sizing.
+  const avatarSize = isMobile ? "110px" : "min(44vh, 360px)";
+  // Mobile aligns the avatar left so the caption + status chip we
+  // pin to the right have room. Desktop keeps the centred portrait.
+  const containerJustify = isMobile ? "justify-start pl-4" : "justify-center";
 
   return (
     <div
       className={cn(
-        "relative w-full h-full flex items-center justify-center pointer-events-none"
+        "relative w-full h-full flex items-center pointer-events-none",
+        containerJustify
       )}
     >
       <div
@@ -970,18 +1041,24 @@ function StaticAvatarFallback({
           <img
             src={`/api/media/${assistant!.profile_image_path}`}
             alt={assistant!.assistant_name}
-            className="aspect-square rounded-full object-cover border-[5px] border-white shadow-xl"
+            className={cn(
+              "aspect-square rounded-full object-cover border-white shadow-xl",
+              isMobile ? "border-[3px]" : "border-[5px]"
+            )}
             style={{
-              width: "min(44vh, 360px)",
-              height: "min(44vh, 360px)",
+              width: avatarSize,
+              height: avatarSize,
             }}
           />
         ) : (
           <div
-            className="rounded-full bg-gradient-to-br from-primary/20 via-primary/10 to-transparent border-[5px] border-white shadow-xl flex flex-col items-center justify-center text-primary"
+            className={cn(
+              "rounded-full bg-gradient-to-br from-primary/20 via-primary/10 to-transparent border-white shadow-xl flex flex-col items-center justify-center text-primary",
+              isMobile ? "border-[3px]" : "border-[5px]"
+            )}
             style={{
-              width: "min(44vh, 360px)",
-              height: "min(44vh, 360px)",
+              width: avatarSize,
+              height: avatarSize,
             }}
           >
             <Bot className="h-24 w-24" />
@@ -1984,6 +2061,7 @@ function ChatPanel({
   audio,
   voiceGender,
   liveSessionId,
+  isMobile,
 }: {
   familyId: number;
   assistantName: string;
@@ -1991,6 +2069,10 @@ function ChatPanel({
   audio: AudioQueueHandle;
   voiceGender: "male" | "female";
   liveSessionId: number | null;
+  // Drives the "mic default OFF on phones, ON on desktops" UX rule.
+  // Members on mobile usually want to type quietly (school pickup,
+  // bedtime, in-public); the kitchen iMac wants to walk-up-and-talk.
+  isMobile: boolean;
 }) {
   const toast = useToast();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -1999,15 +2081,23 @@ function ChatPanel({
   const [recognizedPersonId, setRecognizedPersonId] = useState<number | null>(
     null
   );
-  // Mic defaults to ON every page load so the family can just walk up
-  // and start talking — same "always on for now" pattern as the
-  // speaker. We intentionally do NOT seed from localStorage; an old
-  // "0" value from a previous testing session was the reason the mic
-  // appeared dead on refresh. The toggle still works mid-session.
-  // Note: the browser still requires a user gesture for the permission
-  // prompt the first time, which happens automatically when the effect
-  // below attempts to `rec.start()` on mount.
-  const [listening, setListening] = useState<boolean>(true);
+  // Mic default is PLATFORM-AWARE, not persisted:
+  //
+  //   * Desktop  → ON. Family iMac in the kitchen — they want to walk
+  //                up and start talking without having to click a mic
+  //                button first.
+  //   * Mobile   → OFF. Phones get used in quiet/private contexts
+  //                (bed, library, school pickup) where auto-listening
+  //                is rude AND it conflicts with the device's audio
+  //                routing while Avi is also speaking. Toggle still
+  //                works mid-session for "OK, listen now".
+  //
+  // We deliberately do NOT seed from localStorage; an old "0" value
+  // from a previous testing session was the reason the mic appeared
+  // dead on refresh. Note: the browser still requires a user gesture
+  // for the permission prompt the first time, which happens
+  // automatically when the effect below attempts to `rec.start()`.
+  const [listening, setListening] = useState<boolean>(!isMobile);
   const [speechSupported, setSpeechSupported] = useState(false);
   const messagesRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);

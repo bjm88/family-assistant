@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from .. import models
+from ..crypto import decrypt_str
 from . import authz
 
 
@@ -36,6 +37,7 @@ def build_person_context(
     person: models.Person,
     *,
     requestor_person_id: Optional[int] = None,
+    requestor_is_admin: bool = False,
 ) -> str:
     """Render a person's RAG context as plain text bullets.
 
@@ -50,14 +52,19 @@ def build_person_context(
     When ``requestor_person_id`` is ``None`` we behave as before — the
     callers that don't care about redaction (greet, followup, where the
     speaker IS the subject) keep their existing behaviour unchanged.
+
+    ``requestor_is_admin`` short-circuits the relationship gate to
+    ALLOW. Used for the AI-as-operator path (Avi logged in as the
+    assistant) and ``ADMIN_EMAILS`` operators.
     """
-    if requestor_person_id is None:
+    if requestor_person_id is None and not requestor_is_admin:
         access_allowed = True
     else:
         access_allowed = authz.can_access_sensitive(
             db,
             requestor_person_id=requestor_person_id,
             subject_person_id=person.person_id,
+            requestor_is_admin=requestor_is_admin,
         ).allowed
 
     lines: List[str] = []
@@ -274,21 +281,31 @@ def build_family_overview(
     family: models.Family,
     *,
     requestor_person_id: Optional[int] = None,
+    requestor_is_admin: bool = False,
 ) -> str:
     """High-level RAG block describing the whole household.
 
     The output is intentionally dense, sectioned, and bulletised so a
     small local model (Gemma 4) can scan it for a specific entity in
-    the conversation. Sensitive identifiers (full account numbers,
-    VINs, plate numbers, SSNs) are *never* surfaced — only their
-    last-four helpers, which is what humans actually quote anyway.
+    the conversation. Last-four helper columns are surfaced freely;
+    full encrypted values (SSN, VIN, account numbers) are surfaced in
+    a dedicated "Sensitive identifiers" section below ONLY for the
+    subjects the speaker is authorised to see. The relationship gate
+    (:mod:`ai.authz`) decides; the decrypted plaintext therefore only
+    reaches the LLM when sharing it with the speaker is already
+    permitted, removing the need for a separate ``reveal_*`` tool
+    round-trip on routine "what's my child's SSN?" questions.
 
     When ``requestor_person_id`` is supplied, per-person sensitive
     blocks (medical conditions, medications, physicians, identity-doc
-    counts, financial-account last-fours) are also redacted to match
-    the speaker's relationship-based access window. See :mod:`ai.authz`.
-    Without a requestor we fall back to the original "trusted reader"
-    behaviour for backwards compatibility.
+    counts, financial-account last-fours) are redacted to match the
+    speaker's relationship-based access window. Without a requestor we
+    fall back to the original "trusted reader" behaviour for
+    backwards compatibility.
+
+    ``requestor_is_admin`` is the operator override — when ``True``
+    every person is treated as accessible (Avi-as-operator and
+    ``ADMIN_EMAILS`` paths).
     """
     # Pre-compute who the speaker is allowed to see in detail. When
     # requestor is None this stays empty and the access lookup short-
@@ -298,7 +315,19 @@ def build_family_overview(
     # per-decision detail is still available at DEBUG.
     accessible_subject_ids: set[int] = set()
     denied_subject_ids: set[int] = set()
-    if requestor_person_id is not None and family.people:
+    if requestor_is_admin and family.people:
+        # Operator path — every household member is in scope. Skip
+        # the per-person authz call (it would just return ALLOW for
+        # each one) and emit a single SUMMARY line so the audit log
+        # still carries the bypass.
+        accessible_subject_ids = {p.person_id for p in family.people}
+        authz.log_scope_summary(
+            scope="sensitive",
+            requestor_person_id=requestor_person_id,
+            allowed_subject_ids=accessible_subject_ids,
+            denied_subject_ids=denied_subject_ids,
+        )
+    elif requestor_person_id is not None and family.people:
         for p in family.people:
             decision = authz.can_access_sensitive(
                 db,
@@ -318,6 +347,8 @@ def build_family_overview(
         )
 
     def _can_see(subject_person_id: Optional[int]) -> bool:
+        if requestor_is_admin:
+            return True
         if requestor_person_id is None:
             return True
         if subject_person_id is None:
@@ -606,6 +637,62 @@ def build_family_overview(
         names = {p.person_id: _person_display_name(p) for p in people}
         for pid, n in id_doc_count_by_person.items():
             lines.append(f"- {names.get(pid, f'Person {pid}')}: {n} document(s)")
+
+    # ---- Sensitive identifiers (decrypted, gated by speaker scope) ---
+    # Surface the FULL plaintext SSN / tax-id for every subject the
+    # speaker is already authorised to see. The relationship gate
+    # has already been applied above (``accessible_subject_ids``); a
+    # value only lands in the prompt when sharing it with the speaker
+    # is permitted, removing the need for a ``reveal_sensitive_identifier``
+    # tool round-trip on routine "what's my child's SSN?" questions.
+    #
+    # If decryption fails for any row (e.g. ``FA_ENCRYPTION_KEY`` was
+    # rotated without re-encrypting) we silently skip that row — the
+    # admin will see the failure in ``/admin`` instead. Worst case the
+    # LLM falls back to the heavy-agent reveal tool path for that row.
+    sensitive_visible_ids = sorted(accessible_subject_ids)
+    if sensitive_visible_ids:
+        rows = (
+            db.execute(
+                select(models.SensitiveIdentifier).where(
+                    models.SensitiveIdentifier.person_id.in_(
+                        sensitive_visible_ids
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if rows:
+            names = {p.person_id: _person_display_name(p) for p in people}
+            decrypted_lines: List[str] = []
+            for row in rows:
+                try:
+                    plaintext = decrypt_str(row.identifier_value_encrypted)
+                except RuntimeError:
+                    # Skip silently — falling back to the reveal tool
+                    # is safer than embedding an error string in the
+                    # prompt where the LLM might paraphrase it.
+                    continue
+                subject_name = names.get(
+                    row.person_id, f"Person {row.person_id}"
+                )
+                last4 = (
+                    f" (last 4: {row.identifier_last_four})"
+                    if row.identifier_last_four
+                    else ""
+                )
+                decrypted_lines.append(
+                    f"- {subject_name} (person_id={row.person_id}): "
+                    f"{row.identifier_type} = {plaintext}{last4}"
+                )
+            if decrypted_lines:
+                lines.append("")
+                lines.append(
+                    "## Sensitive identifiers "
+                    "(speaker is authorised — share verbatim when asked)"
+                )
+                lines.extend(decrypted_lines)
 
     return "\n".join(lines).strip()
 

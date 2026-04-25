@@ -1,0 +1,204 @@
+# Q → SQL templates.
+#
+# These teach the fast model the common query patterns it should reach
+# for when asked a family question. Each template declares:
+#
+#   applies_to:   a filter that decides which tables the template
+#                 expands against. Options:
+#                   all                   — every table
+#                   has_family_id         — tables with a family_id column
+#                   has_column: <name>    — tables that have <name>
+#                   table_in: [a, b, c]   — explicit allow-list
+#   q:            user question template (placeholders like {table})
+#   a:            assistant answer — must include the SQL.
+#
+# The dataset builder formats {table}, {table_human}, the primary-key
+# column name (detected as "<table_singular>_id"), and {sample_col} /
+# {sample_col_human} — a representative human-readable column auto-
+# picked as the first column whose name is NOT the pk, not family_id,
+# not *_id, not *_encrypted, and whose type isn't bytea.
+#
+# Keep the answers natural-language-wrapped ("Here's the SQL: …")
+# because that's what Avi actually writes in production — pure-SQL
+# one-liners train the model to dump raw SQL into chat replies.
+
+# ------------------------------------------------------------------------
+# Tables scoped by family_id — the biggest group. Teach "filter by family".
+# ------------------------------------------------------------------------
+
+- applies_to: has_family_id
+  q: "List every {table_human} for family {fam}."
+  a: |
+    SELECT {sample_col}
+      FROM {table}
+     WHERE family_id = {fam};
+
+- applies_to: has_family_id
+  q: "How many {table_human}s does family {fam} have?"
+  a: |
+    SELECT COUNT(*)
+      FROM {table}
+     WHERE family_id = {fam};
+
+- applies_to: has_family_id
+  q: "Show me the {table_human}s for the family I'm scoped to."
+  a: |
+    SELECT *
+      FROM {table}
+     WHERE family_id = :family_id
+     ORDER BY created_at DESC
+     LIMIT 50;
+
+# ------------------------------------------------------------------------
+# Tables with a `person_id` — join-through-people patterns.
+# ------------------------------------------------------------------------
+
+- applies_to: "has_column: person_id"
+  q: "What {table_human}s does {name} have?"
+  a: |
+    SELECT t.*
+      FROM {table} t
+      JOIN people p ON p.person_id = t.person_id
+     WHERE p.first_name = '{name}'
+       AND p.family_id = :family_id;
+
+- applies_to: "has_column: person_id"
+  q: "Who in the family has at least one {table_human} recorded?"
+  a: |
+    SELECT DISTINCT p.first_name, p.last_name
+      FROM {table} t
+      JOIN people p ON p.person_id = t.person_id
+     WHERE p.family_id = :family_id;
+
+# ------------------------------------------------------------------------
+# Free-text search on a sample column.
+# ------------------------------------------------------------------------
+
+- applies_to: has_family_id
+  q: "Find {table_human}s where {sample_col_human} contains '{needle}'."
+  a: |
+    SELECT *
+      FROM {table}
+     WHERE family_id = :family_id
+       AND {sample_col} ILIKE '%{needle}%'
+     ORDER BY created_at DESC;
+
+# ------------------------------------------------------------------------
+# Explicit templates for the tables the fast model will hit most often.
+# These are HIGHER quality than generic expansions because they use
+# real column names the model will see at inference time.
+# ------------------------------------------------------------------------
+
+- applies_to:
+    table_in: [goals]
+  q: "What goals has {name} set?"
+  a: |
+    SELECT g.goal_name, g.priority, g.goal_description
+      FROM goals g
+      JOIN people p ON p.person_id = g.person_id
+     WHERE p.family_id = :family_id
+       AND p.first_name = '{name}'
+     ORDER BY CASE g.priority
+                WHEN 'urgent' THEN 1
+                WHEN 'semi_urgent' THEN 2
+                WHEN 'normal' THEN 3
+                WHEN 'low' THEN 4
+              END;
+
+- applies_to:
+    table_in: [goals]
+  q: "Who in the family has an urgent goal?"
+  a: |
+    SELECT p.first_name, g.goal_name
+      FROM goals g
+      JOIN people p ON p.person_id = g.person_id
+     WHERE p.family_id = :family_id
+       AND g.priority = 'urgent';
+
+- applies_to:
+    table_in: [vehicles]
+  q: "Any vehicle registrations expiring in the next 30 days?"
+  a: |
+    SELECT label, make, model, registration_expiration_date
+      FROM vehicles
+     WHERE family_id = :family_id
+       AND registration_expiration_date BETWEEN CURRENT_DATE
+                                           AND CURRENT_DATE + INTERVAL '30 days'
+     ORDER BY registration_expiration_date;
+
+- applies_to:
+    table_in: [vehicles]
+  q: "List our vehicles with their license-plate last four."
+  a: |
+    SELECT label, make, model, license_plate_last_four
+      FROM vehicles
+     WHERE family_id = :family_id
+     ORDER BY label;
+
+- applies_to:
+    table_in: [insurance_policies]
+  q: "Which insurance policies do we have?"
+  a: |
+    SELECT policy_type, carrier_name, policy_number_last_four, renewal_date
+      FROM insurance_policies
+     WHERE family_id = :family_id
+     ORDER BY renewal_date;
+
+- applies_to:
+    table_in: [medications]
+  q: "What medications is {name} taking?"
+  a: |
+    SELECT m.medication_name, m.dosage, m.frequency, m.reason
+      FROM medications m
+      JOIN people p ON p.person_id = m.person_id
+     WHERE p.family_id = :family_id
+       AND p.first_name = '{name}';
+
+- applies_to:
+    table_in: [tasks]
+  q: "What's on the family's to-do list?"
+  a: |
+    SELECT title, status, priority, due_date, assignee_person_id
+      FROM tasks
+     WHERE family_id = :family_id
+       AND task_kind = 'todo'
+       AND status IN ('open', 'in_progress')
+     ORDER BY COALESCE(due_date, CURRENT_DATE + INTERVAL '365 days');
+
+- applies_to:
+    table_in: [tasks]
+  q: "Which monitoring jobs does Avi have running?"
+  a: |
+    SELECT title, cron_schedule, next_run_at, last_run_status, last_run_at
+      FROM tasks
+     WHERE family_id = :family_id
+       AND owner_kind = 'ai'
+       AND task_kind = 'monitoring'
+     ORDER BY next_run_at;
+
+- applies_to:
+    table_in: [pets]
+  q: "What pets does the family have?"
+  a: |
+    SELECT pet_name, species, breed, date_of_birth
+      FROM pets
+     WHERE family_id = :family_id;
+
+- applies_to:
+    table_in: [residences]
+  q: "Where does the family live?"
+  a: |
+    SELECT r.label, a.street_line_1, a.city, a.state, a.postal_code
+      FROM residences r
+      JOIN addresses a ON a.address_id = r.address_id
+     WHERE r.family_id = :family_id
+     ORDER BY r.is_primary DESC;
+
+- applies_to:
+    table_in: [people]
+  q: "Who are the members of this family?"
+  a: |
+    SELECT first_name, preferred_name, primary_family_relationship, date_of_birth
+      FROM people
+     WHERE family_id = :family_id
+     ORDER BY date_of_birth NULLS LAST;

@@ -33,12 +33,14 @@ from ..auth import (
 from ..ai import agent as agent_loop
 from ..ai import assistants as _assistants
 from ..ai import chat_prompts
+from ..ai import family_qa_router
 from ..ai import fast_ack
 from ..ai import ollama
 from ..ai import planner as ai_planner
 from ..ai import prompts
 from ..ai import rag
 from ..ai import schema_catalog
+from ..ai import sensitive_intent
 from ..ai import session as live_session
 from ..ai import sql_tool
 from ..ai import tools as agent_tools
@@ -137,8 +139,10 @@ def _shortcut_stream_response(
     family_id: int,
     recognized_person_id: Optional[int],
     user_message: str,
+    shortcut_name: str,
+    used_model: str,
 ) -> StreamingResponse:
-    """Wrap a one-shot web-search-shortcut answer as a SSE stream.
+    """Wrap a one-shot shortcut answer as a SSE stream.
 
     Matches the shape the live-chat UI already consumes from the
     heavy-agent path so the front-end needs no changes:
@@ -151,6 +155,11 @@ def _shortcut_stream_response(
        any client logic that waits on ``task_completed`` keeps working.
     4. ``{"done": true}`` — terminal marker, identical to the heavy
        path.
+
+    ``shortcut_name`` (e.g. ``"web_search"`` or ``"family_qa"``) +
+    ``used_model`` are surfaced in the SSE ``task_completed`` event
+    and in the live-session transcript ``meta`` so debugging tools
+    and the History view can tell the two shortcut paths apart.
 
     The user message has already been logged to the live-session
     transcript by the caller (or rather, would have been — but the
@@ -168,7 +177,7 @@ def _shortcut_stream_response(
                     "type": "task_completed",
                     "task_id": None,
                     "summary": final_text,
-                    "shortcut": "web_search",
+                    "shortcut": shortcut_name,
                 }
             )
             + "\n\n"
@@ -199,15 +208,16 @@ def _shortcut_stream_response(
                         person_id=recognized_person_id,
                         meta={
                             "kind": "chat",
-                            "shortcut": "web_search",
-                            "used_model": "gemini_grounded",
+                            "shortcut": shortcut_name,
+                            "used_model": used_model,
                         },
                     )
                     log_db.commit()
             except Exception:  # noqa: BLE001 — logging must never break the stream
                 logger.exception(
-                    "web_search shortcut: failed to log assistant chat "
+                    "%s shortcut: failed to log assistant chat "
                     "message for live_session=%s",
+                    shortcut_name,
                     live_session_id,
                 )
                 log_db.rollback()
@@ -765,12 +775,115 @@ async def chat(
                 family_id=payload.family_id,
                 recognized_person_id=payload.recognized_person_id,
                 user_message=latest_user_for_shortcut,
+                shortcut_name="web_search",
+                used_model="gemini_grounded",
             )
 
     assistant_name, family_name = _load_assistant(db, payload.family_id)
+
+    # ---------- Fast-path fine-tuned family-Q&A shortcut -----------------
+    #
+    # If the web-search classifier said "AGENT" (so we didn't return
+    # above), see whether the question can be answered by the fine-
+    # tuned lightweight model directly — using the same RAG block the
+    # heavy agent would build, but without any tool plumbing or plan/
+    # execute/observe loop. When this lands we save ~10-15 s per turn
+    # on routine family-recall questions ("what's Sara's top goal?",
+    # "when does the Subaru's registration expire?", "who is Theo's
+    # doctor?"). The classifier and the answer call are BOTH bounded
+    # by short timeouts and every failure mode returns None from
+    # :func:`family_qa_router.try_shortcut`, so the worst case is a
+    # few hundred extra milliseconds before we fall through to the
+    # existing heavy-agent path with no behavioural change.
+    #
+    # Training + model registration live under scripts/ai_training/.
+    # The feature is implicitly disabled until both
+    # AI_FAMILY_QA_SHORTCUT_ENABLED=true and AI_FAMILY_QA_MODEL=<tag>
+    # are set in .env.
+    settings = get_settings()
+    # Admins are routed to the heavy agent — the fine-tuned fast model
+    # was NOT trained on admin / operator-mode override examples (its
+    # "sensitive" labels in labeled_examples.jsonl only cover sharing
+    # the SPEAKER'S OWN identifiers), so it will refuse a question
+    # like "what's Jax's SSN?" even when the admin RAG block contains
+    # the value. The heavy agent enforces the admin bypass
+    # deterministically at the tool layer (`secrets.handle_reveal_*`
+    # honours `ctx.is_admin`), so the operator always gets a correct
+    # answer at the cost of ~5-10 s of extra latency. Once the fast
+    # model is re-fine-tuned with admin-mode examples we can drop
+    # this guard.
+    #
+    # Sensitive-identifier asks (SSN, VIN, account number, passport,
+    # DL, policy number — see `sensitive_intent`) ALSO skip the
+    # shortcut for ANY speaker, admin or not. The fast tier has no
+    # `reveal_secret` / `reveal_sensitive_identifier` tool, and the
+    # encrypted values (other than SSN, which the RAG builder
+    # denormalises for authorised speakers) are NEVER in the prompt
+    # — so a fast-tier "answer" is at best a refusal and at worst a
+    # wrong number. Forcing these to the heavy agent guarantees the
+    # deterministic household privacy gate in `secrets.py` makes the
+    # call: parent ↔ child / spouse ↔ spouse / self → ALLOW, every
+    # other relationship → polite refusal. This is what "the code
+    # needs to know who is asking and who they are asking about" looks
+    # like in practice — no LLM in the authorisation loop.
+    is_sensitive_ask = sensitive_intent.is_sensitive_identifier_ask(
+        latest_user_for_shortcut
+    )
+    if is_sensitive_ask:
+        logger.info(
+            "[orch] surface=live_chat shortcut=family_qa skipped "
+            "reason=sensitive_identifier_ask family_id=%s msg=%r — "
+            "routing to heavy agent so authz runs at the tool layer",
+            payload.family_id,
+            latest_user_for_shortcut[:80],
+        )
+    if (
+        latest_user_for_shortcut
+        and settings.AI_FAMILY_QA_SHORTCUT_ENABLED
+        and (settings.AI_FAMILY_QA_MODEL or "").strip()
+        and not user.is_admin
+        and not is_sensitive_ask
+    ):
+        family_answer = await family_qa_router.try_shortcut(
+            latest_user_for_shortcut,
+            db=db,
+            family_id=payload.family_id,
+            recognized_person_id=payload.recognized_person_id,
+            assistant_name=assistant_name,
+            family_name=family_name,
+            requestor_is_admin=bool(user.is_admin),
+        )
+        if family_answer:
+            logger.info(
+                "[orch] surface=live_chat path=family_qa_shortcut "
+                "family_id=%s session=%s reply_chars=%d msg=%r "
+                "(skipping heavy agent)",
+                payload.family_id,
+                payload.live_session_id,
+                len(family_answer),
+                latest_user_for_shortcut[:80],
+            )
+            return _shortcut_stream_response(
+                final_text=family_answer,
+                live_session_id=payload.live_session_id,
+                family_id=payload.family_id,
+                recognized_person_id=payload.recognized_person_id,
+                user_message=latest_user_for_shortcut,
+                shortcut_name="family_qa",
+                used_model=settings.AI_FAMILY_QA_MODEL,
+            )
     assistant_id = _assistant_id_for(db, payload.family_id)
+    # Admins (Avi-as-operator and ADMIN_EMAILS humans) bypass the
+    # household relationship gate end-to-end: the RAG block surfaces
+    # every member's full sensitive data and the speaker-scope prompt
+    # tells the LLM "operator mode — no privacy gate applies". See
+    # ``api.ai.authz`` for the bypass implementation and audit trail.
+    requestor_is_admin = bool(user.is_admin)
     rag_block = chat_prompts.build_rag_block(
-        db, payload.family_id, payload.recognized_person_id
+        db,
+        payload.family_id,
+        payload.recognized_person_id,
+        requestor_is_admin=requestor_is_admin,
     )
 
     # Build the tool registry up-front so the same instance is used to
@@ -832,6 +945,8 @@ async def chat(
         capabilities_block=capabilities_block,
         live_data_block=live_data_block,
         speaker_person_id=payload.recognized_person_id,
+        family_id=payload.family_id,
+        requestor_is_admin=requestor_is_admin,
     )
 
     # Tool-use protocol reminder. Goes after the safety + capabilities
@@ -948,6 +1063,7 @@ async def chat(
                     user_message=latest_user_content,
                     registry=registry,
                     capabilities=capabilities,
+                    requestor_is_admin=requestor_is_admin,
                 ):
                     await queue.put(("event", event))
             except Exception as exc:  # noqa: BLE001 - never crash the stream

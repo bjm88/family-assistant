@@ -1,0 +1,56 @@
+# Schema-awareness Q→A templates.
+#
+# Each entry is a natural-language question / answer pair that gets
+# expanded against every table OR every column in the corpus. The
+# placeholders are:
+#   {table}        — table name (e.g. "people")
+#   {table_human}  — humanised table ("people" → "person", "pets" → "pet")
+#   {table_desc}   — the table's COMMENT ON TABLE description
+#   {column}       — column name
+#   {data_type}    — Postgres data type
+#   {column_desc}  — the column's COMMENT ON COLUMN description
+#
+# Rows with a missing expansion value are silently dropped by the
+# dataset builder (so you don't need to author conditionals here).
+
+# ------------------------------------------------------------------------
+# Per-table templates. These expand once per table in the corpus.
+# ------------------------------------------------------------------------
+
+per_table:
+  - q: "What's stored in the {table} table?"
+    a: "The {table} table holds {table_desc_lower}"
+
+  - q: "Where does the app keep {table_human} information?"
+    a: "In the {table} table. {table_desc}"
+
+  - q: "Which table should I look at to find {table_human} data?"
+    a: "The {table} table. It stores {table_desc_lower}"
+
+  - q: "Give me a one-line summary of the {table} table."
+    a: "{table_desc}"
+
+  - q: "Is there a table for {table_human}s?"
+    a: "Yes — the {table} table."
+
+# ------------------------------------------------------------------------
+# Per-column templates. These expand once per (table, column) pair where
+# the column has a COMMENT. No comment → no expansion (keeps the corpus
+# clean of "this column stores None" noise).
+# ------------------------------------------------------------------------
+
+per_column:
+  - q: "What does {table}.{column} store?"
+    a: "{column_desc}"
+
+  - q: "In the {table} table, what's the {column} column for?"
+    a: "{column_desc}"
+
+  - q: "Is {column} nullable on {table}?"
+    a: "{nullable_answer}"
+
+  - q: "What's the data type of {table}.{column}?"
+    a: "It's a {data_type}."
+
+  - q: "I need {column_human} — which table and column?"
+    a: "Look at {table}.{column}. {column_desc}"

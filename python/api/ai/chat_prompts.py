@@ -20,7 +20,11 @@ from . import authz, ollama, prompts, rag, schema_catalog
 
 
 def build_rag_block(
-    db: Session, family_id: int, person_id: Optional[int]
+    db: Session,
+    family_id: int,
+    person_id: Optional[int],
+    *,
+    requestor_is_admin: bool = False,
 ) -> str:
     """Static context block: family overview + (optional) speaker focus.
 
@@ -33,12 +37,23 @@ def build_rag_block(
     sensitive details about other family members are pre-redacted in
     the static context — the LLM literally never sees the secrets it
     isn't allowed to share. See :mod:`api.ai.authz`.
+
+    ``requestor_is_admin`` is the operator-bypass flag for Avi (the
+    AI logged in as itself) and ``ADMIN_EMAILS`` operators. When set,
+    every household member's sensitive data is included in the RAG
+    block so the assistant can answer cross-family questions without
+    a reveal-tool round-trip.
     """
     family = db.get(models.Family, family_id)
     if family is None:
         return ""
     parts: List[str] = [
-        rag.build_family_overview(db, family, requestor_person_id=person_id)
+        rag.build_family_overview(
+            db,
+            family,
+            requestor_person_id=person_id,
+            requestor_is_admin=requestor_is_admin,
+        )
     ]
     if person_id is not None:
         person = db.get(models.Person, person_id)
@@ -46,7 +61,10 @@ def build_rag_block(
             parts.append(
                 "Currently talking to:\n"
                 + rag.build_person_context(
-                    db, person, requestor_person_id=person_id
+                    db,
+                    person,
+                    requestor_person_id=person_id,
+                    requestor_is_admin=requestor_is_admin,
                 )
             )
     return "\n\n".join(parts).strip()
@@ -61,6 +79,8 @@ def build_system_prompt(
     capabilities_block: str = "",
     live_data_block: Optional[str] = None,
     speaker_person_id: Optional[int] = None,
+    family_id: Optional[int] = None,
+    requestor_is_admin: bool = False,
 ) -> str:
     """Assemble the full system prompt and wrap it in the safety sandbox.
 
@@ -94,7 +114,12 @@ def build_system_prompt(
     # the model to treat the conversation as anonymous and clamp down.
     parts.append(
         authz.render_speaker_scope_block(
-            authz.build_speaker_scope(db, speaker_person_id=speaker_person_id)
+            authz.build_speaker_scope(
+                db,
+                speaker_person_id=speaker_person_id,
+                family_id=family_id,
+                requestor_is_admin=requestor_is_admin,
+            )
         )
     )
     if rag_block:

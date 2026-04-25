@@ -63,6 +63,12 @@ logs/
 # secrets and personally-identifying data. Never commit.
 backups/
 
+# Fine-tuning pipeline output (scripts/ai_training/). Everything under
+# artifacts/ is regenerable: corpus dumps, LoRA adapters, fused HF
+# weights, intermediate + quantised GGUFs, llama.cpp clone, base-model
+# SHA state. Multi-GB per run, never committed.
+scripts/ai_training/artifacts/
+
 # OS
 .DS_Store
 Thumbs.db
