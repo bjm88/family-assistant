@@ -472,6 +472,14 @@ def _handle_one_message(
         },
     )
 
+    # Combined "what the user actually asked" text - used both as the
+    # input to the web-search shortcut classifier (so subject-only
+    # questions like "When does the truck reg expire?" are routed
+    # correctly) and as the audit ``input_text`` on the agent_task
+    # row (so debugging "why did Avi reply that way?" doesn't lose
+    # the subject line).
+    classifier_text = _combined_text_for_shortcut(msg)
+
     # The agent task is created BEFORE the LLM run so a UI tail of
     # ``agent_tasks`` can spot the row appear in real time.
     task = agent_loop.create_task(
@@ -480,7 +488,7 @@ def _handle_one_message(
         live_session_id=session.live_session_id,
         person_id=person.person_id,
         kind="email",
-        input_text=msg.body_text or "",
+        input_text=classifier_text,
         model=ollama._model(),
     )
     db.commit()
@@ -494,15 +502,17 @@ def _handle_one_message(
     # When the user emails Avi asking a pure web-lookup question
     # ("What's the latest on the Fed rate decision?"), short-circuit
     # the heavy agent and reply with Gemini's grounded answer
-    # directly. The classifier sees the raw body (subject is
-    # informational metadata only). ``try_shortcut_sync`` itself is
-    # total — every failure mode returns ``None`` so we just check
-    # the return.
+    # directly. The classifier sees ``classifier_text`` (subject +
+    # body, deduped - see :func:`_combined_text_for_shortcut`) so a
+    # subject-only message like "When does the truck reg expire?"
+    # with an empty body still routes correctly. ``try_shortcut_sync``
+    # itself is total - every failure mode returns ``None`` so we
+    # just check the return.
     agent_failed = False
     final_text: Optional[str] = None
     shortcut_used = False
     shortcut_text = web_search_shortcut.try_shortcut_sync(
-        (msg.body_text or "").strip()
+        classifier_text
     )
     if shortcut_text:
         logger.info(
@@ -758,6 +768,46 @@ def _format_inbound_for_log(
         bits.append("")
         bits.append(attachment_block)
     return "\n".join(bits)
+
+
+def _combined_text_for_shortcut(msg: gmail.FetchedMessage) -> str:
+    """Produce the single string used by the web-search shortcut classifier.
+
+    Email is unique among inbound surfaces in having a subject line.
+    Users routinely put the entire question in the subject and leave
+    the body empty (or just "thanks"), e.g.:
+
+        Subject: When does the truck registration expire?
+        Body:    (empty)
+
+    If we passed only the body to
+    :func:`web_search_shortcut.try_shortcut_sync`, the classifier
+    would see an empty / signature-only string and vote AGENT,
+    losing the latency win and misclassifying the email. Conversely,
+    a long body with a vague subject like ``"Re: question"`` should
+    classify on the body. So we concatenate both, deduping when one
+    is a prefix of the other or when the subject is a thread-reply
+    marker like ``"Re: ..."``.
+
+    The resulting string is also a clean grounded-chat prompt for
+    Gemini (the shortcut feeds the same string to ``classify`` and
+    to ``run``): ``"What's the Fed rate?\\n\\nthanks"`` reads as a
+    natural question-with-context, and a body-only or subject-only
+    case collapses to just that one piece.
+    """
+    subject = (msg.subject or "").strip()
+    body = (msg.body_text or "").strip()
+    if subject.lower().startswith(("re:", "fwd:", "fw:")):
+        subject = subject.split(":", 1)[1].strip()
+    if not subject:
+        return body
+    if not body:
+        return subject
+    if subject in body:
+        return body
+    if body in subject:
+        return subject
+    return f"{subject}\n\n{body}"
 
 
 def _format_user_message_for_agent(

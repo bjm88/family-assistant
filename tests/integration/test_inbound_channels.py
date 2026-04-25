@@ -307,6 +307,152 @@ def test_email_inbound_routes_to_agent(test_family, db):
 
 
 # ---------------------------------------------------------------------------
+# Email subject MUST be considered by the LLM, not just the body
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_email(*, subject: str | None, body: str | None):
+    """Tiny FetchedMessage builder for the subject-vs-body tests."""
+    from api.integrations import gmail
+
+    return gmail.FetchedMessage(
+        message_id="msg_subject_test",
+        thread_id="thr_subject_test",
+        sender_email="parent@example.com",
+        sender_name="Test Parent",
+        subject=subject,
+        body_text=body,
+        in_reply_to_header=None,
+        references_header=None,
+        list_id_header=None,
+        precedence_header=None,
+        auto_submitted_header=None,
+        received_at=datetime.now(timezone.utc),
+        label_ids=["INBOX", "UNREAD"],
+    )
+
+
+def test_email_combined_text_subject_only_is_returned():
+    """Subject-only email: classifier must see the subject as the question."""
+    from api.services import email_inbox
+
+    text = email_inbox._combined_text_for_shortcut(
+        _make_fake_email(
+            subject="What's the latest Fed rate decision?", body=""
+        )
+    )
+    assert text == "What's the latest Fed rate decision?"
+
+
+def test_email_combined_text_body_only_is_returned():
+    """Body-only email (no subject): classifier sees the body."""
+    from api.services import email_inbox
+
+    text = email_inbox._combined_text_for_shortcut(
+        _make_fake_email(subject=None, body="What is the population of France?")
+    )
+    assert text == "What is the population of France?"
+
+
+def test_email_combined_text_concatenates_subject_and_body():
+    """Both present and distinct: classifier sees subject AND body."""
+    from api.services import email_inbox
+
+    text = email_inbox._combined_text_for_shortcut(
+        _make_fake_email(
+            subject="Quick question about Avi",
+            body="Can you remind me when the truck registration expires?",
+        )
+    )
+    assert "Quick question about Avi" in text
+    assert "Can you remind me when the truck registration expires?" in text
+
+
+def test_email_combined_text_strips_re_fwd_prefixes():
+    """Thread-reply markers (Re:, Fwd:) are noise, not signal."""
+    from api.services import email_inbox
+
+    text = email_inbox._combined_text_for_shortcut(
+        _make_fake_email(subject="Re: weather", body="What's the forecast?")
+    )
+    assert "Re:" not in text
+    assert "weather" in text
+    assert "What's the forecast?" in text
+
+
+def test_email_combined_text_dedupes_when_subject_in_body():
+    """If the subject is just a prefix of the body, don't double it."""
+    from api.services import email_inbox
+
+    body = "What is the speed limit on I-95?"
+    text = email_inbox._combined_text_for_shortcut(
+        _make_fake_email(subject="What is the speed limit", body=body)
+    )
+    assert text == body
+
+
+def test_email_classifier_receives_subject_when_body_is_empty(
+    test_family, db
+):
+    """End-to-end proof: subject-only email reaches the web-search shortcut.
+
+    Regression test for the bug where the email handler passed only
+    ``msg.body_text`` to ``web_search_shortcut.try_shortcut_sync`` —
+    so a question typed entirely into the subject line never reached
+    the classifier and was silently misrouted to the heavy agent.
+    """
+    from api.services import email_inbox
+
+    msg_id = "msg_subjtest_" + str(
+        int(datetime.now(timezone.utc).timestamp() * 1000000)
+    )
+    fake_msg = _make_fake_email(
+        subject="What is the population of Tokyo right now?",
+        body="",
+    )
+    fake_msg.message_id = msg_id
+    fake_msg.thread_id = "thr_" + msg_id
+    fake_msg.sender_email = test_family["person_email"]
+
+    captured: list[str] = []
+
+    def fake_shortcut(text: str):
+        captured.append(text)
+        return None
+
+    with patch(
+        "api.services.email_inbox.gmail.fetch_message", return_value=fake_msg,
+    ), patch(
+        "api.services.email_inbox._safe_mark_read", return_value=None,
+    ), patch(
+        "api.services.email_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ), patch(
+        "api.services.email_inbox.web_search_shortcut.try_shortcut_sync",
+        side_effect=fake_shortcut,
+    ), patch(
+        "api.services.email_inbox.gmail.send_reply",
+        side_effect=lambda *a, **kw: "gmail_sent_id_xyz",
+    ):
+        email_inbox._handle_one_message(
+            db,
+            assistant_id=test_family["assistant_id"],
+            granted_email="avi-bot@example.com",
+            family_id=test_family["family_id"],
+            creds=MagicMock(),
+            gmail_message_id=msg_id,
+        )
+
+    assert len(captured) == 1, (
+        f"Expected exactly one shortcut call, got {len(captured)}"
+    )
+    assert "Tokyo" in captured[0], (
+        f"Subject keyword 'Tokyo' must reach the web-search classifier, "
+        f"but it received: {captured[0]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Live web chat — sanity check the chat surface is mounted + healthy
 # ---------------------------------------------------------------------------
 
