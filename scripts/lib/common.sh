@@ -39,6 +39,11 @@ NGROK_AGENT_PORT="${NGROK_AGENT_PORT:-4040}"
 # Extra log files for the daemons that scripts/start.sh doesn't manage.
 NGROK_LOG="${LOG_DIR}/ngrok.log"
 OLLAMA_LOG="${LOG_DIR}/ollama.log"
+# Output log for the weekly DB-backup → Drive LaunchAgent. Each run
+# appends a banner + pg_dump stdout + the upload result, so a quick
+# `tail logs/db_backup.log` is the diagnostic for "did Sunday's
+# backup run?".
+DB_BACKUP_LOG="${LOG_DIR}/db_backup.log"
 
 # macOS LaunchAgent layout.
 LAUNCHAGENTS_DIR="${HOME}/Library/LaunchAgents"

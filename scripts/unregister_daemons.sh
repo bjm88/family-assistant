@@ -38,7 +38,7 @@ done
 
 log_step "family-assistant · unregister LaunchAgents"
 
-for short in ngrok backend frontend; do
+for short in ngrok backend frontend dbbackup; do
     log_step "Removing ${short}"
     launchagent_unload "${short}"
 done

@@ -116,6 +116,19 @@ DEFAULT_SCOPES: tuple[str, ...] = (
     # the same "View your calendars" line so the user doesn't see an
     # extra checkbox.
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+    # drive.file is the *least-privilege* Drive scope — it grants
+    # access ONLY to files the app itself creates or that the user
+    # explicitly opens through a Google Picker. Avi cannot list,
+    # read, or modify any of the user's other Drive files. Used by
+    # the weekly DB-backup uploader (scripts/db_backup_to_gdrive.py)
+    # to drop pg_dump archives into the folder configured via
+    # DB_BACKUP_GDRIVE; uploads target a known folder id (the user
+    # supplies the folder URL in .env) so we don't need broader
+    # ``drive`` access. As with the calendar scope upgrade above:
+    # households connected before this scope was added must
+    # disconnect + reconnect Google on the AI Assistant settings
+    # page before the backup uploader can write to Drive.
+    "https://www.googleapis.com/auth/drive.file",
 )
 
 

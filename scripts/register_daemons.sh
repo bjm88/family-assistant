@@ -18,9 +18,16 @@
 #                        ~/Library/LaunchAgents/com.familyassistant.ngrok.plist
 #   * FastAPI backend — our own LaunchAgent (com.familyassistant.backend.plist)
 #   * Vite frontend   — our own LaunchAgent (com.familyassistant.frontend.plist)
+#   * DB backup       — our own scheduled LaunchAgent
+#                        (com.familyassistant.dbbackup.plist) that runs
+#                        scripts/db_backup_to_gdrive.py every Sunday at 23:55
+#                        local time. Unlike the daemons above this one is
+#                        single-shot (StartCalendarInterval, no KeepAlive).
 #
-# Each generated agent has ``RunAtLoad=true`` and ``KeepAlive=true``, so a
-# crashed service is restarted by launchd within a few seconds.
+# The always-on daemons above use ``RunAtLoad=true`` + ``KeepAlive=true`` so a
+# crash is resurrected by launchd within a few seconds. The DB-backup agent
+# uses ``RunAtLoad=false`` + ``StartCalendarInterval`` instead so it fires
+# exactly once on its weekly schedule and then exits.
 #
 # Re-running this script is safe: existing agents are torn down and rebuilt
 # with the latest paths/env vars.
@@ -116,6 +123,48 @@ plist_close() {
 XML
 }
 
+# plist_close_scheduled — variant of plist_close for cron-like jobs.
+#
+# Long-running daemons (backend, ngrok, frontend) want RunAtLoad=true +
+# KeepAlive so launchd resurrects them on crash. A weekly backup is the
+# opposite: it should fire ONCE on a fixed schedule and exit cleanly.
+# RunAtLoad=true would re-fire every login; KeepAlive would relaunch
+# the script in a tight loop after each successful exit. So we emit
+# StartCalendarInterval (Weekday/Hour/Minute) + RunAtLoad=false and
+# omit KeepAlive entirely.
+#
+# Args:
+#   1: stdout/stderr log path
+#   2: weekday (0 = Sunday, 1 = Monday, …, 7 = Sunday — launchd
+#      historically accepted both 0 and 7 for Sunday; we use 0)
+#   3: hour (0-23, local time)
+#   4: minute (0-59)
+plist_close_scheduled() {
+    local stdout_log="$1"
+    local weekday="$2"
+    local hour="$3"
+    local minute="$4"
+    cat <<XML
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>${weekday}</integer>
+    <key>Hour</key>
+    <integer>${hour}</integer>
+    <key>Minute</key>
+    <integer>${minute}</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${stdout_log}</string>
+  <key>StandardErrorPath</key>
+  <string>${stdout_log}</string>
+</dict>
+</plist>
+XML
+}
+
 build_ngrok_plist() {
     local label="$1"
     local domain="$2"
@@ -182,6 +231,47 @@ XML
     }
 }
 
+build_dbbackup_plist() {
+    # Weekly DB backup → Google Drive uploader. Fires every Sunday at
+    # 23:55 local time (the user's family is east coast — adjust the
+    # Hour/Minute args here if you ever need a different cadence).
+    # The Python script handles its own success/failure logging; the
+    # LaunchAgent just supplies a working dir + PATH so ``uv`` and
+    # ``pg_dump`` resolve.
+    local label="$1"
+    {
+        plist_open "${label}"
+        cat <<XML
+  <key>ProgramArguments</key>
+  <array>
+    <string>${UV_BIN}</string>
+    <string>run</string>
+    <string>python</string>
+    <string>scripts/db_backup_to_gdrive.py</string>
+    <string>--keep</string>
+    <string>8</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${PROJECT_ROOT}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${USER_HOME}</string>
+    <key>USER</key>
+    <string>${USER_NAME}</string>
+    <key>PATH</key>
+    <string>${DAEMON_PATH}</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+XML
+        # Sunday (0) at 23:55 — the latest reasonable slot before the
+        # week rolls over so the dump captures everything that
+        # happened during the week.
+        plist_close_scheduled "${DB_BACKUP_LOG}" 0 23 55
+    }
+}
+
 build_frontend_plist() {
     local label="$1"
     {
@@ -219,7 +309,7 @@ XML
 print_status() {
     log_step "LaunchAgent registration status"
     printf "  %-12s %-10s %s\n" "service" "agent" "plist"
-    for short in ngrok backend frontend; do
+    for short in ngrok backend frontend dbbackup; do
         local state path
         state="$(launchagent_status "${short}")"
         path="$(launchagent_path "${short}")"
@@ -322,6 +412,19 @@ else
     log_info "  Listens : http://localhost:${FRONTEND_PORT}"
     log_info "  Logs    : ${FRONTEND_LOG}"
 fi
+
+# ---- Weekly DB backup → Google Drive (scheduled LaunchAgent) -------------
+# Unlike the always-on daemons above, this one is launched once a week
+# by launchd's StartCalendarInterval (Sun 23:55) and exits when done.
+# We register it unconditionally; the script itself logs and exits 2
+# if DB_BACKUP_GDRIVE isn't set in .env, so a missing folder URL is a
+# soft fail rather than a registration-time error.
+log_step "Weekly DB backup → Drive (scheduled LaunchAgent)"
+launchagent_install "dbbackup" \
+    "$(build_dbbackup_plist "$(launchagent_label dbbackup)")"
+log_info "  Schedule : every Sunday at 23:55 local time"
+log_info "  Script   : scripts/db_backup_to_gdrive.py --keep 8"
+log_info "  Logs     : ${DB_BACKUP_LOG}"
 
 echo ""
 log_success "Done."

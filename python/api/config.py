@@ -501,6 +501,22 @@ class Settings(BaseSettings):
     # on Gemini Vision calls before the agent even starts.
     AI_ATTACHMENT_MAX_PER_MESSAGE: int = 6
 
+    # ---- Database backup → Google Drive --------------------------------
+    # Destination folder for the weekly pg_dump uploaded by
+    # ``scripts/db_backup_to_gdrive.py`` (driven by the
+    # ``com.familyassistant.dbbackup`` LaunchAgent on Sunday nights).
+    # Paste the *folder URL* you see in the address bar after opening
+    # the destination folder in Google Drive — e.g.
+    # ``https://drive.google.com/drive/u/1/folders/<FOLDER_ID>``. The
+    # uploader extracts the folder id from the tail of the path. Leave
+    # unset to disable the upload step (the cron will still produce a
+    # local dump under ``backups/``). The folder must be readable by
+    # the Google account Avi authenticated with — easiest is to share
+    # it with that account directly. We use the ``drive.file`` OAuth
+    # scope, so Avi can only access files it creates inside the folder
+    # (not anything else in your Drive).
+    DB_BACKUP_GDRIVE: Optional[str] = None
+
     @property
     def database_url(self) -> str:
         return (
