@@ -393,7 +393,10 @@ def process_inbound_sms(
     # failure mode returns ``None`` so we just check the return.
     agent_failed = False
     final_text: Optional[str] = None
-    shortcut_used = False
+    # ``shortcut_used`` tags which fast path (if any) produced the
+    # reply so we can annotate the audit row meta. ``None`` means the
+    # heavy agent handled the turn.
+    shortcut_used: Optional[str] = None
     shortcut_text = web_search_shortcut.try_shortcut_sync(
         (inbound.body or "").strip()
     )
@@ -408,9 +411,29 @@ def process_inbound_sms(
             len(shortcut_text),
         )
         final_text = shortcut_text
-        shortcut_used = True
+        shortcut_used = "web_search"
 
-    if not shortcut_used:
+    if shortcut_used is None:
+        system_prompt = _build_sms_system_prompt(
+            db,
+            family_id=person.family_id,
+            person=person,
+            from_phone=inbound.from_phone,
+            chan=chan,
+        )
+        assistant_id_for_fam = _assistant_id_for_family(db, person.family_id)
+        inbound_attachment_refs = [
+            agent_tools.InboundAttachmentRef(
+                media_index=m["media_index"],
+                filename=m["filename"],
+                mime_type=m.get("mime_type"),
+                size_bytes=m.get("file_size_bytes"),
+                stored_path=m["stored_path"],
+                channel=chan.label.lower(),
+            )
+            for m in attachments_meta
+        ]
+
         logger.info(
             "[orch] surface=%s path=heavy_agent sid=%s task=%s "
             "person_id=%s n_attachments=%d",
@@ -420,43 +443,27 @@ def process_inbound_sms(
             person.person_id,
             inbound.num_media,
         )
-        system_prompt = _build_sms_system_prompt(
-            db,
-            family_id=person.family_id,
-            person=person,
-            from_phone=inbound.from_phone,
-            chan=chan,
-        )
 
-        # The contract with the user is: every inbound message from a
-        # registered family member gets a reply, period. Even if the
-        # agent loop crashes (LLM offline, tool exception, asyncio
-        # glitch, …) we still want SOMETHING to land on their phone
-        # so they know we received the message and aren't silently
-        # dropping it. So: catch everything here and fall back to a
-        # short, honest "I tried but hit a snag" string — the audit
-        # row + the agent_task row keep the full forensic trail for
+        # The contract with the user is: every inbound message
+        # from a registered family member gets a reply, period.
+        # Even if the agent loop crashes (LLM offline, tool
+        # exception, asyncio glitch, …) we still want SOMETHING
+        # to land on their phone so they know we received the
+        # message and aren't silently dropping it. So: catch
+        # everything here and fall back to a short, honest "I
+        # tried but hit a snag" string — the audit row + the
+        # agent_task row keep the full forensic trail for
         # debugging.
         try:
             final_text = _run_agent_to_completion(
                 task_id=task.agent_task_id,
                 family_id=person.family_id,
-                assistant_id=_assistant_id_for_family(db, person.family_id),
+                assistant_id=assistant_id_for_fam,
                 person_id=person.person_id,
                 system_prompt=system_prompt,
                 history=[],
                 user_message=user_message,
-                inbound_attachments=[
-                    agent_tools.InboundAttachmentRef(
-                        media_index=m["media_index"],
-                        filename=m["filename"],
-                        mime_type=m.get("mime_type"),
-                        size_bytes=m.get("file_size_bytes"),
-                        stored_path=m["stored_path"],
-                        channel=chan.label.lower(),
-                    )
-                    for m in attachments_meta
-                ],
+                inbound_attachments=inbound_attachment_refs,
             )
         except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
             logger.exception(
@@ -520,7 +527,7 @@ def process_inbound_sms(
             "agent_task_id": task.agent_task_id,
             "twilio_message_sid": reply_sid,
             "in_reply_to": inbound.message_sid,
-            **({"shortcut": "web_search"} if shortcut_used else {}),
+            **({"shortcut": shortcut_used} if shortcut_used else {}),
         },
     )
     if agent_failed:

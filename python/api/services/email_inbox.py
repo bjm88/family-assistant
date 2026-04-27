@@ -510,7 +510,10 @@ def _handle_one_message(
     # just check the return.
     agent_failed = False
     final_text: Optional[str] = None
-    shortcut_used = False
+    # ``shortcut_used`` tags which fast path (if any) produced the
+    # reply so we can annotate the audit row. ``None`` means the
+    # heavy agent handled the turn.
+    shortcut_used: Optional[str] = None
     shortcut_text = web_search_shortcut.try_shortcut_sync(
         classifier_text
     )
@@ -524,17 +527,9 @@ def _handle_one_message(
             len(shortcut_text),
         )
         final_text = shortcut_text
-        shortcut_used = True
+        shortcut_used = "web_search"
 
-    if not shortcut_used:
-        logger.info(
-            "[orch] surface=email path=heavy_agent message_id=%s task=%s "
-            "person_id=%s n_attachments=%d",
-            msg.message_id,
-            task.agent_task_id,
-            person.person_id,
-            len(msg.attachments),
-        )
+    if shortcut_used is None:
         system_prompt = _build_email_system_prompt(
             db,
             family_id=family_id,
@@ -543,14 +538,34 @@ def _handle_one_message(
             subject=msg.subject,
             assistant_id=assistant_id,
         )
+        inbound_attachment_refs = [
+            agent_tools.InboundAttachmentRef(
+                media_index=p["media_index"],
+                filename=p["filename"],
+                mime_type=p.get("mime_type"),
+                size_bytes=p.get("file_size_bytes"),
+                stored_path=p["stored_path"],
+                channel="email",
+            )
+            for p in persisted_attachments
+        ]
+
+        logger.info(
+            "[orch] surface=email path=heavy_agent message_id=%s task=%s "
+            "person_id=%s n_attachments=%d",
+            msg.message_id,
+            task.agent_task_id,
+            person.person_id,
+            len(msg.attachments),
+        )
 
         # Drive the agent loop synchronously by draining the async
         # generator. Same contract as the SMS / chat paths: every
-        # inbound from a registered family member gets a reply, full
-        # stop. If the agent itself crashes (LLM offline, tool
-        # exception, asyncio glitch, …) we still send a short, honest
-        # fallback so the sender knows we received their email and
-        # aren't silently dropping it.
+        # inbound from a registered family member gets a reply,
+        # full stop. If the agent itself crashes (LLM offline,
+        # tool exception, asyncio glitch, …) we still send a
+        # short, honest fallback so the sender knows we received
+        # their email and aren't silently dropping it.
         try:
             final_text = _run_agent_to_completion(
                 task_id=task.agent_task_id,
@@ -560,17 +575,7 @@ def _handle_one_message(
                 system_prompt=system_prompt,
                 history=history,
                 user_message=user_message,
-                inbound_attachments=[
-                    agent_tools.InboundAttachmentRef(
-                        media_index=p["media_index"],
-                        filename=p["filename"],
-                        mime_type=p.get("mime_type"),
-                        size_bytes=p.get("file_size_bytes"),
-                        stored_path=p["stored_path"],
-                        channel="email",
-                    )
-                    for p in persisted_attachments
-                ],
+                inbound_attachments=inbound_attachment_refs,
             )
         except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
             logger.exception(
@@ -630,7 +635,7 @@ def _handle_one_message(
     )
     if agent_failed:
         status_reason: Optional[str] = "Agent loop crashed; sent fallback apology."
-    elif shortcut_used:
+    elif shortcut_used == "web_search":
         status_reason = "Web-search shortcut handled (skipped heavy agent)."
     else:
         status_reason = None

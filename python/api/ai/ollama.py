@@ -409,6 +409,10 @@ async def chat_with_tools(
     temperature: float = 0.2,
     timeout_seconds: float = 90.0,
     think: Optional[bool] = None,
+    keep_alive: str = "1h",
+    num_ctx: int = 16384,
+    top_k: int = 40,
+    top_p: float = 0.9,
 ) -> ChatWithToolsResult:
     """Single non-streaming chat turn with tool-calling enabled.
 
@@ -424,6 +428,24 @@ async def chat_with_tools(
     the top-level ``think`` flag — set ``True`` for monitoring runs to
     enable extended reasoning on Gemma 4 / models that support it.
     Models that don't expose the flag silently ignore it.
+
+    Hot-cache options
+    -----------------
+    * ``keep_alive`` pins the model in VRAM for an hour between calls
+      so successive agent cycles (and back-to-back inbound messages)
+      don't pay a cold-load penalty. Warmup already pins both models
+      at startup; this keeps them pinned as activity continues.
+    * ``num_ctx`` fixes the KV-cache slot size. Without it Ollama
+      auto-expands the context window per request to fit the prompt,
+      and a change in prompt size between two adjacent calls forces
+      a full KV-cache rebuild — murdering our cross-cycle cache
+      reuse. 16 K is enough for the trimmed inbound prompt (~6-8 K
+      tokens) plus a round or two of tool results. Bump if the agent
+      starts complaining about truncated context.
+    * ``top_k`` / ``top_p`` trim Gemma's modelfile defaults (top_k=64,
+      top_p=0.95) which are tuned for creative writing; a tool-pick
+      decision wants tighter sampling so the model is more likely to
+      reach for the same tool name twice in similar situations.
     """
     target_model = model or _model()
     ollama_messages: List[Dict[str, Any]] = []
@@ -436,7 +458,13 @@ async def chat_with_tools(
         "messages": ollama_messages,
         "stream": False,
         "tools": tools,
-        "options": {"temperature": temperature},
+        "keep_alive": keep_alive,
+        "options": {
+            "temperature": temperature,
+            "num_ctx": num_ctx,
+            "top_k": top_k,
+            "top_p": top_p,
+        },
     }
     if think is not None:
         payload["think"] = bool(think)

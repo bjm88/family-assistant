@@ -473,6 +473,11 @@ def process_inbound_update(
     shortcut_text = web_search_shortcut.try_shortcut_sync(
         (inbound.body or "").strip()
     )
+    ack_sent_message_id: Optional[int] = None
+    # ``shortcut_used`` tags which fast path (if any) produced the
+    # reply so we can annotate the audit row and LiveSessionMessage
+    # meta. ``None`` means the heavy agent handled the turn.
+    shortcut_used: Optional[str] = None
     if shortcut_text:
         logger.info(
             "[orch] surface=telegram path=web_shortcut update_id=%s task=%s "
@@ -484,8 +489,7 @@ def process_inbound_update(
         )
         final_text = shortcut_text
         agent_failed = False
-        ack_sent_message_id: Optional[int] = None
-        shortcut_used = True
+        shortcut_used = "web_search"
     else:
         logger.info(
             "[orch] surface=telegram path=heavy_agent_with_ack_race "
@@ -494,6 +498,7 @@ def process_inbound_update(
             task.agent_task_id,
             person.person_id,
         )
+
         system_prompt = _build_telegram_system_prompt(
             db,
             family_id=person.family_id,
@@ -503,39 +508,40 @@ def process_inbound_update(
             or str(inbound.from_user_id or "?"),
         )
 
-        # ---- Race-and-ack pattern (see api.ai.fast_ack docstring) -
-        # Kick the heavy agent off on a background thread immediately
-        # so we can either:
-        #   (a) send a single reply if the agent finishes inside the
-        #       AI_FAST_ACK_AFTER_SECONDS window (no ack noise for
-        #       short answers), or
-        #   (b) fire a quick contextual "I'm on it" ack from the fast
-        #       model and follow up with the real answer when the
-        #       heavy agent converges.
+        # ---- Race-and-ack pattern (see api.ai.fast_ack docstring)
+        # Kick the heavy agent off on a background thread
+        # immediately so we can either:
+        #   (a) send a single reply if the agent finishes inside
+        #       the AI_FAST_ACK_AFTER_SECONDS window (no ack noise
+        #       for short answers), or
+        #   (b) fire a quick contextual "I'm on it" ack from the
+        #       fast model and follow up with the real answer
+        #       when the heavy agent converges.
         # Either way the audit row reflects exactly what was sent.
-        final_text, agent_failed, ack_sent_message_id = _run_agent_with_fast_ack(
-            db,
-            inbound=inbound,
-            person=person,
-            task_id=task.agent_task_id,
-            assistant_id=assistant_id_for_family,
-            system_prompt=system_prompt,
-            user_message=user_message,
-            session=session,
-            audit=audit,
-            inbound_attachments=[
-                agent_tools.InboundAttachmentRef(
-                    media_index=m["media_index"],
-                    filename=m["filename"],
-                    mime_type=m.get("mime_type"),
-                    size_bytes=m.get("file_size_bytes"),
-                    stored_path=m["stored_path"],
-                    channel="telegram",
-                )
-                for m in attachments_meta
-            ],
+        final_text, agent_failed, ack_sent_message_id = (
+            _run_agent_with_fast_ack(
+                db,
+                inbound=inbound,
+                person=person,
+                task_id=task.agent_task_id,
+                assistant_id=assistant_id_for_family,
+                system_prompt=system_prompt,
+                user_message=user_message,
+                session=session,
+                audit=audit,
+                inbound_attachments=[
+                    agent_tools.InboundAttachmentRef(
+                        media_index=m["media_index"],
+                        filename=m["filename"],
+                        mime_type=m.get("mime_type"),
+                        size_bytes=m.get("file_size_bytes"),
+                        stored_path=m["stored_path"],
+                        channel="telegram",
+                    )
+                    for m in attachments_meta
+                ],
+            )
         )
-        shortcut_used = False
 
     final_text = telegram.truncate_for_telegram(
         final_text or "Got your message — nothing to add right now.",
@@ -577,13 +583,13 @@ def process_inbound_update(
             # reading the transcript can see both halves of the
             # exchange in the right order.
             "ack_telegram_message_id": ack_sent_message_id,
-            **({"shortcut": "web_search"} if shortcut_used else {}),
+            **({"shortcut": shortcut_used} if shortcut_used else {}),
         },
     )
     audit.status = "processed_replied"
     if agent_failed:
         audit.status_reason = "Agent loop crashed; sent fallback apology."
-    elif shortcut_used:
+    elif shortcut_used == "web_search":
         audit.status_reason = (
             "Web-search shortcut handled (skipped heavy agent + ack race)."
         )

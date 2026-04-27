@@ -361,6 +361,42 @@ else
 fi
 
 # ---- Ollama --------------------------------------------------------------
+# Homebrew writes its default plist for ``ollama`` without the env vars
+# that matter for our concurrent-request workload. We patch them into
+# the plist post-install so a ``brew upgrade ollama`` that regenerates
+# the file also gets re-tuned the next time this script runs. Keys
+# tuned:
+#   * OLLAMA_NUM_PARALLEL=2 — lets two inbound inboxes (Telegram +
+#     WhatsApp, say) run the heavy model concurrently instead of
+#     serialising through a single slot. Without this the second
+#     request queues behind the first for its entire prefill, and the
+#     KV cache thrashes between the two.
+#   * OLLAMA_FLASH_ATTENTION=1 and OLLAMA_KV_CACHE_TYPE=q8_0 — already
+#     set on this machine's plist; ensure they survive a reinstall.
+# Uses /usr/libexec/PlistBuddy so we edit the XML correctly. The Set-
+# or-Add idiom is idempotent: a key that already matches is a no-op.
+tune_ollama_plist_env() {
+    local plist="$1"
+    local key="$2"
+    local value="$3"
+    if /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables" "$plist" \
+        >/dev/null 2>&1; then
+        :
+    else
+        /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$plist" \
+            >/dev/null 2>&1 || true
+    fi
+    if /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:${key}" \
+        "$plist" >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:${key} ${value}" \
+            "$plist" >/dev/null 2>&1
+    else
+        /usr/libexec/PlistBuddy -c \
+            "Add :EnvironmentVariables:${key} string ${value}" \
+            "$plist" >/dev/null 2>&1
+    fi
+}
+
 log_step "Ollama"
 case "$(ollama_install_kind)" in
     brew)
@@ -369,11 +405,29 @@ case "$(ollama_install_kind)" in
         else
             log_warn "'brew services start ollama' failed — try 'brew install ollama' first"
         fi
+        OLLAMA_PLIST="${HOME}/Library/LaunchAgents/homebrew.mxcl.ollama.plist"
+        if [[ -f "${OLLAMA_PLIST}" ]]; then
+            tune_ollama_plist_env "${OLLAMA_PLIST}" OLLAMA_NUM_PARALLEL 2
+            tune_ollama_plist_env "${OLLAMA_PLIST}" OLLAMA_FLASH_ATTENTION 1
+            tune_ollama_plist_env "${OLLAMA_PLIST}" OLLAMA_KV_CACHE_TYPE q8_0
+            log_info "  Env     : OLLAMA_NUM_PARALLEL=2, OLLAMA_FLASH_ATTENTION=1, OLLAMA_KV_CACHE_TYPE=q8_0"
+            # Restart so the new env takes effect immediately. Without
+            # this the next inbound message would still hit the old
+            # single-slot daemon until the user reboots.
+            if brew services restart ollama >/dev/null; then
+                log_success "Restarted Ollama with the tuned environment"
+            else
+                log_warn "Could not restart Ollama — run 'brew services restart ollama' manually to apply the new env"
+            fi
+        else
+            log_warn "Ollama plist ${OLLAMA_PLIST} missing — skipping env tune"
+        fi
         ;;
     app)
         log_info "Ollama.app is installed under /Applications."
         log_info "  Open Ollama → Settings and enable 'Launch Ollama on login'."
         log_info "  (The app manages its own launch agent; we don't override it.)"
+        log_info "  For concurrent requests set OLLAMA_NUM_PARALLEL=2 in the app's Advanced settings."
         ;;
     "")
         log_warn "Ollama isn't installed via Homebrew or Ollama.app."
