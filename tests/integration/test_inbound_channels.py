@@ -159,6 +159,297 @@ def test_sms_outbound_uses_messaging_service(client, test_family, db):
     )
 
 
+def test_sms_join_confirms_linked_family(client, test_family, db):
+    """JOIN from a rostered phone confirms the household by name."""
+    sid = f"SM_test_join_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="JOIN",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    with patch(
+        "api.services.sms_inbox._run_agent_to_completion"
+    ) as agent_mock, patch(
+        "api.integrations.twilio_sms.send_sms",
+        side_effect=lambda **kw: sms_calls.append(kw) or "SMjoin-linked",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    agent_mock.assert_not_called()
+    assert len(sms_calls) == 1
+    body = sms_calls[0]["body"]
+    assert test_family["family_name"] in body
+    assert "registered" in body.lower()
+    assert "family" in body.lower()
+    assert "STOP" in body
+    assert "HELP" in body
+
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == sid)
+    ).scalar_one()
+    assert audit.status == "processed_replied"
+    assert audit.person_id == test_family["person_id"]
+    assert audit.reply_message_sid == "SMjoin-linked"
+    assert "campaign join" in (audit.status_reason or "")
+
+
+def test_sms_join_unknown_number_points_at_register_url(client, db):
+    """JOIN from an unlinked phone gets the public register URL, not silence."""
+    from api.config import get_settings
+
+    sid = f"SM_test_join_unk_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone="+15559990000",
+        to_phone="+15550001111",
+        body="join",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    with patch(
+        "api.services.sms_inbox._run_agent_to_completion"
+    ) as agent_mock, patch(
+        "api.integrations.twilio_sms.send_sms",
+        side_effect=lambda **kw: sms_calls.append(kw) or "SMjoin-unknown",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    agent_mock.assert_not_called()
+    assert len(sms_calls) == 1
+    body = sms_calls[0]["body"]
+    assert "register" in body.lower()
+    assert get_settings().PUBLIC_BASE_URL.rstrip("/") in body
+    assert "STOP" in body
+
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == sid)
+    ).scalar_one()
+    assert audit.status == "processed_replied"
+    assert audit.person_id is None
+    assert audit.family_id is None
+
+
+def test_sms_subscribe_is_same_opt_in_as_join(client, test_family, db):
+    """SUBSCRIBE is an advertised opt-in alias for JOIN."""
+    sid = f"SM_test_sub_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="SUBSCRIBE",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    with patch(
+        "api.integrations.twilio_sms.send_sms",
+        side_effect=lambda **kw: sms_calls.append(kw) or "SMsubscribe",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    assert len(sms_calls) == 1
+    assert "registered" in sms_calls[0]["body"].lower()
+    assert test_family["family_name"] in sms_calls[0]["body"]
+
+
+def test_sms_opt_out_sets_flag_and_sends_nothing(client, test_family, db):
+    """STOP-style keywords flip sms_opted_out and never reply."""
+    person = db.get(models.Person, test_family["person_id"])
+    assert person is not None
+    person.sms_opted_out = False
+    person.sms_opted_out_at = None
+    db.commit()
+
+    sid = f"SM_test_stop_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="OPTOUT",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    try:
+        with patch(
+            "api.services.sms_inbox._run_agent_to_completion"
+        ) as agent_mock, patch(
+            "api.integrations.twilio_sms.send_sms",
+            side_effect=lambda **kw: sms_calls.append(kw) or "SMshould-not",
+        ):
+            resp = client.post("/api/sms/twilio/inbound", data=form)
+
+        assert resp.status_code in (200, 204), resp.text
+        agent_mock.assert_not_called()
+        assert sms_calls == []
+
+        db.expire_all()
+        person = db.get(models.Person, test_family["person_id"])
+        assert person is not None
+        assert person.sms_opted_out is True
+        assert person.sms_opted_out_at is not None
+
+        audit = db.execute(
+            select(models.SmsInboxMessage)
+            .where(models.SmsInboxMessage.twilio_message_sid == sid)
+        ).scalar_one()
+        assert audit.status == "ignored_stop"
+        assert audit.person_id == test_family["person_id"]
+    finally:
+        person = db.get(models.Person, test_family["person_id"])
+        if person is not None:
+            person.sms_opted_out = False
+            person.sms_opted_out_at = None
+            db.commit()
+
+
+def test_sms_opted_out_person_gets_no_response(client, test_family, db):
+    """A later normal text from an opted-out person is dropped."""
+    person = db.get(models.Person, test_family["person_id"])
+    assert person is not None
+    person.sms_opted_out = True
+    db.commit()
+
+    sid = f"SM_test_opted_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="What's on my calendar?",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    try:
+        with patch(
+            "api.services.sms_inbox._run_agent_to_completion"
+        ) as agent_mock, patch(
+            "api.integrations.twilio_sms.send_sms",
+            side_effect=lambda **kw: sms_calls.append(kw) or "SMshould-not",
+        ):
+            resp = client.post("/api/sms/twilio/inbound", data=form)
+
+        assert resp.status_code in (200, 204), resp.text
+        agent_mock.assert_not_called()
+        assert sms_calls == []
+        audit = db.execute(
+            select(models.SmsInboxMessage)
+            .where(models.SmsInboxMessage.twilio_message_sid == sid)
+        ).scalar_one()
+        assert audit.status == "ignored_opted_out"
+    finally:
+        person = db.get(models.Person, test_family["person_id"])
+        if person is not None:
+            person.sms_opted_out = False
+            person.sms_opted_out_at = None
+            db.commit()
+
+
+def test_sms_join_clears_prior_opt_out(client, test_family, db):
+    """JOIN after STOP re-enables SMS and confirms the family."""
+    person = db.get(models.Person, test_family["person_id"])
+    assert person is not None
+    person.sms_opted_out = True
+    db.commit()
+
+    sid = f"SM_test_rejoin_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="JOIN",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    try:
+        with patch(
+            "api.integrations.twilio_sms.send_sms",
+            side_effect=lambda **kw: sms_calls.append(kw) or "SMrejoin",
+        ):
+            resp = client.post("/api/sms/twilio/inbound", data=form)
+
+        assert resp.status_code in (200, 204), resp.text
+        assert len(sms_calls) == 1
+        assert "registered" in sms_calls[0]["body"].lower()
+
+        db.expire_all()
+        person = db.get(models.Person, test_family["person_id"])
+        assert person is not None
+        assert person.sms_opted_out is False
+        assert person.sms_opted_out_at is None
+    finally:
+        person = db.get(models.Person, test_family["person_id"])
+        if person is not None:
+            person.sms_opted_out = False
+            person.sms_opted_out_at = None
+            db.commit()
+
+
+def test_sms_help_replies_to_unknown_sender(client, db):
+    """HELP is a campaign keyword — reply even when the number is unknown."""
+    sid = f"SM_test_help_unk_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone="+15559990001",
+        to_phone="+15550001111",
+        body="HELP",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    with patch(
+        "api.integrations.twilio_sms.send_sms",
+        side_effect=lambda **kw: sms_calls.append(kw) or "SMhelp-unknown",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    assert len(sms_calls) == 1
+    body = sms_calls[0]["body"]
+    from api.config import get_settings
+
+    assert "Family AI Assistant" in body or "family's AI assistant" in body
+    assert "household" in body.lower()
+    assert get_settings().PUBLIC_BASE_URL.rstrip("/") in body
+    assert "STOP" in body
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == sid)
+    ).scalar_one()
+    assert audit.status == "processed_replied"
+    assert "campaign help" in (audit.status_reason or "")
+
+
+def test_sms_unknown_sender_still_ignored_for_normal_text(client, db):
+    """A stranger texting something other than JOIN/HELP stays silent."""
+    sid = f"SM_test_unk_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone="+15559990002",
+        to_phone="+15550001111",
+        body="What's for dinner?",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    with patch(
+        "api.integrations.twilio_sms.send_sms",
+        side_effect=lambda **kw: sms_calls.append(kw) or "SMshould-not-send",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    assert sms_calls == []
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == sid)
+    ).scalar_one()
+    assert audit.status == "ignored_unknown_sender"
+
+
 def test_twilio_status_callback_accepted(client):
     """Delivery receipts are public (Twilio-signed) and return 2xx."""
     resp = client.post(

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import List, Optional
 
-from sqlalchemy import BigInteger, Boolean, Date, ForeignKey, String, Text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, String, Text
 from sqlalchemy.sql import false as sql_false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -117,6 +117,29 @@ class Person(Base, TimestampMixin):
             "ALSO be shared with the assistant's Google account "
             "with edit permission — this flag is the in-app consent "
             "half of that pair."
+        ),
+    )
+
+    sms_opted_out: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=sql_false(),
+        comment=(
+            "When true, this person has texted STOP / OPTOUT / "
+            "CANCEL / END / QUIT / UNSUBSCRIBE / REVOKE / STOPALL "
+            "(or an admin flipped the flag). Avi must not send them "
+            "outbound SMS or reply to their texts. Cleared when they "
+            "text JOIN or SUBSCRIBE. Carrier-level Twilio opt-out "
+            "still applies independently."
+        ),
+    )
+    sms_opted_out_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=(
+            "When sms_opted_out last flipped to true. NULL while "
+            "the person is opted in (the default)."
         ),
     )
 

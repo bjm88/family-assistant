@@ -1,5 +1,5 @@
-import { useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import {
@@ -242,15 +242,30 @@ export default function TasksPage() {
   const toast = useToast();
   const { isAdmin } = useAuth();
 
-  // Top-level tab — kanban (human todos) vs. monitoring (Avi-owned
-  // standing jobs). Persisted only in component state so a hard
-  // refresh lands on the kanban; a future enhancement can move this
-  // to URL search params.
-  const [tab, setTab] = useState<TaskKind>("todo");
+  // Top-level tab + open-task id live in the URL so a monitoring
+  // key-event email can deep-link to
+  // `/admin/families/:id/tasks?tab=monitoring&task=123`.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [tab, setTab] = useState<TaskKind>(() =>
+    searchParams.get("tab") === "monitoring" ? "monitoring" : "todo",
+  );
 
   const [createOpen, setCreateOpen] = useState(false);
-  const [activeTaskId, setActiveTaskId] = useState<number | null>(null);
+  const [activeTaskId, setActiveTaskId] = useState<number | null>(() => {
+    const raw = searchParams.get("task");
+    const n = raw ? Number(raw) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : null;
+  });
   const [confirmDelete, setConfirmDelete] = useState<Task | null>(null);
+
+  useEffect(() => {
+    const next = new URLSearchParams();
+    if (tab === "monitoring") next.set("tab", "monitoring");
+    if (activeTaskId != null) next.set("task", String(activeTaskId));
+    if (searchParams.toString() !== next.toString()) {
+      setSearchParams(next, { replace: true });
+    }
+  }, [tab, activeTaskId, searchParams, setSearchParams]);
 
   // Drag-and-drop state. ``draggingId`` drives the source-card
   // opacity; ``dropTarget`` highlights the column the cursor is over.

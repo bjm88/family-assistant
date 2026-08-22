@@ -26,10 +26,11 @@ divergences (sender number, length cap, env flag, live-session
   ``people.{mobile,home,work}_phone_number`` for every family in the
   database, after stripping the ``whatsapp:`` prefix so the same
   person reaching us on SMS and on WhatsApp resolves to the same
-  household member. **All unmatched senders are silently ignored,
-  recorded in ``sms_inbox_messages`` with
-  ``status='ignored_unknown_sender'``.** This is the single security
-  gate — no other code path replies to either surface.
+  household member. **Unmatched senders are silently ignored**
+  (``status='ignored_unknown_sender'``) except A2P campaign keywords
+  (JOIN / START / HELP), which get a canned register-or-confirm
+  reply so the 10DLC campaign can pass review. That is the security
+  gate — the agent loop never runs for a stranger.
 * When the sender does match a registered person we open / reuse a
   ``LiveSession`` keyed on the counterparty's E.164 phone with
   ``source='sms'`` or ``source='whatsapp'`` so the two surfaces keep
@@ -54,10 +55,18 @@ audit row finalisation.
 What this code DELIBERATELY does not do
 ---------------------------------------
 * Reply to anyone whose phone number does not match (after E.164
-  normalisation) one ``Person.{mobile,home,work}_phone_number``.
-* Reply to STOP / UNSUBSCRIBE / END keywords. Twilio handles the
-  carrier-level opt-out; we still record the row but never fire
-  the agent loop.
+  normalisation) one ``Person.{mobile,home,work}_phone_number`` —
+  except the A2P campaign keywords (JOIN / START / YES / UNSTOP /
+  HELP / INFO). Those get a canned reply even from an unknown
+  number so Twilio's 10DLC reviewer can pass the program. The
+  unknown-sender reply is a register-here pointer, not an agent
+  conversation.
+* Reply to STOP / OPTOUT / CANCEL / END / QUIT / UNSUBSCRIBE /
+  REVOKE / STOPALL. Those flip ``people.sms_opted_out`` when the
+  number matches a household member and never get an Avi SMS.
+* Send any SMS (ack, agent reply, campaign HELP, Telegram
+  verification) to a person whose ``sms_opted_out`` flag is set.
+  JOIN / SUBSCRIBE clear the flag and confirm the family name.
 * Loop on its own outbound traffic. If an inbound's ``From`` (after
   stripping ``whatsapp:``) matches ``TWILIO_PRIMARY_PHONE`` (for SMS)
   or ``TWILIO_WHATSAPP_SENDER_NUMBER`` (for WhatsApp) it's recorded
@@ -99,7 +108,32 @@ logger = logging.getLogger(__name__)
 # reply that races Twilio's own STOP confirmation, so we treat them as
 # a hard ignore.
 _OPT_OUT_KEYWORDS: frozenset[str] = frozenset(
-    {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"}
+    {
+        "optout",
+        "opt-out",
+        "cancel",
+        "end",
+        "quit",
+        "unsubscribe",
+        "revoke",
+        "stop",
+        "stopall",
+    }
+)
+
+# A2P 10DLC campaign keywords. JOIN / SUBSCRIBE are the household's
+# advertised opt-in (they also clear people.sms_opted_out). START /
+# YES / UNSTOP are the carrier-standard re-subscribe aliases after a
+# STOP. HELP / INFO are the required support keywords. Exact
+# single-token match only — "please JOIN" still goes through the
+# normal agent / unknown-sender path.
+_OPT_IN_KEYWORDS: frozenset[str] = frozenset(
+    {"join", "subscribe", "start", "yes", "unstop"}
+)
+_HELP_KEYWORDS: frozenset[str] = frozenset({"help", "info"})
+
+_CAMPAIGN_FOOTER = (
+    "Msg & data rates may apply. Reply STOP to unsubscribe, HELP for help."
 )
 
 
@@ -292,17 +326,31 @@ def process_inbound_sms(
         )
 
     # ---- Opt-out keyword --------------------------------------------
+    # STOP / OPTOUT / … flip people.sms_opted_out when we know who
+    # it is. We never send a reply — Twilio's carrier handler may
+    # already confirm STOP, and the household asked us not to text
+    # opted-out numbers at all.
     if _is_opt_out(inbound.body):
-        return _save_audit(
+        return _handle_opt_out(
             db,
-            family_id=None,
-            person_id=None,
-            status="ignored_stop",
-            status_reason=(
-                f"Opt-out keyword received ({inbound.body.strip()!r}); "
-                "Twilio handles the carrier-level opt-out."
-            ),
-            **common,
+            from_phone_bare=from_phone_bare,
+            inbound_body=inbound.body,
+            common=common,
+        )
+
+    # ---- A2P campaign keywords (SMS only) --------------------------
+    # JOIN / SUBSCRIBE / HELP must reply even when the sender is not
+    # a registered household member — Twilio's campaign reviewer
+    # texts these from an unknown number and expects a compliant
+    # canned message, not silence. JOIN also clears sms_opted_out.
+    if chan.channel == "sms" and _is_campaign_keyword(inbound.body):
+        return _handle_campaign_keyword(
+            db,
+            inbound=inbound,
+            from_phone_bare=from_phone_bare,
+            chan=chan,
+            settings=settings,
+            common=common,
         )
 
     # ---- Person lookup ----------------------------------------------
@@ -322,6 +370,26 @@ def process_inbound_sms(
             status_reason=(
                 f"No Person.{{mobile,home,work}}_phone_number across any "
                 f"family matches {inbound.from_phone!r}."
+            ),
+            **common,
+        )
+
+    # A prior STOP/OPTOUT is stored on the person. Do not ack, do
+    # not run the agent, do not send any SMS until they JOIN again.
+    if chan.channel == "sms" and bool(getattr(person, "sms_opted_out", False)):
+        logger.info(
+            "SMS inbox: suppressing reply for opted-out person_id=%s sid=%s",
+            person.person_id,
+            inbound.message_sid,
+        )
+        return _save_audit(
+            db,
+            family_id=person.family_id,
+            person_id=person.person_id,
+            status="ignored_opted_out",
+            status_reason=(
+                "Person has sms_opted_out=true; no outbound or "
+                "response SMS will be sent. Text JOIN to opt back in."
             ),
             **common,
         )
@@ -670,10 +738,218 @@ def _already_processed(db: Session, twilio_message_sid: str) -> bool:
     )
 
 
-def _is_opt_out(body: Optional[str]) -> bool:
+def _keyword_token(body: Optional[str]) -> str:
+    """Single-token, case-folded body used for campaign keyword matching."""
     if not body:
-        return False
-    return body.strip().lower() in _OPT_OUT_KEYWORDS
+        return ""
+    return body.strip().lower()
+
+
+def _is_opt_out(body: Optional[str]) -> bool:
+    return _keyword_token(body) in _OPT_OUT_KEYWORDS
+
+
+def _is_opt_in(body: Optional[str]) -> bool:
+    return _keyword_token(body) in _OPT_IN_KEYWORDS
+
+
+def _is_help(body: Optional[str]) -> bool:
+    return _keyword_token(body) in _HELP_KEYWORDS
+
+
+def _is_campaign_keyword(body: Optional[str]) -> bool:
+    return _is_opt_in(body) or _is_help(body)
+
+
+def _family_short_name(family: Optional[models.Family]) -> str:
+    """'Maisano Family' → 'Maisano' so we can say 'the Maisano family'."""
+    raw = (family.family_name if family else "") or ""
+    name = raw.strip()
+    if name.lower().endswith(" family"):
+        name = name[: -len(" family")].strip()
+    return name
+
+
+def _register_url() -> str:
+    return (get_settings().PUBLIC_BASE_URL or "http://localhost:8000").rstrip(
+        "/"
+    ) + "/"
+
+
+def _campaign_join_body(*, family: Optional[models.Family]) -> str:
+    label = _family_short_name(family)
+    if label:
+        return (
+            f"You are registered with the {label} family. "
+            f"{_CAMPAIGN_FOOTER}"
+        )
+    return (
+        "This number isn't linked to a family yet. Register at "
+        f"{_register_url()} then text JOIN again. {_CAMPAIGN_FOOTER}"
+    )
+
+
+def _set_sms_opt_out(person: models.Person, *, opted_out: bool) -> None:
+    """Flip the per-person SMS consent flag and stamp / clear the time."""
+    person.sms_opted_out = opted_out
+    person.sms_opted_out_at = _utcnow() if opted_out else None
+
+
+def _handle_opt_out(
+    db: Session,
+    *,
+    from_phone_bare: str,
+    inbound_body: Optional[str],
+    common: dict,
+) -> models.SmsInboxMessage:
+    """Record a STOP-style keyword. Never send a reply."""
+    person = _lookup_family_member_by_phone(db, from_phone_bare)
+    token = _keyword_token(inbound_body)
+    if person is not None:
+        _set_sms_opt_out(person, opted_out=True)
+        db.commit()
+        logger.info(
+            "SMS inbox: person_id=%s opted out via %r",
+            person.person_id,
+            token,
+        )
+        return _save_audit(
+            db,
+            family_id=person.family_id,
+            person_id=person.person_id,
+            status="ignored_stop",
+            status_reason=(
+                f"Opt-out keyword {token!r}; sms_opted_out set. "
+                "No SMS reply sent."
+            ),
+            **common,
+        )
+    return _save_audit(
+        db,
+        family_id=None,
+        person_id=None,
+        status="ignored_stop",
+        status_reason=(
+            f"Opt-out keyword {token!r} from an unknown number; "
+            "Twilio handles the carrier-level opt-out."
+        ),
+        **common,
+    )
+
+
+def _campaign_help_body(*, family: Optional[models.Family]) -> str:
+    site = _register_url()
+    label = _family_short_name(family)
+    who = (
+        f"Avi is the {label} family's AI assistant"
+        if label
+        else "Avi is your Family AI Assistant"
+    )
+    return (
+        f"{who} — a private household helper that answers questions, "
+        "keeps the calendar and tasks, and sends reminders over text. "
+        f"Learn more: {site} {_CAMPAIGN_FOOTER}"
+    )
+
+
+def _handle_campaign_keyword(
+    db: Session,
+    *,
+    inbound: twilio_sms.InboundSms,
+    from_phone_bare: str,
+    chan: _ChannelConfig,
+    settings: Settings,
+    common: dict,
+) -> models.SmsInboxMessage:
+    """Canned JOIN / HELP reply for A2P 10DLC campaign compliance.
+
+    Looks the sender up the same way as a normal inbound so a linked
+    phone gets the family name; an unknown phone gets the public
+    register URL. Never opens a session or spends an LLM call.
+    """
+    person = _lookup_family_member_by_phone(db, from_phone_bare)
+    family = (
+        db.get(models.Family, person.family_id) if person is not None else None
+    )
+    if _is_help(inbound.body):
+        if person is not None and bool(getattr(person, "sms_opted_out", False)):
+            return _save_audit(
+                db,
+                family_id=person.family_id,
+                person_id=person.person_id,
+                status="ignored_opted_out",
+                status_reason=(
+                    "HELP received but person has sms_opted_out=true; "
+                    "no SMS sent. Text JOIN to opt back in."
+                ),
+                **common,
+            )
+        reply = _campaign_help_body(family=family)
+        kind = "help"
+    else:
+        if person is not None:
+            _set_sms_opt_out(person, opted_out=False)
+            db.commit()
+        reply = _campaign_join_body(family=family)
+        kind = "join"
+
+    if not chan.sender_number:
+        return _save_audit(
+            db,
+            family_id=person.family_id if person else None,
+            person_id=person.person_id if person else None,
+            status="failed",
+            status_reason=(
+                f"Campaign {kind} keyword received but "
+                f"{chan.sender_env_name} is not configured."
+            ),
+            **common,
+        )
+
+    send_func = _send_for_channel(chan)
+    try:
+        reply_sid = send_func(
+            account_sid=settings.TWILIO_ACCOUNT_SID or "",
+            auth_token=settings.TWILIO_AUTH_TOKEN or "",
+            from_phone=chan.sender_number,
+            to_phone=inbound.from_phone,
+            body=reply,
+            **_outbound_extra(chan, settings),
+        )
+    except twilio_sms.TwilioSendError as exc:
+        logger.exception(
+            "SMS inbox: campaign %s reply failed for sid=%s",
+            kind,
+            inbound.message_sid,
+        )
+        return _save_audit(
+            db,
+            family_id=person.family_id if person else None,
+            person_id=person.person_id if person else None,
+            status="failed",
+            status_reason=f"campaign {kind} twilio send: {exc}",
+            **common,
+        )
+
+    logger.info(
+        "SMS inbox: campaign %s reply sent to %s family=%s sid=%s",
+        kind,
+        inbound.from_phone,
+        family.family_name if family else None,
+        reply_sid,
+    )
+    return _save_audit(
+        db,
+        family_id=person.family_id if person else None,
+        person_id=person.person_id if person else None,
+        status="processed_replied",
+        status_reason=(
+            f"A2P campaign {kind} keyword; canned reply "
+            f"(family={'linked' if family else 'unlinked'})."
+        ),
+        reply_message_sid=reply_sid,
+        **common,
+    )
 
 
 def _lookup_family_member_by_phone(

@@ -257,6 +257,12 @@ def _resolve_invite_channel(
                 "the invite. Try channel='email' or add a phone in "
                 "the admin console first."
             )
+        if bool(getattr(invitee, "sms_opted_out", False)):
+            raise ToolError(
+                f"{invitee.preferred_name or invitee.first_name} has "
+                "opted out of SMS (sms_opted_out). Use channel='email' "
+                "or have them text JOIN to the Avi number first."
+            )
         return "sms", invitee.mobile_phone_number.strip()
 
     if channel == "email":
@@ -269,7 +275,7 @@ def _resolve_invite_channel(
             )
         return "email", invitee.email_address.strip()
 
-    if has_phone:
+    if has_phone and not bool(getattr(invitee, "sms_opted_out", False)):
         return "sms", invitee.mobile_phone_number.strip()
     if has_email:
         return "email", invitee.email_address.strip()

@@ -69,6 +69,7 @@ type PersonForm = {
   interests_and_activities?: string;
   notes?: string;
   ai_can_write_calendar?: boolean;
+  sms_opted_out?: boolean;
 };
 
 export default function PersonDetail() {
@@ -101,6 +102,7 @@ export default function PersonDetail() {
         interests_and_activities: person.interests_and_activities ?? "",
         notes: person.notes ?? "",
         ai_can_write_calendar: person.ai_can_write_calendar ?? false,
+        sms_opted_out: person.sms_opted_out ?? false,
       });
     }
   }, [person, reset]);
@@ -313,6 +315,25 @@ export default function PersonDetail() {
                     />
                     <span className="text-sm text-muted-foreground">
                       Avi may add events to this person's calendar
+                    </span>
+                  </label>
+                </Field>
+              </div>
+              <div className="col-span-2">
+                <Field
+                  label="SMS opt-out"
+                  htmlFor="sms_opted_out"
+                  hint="Set automatically when this person texts STOP, OPTOUT, CANCEL, END, QUIT, UNSUBSCRIBE, REVOKE, or STOPALL. Avi will not send them texts or reply to their SMS until they text JOIN / SUBSCRIBE, or you clear this flag."
+                >
+                  <label className="inline-flex items-center gap-2 cursor-pointer">
+                    <input
+                      id="sms_opted_out"
+                      type="checkbox"
+                      className="h-4 w-4"
+                      {...register("sms_opted_out")}
+                    />
+                    <span className="text-sm text-muted-foreground">
+                      This person has opted out of SMS
                     </span>
                   </label>
                 </Field>

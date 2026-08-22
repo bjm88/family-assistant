@@ -11,13 +11,19 @@ explicit security verdict (:attr:`status`):
 * ``processed_replied``       — sender matched a registered family
   member, the agent loop ran, and Twilio accepted the reply send.
 * ``ignored_unknown_sender``  — sender's phone number did not match
-  any ``Person.{mobile,home,work}_phone_number``. Avi never replies to
-  strangers; this row is the receipt that proves it.
+  any ``Person.{mobile,home,work}_phone_number`` and the body was
+  not an A2P campaign keyword (JOIN / HELP). Avi never runs the
+  agent for strangers; JOIN / HELP from an unknown number are
+  instead ``processed_replied`` with a canned register-here text.
 * ``ignored_self``            — the inbound came from our own Twilio
   number (loopback / status callback misroute).
-* ``ignored_stop``            — the body was a STOP / UNSUBSCRIBE
-  keyword. Twilio handles the carrier-level opt-out automatically;
-  we record the row and move on.
+* ``ignored_stop``            — the body was a STOP / OPTOUT /
+  CANCEL / END / QUIT / UNSUBSCRIBE / REVOKE / STOPALL keyword.
+  We flip ``people.sms_opted_out`` when the number matches a
+  household member and never send a reply (Twilio may still send
+  its own carrier STOP confirmation).
+* ``ignored_opted_out``       — a later inbound from a person whose
+  ``sms_opted_out`` flag is still set. No ack, no agent, no SMS.
 * ``ignored_already_seen``    — dedup hit by ``twilio_message_sid``;
   Twilio retries on transient HTTP failures so we treat duplicate
   webhooks as a noop.
@@ -59,6 +65,7 @@ SMS_INBOX_STATUSES: tuple[str, ...] = (
     "ignored_unknown_sender",
     "ignored_self",
     "ignored_stop",
+    "ignored_opted_out",
     "ignored_already_seen",
     "failed",
 )
@@ -80,8 +87,8 @@ class SmsInboxMessage(Base, TimestampMixin):
         CheckConstraint(
             "status IN ("
             "'processed_replied', 'ignored_unknown_sender', "
-            "'ignored_self', 'ignored_stop', 'ignored_already_seen', "
-            "'failed'"
+            "'ignored_self', 'ignored_stop', 'ignored_opted_out', "
+            "'ignored_already_seen', 'failed'"
             ")",
             name="ck_sms_inbox_messages_status",
         ),

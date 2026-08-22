@@ -20,6 +20,7 @@ SmsInboxStatus = Literal[
     "ignored_unknown_sender",
     "ignored_self",
     "ignored_stop",
+    "ignored_opted_out",
     "ignored_already_seen",
     "failed",
 ]

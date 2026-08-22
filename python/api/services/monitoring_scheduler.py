@@ -57,7 +57,7 @@ from ..ai import ollama, prompts, rag, schema_catalog
 from ..ai import tools as agent_tools
 from ..config import get_settings
 from ..db import SessionLocal
-from . import background_agent, cron_helpers
+from . import background_agent, cron_helpers, monitoring_notify
 
 
 logger = logging.getLogger(__name__)
@@ -299,6 +299,29 @@ def _run_one_monitoring_task(task_id: int) -> None:
             task.last_run_at = datetime.now(timezone.utc)
             db.commit()
 
+        # Key-event email is best-effort and must never flip a
+        # successful run to 'error'. Quiet "nothing new" comments
+        # are classified as no_change and skipped.
+        try:
+            with _session() as db:
+                notify = monitoring_notify.notify_if_key_event(
+                    db,
+                    task_id=task_id,
+                    run_started_at=started_at,
+                    fallback_body=comment_body,
+                )
+            if notify.sent:
+                logger.info(
+                    "monitoring_scheduler: task %d key-event email → %s",
+                    task_id,
+                    notify.detail,
+                )
+        except Exception:  # noqa: BLE001 - notify must not fail the run
+            logger.exception(
+                "monitoring_scheduler: key-event notify failed for task %d",
+                task_id,
+            )
+
         elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
         logger.info(
             "monitoring_scheduler: task %d ('%s') ran in %.1fs (agent_task=%d)",
@@ -400,7 +423,9 @@ def _build_user_message(
         "sources you reference, task_add_comment if you want to break "
         "the report into sections rather than one comment). Your final "
         "narrative answer becomes the new comment posted to the task — "
-        "make it useful, concise, and structured."
+        "make it useful, concise, and structured. Start that final "
+        "comment with FINDING: key_event or FINDING: no_change so the "
+        "household is emailed only when something newsworthy turned up."
     )
     return "\n".join(parts)
 
@@ -477,10 +502,20 @@ def _build_monitoring_system_prompt(
         "  a brief headline + 3-6 short bullets / paragraphs. Use "
         "  Markdown — bold the key takeaways. Don't repeat the task "
         "  description back to the user.\n"
+        "* Start the FINAL comment with exactly one of these tags so "
+        "  the household gets emailed only when it matters:\n"
+        "    FINDING: key_event   — something newsworthy happened "
+        "(a deal, deadline, announcement, listing, significant price "
+        "move, earnings, launch). The system will email the task "
+        "creator and followers a summary plus a link to this task. "
+        "Do NOT call gmail_send yourself.\n"
+        "    FINDING: no_change   — nothing the household needs to "
+        "act on. No email is sent.\n"
         "* If the search tool is not configured, say so plainly in the "
         "  comment so the household admin knows to set up an API key.\n"
-        "* If nothing meaningful changed since the last run, say "
-        "  exactly that in one sentence — better than padding."
+        "* If nothing meaningful changed since the last run, use "
+        "  FINDING: no_change and say that in one sentence — better "
+        "  than padding."
     )
 
     return prompts.with_safety("\n\n".join(parts))

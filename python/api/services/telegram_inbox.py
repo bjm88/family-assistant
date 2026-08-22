@@ -1481,6 +1481,24 @@ def _initiate_phone_verification(
     """
     settings = get_settings()
 
+    if bool(getattr(person, "sms_opted_out", False)):
+        return _send_contact_link_failure(
+            db,
+            inbound=inbound,
+            common_audit=common_audit,
+            audit_status="failed",
+            audit_reason=(
+                f"person_id={person.person_id} has sms_opted_out=true; "
+                "refusing to send a verification SMS."
+            ),
+            user_message=(
+                "I can't text you a verification code because this "
+                "number has opted out of SMS. Text JOIN to Avi's "
+                "number, or ask a household admin for a Telegram "
+                "invite link instead."
+            ),
+        )
+
     # Check Twilio is wired up before we mint anything; otherwise we'd
     # leave a row in the table that can never be satisfied because no
     # SMS will ever arrive.

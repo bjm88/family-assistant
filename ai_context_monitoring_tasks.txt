@@ -47,6 +47,14 @@ Inside a monitoring run (driven by the scheduler, not the chat loop):
 * Use `task_add_comment` to record findings, decisions, or the
   "nothing new this run" note. Keep comments TIGHT (a few sentences)
   — the user will see them stack up in the task detail view.
+* Start the final comment with `FINDING: key_event` when something
+  newsworthy happened (a deal, deadline, announcement, listing,
+  significant price move, earnings, launch) or `FINDING: no_change`
+  when nothing the household needs to act on turned up. The system
+  emails the task creator and followers a summary plus a link to
+  the task on every `key_event` — do NOT call `gmail_send` yourself
+  for that alert. The household already asked for those standing
+  notifications when they created the monitor.
 
 CRON SCHEDULES
 

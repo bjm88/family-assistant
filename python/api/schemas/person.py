@@ -45,6 +45,15 @@ class PersonBase(BaseModel):
             "this flag is the in-app consent half of that pair."
         ),
     )
+    sms_opted_out: Optional[bool] = Field(
+        default=False,
+        description=(
+            "When true, this person has opted out of SMS (STOP / "
+            "OPTOUT / CANCEL / …). Avi will not send them texts or "
+            "reply to inbound SMS until they text JOIN or SUBSCRIBE "
+            "(or an admin clears the flag)."
+        ),
+    )
 
 
 class PersonCreate(PersonBase):
@@ -68,6 +77,7 @@ class PersonUpdate(BaseModel):
     interests_and_activities: Optional[str] = None
     notes: Optional[str] = None
     ai_can_write_calendar: Optional[bool] = None
+    sms_opted_out: Optional[bool] = None
 
 
 class PersonRead(OrmModel):
@@ -90,6 +100,8 @@ class PersonRead(OrmModel):
     interests_and_activities: Optional[str]
     notes: Optional[str]
     ai_can_write_calendar: bool
+    sms_opted_out: bool
+    sms_opted_out_at: Optional[datetime]
     created_at: datetime
     updated_at: datetime
 

@@ -44,6 +44,8 @@ export interface Person {
   interests_and_activities: string | null;
   notes: string | null;
   ai_can_write_calendar: boolean;
+  sms_opted_out: boolean;
+  sms_opted_out_at: string | null;
   created_at: string;
   updated_at: string;
 }

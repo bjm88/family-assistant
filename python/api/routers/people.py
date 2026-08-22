@@ -88,7 +88,16 @@ def update_person(
     db: Session = Depends(get_db),
 ) -> models.Person:
     person = _get_person_or_404(db, person_id)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    if "sms_opted_out" in updates:
+        from datetime import datetime, timezone
+
+        opted = bool(updates["sms_opted_out"])
+        updates["sms_opted_out"] = opted
+        updates["sms_opted_out_at"] = (
+            datetime.now(timezone.utc) if opted else None
+        )
+    for field, value in updates.items():
         setattr(person, field, value)
     db.flush()
     db.refresh(person)
