@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .ai import llm as ai_llm
 from .ai import ollama as ai_ollama
 from .auth import (
     cookie_attrs,
@@ -144,26 +145,44 @@ async def _lifespan(app: FastAPI):
         )
     )
 
-    # Pre-warm both Ollama models so the first chat doesn't pay the
-    # 1–10 s cold-load cost. The fast (e2b) ack model is the more
-    # critical one — its whole job is to land inside a few seconds,
-    # so a cold start blows the AI_FAST_ACK_TIMEOUT_SECONDS budget
-    # and the user never sees the contextual placeholder. We pin
-    # both models for an hour via the warmup helper's keep_alive.
-    #
-    # The warmup is fired-and-forgotten on a background task so a
-    # missing / unpulled model (or a down Ollama) never blocks
-    # FastAPI startup. Both functions log their own outcome.
-    async def _ollama_warmup() -> None:
-        await asyncio.gather(
-            ai_ollama.warmup_model(ai_ollama._model()),
-            ai_ollama.warmup_model(ai_ollama.fast_model()),
-            return_exceptions=True,
-        )
-
-    background_tasks.append(
-        asyncio.create_task(_ollama_warmup(), name="ollama_warmup")
+    logging.getLogger(__name__).info(
+        "LLM provider=%s heavy=%s fast=%s ollama_warmup=%s",
+        ai_llm.provider(),
+        ai_llm._model(),
+        ai_llm.fast_model(),
+        ai_llm.ollama_warmup_enabled(),
     )
+
+    # Pre-warm local Ollama models only when they are actually in
+    # use. The default live path is Grok (remote), so pinning 26B
+    # weights in VRAM is wasted RAM until a household fine-tune is
+    # re-enabled via AI_LLM_PROVIDER=ollama.
+    async def _ollama_warmup_loop() -> None:
+        if not ai_llm.ollama_warmup_enabled():
+            return
+        interval_s = max(60.0, settings.AI_MODEL_KEEPALIVE_INTERVAL_S)
+        while not stop_event.is_set():
+            try:
+                await asyncio.gather(
+                    ai_ollama.warmup_model(settings.AI_OLLAMA_MODEL),
+                    ai_ollama.warmup_model(settings.AI_OLLAMA_FAST_MODEL),
+                    return_exceptions=True,
+                )
+            except Exception:  # noqa: BLE001 - warmup must never crash the loop
+                logging.getLogger(__name__).exception(
+                    "Ollama keep-alive ping crashed; will retry"
+                )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+            except asyncio.TimeoutError:
+                pass
+
+    if ai_llm.ollama_warmup_enabled():
+        background_tasks.append(
+            asyncio.create_task(
+                _ollama_warmup_loop(), name="ollama_warmup_loop"
+            )
+        )
 
     try:
         yield

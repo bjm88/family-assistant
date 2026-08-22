@@ -293,6 +293,60 @@ async def generate(
     return text_out
 
 
+async def chat_oneshot(
+    *,
+    system: str,
+    user: str,
+    model: str,
+    temperature: float = 0.0,
+    max_tokens: int = 8,
+    timeout_s: float = 10.0,
+) -> str:
+    """Minimal non-streaming ``/api/chat`` used by classifiers and acks.
+
+    Uses ``think=False`` so Gemma 4 does not burn the token budget on
+    the hidden thinking channel.
+    """
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+        "think": False,
+        "keep_alive": "1h",
+        "options": {
+            "num_predict": max_tokens,
+            "temperature": temperature,
+        },
+    }
+    request_timeout = httpx.Timeout(
+        connect=5.0, read=timeout_s, write=timeout_s, pool=2.0
+    )
+    try:
+        async with httpx.AsyncClient(timeout=request_timeout) as client:
+            r = await client.post(f"{_base()}/api/chat", json=payload)
+    except httpx.ConnectError as exc:
+        raise OllamaUnavailable(
+            f"Ollama at {_base()} is not responding: {exc}"
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise OllamaTimeout(
+            f"Ollama {model!r} did not respond within {timeout_s:.1f}s "
+            f"({type(exc).__name__})."
+        ) from exc
+    if r.status_code == 404:
+        raise OllamaUnavailable(
+            f"Model '{model}' is not pulled. Run `ollama pull {model}`."
+        )
+    if r.status_code >= 400:
+        raise OllamaError(f"Ollama returned {r.status_code}: {r.text[:400]}")
+    data = r.json()
+    message = data.get("message") or {}
+    return (message.get("content") or "").strip()
+
+
 async def chat_stream(
     messages: List[Dict[str, str]],
     *,
@@ -388,6 +442,9 @@ class ToolCall:
 
     name: str
     arguments: Dict[str, Any]
+    # OpenAI-compatible providers (Grok) require this id on the
+    # subsequent ``role=tool`` message. Ollama ignores it.
+    id: str = ""
 
 
 @dataclass
@@ -408,9 +465,9 @@ async def chat_with_tools(
     model: Optional[str] = None,
     temperature: float = 0.2,
     timeout_seconds: float = 90.0,
-    think: Optional[bool] = None,
+    think: Optional[bool] = False,
     keep_alive: str = "1h",
-    num_ctx: int = 16384,
+    num_ctx: int = 32768,
     top_k: int = 40,
     top_p: float = 0.9,
 ) -> ChatWithToolsResult:
@@ -424,10 +481,18 @@ async def chat_with_tools(
     Temperature defaults low because tool selection is a structured
     decision; bump it for the final answer if you want more flair.
 
-    ``think`` (when not None) is forwarded to Ollama's ``/api/chat`` as
-    the top-level ``think`` flag — set ``True`` for monitoring runs to
-    enable extended reasoning on Gemma 4 / models that support it.
-    Models that don't expose the flag silently ignore it.
+    ``think`` is forwarded to Ollama's ``/api/chat`` as the top-level
+    ``think`` flag. The default is ``False`` because Gemma 4's modelfile
+    enables thinking by default — without an explicit ``think=False``
+    the model can spend its entire ``num_predict`` budget on the
+    hidden ``message.thinking`` channel and return zero
+    ``message.content`` AND zero ``tool_calls`` (the "empty reply"
+    failure mode :class:`api.ai.agent._EmptyModelReply` was added to
+    catch). The monitoring scheduler — the one caller that genuinely
+    benefits from extended reasoning — passes ``think=True`` explicitly.
+    Pass ``None`` to omit the flag entirely (legacy behaviour, useful
+    only for models that crash on an unknown key). Models that don't
+    expose the flag silently ignore it.
 
     Hot-cache options
     -----------------
@@ -439,9 +504,17 @@ async def chat_with_tools(
       auto-expands the context window per request to fit the prompt,
       and a change in prompt size between two adjacent calls forces
       a full KV-cache rebuild — murdering our cross-cycle cache
-      reuse. 16 K is enough for the trimmed inbound prompt (~6-8 K
-      tokens) plus a round or two of tool results. Bump if the agent
-      starts complaining about truncated context.
+      reuse. 32 K accommodates the trimmed inbound prompt (~8-12 K
+      tokens for a typical household) PLUS room for the model to
+      think, emit tool calls, and read tool results without
+      hitting the ceiling. Set to 16 K in earlier revisions —
+      bumped after we observed Gemma 4 silently producing the
+      "empty reply" failure mode when prompt + tools shoved the
+      window flush to the limit (see
+      :class:`api.ai.agent._EmptyModelReply`). The cost is roughly
+      2× KV-cache memory per pinned model; on a Mac Studio with
+      both gemma4:e2b and gemma4:26b kept warm this is well within
+      budget.
     * ``top_k`` / ``top_p`` trim Gemma's modelfile defaults (top_k=64,
       top_p=0.95) which are tuned for creative writing; a tool-pick
       decision wants tighter sampling so the model is more likely to
@@ -695,6 +768,7 @@ __all__ = [
     "OllamaTimeout",
     "OllamaUnavailable",
     "ToolCall",
+    "chat_oneshot",
     "chat_stream",
     "chat_with_tools",
     "fast_model",

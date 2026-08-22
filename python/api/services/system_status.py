@@ -261,10 +261,21 @@ async def _ollama_get_tags(client: httpx.AsyncClient, host: str) -> list[dict[st
     return list(payload.get("models", []))
 
 
+def _ollama_is_parked() -> bool:
+    settings = get_settings()
+    return settings.llm_provider == "grok" and not settings.AI_OLLAMA_ENABLED
+
+
 async def check_ollama_daemon() -> StatusCheck:
-    """Verify the Ollama HTTP server itself responds at all."""
+    """Verify the Ollama HTTP server itself responds at all.
+
+    When Grok is the live provider this row is informational — a
+    missing daemon is ``unknown`` (parked), not ``down``, so it
+    does not turn the whole status page red.
+    """
     settings = get_settings()
     host = settings.AI_OLLAMA_HOST
+    parked = _ollama_is_parked()
     started = _now_ms()
     try:
         async with httpx.AsyncClient() as client:
@@ -273,13 +284,22 @@ async def check_ollama_daemon() -> StatusCheck:
         return StatusCheck(
             key="ollama_daemon",
             label="Ollama daemon",
-            status="down",
+            status="unknown" if parked else "down",
             latency_ms=round(_now_ms() - started, 1),
-            summary=f"No response from {host}",
-            detail={"host": host, "error": str(exc)},
+            summary=(
+                f"Parked (live LLM is Grok). Daemon not running at {host}."
+                if parked
+                else f"No response from {host}"
+            ),
+            detail={"host": host, "error": str(exc), "parked": parked},
             hint=(
-                "Start Ollama: open the Ollama app, or run "
-                "`OLLAMA_HOST=0.0.0.0 ollama serve` in a terminal."
+                "Local models are kept for a future fine-tune. Start "
+                "Ollama only when you flip AI_LLM_PROVIDER=ollama."
+                if parked
+                else (
+                    "Start Ollama: open the Ollama app, or run "
+                    "`OLLAMA_HOST=0.0.0.0 ollama serve` in a terminal."
+                )
             ),
         )
 
@@ -288,8 +308,12 @@ async def check_ollama_daemon() -> StatusCheck:
         label="Ollama daemon",
         status="ok",
         latency_ms=round(_now_ms() - started, 1),
-        summary=f"Reachable at {host}",
-        detail={"host": host},
+        summary=(
+            f"Parked for future fine-tune; reachable at {host}"
+            if parked
+            else f"Reachable at {host}"
+        ),
+        detail={"host": host, "parked": parked},
     )
 
 
@@ -310,14 +334,23 @@ async def check_ollama_models() -> StatusCheck:
         async with httpx.AsyncClient() as client:
             models = await _ollama_get_tags(client, host)
     except Exception as exc:  # noqa: BLE001
+        parked = _ollama_is_parked()
         return StatusCheck(
             key="ollama_models",
             label="Ollama models",
-            status="down",
+            status="unknown" if parked else "down",
             latency_ms=round(_now_ms() - started, 1),
-            summary="Could not list models — daemon unreachable.",
-            detail={"error": str(exc)},
-            hint="Fix the Ollama daemon first; this check derives from /api/tags.",
+            summary=(
+                "Parked (live LLM is Grok). Could not list local models."
+                if parked
+                else "Could not list models — daemon unreachable."
+            ),
+            detail={"error": str(exc), "parked": parked},
+            hint=(
+                "Local models are kept for a future fine-tune."
+                if parked
+                else "Fix the Ollama daemon first; this check derives from /api/tags."
+            ),
         )
 
     installed = sorted({str(m.get("name", "")) for m in models if m.get("name")})
@@ -334,10 +367,11 @@ async def check_ollama_models() -> StatusCheck:
     missing_optional = [t for t in optional if not _present(t)]
 
     if missing_required:
+        parked = _ollama_is_parked()
         return StatusCheck(
             key="ollama_models",
             label="Ollama models",
-            status="down",
+            status="unknown" if parked else "down",
             latency_ms=round(_now_ms() - started, 1),
             summary=f"Missing required model: {', '.join(missing_required)}",
             detail={
@@ -354,10 +388,11 @@ async def check_ollama_models() -> StatusCheck:
         )
 
     if missing_optional:
+        parked = _ollama_is_parked()
         return StatusCheck(
             key="ollama_models",
             label="Ollama models",
-            status="degraded",
+            status="unknown" if parked else "degraded",
             latency_ms=round(_now_ms() - started, 1),
             summary=(
                 f"{len(installed)} models installed · fast model "
@@ -389,22 +424,100 @@ async def check_ollama_models() -> StatusCheck:
     )
 
 
+async def check_grok_api() -> StatusCheck:
+    """Verify GROK_API_KEY can list models at api.x.ai."""
+    settings = get_settings()
+    key = settings.grok_api_key
+    if not key:
+        return StatusCheck(
+            key="grok_api",
+            label="Grok API",
+            status="down" if settings.llm_provider == "grok" else "unknown",
+            summary="GROK_API_KEY (or XAI_API_KEY) is not set in .env.",
+            detail={"provider": settings.llm_provider},
+            hint="Add GROK_API_KEY from https://console.x.ai to .env.",
+        )
+
+    started = _now_ms()
+    try:
+        from ..ai import grok
+
+        models = await grok.list_models()
+    except Exception as exc:  # noqa: BLE001
+        return StatusCheck(
+            key="grok_api",
+            label="Grok API",
+            status="down",
+            latency_ms=round(_now_ms() - started, 1),
+            summary=f"Could not reach {settings.GROK_API_BASE}",
+            detail={"error": str(exc)},
+            hint="Check GROK_API_KEY and network access to api.x.ai.",
+        )
+
+    wanted = [settings.GROK_MODEL, settings.GROK_FAST_MODEL]
+    present = [t for t in wanted if any(t == m or m.startswith(t) for m in models)]
+    return StatusCheck(
+        key="grok_api",
+        label="Grok API",
+        status="ok",
+        latency_ms=round(_now_ms() - started, 1),
+        summary=(
+            f"Key accepted · {len(models)} model(s) visible "
+            f"· live={settings.GROK_MODEL} fast={settings.GROK_FAST_MODEL}"
+        ),
+        detail={
+            "base": settings.GROK_API_BASE,
+            "configured": wanted,
+            "configured_visible": present,
+            "models_preview": models[:12],
+        },
+    )
+
+
 async def check_ai_agent() -> StatusCheck:
-    """End-to-end agent ping: chat with the configured model.
+    """End-to-end ping of the *live* LLM provider.
 
-    A green ``ollama_models`` row proves the tag exists on disk; this
-    proves the model can actually load and produce tokens. We hit
-    ``/api/chat`` (not ``/api/generate``) because that path applies the
-    model's chat template — necessary for instruction-tuned and
-    thinking-style models like Gemma 4 where the raw generate endpoint
-    leaves the chat scaffold to the caller.
-
-    Some thinking models route their first tokens into a separate
-    ``message.thinking`` field; we count that as success too. The point
-    is "did weights load and produce output", not "did the model obey
-    a specific instruction".
+    Grok (default): one cheap generate on the fast model.
+    Ollama: the original /api/chat warmup ping.
     """
     settings = get_settings()
+    if settings.llm_provider == "grok":
+        from ..ai import llm
+
+        started = _now_ms()
+        model = llm.fast_model()
+        try:
+            text = await llm.generate(
+                "Reply with the single word: ok. No explanation.",
+                temperature=0.0,
+                max_tokens=8,
+                model=model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return StatusCheck(
+                key="ai_agent",
+                label="AI agent",
+                status="down",
+                latency_ms=round(_now_ms() - started, 1),
+                summary=f"Grok chat failed: {exc.__class__.__name__}",
+                detail={"model": model, "error": str(exc)},
+                hint="Check GROK_API_KEY and GROK_FAST_MODEL in .env.",
+            )
+        latency = round(_now_ms() - started, 1)
+        preview = (text or "").replace("\n", " ").strip()[:60]
+        return StatusCheck(
+            key="ai_agent",
+            label="AI agent",
+            status="ok" if preview else "degraded",
+            latency_ms=latency,
+            summary=(
+                f'Model "{model}" replied with "{preview}" in {int(latency)} ms'
+                if preview
+                else f'Model "{model}" returned an empty reply.'
+            ),
+            detail={"model": model, "provider": "grok", "response": text},
+        )
+
     host = settings.AI_OLLAMA_HOST
     model = settings.AI_OLLAMA_MODEL
     started = _now_ms()
@@ -1212,10 +1325,11 @@ async def check_telegram_api() -> StatusCheck:
 _CHECK_REGISTRY: list[tuple[str, str, Callable[[], Awaitable[StatusCheck]]]] = [
     ("api", "FastAPI backend", check_api),
     ("postgres", "Postgres", check_postgres),
+    ("grok_api", "Grok API", check_grok_api),
     ("ollama_daemon", "Ollama daemon", check_ollama_daemon),
     ("ollama_models", "Ollama models", check_ollama_models),
     ("ai_agent", "AI agent", check_ai_agent),
-    ("gemini_api", "Gemini API", check_gemini_api),
+    ("gemini_api", "Gemini API (web search)", check_gemini_api),
     ("google_apis", "Google APIs (Gmail + Calendar)", check_google_apis),
     ("telegram_api", "Telegram Bot API", check_telegram_api),
     ("ngrok_local", "ngrok agent", check_ngrok_local),

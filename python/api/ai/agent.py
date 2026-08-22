@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..db import SessionLocal
-from . import ollama, tools
+from . import llm, tools
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,30 @@ DEFAULT_LLM_TIMEOUT_S = 90.0
 # back in, etc.) and clear in seconds. A longer pause just lengthens
 # the user-visible "Avi is thinking" gap on email/SMS/Telegram.
 LLM_TIMEOUT_RETRY_DELAY_S = 1.5
+
+
+class _EmptyModelReply(Exception):
+    """Sentinel raised when the LLM returns 0 tool calls AND 0 content chars.
+
+    Almost always one of two things:
+
+    1. Gemma 4 (and other "thinking" models) burned the entire token
+       budget on the hidden ``thinking`` channel and left the
+       user-visible ``content`` empty. Mitigation is to pass
+       ``think=False`` on the next call — :func:`llm.chat_with_tools`
+       now defaults to that, but a small fraction of turns still
+       degenerate into empty replies when the prompt is at/near the
+       ``num_ctx`` ceiling and the model has no headroom to emit a
+       real tool call OR a real sentence.
+    2. The model decided the conversation is "done" but didn't write
+       a goodbye. Indistinguishable from #1 at this layer and the
+       UX is identical (instant ack from ``fast_ack`` followed by a
+       silent / fallback reply), so we treat both as failures.
+
+    Raised from inside the inner LLM-call retry loop so the existing
+    timeout-retry path (single in-cycle retry, then bail) handles it
+    without duplicating the bookkeeping.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +209,7 @@ async def run_agent(
     started = time.monotonic()
     available_tools = registry.to_ollama_tools(capabilities)
     tool_names_for_log = [t["function"]["name"] for t in available_tools]
-    primary_model_for_log = model_override or ollama._model()
+    primary_model_for_log = llm.resolve_model(model_override)
     logger.info(
         "[agent] task=%s starting family_id=%s person_id=%s assistant_id=%s "
         "model=%s think=%s max_steps=%s tools=%d inbound_attachments=%d (%s)",
@@ -217,7 +241,7 @@ async def run_agent(
             payload={
                 "task_id": task.agent_task_id,
                 "tools": tool_names_for_log,
-                "model": model_override or ollama._model(),
+                "model": llm.resolve_model(model_override),
             },
         )
 
@@ -249,7 +273,7 @@ async def run_agent(
         # monitoring scheduler) point one run at the dedicated
         # AI_OLLAMA_THINKING_MODEL without changing the conversational
         # default for the rest of the surface area.
-        primary_model = model_override or ollama._model()
+        primary_model = llm.resolve_model(model_override)
 
         for cycle in range(max_steps):
             cycle_started = time.monotonic()
@@ -259,10 +283,17 @@ async def run_agent(
             # converts a noisy "agent crashed" into a 1-2s blip the
             # user never sees. We do NOT retry hard errors (4xx, 5xx,
             # ConnectError) because those won't get better in 2 s.
-            timeout_attempts = 0
+            # ``retry_attempts`` is shared by the OllamaTimeout retry and
+            # the _EmptyModelReply retry — both are recoverable transient
+            # failure modes from the same root cause (model stalled / model
+            # spent its budget on hidden thinking), so giving the cycle
+            # ONE total retry across either failure type is the right
+            # budget. Two empty replies in a row, or one empty + one
+            # timeout, both rightly bail the whole task.
+            retry_attempts = 0
             while True:
                 try:
-                    turn = await ollama.chat_with_tools(
+                    turn = await llm.chat_with_tools(
                         messages,
                         tools=available_tools,
                         system=system_prompt,
@@ -270,19 +301,52 @@ async def run_agent(
                         timeout_seconds=DEFAULT_LLM_TIMEOUT_S,
                         think=think,
                     )
+                    # Detect the "empty reply" failure mode BEFORE accepting
+                    # the turn as a final answer. The agent loop's
+                    # final-answer branch used to treat ``content="" +
+                    # tool_calls=[]`` as a perfectly successful "(no
+                    # response)" final and mark the task succeeded — which
+                    # is what was producing the "fast-ack lied" UX where
+                    # the user saw "Setting that up." instantly and then a
+                    # silent fallback 30 s later with NO tool actually
+                    # executed. Now we surface it as a typed retryable
+                    # failure so the same code path that handles transient
+                    # timeouts can give the model one more shot before
+                    # honestly reporting failure to the inbound surface.
+                    if (
+                        not turn.tool_calls
+                        and not (turn.content or "").strip()
+                    ):
+                        raise _EmptyModelReply(
+                            f"Model {turn.model or primary_model!r} returned 0 "
+                            "tool calls and 0 content chars."
+                        )
                     break
-                except ollama.OllamaTimeout as exc:
-                    timeout_attempts += 1
-                    if timeout_attempts > 1:
+                except (llm.LLMTimeout, _EmptyModelReply) as exc:
+                    retry_attempts += 1
+                    is_empty = isinstance(exc, _EmptyModelReply)
+                    failure_label = "empty reply" if is_empty else "timeout"
+                    if retry_attempts > 1:
                         # Already retried once. Give up cleanly with
                         # a typed error step so the email/SMS surface
                         # can render its fallback copy.
+                        err_msg = (
+                            f"LLM {failure_label} (retried once): {exc}"
+                        )
+                        if is_empty:
+                            err_msg += (
+                                " — likely cause: prompt is at the "
+                                "num_ctx ceiling so the model has no "
+                                "headroom to emit a tool call or a "
+                                "sentence. Shrink the system prompt "
+                                "or bump num_ctx."
+                            )
                         step = _append_step(
                             db,
                             task,
                             step_index=step_index,
                             step_type="error",
-                            error=f"LLM timeout (retried once): {exc}",
+                            error=err_msg,
                         )
                         db.commit()
                         yield AgentEvent(
@@ -292,26 +356,27 @@ async def run_agent(
                             db,
                             task,
                             status="failed",
-                            error=str(exc),
+                            error=err_msg,
                             started=started,
                         )
                         yield AgentEvent(
                             type="task_failed",
                             payload={
                                 "task_id": task.agent_task_id,
-                                "error": str(exc),
+                                "error": err_msg,
                             },
                         )
                         return
                     logger.warning(
-                        "Agent task %s: LLM timeout on cycle %d, retrying once: %s",
+                        "Agent task %s: LLM %s on cycle %d, retrying once: %s",
                         task.agent_task_id,
+                        failure_label,
                         cycle,
                         exc,
                     )
                     await asyncio.sleep(LLM_TIMEOUT_RETRY_DELAY_S)
                     continue
-                except ollama.OllamaUnavailable as exc:
+                except llm.LLMUnavailable as exc:
                     step = _append_step(
                         db,
                         task,
@@ -331,7 +396,7 @@ async def run_agent(
                         payload={"task_id": task.agent_task_id, "error": str(exc)},
                     )
                     return
-                except ollama.OllamaError as exc:
+                except llm.LLMError as exc:
                     step = _append_step(
                         db,
                         task,
@@ -394,12 +459,14 @@ async def run_agent(
                         "content": turn.content or "",
                         "tool_calls": [
                             {
+                                "id": c.id or f"call_{step_index}_{i}",
+                                "type": "function",
                                 "function": {
                                     "name": c.name,
                                     "arguments": c.arguments,
-                                }
+                                },
                             }
-                            for c in turn.tool_calls
+                            for i, c in enumerate(turn.tool_calls)
                         ],
                     }
                 )
@@ -428,6 +495,7 @@ async def run_agent(
                         {
                             "role": "tool",
                             "name": call.name,
+                            "tool_call_id": call.id or f"call_{step_index}",
                             "content": json.dumps(
                                 result.to_payload(), default=str, ensure_ascii=False
                             ),

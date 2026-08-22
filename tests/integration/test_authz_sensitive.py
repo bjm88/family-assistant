@@ -564,15 +564,15 @@ def test_live_chat_skips_family_qa_shortcut_for_sensitive_asks(
     to the family_qa fast model — even when the shortcut feature flag
     is on.
 
-    We mock the heavy agent so we don't need Ollama, and we patch
-    ``family_qa_router.try_shortcut`` to record whether it was called.
-    The contract: for a sensitive-identifier ask, the live-chat
-    endpoint must skip ``try_shortcut`` and run the heavy agent
-    instead. (The heavy agent's tool layer is what we already covered
-    in the tests above; here we just prove the router takes the right
-    branch.)
+    Mocks the heavy agent (so we don't need Ollama) and the unified
+    triage call. We assert that the chat handler passes
+    ``allow_family_qa=False`` to :func:`fast_action_router.try_triage`
+    when the inbound message is a sensitive-identifier ask, which is
+    the new way the gate is enforced after the triage merge.
     """
     from unittest.mock import patch
+
+    from api.ai import fast_action_router
 
     # Mint a real session cookie the same way ``/api/auth/google/callback``
     # would for a non-admin family member of the persistent test
@@ -603,18 +603,17 @@ def test_live_chat_skips_family_qa_shortcut_for_sensitive_asks(
         if False:  # pragma: no cover - keeps the function a generator
             yield None
 
-    shortcut_called: list[str] = []
+    captured_kwargs: list[dict] = []
 
-    async def _fake_shortcut(*_args, **_kwargs):
-        shortcut_called.append(_kwargs.get("recognized_person_id", "?"))
-        return None
+    async def _fake_triage(*_args, **kwargs):
+        captured_kwargs.append(kwargs)
+        return fast_action_router.TriageResult(
+            label=fast_action_router.LABEL_HEAVY
+        )
 
     with patch("api.routers.ai_chat.agent_loop.run_agent", _fake_agent), patch(
-        "api.routers.ai_chat.family_qa_router.try_shortcut",
-        _fake_shortcut,
-    ), patch(
-        "api.routers.ai_chat.web_search_shortcut.try_shortcut",
-        return_value=None,
+        "api.routers.ai_chat.fast_action_router.try_triage",
+        _fake_triage,
     ):
         resp = client.post(
             "/api/aiassistant/chat",
@@ -630,9 +629,13 @@ def test_live_chat_skips_family_qa_shortcut_for_sensitive_asks(
         )
 
     assert resp.status_code == 200, resp.text
-    assert not shortcut_called, (
-        "family_qa_router.try_shortcut MUST be skipped for sensitive "
-        "identifier asks so the heavy agent's deterministic authz "
-        "tools make the call. It was invoked instead — the routing "
-        "guard in api.routers.ai_chat is broken."
+    assert len(captured_kwargs) == 1, (
+        f"Expected exactly one triage call, got {len(captured_kwargs)}"
+    )
+    assert captured_kwargs[0].get("allow_family_qa") is False, (
+        "For sensitive-identifier asks, the live-chat router MUST pass "
+        "``allow_family_qa=False`` to fast_action_router.try_triage so "
+        "the family_qa fast tier never sees the question — the heavy "
+        "agent's deterministic privacy gate makes the call instead. "
+        f"Got kwargs={captured_kwargs[0]!r}"
     )

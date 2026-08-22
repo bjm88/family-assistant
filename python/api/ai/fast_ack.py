@@ -46,10 +46,9 @@ import asyncio
 import logging
 from typing import Optional
 
-import httpx
-
 from ..config import get_settings
-from .ollama import OllamaError, OllamaTimeout, OllamaUnavailable, _base, fast_model
+from . import llm
+from .llm import LLMError, LLMUnavailable, fast_model
 
 
 logger = logging.getLogger(__name__)
@@ -191,12 +190,13 @@ def generate_contextual_ack_sync(
 
     async def _call() -> str:
         return await asyncio.wait_for(
-            _chat_oneshot(
+            llm.chat_oneshot(
                 system=_SYSTEM_PROMPT,
                 user=user_prompt,
                 model=fast_model(),
                 temperature=0.4,
                 max_tokens=80,
+                timeout_s=cap,
             ),
             timeout=cap,
         )
@@ -209,13 +209,11 @@ def generate_contextual_ack_sync(
             cap,
         )
         return None
-    except OllamaUnavailable as exc:
-        # Fast model isn't pulled, or Ollama itself is down. Expected
-        # in dev / fresh installs; never bubble up.
+    except LLMUnavailable as exc:
         logger.debug("[fast_ack] %s — skipping ack", exc)
         return None
-    except OllamaError as exc:
-        logger.warning("[fast_ack] Ollama error %s — skipping ack", exc)
+    except LLMError as exc:
+        logger.warning("[fast_ack] LLM error %s — skipping ack", exc)
         return None
     except Exception:  # noqa: BLE001 - last-resort safety
         logger.exception("[fast_ack] unexpected error — skipping ack")
@@ -269,12 +267,13 @@ async def generate_contextual_ack_async(
 
     try:
         text = await asyncio.wait_for(
-            _chat_oneshot(
+            llm.chat_oneshot(
                 system=_SYSTEM_PROMPT,
                 user=user_prompt,
                 model=fast_model(),
                 temperature=0.4,
                 max_tokens=80,
+                timeout_s=cap,
             ),
             timeout=cap,
         )
@@ -284,11 +283,11 @@ async def generate_contextual_ack_async(
             cap,
         )
         return None
-    except OllamaUnavailable as exc:
+    except LLMUnavailable as exc:
         logger.debug("[fast_ack] %s — skipping ack", exc)
         return None
-    except OllamaError as exc:
-        logger.warning("[fast_ack] Ollama error %s — skipping ack", exc)
+    except LLMError as exc:
+        logger.warning("[fast_ack] LLM error %s — skipping ack", exc)
         return None
     except Exception:  # noqa: BLE001 - last-resort safety
         logger.exception("[fast_ack] unexpected error — skipping ack")
@@ -302,83 +301,6 @@ async def generate_contextual_ack_async(
         len(cleaned or ""),
     )
     return cleaned
-
-
-async def _chat_oneshot(
-    *,
-    system: str,
-    user: str,
-    model: str,
-    temperature: float,
-    max_tokens: int,
-) -> str:
-    """Single non-streaming Ollama ``/api/chat`` call returning ``content``.
-
-    We deliberately bypass :func:`api.ai.ollama.generate` for two
-    reasons:
-
-    1. Gemma 4 is a *thinking* model. The raw ``/api/generate``
-       endpoint does not surface the thinking-vs-reply split, so the
-       model burns the entire ``num_predict`` budget on hidden
-       reasoning and returns an empty ``response`` field. Using
-       ``/api/chat`` (which applies the model's chat template and
-       routes thinking into ``message.thinking``) makes the actual
-       reply land in ``message.content``.
-    2. We pass ``"think": false`` to skip the reasoning step entirely
-       — for a 1-sentence ack the reasoning would take longer than
-       the ack itself.
-
-    Errors are mapped onto the same exception types the rest of
-    :mod:`api.ai.ollama` raises so callers can keep their existing
-    handlers.
-    """
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "stream": False,
-        "think": False,
-        # Pin the fast model in Ollama's memory for an hour so the
-        # next ack call doesn't pay the cold-load cost. Combined
-        # with the lifespan warmup this means even the very first
-        # ack of the day lands within ~500 ms instead of 3–4 s.
-        "keep_alive": "1h",
-        "options": {
-            "num_predict": max_tokens,
-            "temperature": temperature,
-        },
-    }
-    # Same structured timeout shape as chat_with_tools: fail-fast on
-    # connect, give the read the full per-call budget. The fast-ack
-    # budget is intentionally short (the user is staring at a blank
-    # live-chat bubble), so a stalled read should give up cleanly
-    # instead of letting an httpcore.ReadTimeout bubble up raw.
-    request_timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=2.0)
-    try:
-        async with httpx.AsyncClient(timeout=request_timeout) as client:
-            r = await client.post(f"{_base()}/api/chat", json=payload)
-    except httpx.ConnectError as exc:
-        raise OllamaUnavailable(
-            f"Ollama at {_base()} is not responding: {exc}"
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise OllamaTimeout(
-            f"Fast-ack model {model!r} did not respond within 10s "
-            f"({type(exc).__name__})."
-        ) from exc
-
-    if r.status_code == 404:
-        raise OllamaUnavailable(
-            f"Model '{model}' is not pulled. Run `ollama pull {model}`."
-        )
-    if r.status_code >= 400:
-        raise OllamaError(f"Ollama returned {r.status_code}: {r.text[:400]}")
-
-    data = r.json()
-    message = data.get("message") or {}
-    return (message.get("content") or "").strip()
 
 
 def _run_async(coro):
@@ -489,8 +411,29 @@ def heuristic_ack(last_user_message: Optional[str]) -> str:
     return "Working on it."
 
 
+def maybe_action_ack(last_user_message: Optional[str]) -> Optional[str]:
+    """Same buckets as :func:`heuristic_ack` but ``None`` on no match.
+
+    Used by SMS / WhatsApp / Telegram where sending an ack costs an
+    extra outbound message — we only want to fire it when the message
+    clearly looks like an *action* the user wants Avi to take. For
+    chit-chat / recall ("thanks", "who is Sarah") the unified triage
+    will hand the answer back inside ~1 s anyway, so the extra ack
+    message would just add noise.
+    """
+    head = (last_user_message or "").strip().lower()[:120]
+    if not head:
+        return None
+    for keywords, ack in _HEURISTIC_BUCKETS:
+        for kw in keywords:
+            if kw in head:
+                return ack
+    return None
+
+
 __all__ = [
     "generate_contextual_ack_sync",
     "generate_contextual_ack_async",
     "heuristic_ack",
+    "maybe_action_ack",
 ]

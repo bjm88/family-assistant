@@ -83,6 +83,23 @@ os.environ.setdefault("AI_SMS_INBOUND_ENABLED", "true")
 # would hijack a "what's the weather?" prompt; for tests we want the
 # normal agent flow (which we mock).
 os.environ.setdefault("AI_WEB_SEARCH_SHORTCUT_ENABLED", "false")
+# Signed-cookie sessions need a secret even in tests — without this
+# ``sign_session`` raises and every admin / live-chat endpoint 401s.
+os.environ.setdefault(
+    "SESSION_SECRET_KEY", "integration-test-secret-key-not-for-prod"
+)
+os.environ.setdefault("ADMIN_EMAILS", "integration-admin@example.com")
+# Family-QA now falls back to the regular fast model when no
+# fine-tune tag is set. Force it off in tests so a stray un-mocked
+# triage path can't try to reach Ollama.
+os.environ.setdefault("AI_FAMILY_QA_SHORTCUT_ENABLED", "false")
+# Live LLM is Grok. Tests mock the brain, so a dummy key is enough
+# to construct settings without touching api.x.ai.
+os.environ.setdefault("AI_LLM_PROVIDER", "grok")
+os.environ.setdefault("GROK_API_KEY", "test-grok-key-not-for-prod")
+os.environ.setdefault("GROK_MODEL", "grok-4.6")
+os.environ.setdefault("GROK_FAST_MODEL", "grok-4.3")
+os.environ.setdefault("AI_OLLAMA_ENABLED", "false")
 
 # ---------------------------------------------------------------------------
 # Now safe to import the app + DB layer. Everything below runs with the
@@ -246,7 +263,26 @@ def client(app):
     NOT using the ``with TestClient(app):`` form — TestClient still
     works for plain request dispatch without it.
     """
-    return TestClient(app)
+    from api.auth import ROLE_ADMIN, sign_session
+
+    token = sign_session(
+        email="integration-admin@example.com",
+        role=ROLE_ADMIN,
+        person_id=None,
+        family_id=None,
+    )
+    tc = TestClient(app)
+    # Admin cookie so /api/admin/* and /api/aiassistant/* (require_user)
+    # work. Inbound webhooks ignore the cookie and still auth by
+    # phone / telegram id / sender email.
+    tc.cookies.set(get_settings().SESSION_COOKIE_NAME, token)
+    return tc
+
+
+@pytest.fixture
+def authed_client(client):
+    """Alias for ``client`` — both carry the admin session cookie."""
+    return client
 
 
 @pytest.fixture

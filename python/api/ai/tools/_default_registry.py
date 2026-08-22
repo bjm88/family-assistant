@@ -521,6 +521,15 @@ def build_default_registry() -> ToolRegistry:
             parameters=_tasks.TASK_ATTACH_MESSAGE_ATTACHMENT_SCHEMA,
             handler=_tasks.handle_task_attach_message_attachment,
             timeout_seconds=15.0,
+            # Gated on the synthetic ``inbound_attachment`` capability
+            # (added by the inbound-channel services when at least one
+            # attachment came in on this turn). Hiding the tool when
+            # there's nothing to attach trims the heavy agent's tool
+            # catalog by one bulky schema on every text-only inbound
+            # — the model can't accidentally claim it attached
+            # something either, and the prompt-tokens / num_ctx budget
+            # both breathe a little easier.
+            requires=("inbound_attachment",),
             examples=(
                 "Make a task to review this house, details attached as a PDF.",
                 "Save the photo I just sent to the broken-fence task.",

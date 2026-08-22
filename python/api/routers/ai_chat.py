@@ -33,9 +33,9 @@ from ..auth import (
 from ..ai import agent as agent_loop
 from ..ai import assistants as _assistants
 from ..ai import chat_prompts
-from ..ai import family_qa_router
 from ..ai import fast_ack
-from ..ai import ollama
+from ..ai import fast_action_router
+from ..ai import llm, ollama
 from ..ai import planner as ai_planner
 from ..ai import prompts
 from ..ai import rag
@@ -44,7 +44,6 @@ from ..ai import sensitive_intent
 from ..ai import session as live_session
 from ..ai import sql_tool
 from ..ai import tools as agent_tools
-from ..ai import web_search_shortcut
 from ..config import get_settings
 from ..db import SessionLocal, get_db
 
@@ -132,108 +131,21 @@ def _load_assistant(db: Session, family_id: int) -> tuple[str, Optional[str]]:
 _assistant_id_for = _assistants.assistant_id_for_family
 
 
-def _shortcut_stream_response(
-    *,
-    final_text: str,
-    live_session_id: Optional[int],
-    family_id: int,
-    recognized_person_id: Optional[int],
-    user_message: str,
-    shortcut_name: str,
-    used_model: str,
-) -> StreamingResponse:
-    """Wrap a one-shot shortcut answer as a SSE stream.
-
-    Matches the shape the live-chat UI already consumes from the
-    heavy-agent path so the front-end needs no changes:
-
-    1. ``{"task_id": null}`` — no agent_task row exists for shortcut
-       turns (per the "minimal audit" design choice). The UI tolerates
-       a null id; the navigation breadcrumb just won't be clickable.
-    2. ``{"delta": "..."}`` — the answer text in one chunk.
-    3. ``{"type": "task_completed", "summary": ...}`` — synthesised so
-       any client logic that waits on ``task_completed`` keeps working.
-    4. ``{"done": true}`` — terminal marker, identical to the heavy
-       path.
-
-    ``shortcut_name`` (e.g. ``"web_search"`` or ``"family_qa"``) +
-    ``used_model`` are surfaced in the SSE ``task_completed`` event
-    and in the live-session transcript ``meta`` so debugging tools
-    and the History view can tell the two shortcut paths apart.
-
-    The user message has already been logged to the live-session
-    transcript by the caller (or rather, would have been — but the
-    shortcut path runs BEFORE the normal logging step, so we do
-    BOTH the user log and the assistant log here in one pass).
-    """
-
-    async def _stream():
-        yield f"data: {json.dumps({'task_id': None})}\n\n"
-        yield f"data: {json.dumps({'delta': final_text})}\n\n"
-        yield (
-            "data: "
-            + json.dumps(
-                {
-                    "type": "task_completed",
-                    "task_id": None,
-                    "summary": final_text,
-                    "shortcut": shortcut_name,
-                }
-            )
-            + "\n\n"
-        )
-
-        # Persist BOTH messages so the History view shows the full
-        # exchange. We open a private session because the request-
-        # scoped one was closed when the StreamingResponse started.
-        if live_session_id is not None:
-            log_db = SessionLocal()
-            try:
-                log_session = log_db.get(models.LiveSession, live_session_id)
-                if log_session is not None and log_session.family_id == family_id:
-                    if user_message:
-                        live_session.log_message(
-                            log_db,
-                            log_session,
-                            role="user",
-                            content=user_message,
-                            person_id=recognized_person_id,
-                            meta={"kind": "chat"},
-                        )
-                    live_session.log_message(
-                        log_db,
-                        log_session,
-                        role="assistant",
-                        content=final_text,
-                        person_id=recognized_person_id,
-                        meta={
-                            "kind": "chat",
-                            "shortcut": shortcut_name,
-                            "used_model": used_model,
-                        },
-                    )
-                    log_db.commit()
-            except Exception:  # noqa: BLE001 — logging must never break the stream
-                logger.exception(
-                    "%s shortcut: failed to log assistant chat "
-                    "message for live_session=%s",
-                    shortcut_name,
-                    live_session_id,
-                )
-                log_db.rollback()
-            finally:
-                log_db.close()
-
-        yield f"data: {json.dumps({'done': True})}\n\n"
-
-    return StreamingResponse(_stream(), media_type="text/event-stream")
-
-
 # ---------- Status --------------------------------------------------------
 
 
 @router.get("/status", response_model=StatusResponse)
 async def status(_: CurrentUser = Depends(require_user)) -> StatusResponse:
+    if llm.provider() == "grok":
+        key_ok = bool(get_settings().grok_api_key)
+        return StatusResponse(
+            host=get_settings().GROK_API_BASE,
+            model=llm._model(),
+            available=key_ok,
+            model_pulled=key_ok,
+            installed_models=[llm._model(), llm.fast_model()],
+            error=None if key_ok else "GROK_API_KEY is not set",
+        )
     info = await ollama.health()
     return StatusResponse(**info)  # type: ignore[arg-type]
 
@@ -279,11 +191,18 @@ async def warmup(_: CurrentUser = Depends(require_user)) -> WarmupResponse:
 
     No DB session, no auth — pure Ollama plumbing.
     """
-    heavy_tag = ollama._model()
-    fast_tag = ollama.fast_model()
+    heavy_tag = llm._model()
+    fast_tag = llm.fast_model()
+    if not llm.ollama_warmup_enabled():
+        return WarmupResponse(
+            heavy=heavy_tag,
+            fast=fast_tag,
+            heavy_loaded=True,
+            fast_loaded=True,
+        )
     heavy_loaded, fast_loaded = await asyncio.gather(
-        ollama.warmup_model(heavy_tag),
-        ollama.warmup_model(fast_tag),
+        ollama.warmup_model(get_settings().AI_OLLAMA_MODEL),
+        ollama.warmup_model(get_settings().AI_OLLAMA_FAST_MODEL),
         return_exceptions=False,
     )
     return WarmupResponse(
@@ -553,22 +472,19 @@ async def followup(
     # The fallback wrapper transparently uses the main chat model if
     # the fast tag isn't pulled yet.
     try:
-        question, followup_model = await ollama.generate_with_fallback(
+        question, followup_model = await llm.generate_with_fallback(
             prompt,
-            primary_model=ollama.fast_model(),
+            primary_model=llm.fast_model(),
             system=system,
             temperature=0.8,
             max_tokens=120,
         )
-    except ollama.OllamaUnavailable as e:
+    except llm.LLMUnavailable as e:
         raise HTTPException(
             status_code=503,
-            detail=(
-                f"Local LLM is not available: {e}. Start Ollama and run "
-                f"`ollama pull {ollama._model()}`."
-            ),
+            detail=f"LLM is not available: {e}",
         )
-    except ollama.OllamaError as e:
+    except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
     raw_question = (question or "").strip()
@@ -695,34 +611,41 @@ async def chat(
     request: Request,
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
-    """Streaming chat endpoint, driven by the AI agent loop.
+    """Streaming chat endpoint, driven by the unified triage router.
 
-    Each invocation creates one ``agent_tasks`` row + N ``agent_steps``
-    rows so every tool call Avi makes is auditable. The SSE stream
-    emits a mix of these event shapes:
+    Pipeline (matches the SMS / WhatsApp / Telegram surfaces in spirit
+    so the "Avi acknowledges instantly" UX contract is identical
+    everywhere):
 
-    * ``{"task_id": ...}`` — sent first so the UI can subscribe to the
-      task page or render an in-flight progress card.
-    * ``{"type": "fast_ack", "text": ...}`` — *optional, at most one
-      per turn.* Sent if the heavy agent hasn't started streaming text
-      within :setting:`AI_FAST_ACK_AFTER_SECONDS`. The UI shows it as
-      a transient placeholder bubble that's replaced when the real
-      reply arrives. Mirrors the Telegram / SMS fast-ack pattern so
-      every surface behaves the same way.
-    * ``{"step": {...}}`` — one event per model thought, tool call, and
-      tool result. The UI renders these as inline timeline entries.
-    * ``{"delta": "..."}`` — final natural-language reply (sent in one
-      chunk after the agent loop converges; older clients that just
-      append deltas continue to work unmodified).
-    * ``{"done": true}`` — terminal marker; the UI clears its
-      "streaming" indicator on this.
+    1.  **Instant heuristic ack.** First byte of the SSE stream is
+        ``{"type": "fast_ack", "text": ..., "fast_ack_kind":
+        "heuristic"}`` — pure Python, no LLM call, ~10 µs. The user
+        sees Avi confirm the message before any classifier runs.
+    2.  **Unified triage** (:func:`api.ai.fast_action_router.try_triage`).
+        One fast-model call decides between WEB / FAMILY_QA /
+        per-intent action / HEAVY. Bounded by
+        :setting:`AI_FAST_ACTION_CLASSIFIER_TIMEOUT_S`; every failure
+        path returns ``label=HEAVY`` so the heavy agent runs.
+    3.  **Shortcut path** — if triage handled the turn, stream the
+        reply as ``{"task_id": null}`` + ``{"delta": ...}`` +
+        ``{"type": "task_completed", ...}`` + ``{"done": true}``.
+        No AgentTask row is created (per the minimal-audit choice
+        for WEB / FAMILY_QA; the action runner creates its own
+        internally).
+    4.  **Heavy path** — :func:`_heavy_agent_stream` takes over.
+        Creates the AgentTask, emits its ``task_id``, runs the
+        full :func:`api.ai.agent.run_agent` loop, optionally races
+        an e2b "upgrade" ack against the first model delta.
 
-    When a ``live_session_id`` is provided the server still records the
-    user message (before the agent runs) and the final assistant reply
-    (after) into the live-session transcript, so the History page is
-    unchanged. The fast-ack, when emitted, is also logged with
-    ``meta.kind="live_fast_ack"`` so the History view can replay it
-    in order.
+    Either path closes with ``{"done": true}`` so the UI's
+    streaming-indicator teardown is uniform.
+
+    When a ``live_session_id`` is provided the server records the
+    user message (in this handler, before the stream) and the final
+    assistant reply (inside the stream, in a fresh DB session). The
+    instant heuristic ack and any e2b upgrade ack are also logged
+    with ``meta.kind="live_fast_ack"`` so the History view replays
+    them in order.
     """
     user = require_family_member(payload.family_id, request)
     if db.get(models.Family, payload.family_id) is None:
@@ -735,97 +658,31 @@ async def chat(
     if not user.is_admin and user.person_id is not None:
         payload.recognized_person_id = user.person_id
 
-    # ---------- Fast-path web-search shortcut ---------------------------
-    #
-    # Before we do ANY heavy setup (RAG, registry, schema dump, system
-    # prompt), give the lightweight Gemma classifier ~300 ms to decide
-    # whether this turn is a pure web-lookup ask. If yes, we stream
-    # Gemini's grounded answer straight back and skip the heavy agent
-    # loop entirely (~5-10 s saved). If no — or if anything fails —
-    # we fall through to the existing flow with no behavioural change.
-    # The classifier itself is bounded by
-    # `AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S` and returns
-    # `False` on every error path, so this is always safe to call.
+    # ---------- Setup (fast pre-stream prep) ---------------------------
+    # Everything here is cheap DB reads that we want done while the
+    # request-scoped session is still open. The actual classifier,
+    # shortcut runner, and heavy agent all run inside the SSE stream
+    # so the user sees the heuristic ack on byte one.
+    settings = get_settings()
     latest_user_for_shortcut = next(
         (m.content for m in reversed(payload.messages) if m.role == "user"),
         "",
     ).strip()
-    if (
-        latest_user_for_shortcut
-        and get_settings().AI_WEB_SEARCH_SHORTCUT_ENABLED
-    ):
-        # ``try_shortcut`` is total — every failure mode returns
-        # ``None`` so we just check the return.
-        shortcut_text = await web_search_shortcut.try_shortcut(
-            latest_user_for_shortcut
-        )
-        if shortcut_text:
-            logger.info(
-                "[orch] surface=live_chat path=web_shortcut "
-                "family_id=%s session=%s reply_chars=%d msg=%r "
-                "(skipping heavy agent)",
-                payload.family_id,
-                payload.live_session_id,
-                len(shortcut_text),
-                latest_user_for_shortcut[:80],
-            )
-            return _shortcut_stream_response(
-                final_text=shortcut_text,
-                live_session_id=payload.live_session_id,
-                family_id=payload.family_id,
-                recognized_person_id=payload.recognized_person_id,
-                user_message=latest_user_for_shortcut,
-                shortcut_name="web_search",
-                used_model="gemini_grounded",
-            )
+    history = [m.model_dump() for m in payload.messages]
+    latest_user_content = next(
+        (m["content"] for m in reversed(history) if m["role"] == "user"),
+        "",
+    )
 
     assistant_name, family_name = _load_assistant(db, payload.family_id)
+    assistant_id = _assistant_id_for(db, payload.family_id)
+    requestor_is_admin = bool(user.is_admin)
 
-    # ---------- Fast-path fine-tuned family-Q&A shortcut -----------------
-    #
-    # If the web-search classifier said "AGENT" (so we didn't return
-    # above), see whether the question can be answered by the fine-
-    # tuned lightweight model directly — using the same RAG block the
-    # heavy agent would build, but without any tool plumbing or plan/
-    # execute/observe loop. When this lands we save ~10-15 s per turn
-    # on routine family-recall questions ("what's Sara's top goal?",
-    # "when does the Subaru's registration expire?", "who is Theo's
-    # doctor?"). The classifier and the answer call are BOTH bounded
-    # by short timeouts and every failure mode returns None from
-    # :func:`family_qa_router.try_shortcut`, so the worst case is a
-    # few hundred extra milliseconds before we fall through to the
-    # existing heavy-agent path with no behavioural change.
-    #
-    # Training + model registration live under scripts/ai_training/.
-    # The feature is implicitly disabled until both
-    # AI_FAMILY_QA_SHORTCUT_ENABLED=true and AI_FAMILY_QA_MODEL=<tag>
-    # are set in .env.
-    settings = get_settings()
-    # Admins are routed to the heavy agent — the fine-tuned fast model
-    # was NOT trained on admin / operator-mode override examples (its
-    # "sensitive" labels in labeled_examples.jsonl only cover sharing
-    # the SPEAKER'S OWN identifiers), so it will refuse a question
-    # like "what's Jax's SSN?" even when the admin RAG block contains
-    # the value. The heavy agent enforces the admin bypass
-    # deterministically at the tool layer (`secrets.handle_reveal_*`
-    # honours `ctx.is_admin`), so the operator always gets a correct
-    # answer at the cost of ~5-10 s of extra latency. Once the fast
-    # model is re-fine-tuned with admin-mode examples we can drop
-    # this guard.
-    #
     # Sensitive-identifier asks (SSN, VIN, account number, passport,
-    # DL, policy number — see `sensitive_intent`) ALSO skip the
-    # shortcut for ANY speaker, admin or not. The fast tier has no
-    # `reveal_secret` / `reveal_sensitive_identifier` tool, and the
-    # encrypted values (other than SSN, which the RAG builder
-    # denormalises for authorised speakers) are NEVER in the prompt
-    # — so a fast-tier "answer" is at best a refusal and at worst a
-    # wrong number. Forcing these to the heavy agent guarantees the
-    # deterministic household privacy gate in `secrets.py` makes the
-    # call: parent ↔ child / spouse ↔ spouse / self → ALLOW, every
-    # other relationship → polite refusal. This is what "the code
-    # needs to know who is asking and who they are asking about" looks
-    # like in practice — no LLM in the authorisation loop.
+    # DL, policy number) bypass FAMILY_QA so the deterministic
+    # household-privacy gate in ``secrets.py`` makes the call. The
+    # action-intent runner is fine because none of its tools touch
+    # encrypted identifiers.
     is_sensitive_ask = sensitive_intent.is_sensitive_identifier_ask(
         latest_user_for_shortcut
     )
@@ -837,142 +694,10 @@ async def chat(
             payload.family_id,
             latest_user_for_shortcut[:80],
         )
-    if (
-        latest_user_for_shortcut
-        and settings.AI_FAMILY_QA_SHORTCUT_ENABLED
-        and (settings.AI_FAMILY_QA_MODEL or "").strip()
-        and not user.is_admin
-        and not is_sensitive_ask
-    ):
-        family_answer = await family_qa_router.try_shortcut(
-            latest_user_for_shortcut,
-            db=db,
-            family_id=payload.family_id,
-            recognized_person_id=payload.recognized_person_id,
-            assistant_name=assistant_name,
-            family_name=family_name,
-            requestor_is_admin=bool(user.is_admin),
-        )
-        if family_answer:
-            logger.info(
-                "[orch] surface=live_chat path=family_qa_shortcut "
-                "family_id=%s session=%s reply_chars=%d msg=%r "
-                "(skipping heavy agent)",
-                payload.family_id,
-                payload.live_session_id,
-                len(family_answer),
-                latest_user_for_shortcut[:80],
-            )
-            return _shortcut_stream_response(
-                final_text=family_answer,
-                live_session_id=payload.live_session_id,
-                family_id=payload.family_id,
-                recognized_person_id=payload.recognized_person_id,
-                user_message=latest_user_for_shortcut,
-                shortcut_name="family_qa",
-                used_model=settings.AI_FAMILY_QA_MODEL,
-            )
-    assistant_id = _assistant_id_for(db, payload.family_id)
-    # Admins (Avi-as-operator and ADMIN_EMAILS humans) bypass the
-    # household relationship gate end-to-end: the RAG block surfaces
-    # every member's full sensitive data and the speaker-scope prompt
-    # tells the LLM "operator mode — no privacy gate applies". See
-    # ``api.ai.authz`` for the bypass implementation and audit trail.
-    requestor_is_admin = bool(user.is_admin)
-    rag_block = chat_prompts.build_rag_block(
-        db,
-        payload.family_id,
-        payload.recognized_person_id,
-        requestor_is_admin=requestor_is_admin,
-    )
 
-    # Build the tool registry up-front so the same instance is used to
-    # (a) describe Avi's capabilities to the model in the system prompt
-    # and (b) dispatch real tool calls in the agent loop. Capabilities
-    # are inspected here so a tool whose backing integration is offline
-    # (no Google account connected, etc.) is hidden from the model
-    # entirely — it can't claim to do something it can't do this turn.
-    registry = agent_tools.build_default_registry()
-    capabilities = agent_tools.detect_capabilities(db, assistant_id)
-    capabilities_block = agent_tools.describe_capabilities(registry, capabilities)
-
-    # Optional dynamic-SQL planner. Disabled by default because a
-    # 26B-parameter local model needs 5-10 s for the extra non-
-    # streaming round trip — too slow for conversational use when the
-    # static RAG block already dumps every household entity into the
-    # system prompt. Flip AI_RAG_PLANNER_ENABLED=true in .env if you're
-    # experimenting with tool-use prompts.
-    live_data_block: Optional[str] = None
-    if get_settings().AI_RAG_PLANNER_ENABLED:
-        latest_user = next(
-            (m.content for m in reversed(payload.messages) if m.role == "user"),
-            "",
-        )
-        if latest_user:
-            try:
-                planner_queries = await ai_planner.plan_queries(
-                    family_id=payload.family_id,
-                    rag_block=rag_block,
-                    schema_dump=schema_catalog.dump_text(db),
-                    last_user_message=latest_user,
-                )
-            except Exception:  # noqa: BLE001 — planner is best-effort
-                logger.exception(
-                    "Planner step crashed; continuing without live data"
-                )
-                planner_queries = []
-            if planner_queries:
-                logger.info(
-                    "[orch] surface=live_chat path=rag_planner+heavy_agent "
-                    "family_id=%s session=%s n_planner_queries=%d queries=%s",
-                    payload.family_id,
-                    payload.live_session_id,
-                    len(planner_queries),
-                    [q[:80] for q in planner_queries],
-                )
-                live_data_block = (
-                    ai_planner.execute_planner_queries(
-                        db, payload.family_id, planner_queries
-                    )
-                    or None
-                )
-
-    system = chat_prompts.build_system_prompt(
-        db,
-        assistant_name=assistant_name,
-        family_name=family_name,
-        rag_block=rag_block,
-        capabilities_block=capabilities_block,
-        live_data_block=live_data_block,
-        speaker_person_id=payload.recognized_person_id,
-        family_id=payload.family_id,
-        requestor_is_admin=requestor_is_admin,
-    )
-
-    # Tool-use protocol reminder. Goes after the safety + capabilities
-    # block; safe to keep here because anything appended after
-    # ``with_safety`` is still bracketed by the trailing reinforcer
-    # that ``with_safety`` adds.
-    system = (
-        system
-        + "\n\n--- Tool-use rules ---\n"
-        "Use the tools listed under 'What you can do' when the user "
-        "asks you to take an action or fetch live data. ALWAYS call "
-        "lookup_person to resolve a household member's email before "
-        "drafting an email to them. After a tool returns, briefly "
-        "confirm what you did (one sentence). Never claim to have sent "
-        "an email unless gmail_send returned ok=true."
-    )
-
-    history = [m.model_dump() for m in payload.messages]
-    latest_user_content = next(
-        (m["content"] for m in reversed(history) if m["role"] == "user"),
-        "",
-    )
-
-    # Up-front session bookkeeping: verify the session exists and log
-    # the latest user message, so the transcript is correct even if the
-    # LLM stream fails partway through.
+    # Log the inbound user message up-front so it's persisted even if
+    # the stream crashes partway through. We need the LiveSession to
+    # exist + belong to this family — verify both here.
     logged_session_id: Optional[int] = None
     if payload.live_session_id is not None:
         session = db.get(models.LiveSession, payload.live_session_id)
@@ -989,35 +714,8 @@ async def chat(
                 )
                 db.commit()
 
-    # Create the audit row up-front so the SSE stream can reference its
-    # id immediately. We commit here so external clients (e.g. a future
-    # /tasks/{id}/events SSE consumer that reconnects) can find the row.
-    task_row = agent_loop.create_task(
-        db,
-        family_id=payload.family_id,
-        live_session_id=logged_session_id,
-        person_id=payload.recognized_person_id,
-        kind="chat",
-        input_text=latest_user_content,
-        model=ollama._model(),
-    )
-    db.commit()
-    task_id = task_row.agent_task_id
-    logger.info(
-        "[orch] surface=live_chat path=heavy_agent_with_ack_race "
-        "family_id=%s session=%s task=%s person_id=%s history_msgs=%d "
-        "rag_planner=%s",
-        payload.family_id,
-        payload.live_session_id,
-        task_id,
-        payload.recognized_person_id,
-        len(payload.messages),
-        bool(live_data_block),
-    )
-
-    # Best display-name for the speaker so the fast-ack prompt can
-    # personalise (*"Looking up your calendar..."*) when known. None
-    # is fine — the fast-ack module falls back to "the user".
+    # Best display-name for the speaker so the e2b ack prompt can
+    # personalise (*"Looking up your calendar..."*) when known.
     sender_display_name: Optional[str] = None
     if payload.recognized_person_id is not None:
         speaker = db.get(models.Person, payload.recognized_person_id)
@@ -1026,247 +724,493 @@ async def chat(
                 speaker.preferred_name or speaker.first_name
             )
 
-    settings = get_settings()
+    # Snapshot mutables we need inside the generator closure (the
+    # request-scoped ``db`` is closed once the StreamingResponse
+    # returns; everything heavy below opens its own SessionLocal).
+    payload_family_id = payload.family_id
+    payload_person_id = payload.recognized_person_id
+    payload_session_id = payload.live_session_id
+    allow_family_qa_for_caller = (
+        not is_sensitive_ask and not requestor_is_admin
+    )
 
     async def event_stream():
-        # SSE framing — each event is `data: {json}\n\n`.
-        # First event tells the UI which task this stream belongs to.
-        yield f"data: {json.dumps({'task_id': task_id})}\n\n"
-
-        accumulated_text = ""
-        terminal_error: Optional[str] = None
-        step_summaries: list[dict] = []  # for live-session transcript
-
-        # Fast-ack race state. ``first_delta_seen`` short-circuits the
-        # ack path the moment the heavy model starts streaming text —
-        # no point announcing work that's already arriving. The ack,
-        # when minted, lands here so the post-stream session-log step
-        # can persist it alongside the final reply.
-        first_delta_seen = asyncio.Event()
-        agent_finished = asyncio.Event()
+        # 1. Instant heuristic ack — pure Python, ~10 µs. The user
+        #    sees Avi acknowledge the message before any LLM call.
         emitted_fast_ack: Optional[str] = None
-
-        # Pump agent events through a queue so the watchdog can
-        # interleave a `fast_ack` event between two heavy-model events
-        # without blocking on the next ``__anext__`` call.
-        queue: asyncio.Queue[Tuple[str, Any]] = asyncio.Queue()
-
-        async def _producer() -> None:
-            try:
-                async for event in agent_loop.run_agent(
-                    task_id=task_id,
-                    family_id=payload.family_id,
-                    assistant_id=assistant_id,
-                    person_id=payload.recognized_person_id,
-                    system_prompt=system,
-                    history=history,
-                    user_message=latest_user_content,
-                    registry=registry,
-                    capabilities=capabilities,
-                    requestor_is_admin=requestor_is_admin,
-                ):
-                    await queue.put(("event", event))
-            except Exception as exc:  # noqa: BLE001 - never crash the stream
-                logger.exception("Agent stream crashed")
-                await queue.put(("crash", exc))
-            finally:
-                agent_finished.set()
-                await queue.put(("done", None))
-
-        async def _ack_watchdog() -> None:
-            """Live-chat fast-ack: heuristic instant + e2b upgrade.
-
-            Two-stage delivery so the user always sees *something*
-            inside the bubble within ~10 ms, even if Ollama is busy
-            or the e2b model is cold:
-
-            1.  Emit a keyword-matched heuristic ack
-                (``heuristic_ack``) immediately. This is pure Python
-                — no model call — and slots into the bubble before
-                the heavy agent has even started loading its prompt.
-            2.  Fire the contextual e2b call in parallel with the
-                heavy agent. If e2b returns *first*, push it as a
-                second ``fast_ack`` event; the UI just replaces the
-                heuristic placeholder with the better wording. If
-                the heavy agent wins, the e2b result is discarded
-                silently (the user already moved past the
-                placeholder when the real content streamed in).
-
-            This dodges the previous failure mode: the e2b call
-            often gets queued behind the in-flight 26b request, so
-            by the time the contextual ack came back the heavy
-            delta had already arrived and we'd silently drop it.
-            With the heuristic stage, the user always gets visible
-            text fast — the e2b stage is just polish.
-
-            Telegram and SMS keep the 3 s threshold via
-            ``generate_contextual_ack_sync``; nothing here changes
-            their behaviour.
-            """
-            instant = fast_ack.heuristic_ack(latest_user_content)
-            if instant and not first_delta_seen.is_set():
-                await queue.put(("fast_ack", instant))
-                logger.info(
-                    "Live chat fast-ack: heuristic emitted for task=%s "
-                    "text=%r (e2b upgrade pending)",
-                    task_id,
-                    instant,
-                )
-            try:
-                ack_text = await fast_ack.generate_contextual_ack_async(
-                    surface="chat",
-                    sender_display_name=sender_display_name,
-                    last_user_message=latest_user_content,
-                )
-            except Exception:  # noqa: BLE001 - ack must never crash chat
-                logger.exception(
-                    "Live chat fast-ack call crashed for task=%s", task_id
-                )
-                return
-            if not ack_text:
-                logger.info(
-                    "Live chat fast-ack: e2b returned no text for task=%s "
-                    "(cold timeout, model not pulled, or feature off) — "
-                    "leaving the heuristic placeholder in place",
-                    task_id,
-                )
-                return
-            if first_delta_seen.is_set() or agent_finished.is_set():
-                logger.info(
-                    "Live chat fast-ack: e2b text ready for task=%s but "
-                    "heavy agent already finished — keeping heuristic "
-                    "and skipping upgrade to avoid flicker",
-                    task_id,
-                )
-                return
-            await queue.put(("fast_ack", ack_text))
-
-        producer_task = asyncio.create_task(_producer())
-        watchdog_task: Optional[asyncio.Task] = None
         if settings.AI_FAST_ACK_ENABLED and latest_user_content:
-            watchdog_task = asyncio.create_task(_ack_watchdog())
-
-        try:
-            while True:
-                kind, item = await queue.get()
-                if kind == "done":
-                    break
-                if kind == "fast_ack":
-                    emitted_fast_ack = item
-                    yield (
-                        "data: "
-                        + json.dumps({"type": "fast_ack", "text": item})
-                        + "\n\n"
-                    )
-                    logger.info(
-                        "Live chat: fast-ack emitted for task=%s text=%r",
-                        task_id,
-                        item,
-                    )
-                    continue
-                if kind == "crash":
-                    terminal_error = str(item)
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            {"error": terminal_error, "kind": "error"}
-                        )
-                        + "\n\n"
-                    )
-                    continue
-                # kind == "event" — an AgentEvent from the loop.
-                event = item
-                if event.type == "step":
-                    step = event.payload.get("step") or {}
-                    step_summaries.append(
+            instant = fast_ack.heuristic_ack(latest_user_content)
+            if instant:
+                yield (
+                    "data: "
+                    + json.dumps(
                         {
-                            "step_index": step.get("step_index"),
-                            "step_type": step.get("step_type"),
-                            "tool_name": step.get("tool_name"),
-                            "duration_ms": step.get("duration_ms"),
-                            "error": step.get("error"),
+                            "type": "fast_ack",
+                            "text": instant,
+                            "fast_ack_kind": "heuristic",
                         }
                     )
-                if event.type == "delta":
-                    accumulated_text += event.payload.get("delta", "")
-                    first_delta_seen.set()
-                if event.type == "task_failed":
-                    terminal_error = (
-                        event.payload.get("error") or "unknown error"
-                    )
-                    # Surface the error in the legacy 'error' shape so
-                    # the existing UI banner still lights up.
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            {"error": terminal_error, "kind": "agent"}
-                        )
-                        + "\n\n"
-                    )
-                yield event.to_sse()
-        finally:
-            # The producer normally completes on its own; we only need
-            # to cancel the watchdog if the agent finished before its
-            # threshold fired (otherwise it's a harmless no-op task
-            # waiting on ``first_delta_seen``).
-            if watchdog_task is not None and not watchdog_task.done():
-                watchdog_task.cancel()
-                try:
-                    await watchdog_task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
-            if not producer_task.done():
-                producer_task.cancel()
-                try:
-                    await producer_task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+                    + "\n\n"
+                )
+                emitted_fast_ack = instant
+                logger.info(
+                    "[orch] surface=live_chat instant_ack family_id=%s "
+                    "session=%s text=%r",
+                    payload_family_id,
+                    payload_session_id,
+                    instant,
+                )
 
-        # Log the fast-ack + assistant reply in their own DB session —
-        # the request-scoped one was closed the moment the
-        # StreamingResponse started. Two rows so the History view can
-        # replay the same Avi-said-X / Avi-said-Y rhythm the user saw.
-        if logged_session_id is not None and (
-            accumulated_text or terminal_error or emitted_fast_ack
+        # 2. Unified triage. One fast-model call decides between
+        #    WEB / FAMILY_QA / one of the action intents / HEAVY.
+        #    Bounded by AI_FAST_ACTION_CLASSIFIER_TIMEOUT_S — every
+        #    failure path returns label=HEAVY so we fall through to
+        #    the heavy agent cleanly.
+        try:
+            triage = await fast_action_router.try_triage(
+                latest_user_for_shortcut,
+                family_id=payload_family_id,
+                person_id=payload_person_id,
+                assistant_id=assistant_id,
+                live_session_id=logged_session_id,
+                surface_label="live chat",
+                agent_task_kind="chat",
+                requestor_is_admin=requestor_is_admin,
+                allow_family_qa=allow_family_qa_for_caller,
+                family_qa_assistant_name=assistant_name,
+                family_qa_family_name=family_name,
+            )
+        except Exception:  # noqa: BLE001 - triage must never crash the stream
+            logger.exception("[orch] surface=live_chat triage crashed")
+            triage = fast_action_router.TriageResult(
+                label=fast_action_router.LABEL_HEAVY
+            )
+
+        # 3a. Shortcut won — stream the reply and persist the
+        #     transcript rows in a fresh DB session.
+        if triage.reply:
+            logger.info(
+                "[orch] surface=live_chat path=%s family_id=%s session=%s "
+                "reply_chars=%d msg=%r (skipping heavy agent)",
+                triage.used_path,
+                payload_family_id,
+                payload_session_id,
+                len(triage.reply),
+                latest_user_for_shortcut[:80],
+            )
+            yield f"data: {json.dumps({'task_id': None})}\n\n"
+            yield f"data: {json.dumps({'delta': triage.reply})}\n\n"
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "task_completed",
+                        "task_id": None,
+                        "summary": triage.reply,
+                        "shortcut": triage.used_path,
+                    }
+                )
+                + "\n\n"
+            )
+            if logged_session_id is not None:
+                _log_shortcut_transcript(
+                    live_session_id=logged_session_id,
+                    family_id=payload_family_id,
+                    recognized_person_id=payload_person_id,
+                    fast_ack_text=emitted_fast_ack,
+                    final_text=triage.reply,
+                    shortcut_name=triage.used_path or "fast",
+                    used_model=triage.used_model or "",
+                )
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            return
+
+        # 3b. HEAVY path — build the full system prompt, create the
+        #     AgentTask, run the agent loop with the e2b upgrade ack
+        #     racing against the first model delta.
+        async for chunk in _heavy_agent_stream(
+            family_id=payload_family_id,
+            recognized_person_id=payload_person_id,
+            assistant_id=assistant_id,
+            assistant_name=assistant_name,
+            family_name=family_name,
+            requestor_is_admin=requestor_is_admin,
+            sender_display_name=sender_display_name,
+            logged_session_id=logged_session_id,
+            history=history,
+            latest_user_content=latest_user_content,
+            emitted_fast_ack_already=emitted_fast_ack,
+            settings=settings,
         ):
-            log_db = SessionLocal()
+            yield chunk
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ---------- Heavy-agent stream helper ------------------------------------
+
+
+async def _heavy_agent_stream(
+    *,
+    family_id: int,
+    recognized_person_id: Optional[int],
+    assistant_id: Optional[int],
+    assistant_name: str,
+    family_name: Optional[str],
+    requestor_is_admin: bool,
+    sender_display_name: Optional[str],
+    logged_session_id: Optional[int],
+    history: List[dict],
+    latest_user_content: str,
+    emitted_fast_ack_already: Optional[str],
+    settings,
+):
+    """Yield SSE events for the heavy 26B agent path.
+
+    Owns its own DB session for all the setup (RAG, registry,
+    capabilities, optional planner, system prompt, AgentTask row)
+    because the request-scoped session is closed by the time the
+    StreamingResponse starts streaming.
+
+    Mirrors the public SSE contract the UI consumes:
+
+    * ``{"task_id": ...}`` — emitted after AgentTask creation
+    * ``{"type": "fast_ack", "text": ...}`` — optional e2b upgrade
+      ack that replaces the heuristic one already shown
+    * ``{"step": ...}`` / ``{"delta": ...}`` — agent loop events
+    * ``{"error": ..., "kind": ...}`` — terminal failure surface
+    * ``{"done": true}`` — terminal marker
+    """
+    setup_db = SessionLocal()
+    try:
+        rag_block = chat_prompts.build_rag_block(
+            setup_db,
+            family_id,
+            recognized_person_id,
+            requestor_is_admin=requestor_is_admin,
+        )
+        registry = agent_tools.build_default_registry()
+        capabilities = agent_tools.detect_capabilities(setup_db, assistant_id)
+        capabilities_block = agent_tools.describe_capabilities(
+            registry, capabilities
+        )
+
+        # Optional dynamic-SQL planner. Disabled by default because a
+        # 26B model needs 5-10 s for the extra non-streaming round
+        # trip — too slow for conversational use when the static RAG
+        # block already covers most household entities.
+        live_data_block: Optional[str] = None
+        if settings.AI_RAG_PLANNER_ENABLED and latest_user_content:
             try:
-                log_session = log_db.get(models.LiveSession, logged_session_id)
-                if log_session is not None:
-                    if emitted_fast_ack:
-                        live_session.log_message(
-                            log_db,
-                            log_session,
-                            role="assistant",
-                            content=emitted_fast_ack,
-                            person_id=payload.recognized_person_id,
-                            meta={
-                                "kind": "live_fast_ack",
-                                "agent_task_id": task_id,
-                                "used_model": ollama.fast_model(),
-                            },
-                        )
+                planner_queries = await ai_planner.plan_queries(
+                    family_id=family_id,
+                    rag_block=rag_block,
+                    schema_dump=schema_catalog.dump_text(setup_db),
+                    last_user_message=latest_user_content,
+                )
+            except Exception:  # noqa: BLE001 — planner is best-effort
+                logger.exception(
+                    "Planner step crashed; continuing without live data"
+                )
+                planner_queries = []
+            if planner_queries:
+                logger.info(
+                    "[orch] surface=live_chat path=rag_planner+heavy "
+                    "family_id=%s n_planner_queries=%d queries=%s",
+                    family_id,
+                    len(planner_queries),
+                    [q[:80] for q in planner_queries],
+                )
+                live_data_block = (
+                    ai_planner.execute_planner_queries(
+                        setup_db, family_id, planner_queries
+                    )
+                    or None
+                )
+
+        system = chat_prompts.build_system_prompt(
+            setup_db,
+            assistant_name=assistant_name,
+            family_name=family_name,
+            rag_block=rag_block,
+            capabilities_block=capabilities_block,
+            live_data_block=live_data_block,
+            speaker_person_id=recognized_person_id,
+            family_id=family_id,
+            requestor_is_admin=requestor_is_admin,
+        )
+        system = (
+            system
+            + "\n\n--- Tool-use rules ---\n"
+            "Use the tools listed under 'What you can do' when the user "
+            "asks you to take an action or fetch live data. ALWAYS call "
+            "lookup_person to resolve a household member's email before "
+            "drafting an email to them. After a tool returns, briefly "
+            "confirm what you did (one sentence). Never claim to have "
+            "sent an email unless gmail_send returned ok=true."
+        )
+
+        task_row = agent_loop.create_task(
+            setup_db,
+            family_id=family_id,
+            live_session_id=logged_session_id,
+            person_id=recognized_person_id,
+            kind="chat",
+            input_text=latest_user_content,
+            model=llm._model(),
+        )
+        setup_db.commit()
+        task_id = task_row.agent_task_id
+    finally:
+        setup_db.close()
+
+    logger.info(
+        "[orch] surface=live_chat path=heavy_agent family_id=%s "
+        "session=%s task=%s person_id=%s history_msgs=%d "
+        "rag_planner=%s instant_acked=%s",
+        family_id,
+        logged_session_id,
+        task_id,
+        recognized_person_id,
+        len(history),
+        bool(live_data_block),
+        bool(emitted_fast_ack_already),
+    )
+
+    yield f"data: {json.dumps({'task_id': task_id})}\n\n"
+
+    accumulated_text = ""
+    terminal_error: Optional[str] = None
+    step_summaries: list[dict] = []
+    emitted_fast_ack: Optional[str] = emitted_fast_ack_already
+
+    first_delta_seen = asyncio.Event()
+    agent_finished = asyncio.Event()
+    queue: asyncio.Queue[Tuple[str, Any]] = asyncio.Queue()
+
+    async def _producer() -> None:
+        try:
+            async for event in agent_loop.run_agent(
+                task_id=task_id,
+                family_id=family_id,
+                assistant_id=assistant_id,
+                person_id=recognized_person_id,
+                system_prompt=system,
+                history=history,
+                user_message=latest_user_content,
+                registry=registry,
+                capabilities=capabilities,
+                requestor_is_admin=requestor_is_admin,
+            ):
+                await queue.put(("event", event))
+        except Exception as exc:  # noqa: BLE001 - never crash the stream
+            logger.exception("Agent stream crashed")
+            await queue.put(("crash", exc))
+        finally:
+            agent_finished.set()
+            await queue.put(("done", None))
+
+    async def _e2b_upgrade_ack() -> None:
+        """Optional second ack from the e2b contextual model.
+
+        The heuristic ack already shipped at byte one of the parent
+        stream, so this is pure polish — if e2b returns before the
+        heavy agent's first delta we push a nicer wording
+        (*"Looking up your calendar..."*) that the UI swaps in for
+        the placeholder.
+        """
+        try:
+            ack_text = await fast_ack.generate_contextual_ack_async(
+                surface="chat",
+                sender_display_name=sender_display_name,
+                last_user_message=latest_user_content,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Live chat e2b upgrade ack crashed for task=%s", task_id
+            )
+            return
+        if not ack_text:
+            return
+        if first_delta_seen.is_set() or agent_finished.is_set():
+            return
+        await queue.put(("fast_ack", ack_text))
+
+    producer_task = asyncio.create_task(_producer())
+    upgrade_task: Optional[asyncio.Task] = None
+    if settings.AI_FAST_ACK_ENABLED and latest_user_content:
+        upgrade_task = asyncio.create_task(_e2b_upgrade_ack())
+
+    try:
+        while True:
+            kind, item = await queue.get()
+            if kind == "done":
+                break
+            if kind == "fast_ack":
+                emitted_fast_ack = item
+                yield (
+                    "data: "
+                    + json.dumps({"type": "fast_ack", "text": item})
+                    + "\n\n"
+                )
+                logger.info(
+                    "Live chat: e2b upgrade ack emitted for task=%s text=%r",
+                    task_id,
+                    item,
+                )
+                continue
+            if kind == "crash":
+                terminal_error = str(item)
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {"error": terminal_error, "kind": "error"}
+                    )
+                    + "\n\n"
+                )
+                continue
+            event = item
+            if event.type == "step":
+                step = event.payload.get("step") or {}
+                step_summaries.append(
+                    {
+                        "step_index": step.get("step_index"),
+                        "step_type": step.get("step_type"),
+                        "tool_name": step.get("tool_name"),
+                        "duration_ms": step.get("duration_ms"),
+                        "error": step.get("error"),
+                    }
+                )
+            if event.type == "delta":
+                accumulated_text += event.payload.get("delta", "")
+                first_delta_seen.set()
+            if event.type == "task_failed":
+                terminal_error = (
+                    event.payload.get("error") or "unknown error"
+                )
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {"error": terminal_error, "kind": "agent"}
+                    )
+                    + "\n\n"
+                )
+            yield event.to_sse()
+    finally:
+        if upgrade_task is not None and not upgrade_task.done():
+            upgrade_task.cancel()
+            try:
+                await upgrade_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if not producer_task.done():
+            producer_task.cancel()
+            try:
+                await producer_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+    if logged_session_id is not None and (
+        accumulated_text or terminal_error or emitted_fast_ack
+    ):
+        log_db = SessionLocal()
+        try:
+            log_session = log_db.get(models.LiveSession, logged_session_id)
+            if log_session is not None:
+                if emitted_fast_ack:
                     live_session.log_message(
                         log_db,
                         log_session,
                         role="assistant",
-                        content=(accumulated_text or "(no response)").strip(),
+                        content=emitted_fast_ack,
+                        person_id=recognized_person_id,
                         meta={
-                            "kind": "chat",
-                            "used_model": ollama._model(),
+                            "kind": "live_fast_ack",
                             "agent_task_id": task_id,
-                            "agent_steps": step_summaries,
-                            "error": terminal_error,
-                            "had_fast_ack": bool(emitted_fast_ack),
+                            "used_model": llm.fast_model(),
                         },
                     )
-                    log_db.commit()
-            except Exception:  # noqa: BLE001 — logging must never break the stream
-                logger.exception("Failed to log assistant chat message")
-                log_db.rollback()
-            finally:
-                log_db.close()
+                live_session.log_message(
+                    log_db,
+                    log_session,
+                    role="assistant",
+                    content=(accumulated_text or "(no response)").strip(),
+                    meta={
+                        "kind": "chat",
+                        "used_model": llm._model(),
+                        "agent_task_id": task_id,
+                        "agent_steps": step_summaries,
+                        "error": terminal_error,
+                        "had_fast_ack": bool(emitted_fast_ack),
+                    },
+                )
+                log_db.commit()
+        except Exception:  # noqa: BLE001 — logging must never break the stream
+            logger.exception("Failed to log assistant chat message")
+            log_db.rollback()
+        finally:
+            log_db.close()
 
-        yield f"data: {json.dumps({'done': True})}\n\n"
+    yield f"data: {json.dumps({'done': True})}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+def _log_shortcut_transcript(
+    *,
+    live_session_id: int,
+    family_id: int,
+    recognized_person_id: Optional[int],
+    fast_ack_text: Optional[str],
+    final_text: str,
+    shortcut_name: str,
+    used_model: str,
+) -> None:
+    """Persist the shortcut path's assistant rows in a fresh DB session.
+
+    The request-scoped session is closed by the time the SSE stream
+    starts yielding, so the shortcut branch (which lives inside the
+    stream generator) needs its own short-lived session for the
+    transcript writes. Logs the optional fast-ack row first so the
+    History view replays the same Avi-said-X / Avi-said-Y rhythm the
+    user saw.
+    """
+    log_db = SessionLocal()
+    try:
+        log_session = log_db.get(models.LiveSession, live_session_id)
+        if log_session is None or log_session.family_id != family_id:
+            return
+        if fast_ack_text:
+            live_session.log_message(
+                log_db,
+                log_session,
+                role="assistant",
+                content=fast_ack_text,
+                person_id=recognized_person_id,
+                meta={
+                    "kind": "live_fast_ack",
+                    "used_model": llm.fast_model(),
+                },
+            )
+        live_session.log_message(
+            log_db,
+            log_session,
+            role="assistant",
+            content=final_text,
+            person_id=recognized_person_id,
+            meta={
+                "kind": "chat",
+                "shortcut": shortcut_name,
+                "used_model": used_model,
+                "had_fast_ack": bool(fast_ack_text),
+            },
+        )
+        log_db.commit()
+    except Exception:  # noqa: BLE001 — logging must never break the stream
+        logger.exception(
+            "Shortcut %s: failed to log assistant chat message for "
+            "live_session=%s",
+            shortcut_name,
+            live_session_id,
+        )
+        log_db.rollback()
+    finally:
+        log_db.close()

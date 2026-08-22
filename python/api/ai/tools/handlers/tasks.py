@@ -343,7 +343,57 @@ async def handle_task_create(
     ctx.db.add(task)
     ctx.db.flush()
 
+    # ``implicit`` tracks every person already attached to the task in
+    # a way that makes it visible to them in the kanban UI:
+    #
+    # * Creator and assignee are inherently attached via the
+    #   ``created_by_person_id`` / ``assigned_to_person_id`` columns.
+    # * Anyone added below (explicit followers AND — see below — the
+    #   speaker when they're neither creator nor assignee) goes into
+    #   ``task_followers`` so the visibility filter in
+    #   :mod:`api.routers.tasks` picks them up.
+    #
+    # We track the set so a follower that's also the creator/assignee
+    # doesn't get a duplicate ``task_followers`` row (which would
+    # also violate the (task_id, person_id) UNIQUE index).
     implicit = {p for p in (ctx.person_id, owner) if p is not None}
+
+    # ---- Speaker-as-follower: keep the asker's UI honest ----------
+    # The tasks list endpoint filters non-admin viewers to rows where
+    # they're the creator, assignee, OR a follower (see
+    # ``api/routers/tasks.py::list_tasks``). When the speaker tells
+    # Avi "add a task for Sarah to renew the passport", the heavy
+    # agent + this handler set ``assigned_to_person_id=Sarah`` and
+    # the speaker's ``person_id`` lands in ``created_by_person_id``
+    # — so a SPEAKER who is not Sarah and not an admin would
+    # otherwise lose sight of their own ask. The UI showing "task
+    # said it was added, where is it?" is the exact bug the user
+    # reported.
+    #
+    # ``created_by_person_id`` is technically enough to satisfy the
+    # filter today, but (1) the column is nullable for AI-owned /
+    # anonymous-speaker tasks, and (2) downstream notifications and
+    # the "tasks I'm following" UI surface ONLY traverse the
+    # follower relation. Adding the speaker as a follower makes the
+    # speaker visible to BOTH legs of the filter and lights up
+    # follow-up notifications without needing the user to ask.
+    #
+    # We skip when the speaker is already creator-equal-assignee
+    # (the common "remind me to renew my passport" case — no point
+    # adding them as a follower OF themselves).
+    if (
+        ctx.person_id is not None
+        and ctx.person_id != owner
+    ):
+        ctx.db.add(
+            models.TaskFollower(
+                task_id=task.task_id,
+                person_id=ctx.person_id,
+                added_at=datetime.now(timezone.utc),
+            )
+        )
+        implicit.add(ctx.person_id)
+
     for pid in follower_person_ids or []:
         if pid in implicit:
             continue

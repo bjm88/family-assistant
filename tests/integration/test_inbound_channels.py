@@ -36,10 +36,23 @@ from unittest.mock import MagicMock, patch
 from sqlalchemy import desc, select
 
 from api import models
+from api.ai import fast_action_router
 from api.integrations import twilio_sms
 
 
 AGENT_REPLY = "Mocked agent reply for the integration suite."
+
+
+def _heavy_triage() -> fast_action_router.TriageResult:
+    """Mock-friendly ``TriageResult`` that always routes to the heavy agent.
+
+    Used wherever a test wants to verify that the unified triage
+    fell through to the heavy agent — the surfaces all interpret
+    ``label=HEAVY`` / ``reply=None`` as "run ``_run_agent_to_completion``".
+    """
+    return fast_action_router.TriageResult(
+        label=fast_action_router.LABEL_HEAVY
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +88,8 @@ def test_sms_inbound_routes_to_agent(client, test_family, db):
         "api.services.sms_inbox._run_agent_to_completion",
         return_value=AGENT_REPLY,
     ) as agent_mock, patch(
-        "api.services.sms_inbox.web_search_shortcut.try_shortcut_sync",
-        return_value=None,
+        "api.services.sms_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
     ), patch(
         "api.integrations.twilio_sms.send_sms",
         side_effect=lambda **kw: sms_calls.append(kw) or "SMmocked-out-sid",
@@ -107,6 +120,81 @@ def test_sms_inbound_routes_to_agent(client, test_family, db):
     assert sms_calls[0]["to_phone"] == test_family["person_phone"]
 
 
+def test_sms_instant_ack_then_agent_reply(client, test_family, db):
+    """SMS fires a keyword-bucket ack, then the real reply.
+
+    The two-message contract: Avi confirms immediately (no LLM) and
+    follows up after the agent (or triage) finishes. Tests force the
+    ack flag on because conftest disables it to keep other mocks
+    simple.
+    """
+    from api.config import get_settings
+
+    sid = f"SM_test_sms_ack_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="Add a task to renew the passport.",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    with patch.object(get_settings(), "AI_FAST_ACK_ENABLED", True), patch(
+        "api.services.sms_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ) as agent_mock, patch(
+        "api.services.sms_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
+    ), patch(
+        "api.integrations.twilio_sms.send_sms",
+        side_effect=lambda **kw: sms_calls.append(kw) or f"SM{len(sms_calls)}",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    agent_mock.assert_called_once()
+    assert len(sms_calls) == 2, (
+        f"Expected instant ack + final reply, got {len(sms_calls)} sends"
+    )
+    assert sms_calls[0]["body"] == "Setting that up."
+    assert sms_calls[1]["body"] == AGENT_REPLY
+
+
+def test_sms_fast_action_skips_heavy_agent(client, test_family, db):
+    """Unified triage reply is sent as-is; heavy agent is not invoked."""
+    sid = f"SM_test_sms_fast_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="Add a task to renew the passport.",
+    )
+    sms_calls: list[dict[str, Any]] = []
+    fast_reply = "Added 'Renew the passport' to your tasks."
+
+    with patch(
+        "api.services.sms_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ) as agent_mock, patch(
+        "api.services.sms_inbox.fast_action_router.try_triage_sync",
+        return_value=fast_action_router.TriageResult(
+            label=fast_action_router.LABEL_TASK_ADD,
+            reply=fast_reply,
+            used_path="fast_action",
+            intent=fast_action_router.LABEL_TASK_ADD,
+        ),
+    ), patch(
+        "api.integrations.twilio_sms.send_sms",
+        side_effect=lambda **kw: sms_calls.append(kw) or "SMfast",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    agent_mock.assert_not_called()
+    assert len(sms_calls) == 1
+    assert sms_calls[0]["body"] == fast_reply
+
+
 def test_whatsapp_inbound_routes_to_agent(client, test_family, db):
     """The WhatsApp ``whatsapp:`` prefix flips channel + session source."""
     sid = f"SM_test_wa_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
@@ -123,8 +211,8 @@ def test_whatsapp_inbound_routes_to_agent(client, test_family, db):
         "api.services.sms_inbox._run_agent_to_completion",
         return_value=AGENT_REPLY,
     ) as agent_mock, patch(
-        "api.services.sms_inbox.web_search_shortcut.try_shortcut_sync",
-        return_value=None,
+        "api.services.sms_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
     ), patch(
         "api.integrations.twilio_sms.send_whatsapp",
         side_effect=lambda **kw: wa_calls.append(kw) or "SMmocked-wa-sid",
@@ -155,6 +243,38 @@ def test_whatsapp_inbound_routes_to_agent(client, test_family, db):
     # we don't care about the exact prefix here, just that the body
     # routed through the WhatsApp sender (not send_sms).
     assert wa_calls[0]["body"] == AGENT_REPLY
+
+
+def test_whatsapp_instant_ack_then_agent_reply(client, test_family, db):
+    """WhatsApp uses the same two-message instant-ack contract as SMS."""
+    from api.config import get_settings
+
+    sid = f"SM_test_wa_ack_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=f"whatsapp:{test_family['person_phone']}",
+        to_phone="whatsapp:+15550002222",
+        body="Add a calendar hold next Monday at 10am.",
+    )
+    wa_calls: list[dict[str, Any]] = []
+
+    with patch.object(get_settings(), "AI_FAST_ACK_ENABLED", True), patch(
+        "api.services.sms_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ) as agent_mock, patch(
+        "api.services.sms_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
+    ), patch(
+        "api.integrations.twilio_sms.send_whatsapp",
+        side_effect=lambda **kw: wa_calls.append(kw) or f"SM{len(wa_calls)}",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    agent_mock.assert_called_once()
+    assert len(wa_calls) == 2
+    assert wa_calls[0]["body"] == "Setting that up."
+    assert wa_calls[1]["body"] == AGENT_REPLY
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +322,8 @@ def test_telegram_inbound_routes_to_agent(test_family, db):
     with patch.object(
         telegram_inbox, "_run_agent_to_completion", return_value=AGENT_REPLY,
     ) as agent_mock, patch(
-        "api.services.telegram_inbox.web_search_shortcut.try_shortcut_sync",
-        return_value=None,
+        "api.services.telegram_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
     ), patch(
         # send_message returns the int message_id of the sent reply, not
         # a message object. The audit + transcript meta record this id,
@@ -268,8 +388,8 @@ def test_email_inbound_routes_to_agent(test_family, db):
         "api.services.email_inbox._run_agent_to_completion",
         return_value=AGENT_REPLY,
     ) as agent_mock, patch(
-        "api.services.email_inbox.web_search_shortcut.try_shortcut_sync",
-        return_value=None,
+        "api.services.email_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
     ), patch(
         # The email service calls ``gmail.send_reply`` (NOT send_email)
         # because every reply has to thread under the original message
@@ -302,6 +422,139 @@ def test_email_inbound_routes_to_agent(test_family, db):
     assert sess.source == "email"
 
     agent_mock.assert_called_once()
+    assert len(sent) == 1
+    assert sent[0].get("body") == AGENT_REPLY
+
+
+def test_email_fast_action_skips_heavy_agent(test_family, db):
+    """Email triage reply is sent as-is; heavy agent is not invoked."""
+    from api.integrations import gmail
+    from api.services import email_inbox
+
+    msg_id = f"msg_fast_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    fake_msg = gmail.FetchedMessage(
+        message_id=msg_id,
+        thread_id=f"thr_{msg_id}",
+        sender_email=test_family["person_email"],
+        sender_name="Integration Test",
+        subject="Add a task",
+        body_text="Add a task to call the plumber.",
+        in_reply_to_header=None,
+        references_header=None,
+        list_id_header=None,
+        precedence_header=None,
+        auto_submitted_header=None,
+        received_at=datetime.now(timezone.utc),
+        label_ids=["INBOX", "UNREAD"],
+    )
+    sent: list[dict[str, Any]] = []
+    fast_reply = "Added 'Call the plumber' to your tasks."
+
+    with patch(
+        "api.services.email_inbox.gmail.fetch_message", return_value=fake_msg,
+    ), patch(
+        "api.services.email_inbox._safe_mark_read", return_value=None,
+    ), patch(
+        "api.services.email_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ) as agent_mock, patch(
+        "api.services.email_inbox.fast_action_router.try_triage_sync",
+        return_value=fast_action_router.TriageResult(
+            label=fast_action_router.LABEL_TASK_ADD,
+            reply=fast_reply,
+            used_path="fast_action",
+            intent=fast_action_router.LABEL_TASK_ADD,
+        ),
+    ), patch(
+        "api.services.email_inbox.gmail.send_reply",
+        side_effect=lambda *a, **kw: sent.append(kw) or "gmail_sent_fast",
+    ):
+        email_inbox._handle_one_message(
+            db,
+            assistant_id=test_family["assistant_id"],
+            granted_email="avi-bot@example.com",
+            family_id=test_family["family_id"],
+            creds=MagicMock(),
+            gmail_message_id=msg_id,
+        )
+
+    agent_mock.assert_not_called()
+    assert len(sent) == 1
+    assert sent[0].get("body") == fast_reply
+
+
+def test_family_qa_uses_fast_model_when_no_finetune():
+    """Family-recall shortcut must not require a custom Ollama tag."""
+    from api.ai import family_qa_router
+    from api.config import get_settings
+
+    settings = get_settings()
+    with patch.object(settings, "AI_FAMILY_QA_MODEL", ""):
+        tag = family_qa_router._answer_model()
+    assert tag, "fast-model fallback must resolve to a non-empty tag"
+    assert tag.startswith("grok"), (
+        f"live provider is Grok; leftover local tags must not win, got {tag!r}"
+    )
+
+
+def test_family_qa_ignores_leftover_ollama_tag_when_provider_is_grok():
+    """A stale AI_FAMILY_QA_MODEL=llama3.2:3b must not be sent to xAI."""
+    from api.ai import family_qa_router
+    from api.config import get_settings
+
+    settings = get_settings()
+    with patch.object(settings, "AI_FAMILY_QA_MODEL", "llama3.2:3b"):
+        tag = family_qa_router._answer_model()
+    assert tag.startswith("grok")
+
+
+def test_email_never_sends_instant_ack(test_family, db):
+    """Email stays one-reply even when the global ack flag is on."""
+    from api.config import get_settings
+    from api.integrations import gmail
+    from api.services import email_inbox
+
+    msg_id = f"msg_noack_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    fake_msg = gmail.FetchedMessage(
+        message_id=msg_id,
+        thread_id=f"thr_{msg_id}",
+        sender_email=test_family["person_email"],
+        sender_name="Integration Test",
+        subject="Add a task",
+        body_text="Add a task to buy milk.",
+        in_reply_to_header=None,
+        references_header=None,
+        list_id_header=None,
+        precedence_header=None,
+        auto_submitted_header=None,
+        received_at=datetime.now(timezone.utc),
+        label_ids=["INBOX", "UNREAD"],
+    )
+    sent: list[dict[str, Any]] = []
+
+    with patch.object(get_settings(), "AI_FAST_ACK_ENABLED", True), patch(
+        "api.services.email_inbox.gmail.fetch_message", return_value=fake_msg,
+    ), patch(
+        "api.services.email_inbox._safe_mark_read", return_value=None,
+    ), patch(
+        "api.services.email_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ), patch(
+        "api.services.email_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
+    ), patch(
+        "api.services.email_inbox.gmail.send_reply",
+        side_effect=lambda *a, **kw: sent.append(kw) or "gmail_sent_noack",
+    ):
+        email_inbox._handle_one_message(
+            db,
+            assistant_id=test_family["assistant_id"],
+            granted_email="avi-bot@example.com",
+            family_id=test_family["family_id"],
+            creds=MagicMock(),
+            gmail_message_id=msg_id,
+        )
+
     assert len(sent) == 1
     assert sent[0].get("body") == AGENT_REPLY
 
@@ -394,12 +647,14 @@ def test_email_combined_text_dedupes_when_subject_in_body():
 def test_email_classifier_receives_subject_when_body_is_empty(
     test_family, db
 ):
-    """End-to-end proof: subject-only email reaches the web-search shortcut.
+    """End-to-end proof: subject-only email reaches the triage classifier.
 
     Regression test for the bug where the email handler passed only
-    ``msg.body_text`` to ``web_search_shortcut.try_shortcut_sync`` —
-    so a question typed entirely into the subject line never reached
-    the classifier and was silently misrouted to the heavy agent.
+    ``msg.body_text`` to the shortcut — so a question typed entirely
+    into the subject line never reached the classifier and was
+    silently misrouted to the heavy agent. The handler now calls
+    :func:`fast_action_router.try_triage_sync`; we capture its first
+    positional arg to prove the subject made it in.
     """
     from api.services import email_inbox
 
@@ -416,9 +671,9 @@ def test_email_classifier_receives_subject_when_body_is_empty(
 
     captured: list[str] = []
 
-    def fake_shortcut(text: str):
+    def fake_triage(text: str, **_kwargs):
         captured.append(text)
-        return None
+        return _heavy_triage()
 
     with patch(
         "api.services.email_inbox.gmail.fetch_message", return_value=fake_msg,
@@ -428,8 +683,8 @@ def test_email_classifier_receives_subject_when_body_is_empty(
         "api.services.email_inbox._run_agent_to_completion",
         return_value=AGENT_REPLY,
     ), patch(
-        "api.services.email_inbox.web_search_shortcut.try_shortcut_sync",
-        side_effect=fake_shortcut,
+        "api.services.email_inbox.fast_action_router.try_triage_sync",
+        side_effect=fake_triage,
     ), patch(
         "api.services.email_inbox.gmail.send_reply",
         side_effect=lambda *a, **kw: "gmail_sent_id_xyz",
@@ -444,10 +699,10 @@ def test_email_classifier_receives_subject_when_body_is_empty(
         )
 
     assert len(captured) == 1, (
-        f"Expected exactly one shortcut call, got {len(captured)}"
+        f"Expected exactly one triage call, got {len(captured)}"
     )
     assert "Tokyo" in captured[0], (
-        f"Subject keyword 'Tokyo' must reach the web-search classifier, "
+        f"Subject keyword 'Tokyo' must reach the triage classifier, "
         f"but it received: {captured[0]!r}"
     )
 
@@ -457,7 +712,7 @@ def test_email_classifier_receives_subject_when_body_is_empty(
 # ---------------------------------------------------------------------------
 
 
-def test_live_chat_status_endpoint_responds(client):
+def test_live_chat_status_endpoint_responds(authed_client):
     """``GET /api/aiassistant/status`` is the live-web smoke probe.
 
     The full ``POST /chat`` SSE pipeline pulls in Ollama and is too
@@ -467,7 +722,7 @@ def test_live_chat_status_endpoint_responds(client):
     locally — that's still a healthy response shape, which is all we
     need to prove the live-web surface is mounted.
     """
-    resp = client.get("/api/aiassistant/status")
+    resp = authed_client.get("/api/aiassistant/status")
     assert resp.status_code == 200
     body = resp.json()
     assert "available" in body

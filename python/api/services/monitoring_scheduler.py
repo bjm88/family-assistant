@@ -87,7 +87,7 @@ async def run_monitoring_loop(stop_event: asyncio.Event) -> None:
         "thinking_model=%r, web_search=%s).",
         interval,
         settings.AI_MONITORING_DEFAULT_CRON,
-        settings.AI_OLLAMA_THINKING_MODEL or settings.AI_OLLAMA_MODEL,
+        _thinking_model(),
         settings.FA_SEARCH_PROVIDER or "(disabled)",
     )
 
@@ -508,11 +508,15 @@ def _resolve_family_timezone(db: Session, family_id: int) -> str:
 def _thinking_model() -> str:
     """Resolve the model used for monitoring runs.
 
-    Honours :data:`Settings.AI_OLLAMA_THINKING_MODEL` when set; falls
-    back to the conversational model so a fresh install needs no extra
-    Ollama pull.
+    Grok (the live default) uses :setting:`GROK_MODEL`. The Ollama
+    thinking-model override only applies when the local provider is
+    active.
     """
+    from ..ai import llm
+
     settings = get_settings()
+    if llm.provider() == "grok":
+        return settings.GROK_MODEL
     return (settings.AI_OLLAMA_THINKING_MODEL or settings.AI_OLLAMA_MODEL).strip()
 
 

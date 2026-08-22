@@ -55,11 +55,10 @@ import logging
 import time
 from typing import Optional
 
-import httpx
-
 from ..config import get_settings
 from ..integrations import web_search
-from .ollama import OllamaError, OllamaUnavailable, _base, fast_model
+from . import llm
+from .llm import LLMError, LLMUnavailable, fast_model
 
 
 logger = logging.getLogger(__name__)
@@ -179,12 +178,13 @@ async def classify(message: str) -> bool:
 
     try:
         raw = await asyncio.wait_for(
-            _chat_oneshot(
+            llm.chat_oneshot(
                 system=_CLASSIFIER_SYSTEM_PROMPT,
                 user=user_prompt,
                 model=fast_model(),
                 temperature=0.0,
                 max_tokens=4,
+                timeout_s=settings.AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S,
             ),
             timeout=settings.AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S,
         )
@@ -194,14 +194,14 @@ async def classify(message: str) -> bool:
             settings.AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S,
         )
         return False
-    except OllamaUnavailable as exc:
-        # Fast model not pulled, Ollama down, etc. The heavy path can
-        # still run via its own model; just skip the shortcut.
+    except LLMUnavailable as exc:
+        # Fast model / API key missing. The heavy path can still run
+        # via its own model; just skip the shortcut.
         logger.debug("[shortcut] %s — skipping shortcut", exc)
         return False
-    except OllamaError as exc:
+    except LLMError as exc:
         logger.warning(
-            "[shortcut] classifier Ollama error %s — falling through",
+            "[shortcut] classifier LLM error %s — falling through",
             exc,
         )
         return False
@@ -346,61 +346,6 @@ def try_shortcut_sync(message: str) -> Optional[str]:
         return None
     finally:
         loop.close()
-
-
-# ---------------------------------------------------------------------------
-# Internal: thin Ollama /api/chat wrapper for the classifier
-# ---------------------------------------------------------------------------
-#
-# We deliberately bypass `api.ai.ollama.generate` for the same
-# reasons fast_ack does: the gemma chat template routes "thinking"
-# tokens into a separate channel, so a one-word reply needs the
-# /api/chat endpoint with `think=False` to actually appear in
-# `message.content`.
-
-
-async def _chat_oneshot(
-    *,
-    system: str,
-    user: str,
-    model: str,
-    temperature: float,
-    max_tokens: int,
-) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "stream": False,
-        "think": False,
-        # Same hour-long pin the fast-ack path uses so the next
-        # classification doesn't pay a cold-load cost.
-        "keep_alive": "1h",
-        "options": {
-            "num_predict": max_tokens,
-            "temperature": temperature,
-        },
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(f"{_base()}/api/chat", json=payload)
-    except httpx.ConnectError as exc:
-        raise OllamaUnavailable(
-            f"Ollama at {_base()} is not responding: {exc}"
-        ) from exc
-
-    if r.status_code == 404:
-        raise OllamaUnavailable(
-            f"Model '{model}' is not pulled. Run `ollama pull {model}`."
-        )
-    if r.status_code >= 400:
-        raise OllamaError(f"Ollama returned {r.status_code}: {r.text[:400]}")
-
-    data = r.json()
-    message = data.get("message") or {}
-    return (message.get("content") or "").strip()
 
 
 __all__ = ["classify", "run", "try_shortcut", "try_shortcut_sync"]

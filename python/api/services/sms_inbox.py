@@ -72,11 +72,12 @@ from .. import models, storage
 from ..ai import agent as agent_loop
 from ..ai import agent_drain
 from ..ai import assistants as _assistants
-from ..ai import ollama
+from ..ai import fast_ack
+from ..ai import fast_action_router
+from ..ai import llm
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
 from ..ai import vision
-from ..ai import web_search_shortcut
 from ..config import Settings, get_settings
 from ..db import SessionLocal
 from ..integrations import twilio_sms
@@ -374,7 +375,7 @@ def process_inbound_sms(
         person_id=person.person_id,
         kind=chan.agent_task_kind,
         input_text=inbound.body or "",
-        model=ollama._model(),
+        model=llm._model(),
     )
     audit.agent_task_id = task.agent_task_id
     db.commit()
@@ -383,37 +384,92 @@ def process_inbound_sms(
         inbound, person, chan, attachment_block=attachment_block
     )
 
-    # ---- Fast-path web-search shortcut ----------------------------
-    # Skip the heavy agent entirely when the lightweight Gemma
-    # classifier is confident this message is a pure web-lookup ask.
-    # Saves ~5-10 s of round-trips. We hand it the RAW body (not the
-    # `[Text message from ...]` wrapper) because the wrapper is a
-    # surface hint for the heavy agent, not signal for the
-    # classifier. ``try_shortcut_sync`` itself is total — every
-    # failure mode returns ``None`` so we just check the return.
+    # ---- Instant heuristic ack (two-message pattern) ---------------
+    # The user's contract is: Avi confirms within milliseconds that he
+    # heard them, THEN follows up with the real answer. Fire the
+    # keyword-bucket ack (no LLM) on every inbound before triage so
+    # SMS / WhatsApp never sit silent while the fast model classifies
+    # or the 26B thinks. Chit-chat still gets a short "Working on it."
+    # — two messages is the agreed UX, not a one-shot reply.
+    ack_text = fast_ack.heuristic_ack(inbound.body)
+    ack_message_sid: Optional[str] = None
+    if ack_text and chan.sender_number and settings.AI_FAST_ACK_ENABLED:
+        try:
+            ack_message_sid = _send_for_channel(chan)(
+                account_sid=settings.TWILIO_ACCOUNT_SID or "",
+                auth_token=settings.TWILIO_AUTH_TOKEN or "",
+                from_phone=chan.sender_number,
+                to_phone=inbound.from_phone,
+                body=ack_text,
+            )
+            logger.info(
+                "[orch] surface=%s instant_ack sid=%s ack_sid=%s text=%r",
+                chan.label.lower(),
+                inbound.message_sid,
+                ack_message_sid,
+                ack_text,
+            )
+            live_session.log_message(
+                db,
+                session,
+                role="assistant",
+                content=ack_text,
+                person_id=person.person_id,
+                meta={
+                    "kind": f"{chan.reply_kind}_ack",
+                    "channel": chan.channel,
+                    "agent_task_id": task.agent_task_id,
+                    "twilio_message_sid": ack_message_sid,
+                    "in_reply_to": inbound.message_sid,
+                },
+            )
+            db.commit()
+        except twilio_sms.TwilioSendError as exc:
+            logger.warning(
+                "[orch] surface=%s instant_ack send failed sid=%s: %s "
+                "(continuing with primary reply)",
+                chan.label.lower(),
+                inbound.message_sid,
+                exc,
+            )
+
+    # ---- Unified triage shortcut -----------------------------------
+    # One fast-model call decides between web-search / family-QA /
+    # action-intent / heavy. Inbound attachments always escalate to
+    # the heavy agent because none of the fast paths know how to
+    # handle ``task_attach_message_attachment``; we pass the gate
+    # via ``allow_action=False`` so the classifier can still pick
+    # WEB / FAMILY_QA when appropriate.
     agent_failed = False
     final_text: Optional[str] = None
-    # ``shortcut_used`` tags which fast path (if any) produced the
-    # reply so we can annotate the audit row meta. ``None`` means the
-    # heavy agent handled the turn.
     shortcut_used: Optional[str] = None
-    shortcut_text = web_search_shortcut.try_shortcut_sync(
-        (inbound.body or "").strip()
+    assistant_id_for_fast = _assistant_id_for_family(db, person.family_id)
+    triage = fast_action_router.try_triage_sync(
+        (inbound.body or "").strip(),
+        family_id=person.family_id,
+        person_id=person.person_id,
+        assistant_id=assistant_id_for_fast,
+        live_session_id=session.live_session_id,
+        surface_label=chan.label,
+        agent_task_kind=chan.agent_task_kind,
+        # Attachments need the heavy agent's full tool set.
+        allow_action=not bool(inbound.media),
     )
-    if shortcut_text:
+    if triage.reply:
         logger.info(
-            "[orch] surface=%s path=web_shortcut sid=%s task=%s "
-            "person_id=%s reply_chars=%d (skipping heavy agent)",
+            "[orch] surface=%s path=%s sid=%s task=%s person_id=%s "
+            "reply_chars=%d (skipping heavy agent)",
             chan.label.lower(),
+            triage.used_path,
             inbound.message_sid,
             task.agent_task_id,
             person.person_id,
-            len(shortcut_text),
+            len(triage.reply),
         )
-        final_text = shortcut_text
-        shortcut_used = "web_search"
+        final_text = triage.reply
+        shortcut_used = triage.used_path
 
-    if shortcut_used is None:
+    if final_text is None:
         system_prompt = _build_sms_system_prompt(
             db,
             family_id=person.family_id,
@@ -528,6 +584,11 @@ def process_inbound_sms(
             "twilio_message_sid": reply_sid,
             "in_reply_to": inbound.message_sid,
             **({"shortcut": shortcut_used} if shortcut_used else {}),
+            **(
+                {"ack_twilio_message_sid": ack_message_sid}
+                if ack_message_sid
+                else {}
+            ),
         },
     )
     if agent_failed:
@@ -869,6 +930,15 @@ def _run_agent_to_completion(
     registry = agent_tools.build_default_registry()
     with SessionLocal() as db_for_caps:
         capabilities = agent_tools.detect_capabilities(db_for_caps, assistant_id)
+
+    # Synthetic capability that gates the ``task_attach_message_attachment``
+    # tool — present only when this inbound actually has attachments.
+    # Trimming that one tool's schema off text-only turns shaves ~1 KB
+    # off the system prompt and removes one decoy from the model's
+    # tool-pick menu (it can't claim to attach something we couldn't
+    # have given it).
+    if inbound_attachments:
+        capabilities = set(capabilities) | {"inbound_attachment"}
 
     result = agent_drain.drain_agent_sync(
         task_id=task_id,

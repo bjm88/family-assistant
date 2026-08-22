@@ -56,11 +56,11 @@ from sqlalchemy.orm import Session
 from .. import models, storage
 from ..ai import agent as agent_loop
 from ..ai import agent_drain
-from ..ai import ollama
+from ..ai import llm
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
 from ..ai import vision
-from ..ai import web_search_shortcut
+from ..ai import fast_action_router
 from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import gmail
@@ -489,7 +489,7 @@ def _handle_one_message(
         person_id=person.person_id,
         kind="email",
         input_text=classifier_text,
-        model=ollama._model(),
+        model=llm._model(),
     )
     db.commit()
 
@@ -498,36 +498,45 @@ def _handle_one_message(
     )
     history: List[dict] = []  # email is one-shot per turn, no in-memory history
 
-    # ---- Fast-path web-search shortcut --------------------------------
-    # When the user emails Avi asking a pure web-lookup question
-    # ("What's the latest on the Fed rate decision?"), short-circuit
-    # the heavy agent and reply with Gemini's grounded answer
-    # directly. The classifier sees ``classifier_text`` (subject +
-    # body, deduped - see :func:`_combined_text_for_shortcut`) so a
-    # subject-only message like "When does the truck reg expire?"
-    # with an empty body still routes correctly. ``try_shortcut_sync``
-    # itself is total - every failure mode returns ``None`` so we
-    # just check the return.
+    # Email is async: the sender is not staring at a chat bubble, so
+    # we skip the instant "working on it" ack used on SMS / WhatsApp /
+    # Telegram / live chat. One real reply is enough.
+
+    # ---- Unified triage shortcut --------------------------------------
+    # One fast-model call decides between web-search / family-QA /
+    # action-intent / heavy. The classifier sees ``classifier_text``
+    # (subject + body, deduped — see :func:`_combined_text_for_shortcut`)
+    # so a subject-only message like "When does the truck reg expire?"
+    # with an empty body still routes correctly. Emails with
+    # attachments escalate to the heavy path because the fast tool
+    # subset doesn't include ``task_attach_message_attachment``.
+    # ``try_triage_sync`` itself is total — every failure mode
+    # returns ``label=HEAVY`` so we just check ``triage.reply``.
     agent_failed = False
     final_text: Optional[str] = None
-    # ``shortcut_used`` tags which fast path (if any) produced the
-    # reply so we can annotate the audit row. ``None`` means the
-    # heavy agent handled the turn.
     shortcut_used: Optional[str] = None
-    shortcut_text = web_search_shortcut.try_shortcut_sync(
-        classifier_text
+    triage = fast_action_router.try_triage_sync(
+        classifier_text,
+        family_id=family_id,
+        person_id=person.person_id,
+        assistant_id=assistant_id,
+        live_session_id=session.live_session_id,
+        surface_label="email",
+        agent_task_kind="email",
+        allow_action=not bool(msg.attachments),
     )
-    if shortcut_text:
+    if triage.reply:
         logger.info(
-            "[orch] surface=email path=web_shortcut message_id=%s task=%s "
+            "[orch] surface=email path=%s message_id=%s task=%s "
             "person_id=%s reply_chars=%d (skipping heavy agent)",
+            triage.used_path,
             msg.message_id,
             task.agent_task_id,
             person.person_id,
-            len(shortcut_text),
+            len(triage.reply),
         )
-        final_text = shortcut_text
-        shortcut_used = "web_search"
+        final_text = triage.reply
+        shortcut_used = triage.used_path
 
     if shortcut_used is None:
         system_prompt = _build_email_system_prompt(
@@ -786,9 +795,9 @@ def _combined_text_for_shortcut(msg: gmail.FetchedMessage) -> str:
         Body:    (empty)
 
     If we passed only the body to
-    :func:`web_search_shortcut.try_shortcut_sync`, the classifier
-    would see an empty / signature-only string and vote AGENT,
-    losing the latency win and misclassifying the email. Conversely,
+    :func:`fast_action_router.try_triage_sync`, the classifier would
+    see an empty / signature-only string and vote HEAVY, losing the
+    latency win and misclassifying the email. Conversely,
     a long body with a vague subject like ``"Re: question"`` should
     classify on the body. So we concatenate both, deduping when one
     is a prefix of the other or when the subject is a thread-reply
@@ -1022,6 +1031,12 @@ def _run_agent_to_completion(
     # independent), so passing our DB session in would be wrong.
     with _session() as db_for_caps:
         capabilities = agent_tools.detect_capabilities(db_for_caps, assistant_id)
+
+    # See sms_inbox._run_agent_to_completion for the rationale —
+    # synthetic capability that hides ``task_attach_message_attachment``
+    # on text-only turns.
+    if inbound_attachments:
+        capabilities = set(capabilities) | {"inbound_attachment"}
 
     result = agent_drain.drain_agent_sync(
         task_id=task_id,

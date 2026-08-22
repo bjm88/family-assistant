@@ -22,7 +22,7 @@ from typing import List
 
 from sqlalchemy.orm import Session
 
-from . import ollama, prompts, sql_tool
+from . import llm, prompts, sql_tool
 
 
 logger = logging.getLogger(__name__)
@@ -69,21 +69,21 @@ async def plan_queries(
     logger.info(
         "[planner] start family_id=%s model=%s user_chars=%d",
         family_id,
-        ollama.fast_model(),
+        llm.fast_model(),
         len(last_user_message or ""),
     )
     started = time.monotonic()
     try:
-        raw, model_used = await ollama.generate_with_fallback(
+        raw, model_used = await llm.generate_with_fallback(
             prompt,
-            primary_model=ollama.fast_model(),
+            primary_model=llm.fast_model(),
             system=prompts.with_safety(
                 "You return strict JSON. No prose. No markdown fences."
             ),
             temperature=0.1,
             max_tokens=400,
         )
-    except ollama.OllamaError as e:
+    except llm.LLMError as e:
         logger.warning(
             "[planner] failed family_id=%s duration_ms=%d error=%s",
             family_id,

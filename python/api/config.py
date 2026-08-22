@@ -98,6 +98,33 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_PROJECT_ID: Optional[str] = None
 
+    # xAI Grok — the default live LLM for every non-search task
+    # (agent loop, triage, family Q&A, planner, fast actions, acks).
+    # ``GROK_API_KEY`` is the preferred name; ``XAI_API_KEY`` is
+    # accepted as an alias so a key minted in the xAI console works
+    # without renaming.
+    GROK_API_KEY: Optional[str] = None
+    XAI_API_KEY: Optional[str] = None
+    GROK_API_BASE: str = "https://api.x.ai/v1"
+    # Flagship conversational / tool-calling model. Override in .env
+    # when xAI ships a newer stable alias.
+    GROK_MODEL: str = "grok-4.6"
+    # Cheaper / faster sibling used for one-token classifiers, family
+    # recall, the SQL planner, and the action micro-loop. Still Grok
+    # — never Ollama, never Gemini — unless AI_LLM_PROVIDER=ollama.
+    GROK_FAST_MODEL: str = "grok-4.3"
+
+    # Which backend drives Avi's LLM calls. ``grok`` (default) talks
+    # to xAI; ``ollama`` is the parked local path for a future
+    # household fine-tune. Gemini is *not* a value here — it is only
+    # used for web search via FA_SEARCH_PROVIDER.
+    AI_LLM_PROVIDER: str = "grok"
+    # When false (default) the Ollama warmup loop is skipped and
+    # status checks treat a missing daemon as parked rather than
+    # down. Flip true only when you intend to actually run inference
+    # on the local models (or when AI_LLM_PROVIDER=ollama).
+    AI_OLLAMA_ENABLED: bool = False
+
     # ---- Google OAuth (Gmail + Calendar for the assistant) -------------
     # Created in Google Cloud Console under
     #   APIs & Services → Credentials → Create OAuth client ID
@@ -170,6 +197,15 @@ class Settings(BaseSettings):
     # (`api.ai.ollama.warmup_model`) plus `keep_alive=1h` on every
     # ack call keep the model warm so this cap rarely matters.
     AI_FAST_ACK_TIMEOUT_SECONDS: float = 6.0
+    # Interval (seconds) between background warmup pings that re-pin
+    # both the heavy and fast Ollama models in memory. Ollama's
+    # ``keep_alive=1h`` is reset on every call, so as long as we
+    # ping before the hour is up the models never unload during
+    # idle stretches. Defaults to 50 min (3000 s) — comfortably
+    # under the 1 h pin so a missed ping or a slow start still
+    # leaves headroom. Lower this in dev to stress-test the
+    # keep-alive path; raising it past 3600 risks cold loads.
+    AI_MODEL_KEEPALIVE_INTERVAL_S: float = 3000.0
     # Bound on concurrent heavy-agent runs across all messaging
     # surfaces. Ollama serialises GPU access anyway, so making this
     # large mostly wastes RAM — but a small pool lets a Telegram
@@ -436,25 +472,25 @@ class Settings(BaseSettings):
     # See scripts/ai_training/ for the pipeline that produces the
     # custom model; AI_FAMILY_QA_MODEL is the Ollama tag that pipeline
     # registers (e.g. ``family-fast:latest``).
-    AI_FAMILY_QA_SHORTCUT_ENABLED: bool = False
-    # Ollama tag of the fine-tuned model. Empty = the feature is
-    # implicitly disabled even when ENABLED=true (so you can flip the
-    # env var on early, then only the presence of a registered tag
-    # activates the path). After running
+    AI_FAMILY_QA_SHORTCUT_ENABLED: bool = True
+    # Ollama tag of an optional household-fine-tuned model. Empty
+    # (default) falls back to :envvar:`AI_OLLAMA_FAST_MODEL` so
+    # routine family-recall asks ("who lives here?", "what's Sarah's
+    # email?") still skip the 26B without requiring the
+    # ``scripts/ai_training/`` pipeline. After running
     # ``scripts/ai_training/3_fine_tune.sh`` set this to whatever the
     # script printed — typically ``<ollama_tag_base>:latest`` from
-    # config.yaml.
+    # config.yaml — to swap in the custom voice.
     AI_FAMILY_QA_MODEL: str = ""
-    # Hard cap on the classifier call. Matches the web-search
-    # classifier's timeout — a warm lightweight model should answer
-    # in 200-500 ms; this is the cold-load safety net.
-    AI_FAMILY_QA_CLASSIFIER_TIMEOUT_S: float = 2.5
+    # Hard cap on the classifier call. Grok is a remote round-trip
+    # so this is wider than the old local-e2b 2.5 s budget.
+    AI_FAMILY_QA_CLASSIFIER_TIMEOUT_S: float = 8.0
     # Hard cap on the fine-tuned model's chat response. At Q4_K_M on
     # a Mac Studio a 4B fine-tuned Gemma should stream its full reply
     # in 1-4 s warm; 15 s gives a cold path comfortable headroom
     # before we fall back to the heavy agent. Must be > than
     # AI_FAST_ACK_AFTER_SECONDS so the shortcut can beat the race.
-    AI_FAMILY_QA_ANSWER_TIMEOUT_S: float = 15.0
+    AI_FAMILY_QA_ANSWER_TIMEOUT_S: float = 30.0
 
     # Fast-path web-search shortcut. When enabled, every inbound user
     # message is first run through the lightweight Gemma classifier
@@ -473,7 +509,39 @@ class Settings(BaseSettings):
     # finish in 200-500 ms; this cap is the safety net for a cold
     # load. Going over should be RARE — if you see it firing often,
     # the lifespan warmup isn't running or `keep_alive` got cleared.
-    AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S: float = 2.5
+    AI_WEB_SEARCH_SHORTCUT_CLASSIFIER_TIMEOUT_S: float = 8.0
+
+    # ---- Fast-path action-intent shortcut ------------------------------
+    # Routes known household action intents (add to calendar, add a
+    # task, list tasks, etc.) to a lightweight model + a tiny per-intent
+    # tool subset (1-3 tools) instead of the 21-tool heavy agent. Saves
+    # ~20-90 s on simple action turns and — more importantly — STOPS the
+    # heavy 26B from hallucinating "I added that" when its context window
+    # is exhausted and it never actually called the tool. The classifier
+    # returns one of CALENDAR_ADD / CALENDAR_LIST / TASK_ADD / TASK_LIST /
+    # TASK_UPDATE / NONE and the heavy agent handles NONE plus every
+    # surface failure path.
+    AI_FAST_ACTION_SHORTCUT_ENABLED: bool = True
+    # Ollama tag used for both the classifier AND the per-intent
+    # micro-agent loop. Empty (default) falls back to
+    # ``AI_OLLAMA_FAST_MODEL`` (typically gemma4:e2b) so a fresh install
+    # works without extra config. Override to ``llama3.2:3b`` or similar
+    # if you find one model picks tools more reliably than another for
+    # your household's phrasing.
+    AI_FAST_ACTION_MODEL: str = ""
+    # Hard cap on the classifier call. Same shape as the web-search
+    # classifier — single-token reply, warm e2b in <500 ms; cap is the
+    # cold-load safety net.
+    AI_FAST_ACTION_CLASSIFIER_TIMEOUT_S: float = 8.0
+    # Per-LLM-turn timeout inside the micro-agent loop. The fast model
+    # only sees 1-3 tools and a slim prompt, so warm calls land in
+    # 1-3 s; 30 s is the cold-load + busy-GPU safety net before we bail
+    # to the heavy agent.
+    AI_FAST_ACTION_TURN_TIMEOUT_S: float = 30.0
+    # Hard cap on plan/execute cycles inside the micro-loop. Three is
+    # enough for "lookup_person -> calendar_create_event -> final reply"
+    # without leaving room for a confused model to thrash.
+    AI_FAST_ACTION_MAX_STEPS: int = 3
 
     # ---- Inbound attachments (vision adapter) --------------------------
     # Master switch for the multi-channel attachment pipeline. When OFF
@@ -516,6 +584,16 @@ class Settings(BaseSettings):
     # scope, so Avi can only access files it creates inside the folder
     # (not anything else in your Drive).
     DB_BACKUP_GDRIVE: Optional[str] = None
+
+    @property
+    def grok_api_key(self) -> Optional[str]:
+        """Prefer ``GROK_API_KEY``; fall back to the xAI console alias."""
+        return (self.GROK_API_KEY or self.XAI_API_KEY or "").strip() or None
+
+    @property
+    def llm_provider(self) -> str:
+        raw = (self.AI_LLM_PROVIDER or "grok").strip().lower()
+        return raw if raw in ("grok", "ollama") else "grok"
 
     @property
     def database_url(self) -> str:

@@ -55,22 +55,32 @@ import logging
 import time
 from typing import Optional
 
-import httpx
-
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from . import authz, chat_prompts
 from . import prompts as prompts_mod
-from .ollama import (
-    OllamaError,
-    OllamaUnavailable,
-    _base,
+from . import llm
+from .llm import (
+    LLMError,
+    LLMUnavailable,
     fast_model,
     system_prompt_for_avi,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _answer_model() -> str:
+    """Ollama tag used to answer a FAMILY_QA turn.
+
+    Prefers :setting:`AI_FAMILY_QA_MODEL` when a household-fine-tuned
+    tag is registered; otherwise falls back to :func:`fast_model` so
+    "who lives here" / "what's Sarah's email" never wait on the 26B
+    just because the fine-tune pipeline hasn't been run.
+    """
+    settings = get_settings()
+    return llm.resolve_model(settings.AI_FAMILY_QA_MODEL, fast=True)
 
 
 # ---------------------------------------------------------------------------
@@ -200,66 +210,6 @@ def _looks_like_escalation(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Shared Ollama helpers (kept local so we don't leak module-private
-# routines into the shared client).
-# ---------------------------------------------------------------------------
-
-
-async def _chat_oneshot(
-    *,
-    system: str,
-    user: str,
-    model: str,
-    temperature: float,
-    max_tokens: int,
-    timeout_s: float,
-) -> str:
-    """Minimal non-streaming ``/api/chat`` call against ``model``.
-
-    Mirrors :func:`api.ai.web_search_shortcut._chat_oneshot` so both
-    shortcuts share the exact same Ollama call shape (``think:false``,
-    ``keep_alive="1h"``) and bypass :mod:`api.ai.ollama`'s defaulting
-    to the heavy model tag.
-    """
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "stream": False,
-        "think": False,
-        "keep_alive": "1h",
-        "options": {
-            "num_predict": max_tokens,
-            "temperature": temperature,
-        },
-    }
-    try:
-        async with httpx.AsyncClient(timeout=timeout_s + 2.0) as client:
-            r = await client.post(f"{_base()}/api/chat", json=payload)
-    except httpx.ConnectError as exc:
-        raise OllamaUnavailable(
-            f"Ollama at {_base()} is not responding: {exc}"
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise OllamaError(
-            f"Ollama call to {model!r} exceeded {timeout_s:.1f}s: {exc}"
-        ) from exc
-
-    if r.status_code == 404:
-        raise OllamaUnavailable(
-            f"Model '{model}' is not pulled. Run `ollama pull {model}`."
-        )
-    if r.status_code >= 400:
-        raise OllamaError(f"Ollama returned {r.status_code}: {r.text[:400]}")
-
-    data = r.json()
-    message = data.get("message") or {}
-    return (message.get("content") or "").strip()
-
-
-# ---------------------------------------------------------------------------
 # Classifier
 # ---------------------------------------------------------------------------
 
@@ -279,9 +229,6 @@ async def classify(message: str) -> bool:
     settings = get_settings()
     if not settings.AI_FAMILY_QA_SHORTCUT_ENABLED:
         return False
-    if not (settings.AI_FAMILY_QA_MODEL or "").strip():
-        # Feature flag is on but no model is registered — treat as off.
-        return False
 
     user_prompt = (
         "Classify this single message. Reply with exactly one word — "
@@ -292,7 +239,7 @@ async def classify(message: str) -> bool:
 
     try:
         raw = await asyncio.wait_for(
-            _chat_oneshot(
+            llm.chat_oneshot(
                 system=_CLASSIFIER_SYSTEM_PROMPT,
                 user=user_prompt,
                 model=fast_model(),
@@ -308,12 +255,12 @@ async def classify(message: str) -> bool:
             settings.AI_FAMILY_QA_CLASSIFIER_TIMEOUT_S,
         )
         return False
-    except OllamaUnavailable as exc:
+    except LLMUnavailable as exc:
         logger.debug("[family_qa] %s — skipping shortcut", exc)
         return False
-    except OllamaError as exc:
+    except LLMError as exc:
         logger.warning(
-            "[family_qa] classifier Ollama error %s — falling through", exc
+            "[family_qa] classifier LLM error %s — falling through", exc
         )
         return False
     except Exception:  # noqa: BLE001 - never crash the inbound
@@ -448,7 +395,11 @@ async def run(
     if not text:
         return None
     settings = get_settings()
-    model_tag = (settings.AI_FAMILY_QA_MODEL or "").strip()
+    # Prefer a household-fine-tuned tag when one is registered; otherwise
+    # the regular fast model (typically gemma4:e2b) answers from the RAG
+    # block. That is the latency path we want for "what's Sarah's email"
+    # / "who lives here" — no 26B, no tool loop.
+    model_tag = _answer_model()
     if not model_tag:
         return None
 
@@ -479,7 +430,7 @@ async def run(
 
     try:
         answer = await asyncio.wait_for(
-            _chat_oneshot(
+            llm.chat_oneshot(
                 system=system,
                 user=text,
                 model=model_tag,
@@ -495,21 +446,21 @@ async def run(
             settings.AI_FAMILY_QA_ANSWER_TIMEOUT_S,
         )
         return None
-    except OllamaUnavailable as exc:
+    except LLMUnavailable as exc:
         logger.info(
             "[family_qa] model %r unavailable: %s — falling through",
             model_tag,
             exc,
         )
         return None
-    except OllamaError as exc:
+    except LLMError as exc:
         logger.warning(
-            "[family_qa] Ollama error %s — falling through", exc
+            "[family_qa] LLM error %s — falling through", exc
         )
         return None
     except Exception:  # noqa: BLE001 - last-ditch safety
         logger.exception(
-            "[family_qa] run crashed in _chat_oneshot — falling through"
+            "[family_qa] run crashed in chat_oneshot — falling through"
         )
         return None
 
@@ -563,11 +514,6 @@ async def try_shortcut(
             "[family_qa] disabled by AI_FAMILY_QA_SHORTCUT_ENABLED=false"
         )
         return None
-    if not (settings.AI_FAMILY_QA_MODEL or "").strip():
-        logger.debug(
-            "[family_qa] AI_FAMILY_QA_MODEL not set — shortcut inactive"
-        )
-        return None
 
     try:
         is_family = await classify(message)
@@ -589,4 +535,4 @@ async def try_shortcut(
         return None
 
 
-__all__ = ["classify", "run", "try_shortcut"]
+__all__ = ["classify", "run", "try_shortcut", "_answer_model"]

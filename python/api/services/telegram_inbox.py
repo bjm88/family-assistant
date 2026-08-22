@@ -59,23 +59,21 @@ from datetime import timedelta
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from concurrent.futures import TimeoutError as FuturesTimeoutError
-
 from .. import models
 from ..ai import agent as agent_loop
 from ..ai import agent_drain
 from ..ai import assistants as _assistants
 from ..ai import fast_ack
-from ..ai import ollama
+from ..ai import fast_action_router
+from ..ai import llm
 from ..ai import session as live_session
 from ..ai import tools as agent_tools
 from ..ai import vision
-from ..ai import web_search_shortcut
 from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import telegram, twilio_sms
 from ..utils.phone import normalize_phone
-from . import background_agent, inbound_prompts, telegram_persistence
+from . import inbound_prompts, telegram_persistence
 
 
 logger = logging.getLogger(__name__)
@@ -450,7 +448,7 @@ def process_inbound_update(
         person_id=person.person_id,
         kind="telegram",
         input_text=inbound.body or "",
-        model=ollama._model(),
+        model=llm._model(),
     )
     audit.agent_task_id = task.agent_task_id
     db.commit()
@@ -460,43 +458,98 @@ def process_inbound_update(
     )
     assistant_id_for_family = _assistant_id_for_family(db, person.family_id)
 
-    # ---- Fast-path web-search shortcut -----------------------------
-    # If the lightweight Gemma classifier decides this Telegram
-    # message is a pure web-lookup ask, skip the heavy agent (and
-    # therefore also the fast-ack race) and go straight to Gemini's
-    # grounded answer. Saves ~5-10 s and removes the ack noise on
-    # turns where the answer arrives well inside the ack threshold
-    # anyway. We pass the RAW body — the formatted "[Telegram from
-    # X]" wrapper is a hint for the heavy agent, not signal for the
-    # classifier. ``try_shortcut_sync`` itself is total — every
-    # failure mode returns ``None`` so we just check the return.
-    shortcut_text = web_search_shortcut.try_shortcut_sync(
-        (inbound.body or "").strip()
-    )
+    # ---- Instant heuristic ack (two-message pattern) ---------------
+    # Fire a tiny "Setting that up." / "Looking that up." reply via
+    # the Bot API BEFORE any LLM round trip whenever the inbound
+    # looks like an action-or-lookup ask. Chit-chat skips the ack
+    # because the unified triage usually answers FAMILY_QA inside
+    # ~1 s and we don't want two messages for a "you're welcome".
+    ack_text = fast_ack.heuristic_ack(inbound.body)
     ack_sent_message_id: Optional[int] = None
-    # ``shortcut_used`` tags which fast path (if any) produced the
-    # reply so we can annotate the audit row and LiveSessionMessage
-    # meta. ``None`` means the heavy agent handled the turn.
+    if ack_text and settings.AI_FAST_ACK_ENABLED:
+        try:
+            ack_text_truncated = telegram.truncate_for_telegram(
+                ack_text,
+                max_chars=settings.AI_TELEGRAM_REPLY_MAX_CHARS,
+            )
+            ack_sent_message_id = telegram.send_message(
+                bot_token=settings.TELEGRAM_BOT_TOKEN or "",
+                chat_id=inbound.chat_id,
+                text=ack_text_truncated,
+                reply_to_message_id=inbound.message_id,
+            )
+            logger.info(
+                "[orch] surface=telegram instant_ack update_id=%s "
+                "ack_msg=%s text=%r",
+                inbound.update_id,
+                ack_sent_message_id,
+                ack_text_truncated,
+            )
+            live_session.log_message(
+                db,
+                session,
+                role="assistant",
+                content=ack_text_truncated,
+                person_id=person.person_id,
+                meta={
+                    "kind": "telegram_fast_ack",
+                    "agent_task_id": task.agent_task_id,
+                    "telegram_chat_id": inbound.chat_id,
+                    "telegram_message_id": ack_sent_message_id,
+                    "in_reply_to": inbound.message_id,
+                },
+            )
+            audit.status_reason = (
+                f"Instant ack sent (msg={ack_sent_message_id}); "
+                "awaiting reply."
+            )
+            db.commit()
+        except telegram.TelegramSendError as exc:
+            logger.warning(
+                "[orch] surface=telegram instant_ack send failed "
+                "update_id=%s: %s (continuing with primary reply)",
+                inbound.update_id,
+                exc,
+            )
+
+    # ---- Unified triage shortcut -----------------------------------
+    # One fast-model call decides between web-search / family-QA /
+    # action-intent / heavy. Inbound attachments always escalate to
+    # the heavy agent because none of the fast paths know how to
+    # handle ``task_attach_message_attachment``.
     shortcut_used: Optional[str] = None
-    if shortcut_text:
+    triage = fast_action_router.try_triage_sync(
+        (inbound.body or "").strip(),
+        family_id=person.family_id,
+        person_id=person.person_id,
+        assistant_id=assistant_id_for_family,
+        live_session_id=session.live_session_id,
+        surface_label="Telegram",
+        agent_task_kind="telegram",
+        allow_action=not bool(inbound.attachments),
+    )
+    if triage.reply:
         logger.info(
-            "[orch] surface=telegram path=web_shortcut update_id=%s task=%s "
-            "person_id=%s reply_chars=%d (skipping heavy agent + ack race)",
+            "[orch] surface=telegram path=%s update_id=%s task=%s "
+            "person_id=%s reply_chars=%d (skipping heavy agent)",
+            triage.used_path,
             inbound.update_id,
             task.agent_task_id,
             person.person_id,
-            len(shortcut_text),
+            len(triage.reply),
         )
-        final_text = shortcut_text
+        final_text = triage.reply
         agent_failed = False
-        shortcut_used = "web_search"
-    else:
+        shortcut_used = triage.used_path
+
+    if shortcut_used is None:
         logger.info(
-            "[orch] surface=telegram path=heavy_agent_with_ack_race "
-            "update_id=%s task=%s person_id=%s",
+            "[orch] surface=telegram path=heavy_agent update_id=%s "
+            "task=%s person_id=%s instant_acked=%s",
             inbound.update_id,
             task.agent_task_id,
             person.person_id,
+            bool(ack_sent_message_id),
         )
 
         system_prompt = _build_telegram_system_prompt(
@@ -508,40 +561,45 @@ def process_inbound_update(
             or str(inbound.from_user_id or "?"),
         )
 
-        # ---- Race-and-ack pattern (see api.ai.fast_ack docstring)
-        # Kick the heavy agent off on a background thread
-        # immediately so we can either:
-        #   (a) send a single reply if the agent finishes inside
-        #       the AI_FAST_ACK_AFTER_SECONDS window (no ack noise
-        #       for short answers), or
-        #   (b) fire a quick contextual "I'm on it" ack from the
-        #       fast model and follow up with the real answer
-        #       when the heavy agent converges.
-        # Either way the audit row reflects exactly what was sent.
-        final_text, agent_failed, ack_sent_message_id = (
-            _run_agent_with_fast_ack(
-                db,
-                inbound=inbound,
-                person=person,
-                task_id=task.agent_task_id,
-                assistant_id=assistant_id_for_family,
-                system_prompt=system_prompt,
-                user_message=user_message,
-                session=session,
-                audit=audit,
-                inbound_attachments=[
-                    agent_tools.InboundAttachmentRef(
-                        media_index=m["media_index"],
-                        filename=m["filename"],
-                        mime_type=m.get("mime_type"),
-                        size_bytes=m.get("file_size_bytes"),
-                        stored_path=m["stored_path"],
-                        channel="telegram",
-                    )
-                    for m in attachments_meta
-                ],
+        inbound_attachment_refs = [
+            agent_tools.InboundAttachmentRef(
+                media_index=m["media_index"],
+                filename=m["filename"],
+                mime_type=m.get("mime_type"),
+                size_bytes=m.get("file_size_bytes"),
+                stored_path=m["stored_path"],
+                channel="telegram",
             )
-        )
+            for m in attachments_meta
+        ]
+
+        # No race-and-ack here: we already sent the instant ack above
+        # (when the message looked like work) so a second e2b ack would
+        # produce three messages for one inbound. Just drain the heavy
+        # agent and send the final reply.
+        try:
+            final_text = _run_agent_to_completion(
+                task_id=task.agent_task_id,
+                family_id=person.family_id,
+                assistant_id=assistant_id_for_family,
+                person_id=person.person_id,
+                system_prompt=system_prompt,
+                history=[],
+                user_message=user_message,
+                inbound_attachments=inbound_attachment_refs,
+            )
+            agent_failed = False
+        except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
+            logger.exception(
+                "Telegram inbox: agent loop crashed for update_id=%s task=%s",
+                inbound.update_id,
+                task.agent_task_id,
+            )
+            agent_failed = True
+            final_text = (
+                "Got your message — Avi here. I hit a snag on my end "
+                "and couldn't finish that just now. I'll look into it."
+            )
 
     final_text = telegram.truncate_for_telegram(
         final_text or "Got your message — nothing to add right now.",
@@ -2185,169 +2243,6 @@ def _build_telegram_system_prompt(
 _assistant_id_for_family = _assistants.assistant_id_for_family
 
 
-def _run_agent_with_fast_ack(
-    db: Session,
-    *,
-    inbound: telegram.InboundTelegramMessage,
-    person: models.Person,
-    task_id: int,
-    assistant_id: Optional[int],
-    system_prompt: str,
-    user_message: str,
-    session: models.LiveSession,
-    audit: models.TelegramInboxMessage,
-    inbound_attachments: Optional[List[agent_tools.InboundAttachmentRef]] = None,
-) -> Tuple[str, bool, Optional[int]]:
-    """Race the heavy agent against the fast-ack threshold.
-
-    Behaviour:
-
-    1. Submits the heavy agent (``_run_agent_to_completion``) to the
-       shared :mod:`api.services.background_agent` thread pool so this
-       caller can race a watchdog against it.
-    2. Waits up to :setting:`AI_FAST_ACK_AFTER_SECONDS`.
-       * If the heavy agent finished in time, returns its text — no
-         ack was needed and none was sent.
-       * Otherwise, asks the lightweight model for a one-sentence
-         contextual ack and sends it as a Telegram reply (threaded
-         under the inbound), then blocks for the heavy agent to
-         finish and returns its text.
-    3. Either way, returns ``(final_text, agent_failed, ack_message_id)``.
-       ``ack_message_id`` is ``None`` when no ack was sent (either the
-       heavy agent won the race or the fast model declined to produce
-       one); otherwise it's the Telegram ``message_id`` of the ack so
-       the caller can cross-link it in the transcript.
-
-    Failure isolation matches the original blocking flow: if the
-    heavy agent crashes we return a fixed apology string and
-    ``agent_failed=True`` so the caller's audit row reflects it. The
-    ack send is best-effort — a Telegram outage during the ack does
-    not abort the heavy reply.
-    """
-    settings = get_settings()
-    family_id = person.family_id
-    person_id = person.person_id
-
-    # ---- Kick off the heavy agent on a background worker -----------
-    def _heavy() -> str:
-        return _run_agent_to_completion(
-            task_id=task_id,
-            family_id=family_id,
-            assistant_id=assistant_id,
-            person_id=person_id,
-            system_prompt=system_prompt,
-            history=[],
-            user_message=user_message,
-            inbound_attachments=list(inbound_attachments or []),
-        )
-
-    future = background_agent.submit(_heavy)
-
-    # ---- Race ------------------------------------------------------
-    threshold = float(settings.AI_FAST_ACK_AFTER_SECONDS)
-    ack_message_id: Optional[int] = None
-    try:
-        final_text = future.result(timeout=threshold)
-        # Heavy agent won the race — skip the ack entirely. Nothing
-        # to log here; the transcript will record only the final
-        # assistant reply.
-        return final_text, False, None
-    except FuturesTimeoutError:
-        pass
-    except Exception:  # noqa: BLE001 - heavy agent crashed
-        logger.exception(
-            "Telegram inbox: agent loop crashed for update_id=%s task=%s",
-            inbound.update_id,
-            task_id,
-        )
-        return (
-            "Got your message — Avi here. I hit a snag on my end and "
-            "couldn't finish that just now. I'll look into it."
-        ), True, None
-
-    # ---- Heavy agent didn't finish in time — send a contextual ack -
-    if settings.AI_FAST_ACK_ENABLED:
-        ack_text = fast_ack.generate_contextual_ack_sync(
-            surface="telegram",
-            sender_display_name=(
-                inbound.sender_display_name
-                or person.preferred_name
-                or person.first_name
-            ),
-            last_user_message=inbound.body or "",
-        )
-        if ack_text:
-            ack_text = telegram.truncate_for_telegram(
-                ack_text,
-                max_chars=settings.AI_TELEGRAM_REPLY_MAX_CHARS,
-            )
-            try:
-                ack_message_id = telegram.send_message(
-                    bot_token=settings.TELEGRAM_BOT_TOKEN or "",
-                    chat_id=inbound.chat_id,
-                    text=ack_text,
-                    reply_to_message_id=inbound.message_id,
-                )
-                logger.info(
-                    "Telegram inbox: fast-ack sent chat=%s msg=%s "
-                    "(update_id=%s, threshold=%.1fs)",
-                    inbound.chat_id,
-                    ack_message_id,
-                    inbound.update_id,
-                    threshold,
-                )
-                live_session.log_message(
-                    db,
-                    session,
-                    role="assistant",
-                    content=ack_text,
-                    person_id=person_id,
-                    meta={
-                        "kind": "telegram_fast_ack",
-                        "agent_task_id": task_id,
-                        "telegram_chat_id": inbound.chat_id,
-                        "telegram_message_id": ack_message_id,
-                        "in_reply_to": inbound.message_id,
-                    },
-                )
-                # Stamp the audit row mid-flight so an operator who
-                # peeks before the heavy agent finishes can see we
-                # already replied with an ack.
-                audit.status_reason = (
-                    f"Fast-ack sent (msg={ack_message_id}); awaiting "
-                    "heavy agent."
-                )
-                db.commit()
-            except telegram.TelegramSendError as exc:
-                # Don't let an ack-send failure abort the heavy reply.
-                # The user will still get the final answer; we just
-                # missed the latency-hider.
-                logger.warning(
-                    "Telegram inbox: fast-ack send failed for "
-                    "update_id=%s (%s) — continuing without ack",
-                    inbound.update_id,
-                    exc,
-                )
-                ack_message_id = None
-
-    # ---- Block until the heavy agent finishes ----------------------
-    try:
-        final_text = future.result()
-    except Exception:  # noqa: BLE001 - heavy agent crashed post-ack
-        logger.exception(
-            "Telegram inbox: agent loop crashed post-ack for "
-            "update_id=%s task=%s",
-            inbound.update_id,
-            task_id,
-        )
-        return (
-            "Got your message — Avi here. I hit a snag on my end and "
-            "couldn't finish that just now. I'll look into it."
-        ), True, ack_message_id
-
-    return final_text, False, ack_message_id
-
-
 def _run_agent_to_completion(
     *,
     task_id: int,
@@ -2367,6 +2262,12 @@ def _run_agent_to_completion(
     registry = agent_tools.build_default_registry()
     with SessionLocal() as db_for_caps:
         capabilities = agent_tools.detect_capabilities(db_for_caps, assistant_id)
+
+    # See sms_inbox._run_agent_to_completion for the rationale —
+    # synthetic capability that hides ``task_attach_message_attachment``
+    # on text-only turns.
+    if inbound_attachments:
+        capabilities = set(capabilities) | {"inbound_attachment"}
 
     result = agent_drain.drain_agent_sync(
         task_id=task_id,
