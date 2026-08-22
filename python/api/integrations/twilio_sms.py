@@ -159,6 +159,8 @@ def send_sms(
     to_phone: str,
     body: str,
     media_urls: Optional[Iterable[str]] = None,
+    messaging_service_sid: Optional[str] = None,
+    status_callback: Optional[str] = None,
     timeout_seconds: float = 15.0,
 ) -> str:
     """Send a single SMS / MMS and return Twilio's MessageSid.
@@ -174,6 +176,14 @@ def send_sms(
     media_urls
         Optional list of public-internet URLs Twilio should attach as
         MMS media. Each URL adds one ``MediaUrl`` form field.
+    messaging_service_sid
+        A2P 10DLC Messaging Service (``MG…``). Required for US-bound
+        SMS from a 10-digit long code — sending with a bare ``From``
+        is accepted by the API then blocked as error 30034.
+    status_callback
+        Public URL Twilio should POST delivery receipts to. Without
+        this we only see the create-time ``queued`` status and miss
+        later ``undelivered`` / ``failed`` outcomes.
     """
     if not account_sid or not auth_token:
         raise TwilioSendError(
@@ -186,6 +196,10 @@ def send_sms(
         ("To", to_phone),
         ("Body", body),
     ]
+    if messaging_service_sid:
+        fields.append(("MessagingServiceSid", messaging_service_sid))
+    if status_callback:
+        fields.append(("StatusCallback", status_callback))
     for media in media_urls or ():
         fields.append(("MediaUrl", media))
 
@@ -222,13 +236,24 @@ def send_sms(
 
     payload = resp.json()
     sid = payload.get("sid", "")
+    status = payload.get("status")
+    error_code = payload.get("error_code")
     logger.info(
-        "Twilio SMS sent sid=%s to=%s from=%s body_len=%d",
+        "Twilio SMS accepted sid=%s to=%s from=%s body_len=%d "
+        "status=%s error_code=%s messaging_service_sid=%s",
         sid,
         to_phone,
         from_phone,
         len(body),
+        status,
+        error_code,
+        messaging_service_sid,
     )
+    if status in {"failed", "undelivered"}:
+        raise TwilioSendError(
+            f"Twilio {status} sid={sid} error_code={error_code} "
+            f"error_message={payload.get('error_message')}"
+        )
     return sid
 
 
@@ -240,6 +265,7 @@ def send_whatsapp(
     to_phone: str,
     body: str,
     media_urls: Optional[Iterable[str]] = None,
+    status_callback: Optional[str] = None,
     timeout_seconds: float = 15.0,
 ) -> str:
     """Send a single WhatsApp reply via Twilio and return the MessageSid.
@@ -270,6 +296,7 @@ def send_whatsapp(
         to_phone=with_whatsapp_prefix(to_phone),
         body=body,
         media_urls=media_urls,
+        status_callback=status_callback,
         timeout_seconds=timeout_seconds,
     )
 

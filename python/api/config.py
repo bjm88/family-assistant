@@ -311,6 +311,11 @@ class Settings(BaseSettings):
     # number even if the inbound came in on a different "To" line, so
     # only set TWILIO_PRIMARY_PHONE to a number you actually own.
     TWILIO_PRIMARY_PHONE: Optional[str] = None
+    # Messaging Service that owns TWILIO_PRIMARY_PHONE and the A2P
+    # 10DLC campaign. US carriers reject outbound 10DLC SMS that is
+    # sent with a bare ``From`` (Twilio error 30034) — replies must go
+    # through this MG… SID once the campaign is approved.
+    TWILIO_MESSAGING_SERVICE_SID: Optional[str] = None
     # Public URL Twilio uses to reach our webhook, e.g.
     # https://your-tunnel.ngrok.app/api/sms/twilio/inbound — must match
     # exactly because it is part of the X-Twilio-Signature input. Leave
@@ -318,6 +323,20 @@ class Settings(BaseSettings):
     # cases but breaks if there is a load balancer between Twilio and
     # us that rewrites the host header).
     TWILIO_WEBHOOK_PUBLIC_URL: Optional[str] = None
+
+    def twilio_status_callback_url(self) -> Optional[str]:
+        """Derive the outbound-SMS status callback from the inbound webhook URL.
+
+        Twilio POSTs delivery receipts (``delivered`` / ``undelivered`` +
+        ``ErrorCode``) here. We swap the inbound path's trailing
+        ``/inbound`` for ``/status`` so operators only have to pin one
+        public URL.
+        """
+        inbound = (self.TWILIO_WEBHOOK_PUBLIC_URL or "").rstrip("/")
+        suffix = "/inbound"
+        if inbound.endswith(suffix):
+            return inbound[: -len(suffix)] + "/status"
+        return None
     # Hard cap on per-message body length when we send a reply. SMS
     # itself supports up to 1600 chars (= 10 segments) but most users
     # appreciate brevity over a wall of text — pick a number you'd be

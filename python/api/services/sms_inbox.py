@@ -37,6 +37,12 @@ divergences (sender number, length cap, env flag, live-session
   opt-in conventions), log the inbound into the transcript, run the
   same agent loop the live chat uses, and send the final answer back
   via Twilio's REST API (``send_sms`` / ``send_whatsapp``).
+* SMS-only: if Twilio is unconfigured, the send raises, or a later
+  delivery receipt comes back ``undelivered`` / ``failed`` (e.g. A2P
+  30034), we email the same reply to ``Person.email_address`` when
+  that member has one and the family assistant has Gmail connected.
+  Instant acks stay SMS-only — only the real answer is worth the
+  fallback. WhatsApp does not use this path.
 
 Architectural parity with email
 -------------------------------
@@ -80,7 +86,7 @@ from ..ai import tools as agent_tools
 from ..ai import vision
 from ..config import Settings, get_settings
 from ..db import SessionLocal
-from ..integrations import twilio_sms
+from ..integrations import gmail, google_oauth, twilio_sms
 from ..utils.phone import normalize_phone
 from . import inbound_prompts
 
@@ -171,6 +177,23 @@ def _send_for_channel(
     if chan.channel == "whatsapp":
         return twilio_sms.send_whatsapp
     return twilio_sms.send_sms
+
+
+def _outbound_extra(chan: _ChannelConfig, settings: Settings) -> dict:
+    """Per-send kwargs that attach A2P + delivery-receipt plumbing.
+
+    WhatsApp does not use A2P 10DLC, so the Messaging Service SID is
+    SMS-only. Both surfaces get a status callback when the public
+    webhook URL is configured so ``undelivered`` / ``30034`` lands in
+    our logs instead of looking like a successful send.
+    """
+    extra: dict = {}
+    if chan.channel == "sms" and settings.TWILIO_MESSAGING_SERVICE_SID:
+        extra["messaging_service_sid"] = settings.TWILIO_MESSAGING_SERVICE_SID
+    callback = settings.twilio_status_callback_url()
+    if callback:
+        extra["status_callback"] = callback
+    return extra
 
 
 def _open_session_for_channel(
@@ -401,6 +424,7 @@ def process_inbound_sms(
                 from_phone=chan.sender_number,
                 to_phone=inbound.from_phone,
                 body=ack_text,
+                **_outbound_extra(chan, settings),
             )
             logger.info(
                 "[orch] surface=%s instant_ack sid=%s ack_sid=%s text=%r",
@@ -541,6 +565,18 @@ def process_inbound_sms(
 
     # ---- Send the reply via Twilio ---------------------------------
     if not chan.sender_number:
+        if chan.channel == "sms":
+            return _finish_with_email_fallback(
+                db,
+                audit=audit,
+                session=session,
+                person=person,
+                inbound=inbound,
+                reply_text=final_text,
+                sms_error=f"{chan.sender_env_name} not configured.",
+                shortcut_used=shortcut_used,
+                agent_failed=agent_failed,
+            )
         audit.status = "failed"
         audit.status_reason = f"{chan.sender_env_name} not configured."
         db.commit()
@@ -558,6 +594,7 @@ def process_inbound_sms(
             # WhatsApp sender helper will not double-prefix.
             to_phone=inbound.from_phone,
             body=final_text,
+            **_outbound_extra(chan, settings),
         )
     except twilio_sms.TwilioSendError as exc:
         logger.exception(
@@ -565,6 +602,18 @@ def process_inbound_sms(
             chan.label,
             inbound.message_sid,
         )
+        if chan.channel == "sms":
+            return _finish_with_email_fallback(
+                db,
+                audit=audit,
+                session=session,
+                person=person,
+                inbound=inbound,
+                reply_text=final_text,
+                sms_error=f"twilio send: {exc}",
+                shortcut_used=shortcut_used,
+                agent_failed=agent_failed,
+            )
         audit.status = "failed"
         audit.status_reason = f"twilio send: {exc}"
         db.commit()
@@ -960,4 +1009,245 @@ def _run_agent_to_completion(
     return result.final_text or "Got your text — nothing to add right now."
 
 
-__all__ = ["process_inbound_sms"]
+# ---------------------------------------------------------------------------
+# Email fallback when SMS cannot be delivered
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _EmailFallbackResult:
+    sent: bool
+    detail: str
+    gmail_message_id: Optional[str] = None
+
+
+def _format_sms_fallback_email(*, inbound_body: Optional[str], reply_text: str) -> Tuple[str, str]:
+    """Subject + body for the SMS→email fallback."""
+    subject = "Avi couldn't deliver a text — here's the reply"
+    quoted = (inbound_body or "").strip() or "(no text)"
+    body = (
+        "Avi here. I received your text but couldn't deliver the reply "
+        "to your phone, so I'm sending it by email instead.\n\n"
+        f"You wrote:\n{quoted}\n\n"
+        f"Avi's reply:\n{reply_text}"
+    )
+    return subject, body
+
+
+def _email_sms_reply(
+    db: Session,
+    *,
+    person: models.Person,
+    inbound_body: Optional[str],
+    reply_text: str,
+) -> _EmailFallbackResult:
+    """Send ``reply_text`` to ``person.email_address`` via the family Gmail.
+
+    Returns a result even when we skip (no email, no Google grant) so
+    callers can put the reason on the audit row. Never raises.
+    """
+    email = (person.email_address or "").strip()
+    if not email:
+        return _EmailFallbackResult(False, "person has no email_address")
+    assistant_id = _assistant_id_for_family(db, person.family_id)
+    if assistant_id is None:
+        return _EmailFallbackResult(False, "no assistant for family")
+    try:
+        _row, creds = google_oauth.load_credentials(db, assistant_id)
+    except google_oauth.GoogleNotConnected:
+        return _EmailFallbackResult(False, "google not connected")
+    except (google_oauth.GoogleOAuthError, google_oauth.GoogleOAuthUnavailable) as exc:
+        return _EmailFallbackResult(False, f"google oauth: {exc}")
+    subject, body = _format_sms_fallback_email(
+        inbound_body=inbound_body, reply_text=reply_text
+    )
+    try:
+        gmail_id = gmail.send_email(creds, to=email, subject=subject, body=body)
+    except gmail.GmailSendError as exc:
+        logger.exception(
+            "SMS email fallback: Gmail send failed person_id=%s to=%s",
+            person.person_id,
+            email,
+        )
+        return _EmailFallbackResult(False, f"gmail send: {exc}")
+    logger.info(
+        "[orch] surface=sms email_fallback person_id=%s to=%s gmail_id=%s",
+        person.person_id,
+        email,
+        gmail_id,
+    )
+    return _EmailFallbackResult(True, f"emailed fallback to {email}", gmail_id)
+
+
+def _finish_with_email_fallback(
+    db: Session,
+    *,
+    audit: models.SmsInboxMessage,
+    session: models.LiveSession,
+    person: models.Person,
+    inbound: twilio_sms.InboundSms,
+    reply_text: str,
+    sms_error: str,
+    shortcut_used: Optional[str],
+    agent_failed: bool,
+) -> models.SmsInboxMessage:
+    """Record a Twilio miss and, when possible, deliver the reply by email."""
+    fallback = _email_sms_reply(
+        db,
+        person=person,
+        inbound_body=inbound.body,
+        reply_text=reply_text,
+    )
+    live_session.log_message(
+        db,
+        session,
+        role="assistant",
+        content=reply_text,
+        person_id=person.person_id,
+        meta={
+            "kind": "sms_email_fallback" if fallback.sent else "sms_reply",
+            "channel": "sms",
+            "in_reply_to": inbound.message_sid,
+            "sms_error": sms_error,
+            **({"shortcut": shortcut_used} if shortcut_used else {}),
+            **(
+                {"gmail_message_id": fallback.gmail_message_id}
+                if fallback.gmail_message_id
+                else {}
+            ),
+        },
+    )
+    if fallback.sent:
+        audit.status = "processed_replied"
+        extra = " Agent loop crashed; emailed fallback apology." if agent_failed else ""
+        audit.status_reason = f"{sms_error}; {fallback.detail}.{extra}".rstrip()
+    else:
+        audit.status = "failed"
+        audit.status_reason = f"{sms_error}; email fallback: {fallback.detail}"
+    db.commit()
+    return audit
+
+
+def _reply_body_from_session(
+    db: Session, audit: models.SmsInboxMessage, twilio_sid: str
+) -> Optional[str]:
+    """Recover the outbound SMS body we logged for ``twilio_sid``."""
+    if audit.live_session_id is None:
+        return None
+    rows = (
+        db.execute(
+            select(models.LiveSessionMessage)
+            .where(
+                models.LiveSessionMessage.live_session_id == audit.live_session_id
+            )
+            .where(models.LiveSessionMessage.role == "assistant")
+            .order_by(models.LiveSessionMessage.live_session_message_id.desc())
+            .limit(12)
+        )
+        .scalars()
+        .all()
+    )
+    sid_match: Optional[str] = None
+    kind_match: Optional[str] = None
+    for row in rows:
+        meta = row.meta or {}
+        if meta.get("kind") == "sms_email_fallback":
+            # Already fell back — caller uses this as an idempotency signal
+            # by seeing status_reason, but skip using this as the SMS body.
+            continue
+        if meta.get("twilio_message_sid") == twilio_sid:
+            sid_match = row.content
+            break
+        if kind_match is None and meta.get("kind") == "sms_reply":
+            kind_match = row.content
+    return sid_match or kind_match
+
+
+def handle_outbound_delivery_failure(
+    db: Session,
+    *,
+    twilio_message_sid: str,
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """Email the SMS reply if a later Twilio receipt says it never landed.
+
+    Instant-ack SIDs are ignored (they are not stored on
+    ``reply_message_sid``). Already-emailed rows are a no-op so Twilio
+    retries do not double-send. WhatsApp receipts are ignored.
+    """
+    if not twilio_message_sid:
+        return
+    audit = db.execute(
+        select(models.SmsInboxMessage).where(
+            models.SmsInboxMessage.reply_message_sid == twilio_message_sid
+        )
+    ).scalar_one_or_none()
+    if audit is None or audit.channel != "sms":
+        return
+    if audit.status_reason and "emailed fallback" in audit.status_reason:
+        logger.info(
+            "SMS delivery failure already emailed sid=%s; skipping.",
+            twilio_message_sid,
+        )
+        return
+    person = audit.person or (
+        db.get(models.Person, audit.person_id) if audit.person_id else None
+    )
+    if person is None:
+        logger.warning(
+            "SMS delivery failure sid=%s has no person; cannot email.",
+            twilio_message_sid,
+        )
+        return
+    reply_text = _reply_body_from_session(db, audit, twilio_message_sid)
+    if not reply_text:
+        logger.warning(
+            "SMS delivery failure sid=%s: no reply body on the session.",
+            twilio_message_sid,
+        )
+        return
+    err = f"SMS undelivered ({error_code or 'unknown'})"
+    if error_message:
+        err = f"{err}: {error_message}"
+    fallback = _email_sms_reply(
+        db,
+        person=person,
+        inbound_body=audit.body,
+        reply_text=reply_text,
+    )
+    session = (
+        db.get(models.LiveSession, audit.live_session_id)
+        if audit.live_session_id
+        else None
+    )
+    if session is not None:
+        live_session.log_message(
+            db,
+            session,
+            role="assistant",
+            content=reply_text,
+            person_id=person.person_id,
+            meta={
+                "kind": "sms_email_fallback" if fallback.sent else "sms_reply",
+                "channel": "sms",
+                "in_reply_to": audit.twilio_message_sid,
+                "failed_twilio_message_sid": twilio_message_sid,
+                "sms_error": err,
+                **(
+                    {"gmail_message_id": fallback.gmail_message_id}
+                    if fallback.gmail_message_id
+                    else {}
+                ),
+            },
+        )
+    if fallback.sent:
+        audit.status = "processed_replied"
+        audit.status_reason = f"{err}; {fallback.detail}"
+    else:
+        audit.status = "failed"
+        audit.status_reason = f"{err}; email fallback: {fallback.detail}"
+    db.commit()
+
+
+__all__ = ["handle_outbound_delivery_failure", "process_inbound_sms"]

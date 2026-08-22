@@ -120,6 +120,200 @@ def test_sms_inbound_routes_to_agent(client, test_family, db):
     assert sms_calls[0]["to_phone"] == test_family["person_phone"]
 
 
+def test_sms_outbound_uses_messaging_service(client, test_family, db):
+    """US SMS replies must go through the A2P Messaging Service (30034)."""
+    from api.config import get_settings
+
+    sid = f"SM_test_sms_ms_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="Hi Avi, integration test — messaging service path.",
+    )
+    sms_calls: list[dict[str, Any]] = []
+
+    with patch.object(
+        get_settings(), "TWILIO_MESSAGING_SERVICE_SID", "MGtestservice"
+    ), patch.object(
+        get_settings(),
+        "TWILIO_WEBHOOK_PUBLIC_URL",
+        "https://example.test/api/sms/twilio/inbound",
+    ), patch(
+        "api.services.sms_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ), patch(
+        "api.services.sms_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
+    ), patch(
+        "api.integrations.twilio_sms.send_sms",
+        side_effect=lambda **kw: sms_calls.append(kw) or "SMmocked-ms-sid",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    assert sms_calls, "expected an outbound SMS send"
+    assert sms_calls[0]["messaging_service_sid"] == "MGtestservice"
+    assert sms_calls[0]["status_callback"] == (
+        "https://example.test/api/sms/twilio/status"
+    )
+
+
+def test_twilio_status_callback_accepted(client):
+    """Delivery receipts are public (Twilio-signed) and return 2xx."""
+    resp = client.post(
+        "/api/sms/twilio/status",
+        data={
+            "MessageSid": "SMstatus-test",
+            "MessageStatus": "undelivered",
+            "ErrorCode": "30034",
+            "From": "+15550001111",
+            "To": "+12035551234",
+        },
+    )
+    assert resp.status_code in (200, 204), resp.text
+
+
+def test_sms_send_failure_falls_back_to_email(client, test_family, db):
+    """Twilio reject on the real reply emails the same answer."""
+    sid = f"SM_test_sms_email_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="What's on my calendar?",
+    )
+    email_calls: list[dict[str, Any]] = []
+
+    with patch(
+        "api.services.sms_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ), patch(
+        "api.services.sms_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
+    ), patch(
+        "api.integrations.twilio_sms.send_sms",
+        side_effect=twilio_sms.TwilioSendError("HTTP 400: unregistered"),
+    ), patch(
+        "api.services.sms_inbox.google_oauth.load_credentials",
+        return_value=(MagicMock(), MagicMock()),
+    ), patch(
+        "api.services.sms_inbox.gmail.send_email",
+        side_effect=lambda creds, **kw: email_calls.append(kw) or "gmail-fallback-1",
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+
+    assert resp.status_code in (200, 204), resp.text
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == sid)
+    ).scalar_one()
+    assert audit.status == "processed_replied"
+    assert audit.status_reason and "emailed fallback" in audit.status_reason
+    assert len(email_calls) == 1
+    assert email_calls[0]["to"] == test_family["person_email"]
+    assert AGENT_REPLY in email_calls[0]["body"]
+    assert "What's on my calendar?" in email_calls[0]["body"]
+
+
+def test_sms_send_failure_without_email_stays_failed(client, test_family, db):
+    """No Person.email_address means we do not invent a destination."""
+    person = db.get(models.Person, test_family["person_id"])
+    assert person is not None
+    original_email = person.email_address
+    person.email_address = None
+    db.commit()
+    sid = f"SM_test_sms_noemail_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="Ping",
+    )
+    try:
+        with patch(
+            "api.services.sms_inbox._run_agent_to_completion",
+            return_value=AGENT_REPLY,
+        ), patch(
+            "api.services.sms_inbox.fast_action_router.try_triage_sync",
+            return_value=_heavy_triage(),
+        ), patch(
+            "api.integrations.twilio_sms.send_sms",
+            side_effect=twilio_sms.TwilioSendError("HTTP 400: unregistered"),
+        ), patch(
+            "api.services.sms_inbox.gmail.send_email",
+        ) as email_mock:
+            resp = client.post("/api/sms/twilio/inbound", data=form)
+    finally:
+        person.email_address = original_email
+        db.commit()
+
+    assert resp.status_code in (200, 204), resp.text
+    email_mock.assert_not_called()
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == sid)
+    ).scalar_one()
+    assert audit.status == "failed"
+    assert audit.status_reason and "no email_address" in audit.status_reason
+
+
+def test_sms_delivery_failure_falls_back_to_email(client, test_family, db):
+    """Later 30034 on the accepted reply still emails the answer."""
+    inbound_sid = f"SM_test_sms_dlv_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    reply_sid = "SMqueued-then-undelivered"
+    form = _twilio_form(
+        inbound_sid,
+        from_phone=test_family["person_phone"],
+        to_phone="+15550001111",
+        body="What's on my calendar next week?",
+    )
+    email_calls: list[dict[str, Any]] = []
+
+    with patch(
+        "api.services.sms_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ), patch(
+        "api.services.sms_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
+    ), patch(
+        "api.integrations.twilio_sms.send_sms",
+        return_value=reply_sid,
+    ):
+        resp = client.post("/api/sms/twilio/inbound", data=form)
+    assert resp.status_code in (200, 204), resp.text
+
+    with patch(
+        "api.services.sms_inbox.google_oauth.load_credentials",
+        return_value=(MagicMock(), MagicMock()),
+    ), patch(
+        "api.services.sms_inbox.gmail.send_email",
+        side_effect=lambda creds, **kw: email_calls.append(kw) or "gmail-dlv-1",
+    ):
+        status_resp = client.post(
+            "/api/sms/twilio/status",
+            data={
+                "MessageSid": reply_sid,
+                "MessageStatus": "undelivered",
+                "ErrorCode": "30034",
+                "From": "+15550001111",
+                "To": test_family["person_phone"],
+            },
+        )
+
+    assert status_resp.status_code in (200, 204), status_resp.text
+    assert len(email_calls) == 1
+    assert email_calls[0]["to"] == test_family["person_email"]
+    assert AGENT_REPLY in email_calls[0]["body"]
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == inbound_sid)
+    ).scalar_one()
+    assert audit.status == "processed_replied"
+    assert audit.status_reason and "emailed fallback" in audit.status_reason
+    assert "30034" in (audit.status_reason or "")
+
+
 def test_sms_instant_ack_then_agent_reply(client, test_family, db):
     """SMS fires a keyword-bucket ack, then the real reply.
 

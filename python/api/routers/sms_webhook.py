@@ -26,7 +26,7 @@ needs to be able to hit it from the open internet.
 from __future__ import annotations
 
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 
@@ -85,6 +85,27 @@ def _process_in_background(inbound: twilio_sms.InboundSms) -> None:
     except Exception:  # noqa: BLE001 - never let a background task escape
         logger.exception(
             "SMS background task crashed for sid=%s", inbound.message_sid
+        )
+
+
+def _delivery_failure_in_background(
+    twilio_message_sid: str,
+    error_code: Optional[str],
+    error_message: Optional[str],
+) -> None:
+    """Email the SMS reply after Twilio reports undelivered / failed."""
+    try:
+        with SessionLocal() as db:
+            sms_inbox.handle_outbound_delivery_failure(
+                db,
+                twilio_message_sid=twilio_message_sid,
+                error_code=error_code,
+                error_message=error_message,
+            )
+    except Exception:  # noqa: BLE001 - never let a background task escape
+        logger.exception(
+            "SMS delivery-failure fallback crashed for sid=%s",
+            twilio_message_sid,
         )
 
 
@@ -149,3 +170,70 @@ async def twilio_inbound(
         content=twilio_sms.empty_twiml(),
         media_type="application/xml",
     )
+
+
+@router.post(
+    "/twilio/status",
+    summary="Twilio outbound SMS status callback",
+    response_class=Response,
+)
+async def twilio_status(
+    request: Request, background: BackgroundTasks
+) -> Response:
+    """Log delivery receipts so a later 30034 is visible in our logs.
+
+    The Messages.create response is almost always ``queued`` / ``sent``.
+    Carrier rejection (A2P 10DLC 30034, filtered, unreachable) arrives
+    seconds later on this callback. We verify the signature the same
+    way as inbound, then log and return 204 — no TwiML needed.
+    """
+    settings = get_settings()
+    raw_form = await request.form()
+    form: Dict[str, str] = {k: str(v) for k, v in raw_form.items()}
+
+    signature = request.headers.get("x-twilio-signature")
+    if settings.TWILIO_AUTH_TOKEN:
+        # Sign against the status URL, not the inbound override —
+        # Twilio HMAC's the URL it actually POSTed.
+        status_url = settings.twilio_status_callback_url() or str(request.url)
+        if not twilio_sms.verify_twilio_signature(
+            auth_token=settings.TWILIO_AUTH_TOKEN,
+            url=status_url,
+            params=form,
+            signature=signature,
+        ):
+            logger.warning(
+                "Twilio status callback signature mismatch (sid=%s) — refusing.",
+                form.get("MessageSid") or form.get("SmsSid"),
+            )
+            raise HTTPException(status_code=403, detail="Invalid Twilio signature.")
+
+    sid = form.get("MessageSid") or form.get("SmsSid")
+    status = form.get("MessageStatus") or form.get("SmsStatus")
+    error_code = form.get("ErrorCode")
+    logger.info(
+        "Twilio SMS status sid=%s status=%s error_code=%s from=%s to=%s",
+        sid,
+        status,
+        error_code,
+        form.get("From"),
+        form.get("To"),
+    )
+    if status in {"failed", "undelivered"}:
+        logger.warning(
+            "Twilio SMS delivery failed sid=%s status=%s error_code=%s "
+            "error_message=%s to=%s",
+            sid,
+            status,
+            error_code,
+            form.get("ErrorMessage"),
+            form.get("To"),
+        )
+        if sid:
+            background.add_task(
+                _delivery_failure_in_background,
+                sid,
+                error_code,
+                form.get("ErrorMessage"),
+            )
+    return Response(status_code=204)

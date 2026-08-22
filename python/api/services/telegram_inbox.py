@@ -1552,6 +1552,8 @@ def _initiate_phone_verification(
             from_phone=settings.TWILIO_PRIMARY_PHONE,
             to_phone=normalised_phone,
             body=sms_body,
+            messaging_service_sid=settings.TWILIO_MESSAGING_SERVICE_SID,
+            status_callback=settings.twilio_status_callback_url(),
         )
     except twilio_sms.TwilioSendError as exc:
         # Couldn't text — revoke the row so it can't be exploited and

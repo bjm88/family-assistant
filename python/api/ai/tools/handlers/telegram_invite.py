@@ -358,6 +358,8 @@ async def _send_invite_sms(*, settings, to_phone: str, body: str) -> str:
             from_phone=settings.TWILIO_PRIMARY_PHONE,
             to_phone=to_phone,
             body=body,
+            messaging_service_sid=settings.TWILIO_MESSAGING_SERVICE_SID,
+            status_callback=settings.twilio_status_callback_url(),
         )
     except twilio_sms.TwilioSendError as exc:
         raise ToolError(f"Twilio refused the invite SMS: {exc}") from exc
