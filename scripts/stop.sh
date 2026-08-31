@@ -2,15 +2,17 @@
 # ============================================================================
 # scripts/stop.sh
 # ----------------------------------------------------------------------------
-# Stops the backend and/or frontend started by scripts/start.sh. Reads PIDs
-# from .run/*.pid, sends SIGTERM (then SIGKILL if needed), and cleans up PID
-# files. With --force, also sweeps anything still listening on our ports,
-# which is useful when PID files are stale (e.g. after a reboot).
+# Stops the backend, frontend, and/or ngrok started by scripts/start.sh.
+# Reads PIDs from .run/*.pid, sends SIGTERM (then SIGKILL if needed), and
+# cleans up PID files. With --force, also sweeps anything still listening
+# on our ports, which is useful when PID files are stale (e.g. after a
+# reboot).
 #
 # Usage:
-#   scripts/stop.sh               # stop both backend and frontend
+#   scripts/stop.sh               # stop backend + frontend + ngrok
 #   scripts/stop.sh backend       # stop just the backend
 #   scripts/stop.sh frontend      # stop just the frontend
+#   scripts/stop.sh ngrok         # stop just the ngrok tunnel
 #   scripts/stop.sh --force       # also kill any orphans on the service ports
 # ============================================================================
 
@@ -25,7 +27,7 @@ TARGETS=()
 for arg in "$@"; do
     case "${arg}" in
         --force|-f) FORCE=1 ;;
-        backend|frontend|all) TARGETS+=("${arg}") ;;
+        backend|frontend|ngrok|all) TARGETS+=("${arg}") ;;
         -h|--help)
             sed -n '4,16p' "$0"
             exit 0
@@ -93,6 +95,7 @@ log_info "Project root: ${PROJECT_ROOT}"
 
 if should_stop backend;  then stop_service "backend"  "${BACKEND_PID_FILE}"  "${BACKEND_PORT}";  fi
 if should_stop frontend; then stop_service "frontend" "${FRONTEND_PID_FILE}" "${FRONTEND_PORT}"; fi
+if should_stop ngrok;    then stop_service "ngrok"    "${NGROK_PID_FILE}"    "${NGROK_AGENT_PORT}"; fi
 
 echo ""
 log_success "Done."

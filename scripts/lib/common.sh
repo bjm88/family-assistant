@@ -25,6 +25,7 @@ RUN_DIR="${PROJECT_ROOT}/.run"
 LOG_DIR="${PROJECT_ROOT}/logs"
 BACKEND_PID_FILE="${RUN_DIR}/backend.pid"
 FRONTEND_PID_FILE="${RUN_DIR}/frontend.pid"
+NGROK_PID_FILE="${RUN_DIR}/ngrok.pid"
 BACKEND_LOG="${LOG_DIR}/backend.log"
 FRONTEND_LOG="${LOG_DIR}/frontend.log"
 
@@ -36,7 +37,6 @@ OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 NGROK_AGENT_PORT="${NGROK_AGENT_PORT:-4040}"
 
-# Extra log files for the daemons that scripts/start.sh doesn't manage.
 NGROK_LOG="${LOG_DIR}/ngrok.log"
 OLLAMA_LOG="${LOG_DIR}/ollama.log"
 # Output log for the weekly DB-backup → Drive LaunchAgent. Each run
@@ -334,6 +334,8 @@ ngrok_start() {
     log_info "Starting ngrok tunnel ${domain} → :${BACKEND_PORT} (log: ${NGROK_LOG})"
     nohup ngrok http "--url=${domain}" "${BACKEND_PORT}" --log=stdout \
         >"${NGROK_LOG}" 2>&1 &
+    local pid=$!
+    echo "${pid}" >"${NGROK_PID_FILE}"
     local i=0
     while ! ngrok_is_running && [[ $i -lt 20 ]]; do
         sleep 0.25

@@ -2,14 +2,15 @@
 # ============================================================================
 # scripts/start.sh
 # ----------------------------------------------------------------------------
-# Starts the family-assistant backend (FastAPI) and frontend (Vite) as
-# detached background processes, recording their PIDs under .run/ and their
-# stdout/stderr under logs/.
+# Starts the family-assistant backend (FastAPI), frontend (Vite), and
+# ngrok tunnel as detached background processes, recording their PIDs
+# under .run/ and their stdout/stderr under logs/.
 #
 # Usage:
-#   scripts/start.sh              # start both backend and frontend
+#   scripts/start.sh              # start backend + frontend + ngrok
 #   scripts/start.sh backend      # start just the backend
 #   scripts/start.sh frontend     # start just the frontend
+#   scripts/start.sh ngrok        # start just the ngrok tunnel
 #   scripts/start.sh --force      # kill anything on our ports before starting
 #
 # Exits non-zero if a service fails its health probe within 30 seconds.
@@ -26,9 +27,9 @@ TARGETS=()
 for arg in "$@"; do
     case "${arg}" in
         --force|-f) FORCE=1 ;;
-        backend|frontend|all) TARGETS+=("${arg}") ;;
+        backend|frontend|ngrok|all) TARGETS+=("${arg}") ;;
         -h|--help)
-            sed -n '4,18p' "$0"
+            sed -n '4,16p' "$0"
             exit 0
             ;;
         *)
@@ -146,6 +147,33 @@ start_frontend() {
     fi
 }
 
+# ---------- ngrok -----------------------------------------------------------
+start_ngrok() {
+    log_step "ngrok tunnel"
+
+    if [[ -z "$(ngrok_domain)" ]]; then
+        log_warn "NGROK_DOMAIN isn't set in .env — skipping ngrok tunnel."
+        return 0
+    fi
+
+    if ngrok_is_running; then
+        log_success "ngrok agent is already up on :${NGROK_AGENT_PORT}. Skipping."
+        return 0
+    fi
+
+    if port_in_use "${NGROK_AGENT_PORT}"; then
+        if [[ "${FORCE}" -eq 1 ]]; then
+            log_warn "Port ${NGROK_AGENT_PORT} is in use — --force was passed, cleaning up orphans."
+            stop_by_port "${NGROK_AGENT_PORT}" "orphaned ngrok"
+        else
+            log_error "Port ${NGROK_AGENT_PORT} is already in use. Pass --force to kill the orphan."
+            return 1
+        fi
+    fi
+
+    ngrok_start
+}
+
 # ---------- orchestration ---------------------------------------------------
 log_step "family-assistant · start"
 log_info "Project root: ${PROJECT_ROOT}"
@@ -154,10 +182,17 @@ check_ollama
 
 if should_start backend;  then start_backend;  fi
 if should_start frontend; then start_frontend; fi
+if should_start ngrok;    then start_ngrok;    fi
 
 echo ""
 log_success "All requested services are up."
 log_info "  Backend:  http://localhost:${BACKEND_PORT}  · logs: ${BACKEND_LOG}"
 log_info "  Frontend: http://localhost:${FRONTEND_PORT}  · logs: ${FRONTEND_LOG}"
-log_info "  Tail both: tail -f ${BACKEND_LOG} ${FRONTEND_LOG}"
+domain="$(ngrok_domain)"
+if [[ -n "${domain}" ]]; then
+    log_info "  ngrok:    https://${domain}  · logs: ${NGROK_LOG}"
+else
+    log_info "  ngrok:    (set NGROK_DOMAIN in .env)  · logs: ${NGROK_LOG}"
+fi
+log_info "  Tail:      tail -f ${BACKEND_LOG} ${FRONTEND_LOG} ${NGROK_LOG}"
 log_info "  Stop:      scripts/stop.sh"

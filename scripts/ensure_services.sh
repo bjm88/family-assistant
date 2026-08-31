@@ -94,7 +94,9 @@ ensure_backend_frontend() {
     # Delegate to the existing start.sh. ``--force`` cleans up any orphan
     # listening on our ports (common after a hard reboot when the PID
     # file is stale but the process is gone).
-    if "${_SELF_DIR}/start.sh" --force all; then
+    # backend + frontend only — ngrok is ensured separately above so a
+    # healthy tunnel isn't recycled just because uvicorn or Vite died.
+    if "${_SELF_DIR}/start.sh" --force backend frontend; then
         return 0
     else
         FAILURES=$((FAILURES + 1))

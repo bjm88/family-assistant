@@ -28,7 +28,7 @@
 #
 # Pass-through arguments let you restart a single service:
 #
-#   scripts/restart.sh                  # deploy --build + restart backend+frontend
+#   scripts/restart.sh                  # deploy --build + restart backend+frontend+ngrok
 #   scripts/restart.sh backend          # deploy --build + restart backend only
 #   scripts/restart.sh frontend         # deploy --build + restart frontend only
 #   scripts/restart.sh ngrok            # deploy --build + restart ngrok only
@@ -91,12 +91,12 @@ launchd_managed_pid() {
 
 # pidfile_for <short>
 #   Return the PID file scripts/start.sh would have written for this
-#   short name, or an empty string for services start.sh doesn't manage
-#   (currently: ngrok, which only has a LaunchAgent path).
+#   short name, or an empty string if start.sh doesn't track that service.
 pidfile_for() {
     case "$1" in
         backend)  echo "${BACKEND_PID_FILE}";;
         frontend) echo "${FRONTEND_PID_FILE}";;
+        ngrok)    echo "${NGROK_PID_FILE}";;
         *)        echo "";;
     esac
 }
@@ -283,15 +283,6 @@ restart_service() {
     if launchagent_is_loaded "${short}"; then
         restart_via_launchd "${short}" "${port}" "${probe_url}" "${log_file}"
     else
-        if [[ "${short}" == "ngrok" ]]; then
-            # We don't have a non-launchd ngrok manager (start.sh only
-            # handles backend/frontend), so make the situation explicit
-            # rather than silently no-op.
-            log_warn "ngrok LaunchAgent isn't installed — nothing to restart."
-            log_warn "  Install via: scripts/register_daemons.sh"
-            log_warn "  Or start manually: ngrok http :${BACKEND_PORT}"
-            return 0
-        fi
         restart_via_scripts "${short}"
     fi
 }
@@ -336,6 +327,9 @@ if launchagent_is_loaded backend && ! should_target backend; then
 fi
 if launchagent_is_loaded frontend && ! should_target frontend; then
     log_info "(Note: frontend LaunchAgent is loaded but not in the target set.)"
+fi
+if launchagent_is_loaded ngrok && ! should_target ngrok; then
+    log_info "(Note: ngrok LaunchAgent is loaded but not in the target set.)"
 fi
 
 failed=0
