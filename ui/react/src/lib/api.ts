@@ -13,6 +13,8 @@ const PASSTHROUGH_ROOTS = [
   "/api/media/",
   "/api/health",
   "/api/auth/",
+  // Contacts connections are per person, not admin-only.
+  "/api/contacts/",
 ];
 
 export function resolveApiPath(path: string): string {

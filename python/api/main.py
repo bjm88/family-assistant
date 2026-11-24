@@ -68,6 +68,7 @@ from .routers import (
     ai_tts,
     assistants,
     auth as auth_router,
+    contacts,
     documents,
     families,
     financial_accounts,
@@ -92,6 +93,7 @@ from .routers import (
     residence_photos,
     residences,
     sensitive_identifiers,
+    slack_webhook,
     sms_webhook,
     spa,
     status,
@@ -266,8 +268,9 @@ def create_app() -> FastAPI:
     # freshly-minted cookie with ``exp = now + SESSION_LIFETIME_DAYS`` so
     # an actively-used session effectively never expires. This middleware
     # never short-circuits — authorization is per-route, so the public
-    # allowlist (/, /legal/*, /api/health, /api/auth/*, the Twilio
-    # webhook, and Avi's Gmail-OAuth callback) needs no special-casing.
+    # allowlist (/, /legal/*, /api/health, /api/auth/*, the Twilio and
+    # Slack webhooks, and Avi's Gmail-OAuth callback) needs no
+    # special-casing.
     @app.middleware("http")
     async def session_cookie_middleware(request, call_next):  # type: ignore[no-untyped-def]
         cookie_name = settings.SESSION_COOKIE_NAME
@@ -342,10 +345,18 @@ def create_app() -> FastAPI:
     # become authenticated browsers here). Per-route guards in
     # :mod:`api.auth` protect everything else.
     app.include_router(auth_router.router, prefix="/api")
+    # Per-person contacts connections. Outside /api/admin because family
+    # members (not just admins) connect their own address book; each
+    # route checks "admin or this person" itself.
+    app.include_router(contacts.router, prefix="/api")
     # Twilio inbound webhook — public (no admin auth) so Twilio can hit it.
     # Signature verification (X-Twilio-Signature) is enforced inside the
     # handler whenever TWILIO_AUTH_TOKEN is configured.
     app.include_router(sms_webhook.router, prefix="/api")
+    # Slack Events API webhook — public for the same reason. Every
+    # request must carry a valid X-Slack-Signature; without
+    # SLACK_APP_SIGNING_SECRET the handler refuses everything.
+    app.include_router(slack_webhook.router, prefix="/api")
     # Public legal pages (Privacy Policy + Terms of Service). Mounted at the
     # site root (no /api prefix) so the URLs you submit to Twilio look like
     # ``https://<host>/legal/privacy-policy`` rather than being buried under

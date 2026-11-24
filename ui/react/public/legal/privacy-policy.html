@@ -132,8 +132,8 @@
         This Privacy Policy explains how the Service collects, uses, stores,
         and protects information when household members interact with Avi
         through the web admin console, the live chat / face-recognition page,
-        registered email accounts, SMS / MMS and WhatsApp via Twilio, and
-        Telegram. By using the Service, or by exchanging messages with our
+        registered email accounts, SMS / MMS and WhatsApp via Twilio,
+        Telegram, and Slack. By using the Service, or by exchanging messages with our
         number, you consent to this Policy.
       </p>
 
@@ -156,7 +156,10 @@
           email, and SMS messages exchanged with Avi, plus the
           assistant&rsquo;s replies. SMS transcripts include the
           sender&rsquo;s phone number, the body of each text, and any MMS
-          attachments.
+          attachments. Slack transcripts include the sender&rsquo;s Slack
+          member ID, the email address and display name on their Slack
+          account, the body of each message, and any files shared with
+          it.
         </li>
         <li>
           <strong>Operational &amp; audit data.</strong> Timestamps, message
@@ -240,9 +243,14 @@
               you exchange with us.
             </li>
             <li>
+              <strong>Slack Technologies, LLC</strong>, which carries
+              Slack messages and files you exchange with us.
+            </li>
+            <li>
               <strong>Google LLC</strong> for Gmail and Calendar integration
-              when you connect a Google account, and for reading photos and
-              PDFs you send (Gemini).
+              when you connect a Google account, for looking up and saving
+              contacts in your own Google Contacts if you choose to connect
+              them, and for reading photos and PDFs you send (Gemini).
             </li>
             <li>
               <strong>AI model providers</strong> &mdash; xAI (Grok),
@@ -281,7 +289,8 @@
         Fernet (AES-128-CBC + HMAC-SHA256). Access to the admin console is
         restricted to the operator and authorized household members. Inbound
         Twilio webhooks are authenticated using Twilio&rsquo;s HMAC-SHA1
-        signature.
+        signature, and inbound Slack events using Slack&rsquo;s
+        HMAC-SHA256 request signature.
       </p>
 
       <h2>9. Your rights</h2>
@@ -291,6 +300,7 @@
         <li>Request correction or deletion of inaccurate data.</li>
         <li>Opt out of SMS at any time (text <code>STOP</code>).</li>
         <li>Stop WhatsApp or Telegram messages at any time by asking the operator to remove your number.</li>
+        <li>Stop Slack replies at any time by asking the operator to remove your email address, or by leaving the Slack workspace.</li>
         <li>Withdraw consent and request deletion of your records.</li>
       </ul>
       <p>

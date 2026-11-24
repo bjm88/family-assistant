@@ -15,8 +15,8 @@ from api.integrations import twilio_sms
 from api.services import email_inbox, inbound_recovery
 
 
-def test_recover_runs_email_sms_and_telegram():
-    """One call reviews all three surfaces and reports the counts."""
+def test_recover_runs_email_sms_telegram_and_slack():
+    """One call reviews every surface and reports the counts."""
     with (
         patch.object(
             inbound_recovery.email_inbox,
@@ -33,6 +33,11 @@ def test_recover_runs_email_sms_and_telegram():
             "drain_pending_updates",
             return_value=1,
         ) as telegram,
+        patch.object(
+            inbound_recovery.slack_inbox,
+            "replay_missed_messages",
+            return_value=3,
+        ) as slack,
     ):
         report = inbound_recovery.recover_missed_inbound()
 
@@ -40,11 +45,14 @@ def test_recover_runs_email_sms_and_telegram():
     assert report.emails_examined == 4
     assert report.messages_replayed == 2
     assert report.telegram_updates == 1
+    assert report.slack_messages == 3
     assert report.errors == []
     email.assert_called_once()
     sms.assert_called_once()
     telegram.assert_called_once()
+    slack.assert_called_once()
     assert "4 email" in report.summary()
+    assert "3 Slack message" in report.summary()
 
 
 def test_recover_keeps_going_when_one_channel_fails():
@@ -65,11 +73,17 @@ def test_recover_keeps_going_when_one_channel_fails():
             "drain_pending_updates",
             return_value=0,
         ),
+        patch.object(
+            inbound_recovery.slack_inbox,
+            "replay_missed_messages",
+            return_value=2,
+        ),
     ):
         report = inbound_recovery.recover_missed_inbound()
 
     assert report.emails_examined == 0
     assert report.messages_replayed == 1
+    assert report.slack_messages == 2
     assert any(err.startswith("email:") for err in report.errors)
 
 

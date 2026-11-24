@@ -28,6 +28,7 @@ import { Field } from "@/components/Field";
 import { Modal } from "@/components/Modal";
 import { ProfileAvatar } from "@/components/ProfileAvatar";
 import { useToast } from "@/components/Toast";
+import { ContactsConnectionCard } from "@/components/ContactsConnectionCard";
 import { useConfirm } from "@/components/ConfirmDialog";
 import {
   GENDERS,
@@ -394,6 +395,13 @@ export default function PersonDetail() {
 
         <div className="lg:col-span-3">
           <PhotosSection personId={Number(personId)} />
+        </div>
+        <div className="lg:col-span-3">
+          <ContactsConnectionCard
+            personId={Number(personId)}
+            personFirstName={person?.first_name}
+            returnTo={`/admin/families/${familyId}/people/${personId}`}
+          />
         </div>
         <div className="lg:col-span-3">
           <GoalsSection personId={Number(personId)} />

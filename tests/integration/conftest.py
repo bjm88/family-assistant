@@ -78,6 +78,15 @@ os.environ.setdefault("TWILIO_WHATSAPP_SENDER_NUMBER", "+15550002222")
 os.environ.setdefault("AI_WHATSAPP_INBOUND_ENABLED", "true")
 os.environ.setdefault("AI_SMS_INBOUND_ENABLED", "true")
 
+# Slack: .env holds the real workspace tokens, so these are forced (not
+# setdefault) to dummies. The ``_no_real_slack`` fixture below also
+# blocks every Slack HTTP call that a test hasn't faked.
+os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-bot-token"
+os.environ["SLACK_USER_TOKEN"] = "xoxp-test-user-token"
+os.environ["SLACK_APP_SIGNING_SECRET"] = "test-slack-signing-secret"
+os.environ["SLACK_APP_ID"] = "A0TESTAPP"
+os.environ["AI_SLACK_INBOUND_ENABLED"] = "true"
+
 # Disable the live-chat web-search shortcut so /chat tests don't try
 # to call out to Gemini. The shortcut is a pre-agent fast path that
 # would hijack a "what's the weather?" prompt; for tests we want the
@@ -231,6 +240,41 @@ def _bootstrap_test_database():
     with engine.connect() as conn:
         conn.execute(text("SELECT 1 FROM families LIMIT 1"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_slack(monkeypatch):
+    """No test may reach slack.com.
+
+    The Slack adapter makes every request through its module-level
+    ``httpx``; that is swapped for a stand-in whose ``get`` / ``post``
+    fail the way an unplugged network would, so un-faked calls surface
+    as the adapter's ordinary "transport error". Tests that exercise
+    the channel patch the higher-level helpers they need. The identity
+    and user caches are emptied so one test's fake workspace never
+    leaks into the next.
+    """
+    import types
+
+    import httpx
+
+    from api.integrations import slack
+
+    def _unreachable(*_args, **_kwargs):
+        raise httpx.ConnectError("Slack is not reachable from tests.")
+
+    monkeypatch.setattr(
+        slack,
+        "httpx",
+        types.SimpleNamespace(
+            get=_unreachable, post=_unreachable, HTTPError=httpx.HTTPError
+        ),
+    )
+    slack._IDENTITY_CACHE.clear()
+    slack._USER_CACHE.clear()
+    yield
+    slack._IDENTITY_CACHE.clear()
+    slack._USER_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------

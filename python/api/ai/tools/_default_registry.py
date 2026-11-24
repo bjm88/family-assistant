@@ -21,6 +21,8 @@ from sqlalchemy.orm import Session
 from ...integrations import google_oauth, web_search as web_search_integration
 from ._registry import Tool, ToolRegistry
 from .handlers import calendar as _cal
+from .handlers import contacts as _contacts
+from .handlers import household as _household
 from .handlers import messaging as _msg
 from .handlers import records as _rec
 from .handlers import secrets as _sec
@@ -547,21 +549,62 @@ def build_default_registry() -> ToolRegistry:
     reg.register(
         Tool(
             name="household_records_list",
-            label="List a person's goals, medications, IDs, or documents",
+            label="List household records with their ids",
             description=(
-                "List one person's goals, medications, identity "
-                "documents, or saved documents with their ids. Call "
-                "this before updating an existing record so you pass "
-                "the right *_id. Identity documents show the plain "
-                "identifier and only the last four of the secret "
-                "number."
+                "List household records of one kind with their ids. "
+                "Per person: goal, medication, identity_document, "
+                "document, medical_condition, physician, job, website, "
+                "sensitive_identifier. Household-wide: person, "
+                "relationship, pet, vehicle, residence, "
+                "insurance_policy, financial_account. Call this before "
+                "updating an existing record so you pass the right id. "
+                "Secret numbers show only their last four."
             ),
-            parameters=_rec.HOUSEHOLD_RECORDS_LIST_SCHEMA,
+            parameters=_rec.household_records_list_schema(),
             handler=_rec.handle_household_records_list,
             timeout_seconds=5.0,
             examples=(
                 "What medications is Jackson on?",
                 "What goals do I have?",
+                "Which cars do we have on file?",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="household_record_save",
+            label="Add or update a household record",
+            description=(
+                "Add or update any other household record: a family "
+                "member's profile, a relationship, pet, vehicle, "
+                "residence, insurance policy, financial account, "
+                "medical condition, physician, job, website, sensitive "
+                "identifier (SSN / tax id), a saved document's details, "
+                "or the family's settings. (Goals, medications and "
+                "identity documents have their own *_save tools.) "
+                "Omit record_id to create; pass it to update — get it "
+                "from household_records_list. Put only the fields being "
+                "set in `fields`; never guess a value the user didn't "
+                "give. Fields per kind (* = needed for a new record):\n"
+                + _household.field_guide()
+                + "\nPets, vehicles, residences, insurance, financial "
+                "accounts, relationships, new family members and family "
+                "settings can be changed only by a parent of the "
+                "household; a person's own records by them or a parent. "
+                "Email addresses, phone numbers and parent / guardian "
+                "roles can't be changed by message at all. There is no "
+                "delete. If the tool refuses, tell the user plainly "
+                "that nothing was changed — never claim it was saved."
+            ),
+            parameters=_household.HOUSEHOLD_RECORD_SAVE_SCHEMA,
+            handler=_household.handle_household_record_save,
+            timeout_seconds=10.0,
+            examples=(
+                "We got a new puppy — Biscuit, a golden retriever born March 3.",
+                "The Odyssey has 48,200 miles now.",
+                "Our State Farm auto policy renews on 2027-06-01 at $1,480 a year.",
+                "Add Dr. Patel as Jackson's pediatrician, 555-0134.",
+                "I started a new job at Acme as a senior engineer.",
             ),
         )
     )
@@ -676,6 +719,67 @@ def build_default_registry() -> ToolRegistry:
                 "Make this Paisley's profile picture.",
                 "Add these to Jackson's photos.",
                 "Use this as my main photo.",
+            ),
+        )
+    )
+    _contacts_scope = (
+        "Works on the SPEAKER's own address book only — never anyone "
+        "else's. If the speaker hasn't connected their contacts the tool "
+        "returns a permission request with a link: pass that link on and "
+        "say nothing was saved."
+    )
+    reg.register(
+        Tool(
+            name="contacts_search",
+            label="Look someone up in your contacts",
+            description=(
+                "Search the speaker's personal address book (Google "
+                "Contacts) by name, email, phone number or company. Use "
+                "for 'do I have a number for…', 'what's Dana's email', or "
+                "to find a contact_id. Not needed before contacts_save, "
+                "which checks for an existing contact itself. "
+                + _contacts_scope
+            ),
+            parameters=_contacts.CONTACTS_SEARCH_SCHEMA,
+            handler=_contacts.handle_contacts_search,
+            timeout_seconds=30.0,
+            examples=(
+                "Do I have a number for Dana Whitfield?",
+                "What's the plumber's email in my contacts?",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="contacts_save",
+            label="Add or update someone in your contacts",
+            description=(
+                "Save a person to the speaker's personal address book "
+                "(Google Contacts). It finds an existing contact by "
+                "email, then phone, and updates it — adding new emails "
+                "and numbers, refreshing company and job title, never "
+                "removing anything — or creates a new contact if there "
+                "is none. Use when the user forwards an email and asks "
+                "to add or sync the sender, shares a contact card, sends "
+                "a business-card photo, or pastes someone's details. "
+                "Take the name, company, job title, phone and email from "
+                "the email signature, the card, or the pasted text; for "
+                "a forwarded email the contact is the ORIGINAL sender, "
+                "not the family member who forwarded it. Put a number in "
+                "mobile_phone whenever it is marked mobile / cell / M. "
+                "Pass only details you can actually see — never guess or "
+                "invent a field. If the result is needs_confirmation, "
+                "nothing was saved: ask the user, then call again with "
+                "contact_id or create_new. Afterwards confirm in a "
+                "sentence what was added or changed. " + _contacts_scope
+            ),
+            parameters=_contacts.CONTACTS_SAVE_SCHEMA,
+            handler=_contacts.handle_contacts_save,
+            timeout_seconds=45.0,
+            examples=(
+                "Add the person in this forwarded email to my contacts.",
+                "Save this business card to my contacts.",
+                "Update Dana Whitfield's mobile to 415-555-0142.",
             ),
         )
     )

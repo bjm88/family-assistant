@@ -499,3 +499,35 @@ export interface SystemStatusReport {
   generated_at: string;
   checks: SystemStatusCheck[];
 }
+
+// --- Contacts (per-person address-book connection) -----------------------
+
+export interface ContactsProviderStatus {
+  provider: string;
+  label: string;
+  // False for placeholder providers (Apple) — shown as "coming soon".
+  available: boolean;
+  is_default: boolean;
+  connected: boolean;
+  account_identifier: string | null;
+  needs_reconnect: boolean;
+  // False when the linked account isn't the person's own email address.
+  account_matches_person: boolean | null;
+  connected_at: string | null;
+}
+
+export interface ContactsStatus {
+  person_id: number;
+  google_oauth_configured: boolean;
+  google_redirect_uri: string;
+  permission_summary: string;
+  google_consent_note: string;
+  providers: ContactsProviderStatus[];
+}
+
+export interface ContactsTestResult {
+  ok: boolean;
+  provider: string;
+  account_identifier: string;
+  contact_count: number;
+}

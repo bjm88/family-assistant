@@ -70,7 +70,7 @@ class InboundAttachmentRef:
     mime_type: Optional[str]
     size_bytes: Optional[int]
     stored_path: str
-    # ``"email" | "sms" | "whatsapp" | "telegram" | "live"`` — purely
+    # ``"email" | "sms" | "whatsapp" | "telegram" | "slack" | "live"`` — purely
     # for log lines and provenance in TaskAttachment.caption. The tool
     # works the same regardless of channel.
     channel: str = "msg"

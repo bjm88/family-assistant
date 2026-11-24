@@ -42,6 +42,7 @@ from .insurance_policy import (
 from .financial_account import FinancialAccount
 from .document import Document
 from .pending_attachment import PendingAttachment
+from .contact_provider_connection import ContactProviderConnection
 from .live_session import (
     LiveSession,
     LIVE_SESSION_END_REASONS,
@@ -68,6 +69,12 @@ from .telegram_inbox_message import (
     TelegramInboxMessage,
     TELEGRAM_ATTACHMENT_KINDS,
     TELEGRAM_INBOX_STATUSES,
+)
+from .slack_inbox_message import (
+    SlackInboxAttachment,
+    SlackInboxMessage,
+    SLACK_INBOX_STATUSES,
+    SLACK_INBOX_VIA,
 )
 from .telegram_invite import (
     TelegramInvite,
@@ -133,6 +140,7 @@ __all__ = [
     "FinancialAccount",
     "Document",
     "PendingAttachment",
+    "ContactProviderConnection",
     "LiveSession",
     "LIVE_SESSION_END_REASONS",
     "LIVE_SESSION_SOURCES",
@@ -150,6 +158,10 @@ __all__ = [
     "TelegramInboxAttachment",
     "TELEGRAM_ATTACHMENT_KINDS",
     "TELEGRAM_INBOX_STATUSES",
+    "SlackInboxMessage",
+    "SlackInboxAttachment",
+    "SLACK_INBOX_STATUSES",
+    "SLACK_INBOX_VIA",
     "TelegramInvite",
     "TELEGRAM_INVITE_CHANNELS",
     "TELEGRAM_INVITE_DEFAULT_TTL",

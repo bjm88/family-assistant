@@ -52,7 +52,8 @@ The project has three cooperating layers:
 ## Architecture Diagram
 
 A bird's-eye view. Every family member — whether they're standing in
-front of the camera, texting, emailing, or chatting on Telegram —
+front of the camera, texting, emailing, or chatting on Telegram or
+Slack —
 lands on the same **messaging service**, which hands the conversation
 to the **agent AI** to plan, call tools, and reply. Models all run
 locally on the box; the only outbound traffic is to opt-in cloud APIs.
@@ -67,6 +68,7 @@ flowchart TB
         WA["WhatsApp"]
         Email["Email"]
         Telegram["Telegram"]
+        Slack["Slack"]
     end
 
     %% ─── Core ───────────────────────────────────────────────────
@@ -102,6 +104,7 @@ flowchart TB
     WA --> Hub
     Email --> Hub
     Telegram --> Hub
+    Slack --> Hub
 
     %% Invisible links to coax Mermaid into aligning the admin
     %% pipeline (right column) next to the messaging pipeline
@@ -135,7 +138,7 @@ flowchart TB
     classDef ai fill:#fdf4ff,stroke:#a21caf,color:#581c87,stroke-width:2px
     classDef integ fill:#ecfeff,stroke:#0891b2,color:#164e63,stroke-width:2px
     classDef data fill:#fff7ed,stroke:#d97706,color:#7c2d12,stroke-width:2px
-    class Web,SMS,WA,Email,Telegram inbound
+    class Web,SMS,WA,Email,Telegram,Slack inbound
     class Hub,Agent core
     class AdminUI,CRUD admin
     class LLM,RAG,Face,Voice,Tasks,Cron ai
@@ -151,6 +154,7 @@ flowchart TB
 | **SMS** | Twilio inbound webhook (signed) | `from` matches `people.mobile_phone_number` (E.164) | REST `Messages.create` reply via Twilio (empty TwiML on the webhook) | `live_sessions(source='sms', external_thread_id=<E.164>)`, never auto-closed |
 | **WhatsApp** | Twilio inbound webhook (signed) — same `/api/sms/twilio/inbound` URL as SMS, dispatched on the `whatsapp:` prefix | `from` (after stripping `whatsapp:`) matches `people.{mobile,home,work}_phone_number` (E.164) | REST `Messages.create` with `From`/`To` `whatsapp:` prefixes via `TWILIO_WHATSAPP_SENDER_NUMBER` | `live_sessions(source='whatsapp', external_thread_id=<E.164>)`, never auto-closed |
 | **Telegram** | bot long-poll, 25 s window | `message.from.id` ↔ `people.telegram_user_id` (or `@username`); unknowns get a one-tap "Share contact" prompt + SMS-2FA bind | `sendMessage` (+ optional fast-ack pre-message) | `live_sessions(source='telegram', external_thread_id=<chat_id>)` |
+| **Slack** | Events API webhook (signed) at `/api/slack/events` — a DM to the Avi app or to Avi's own member account, or an @-mention in a channel | the sender's Slack account email matches `people.email_address` or a job's `work_email`; other workspaces and bot accounts are refused | `chat.postMessage` with the token of the identity that received the message; DMs inline, channel mentions in a thread | `live_sessions(source='slack', external_thread_id=<channel id>)` |
 | **Email** | Gmail unread poll, 60 s | `From:` matches `people.email_address` | `users.messages.send` reply, threaded | `live_sessions(source='email', external_thread_id=<thread_id>)` |
 | **Doorbird gate** | scaffold only (planned) | LAN device, no auth surface yet | open / ring | n/a |
 
@@ -177,7 +181,7 @@ Mac fires **zero** times instead of every 2.5 s.
 | Validation | **Pydantic v2** · `pydantic-settings` | Request/response schemas + `.env` loading |
 | Encryption | `cryptography` (Fernet) | AES-128-CBC + HMAC-SHA256 for sensitive columns |
 | File uploads | `python-multipart` · Pillow | Photo + document ingest |
-| HTTP client | **`httpx`** | Streaming Ollama, Gmail, Calendar, Twilio, Telegram, Doorbird |
+| HTTP client | **`httpx`** | Streaming Ollama, Gmail, Calendar, Twilio, Telegram, Slack, Doorbird |
 | Face recognition | **InsightFace** · `onnxruntime` · OpenCV | ArcFace 512-d embeddings, CoreML provider on Apple Silicon |
 | Text-to-speech | **kokoro-onnx** · `soundfile` · `espeakng-loader` | Kokoro-82M neural voices, 24 kHz mono WAV, ONNX Runtime (~330 MB weights) |
 | Concurrency | `asyncio` · `concurrent.futures.ThreadPoolExecutor` | Long-poll inbox loops on the event loop, heavy agent runs on a bounded background pool |
@@ -186,6 +190,7 @@ Mac fires **zero** times instead of every 2.5 s.
 | SMS | Twilio REST + signed webhooks (validated in-process) | Two-way SMS as a chat surface, plus the second factor for Telegram contact verification |
 | WhatsApp | Twilio Programmable Messaging WhatsApp Sender (REST + same signed webhook as SMS, dispatched on the `whatsapp:` prefix) | Two-way WhatsApp Business as a chat surface alongside SMS — same auth, dedup, and audit table |
 | Telegram | Bot API over `httpx` (no python-telegram-bot dep) | `getUpdates` long-poll, `sendMessage`, `request_contact`, file download |
+| Slack | Web API + Events API over `httpx` (no Slack SDK dep) | Signed event webhook, `chat.postMessage`, `users.info`, file download, `conversations.history` for catch-up |
 | Door / gate | local `httpx` calls to a Doorbird IP | Open-gate intent (scaffold) |
 
 ### AI / agent layer
@@ -195,7 +200,7 @@ Mac fires **zero** times instead of every 2.5 s.
 | Heavy chat model | **`gemma4:26b`** via Ollama | Tool-using agent, multi-turn reasoning. Default for every surface. |
 | Fast model | **`gemma4:e2b`** via Ollama (`/api/chat`, `think: false`) | 1-sentence contextual acknowledgments inside the 3-second race window so push surfaces never sit silent. |
 | Agent loop | `ai/agent.py` | Plan/execute/observe loop, async generator that yields `task_started · step · delta · task_completed · task_failed` events to the SSE channel and writes one `agent_steps` row per emission. |
-| Tool registry | `ai/tools.py` | 19 callable tools: `sql_query`, `lookup_person`, `reveal_sensitive_identifier`, `reveal_secret`, `gmail_send`, `calendar_list_upcoming`, `calendar_check_availability`, `calendar_find_free_slots`, `calendar_list_for_person`, `task_create / list / get / update / add_comment / add_follower / set_schedule / attach_link`, `web_search`, `telegram_invite`. Each is a `Tool(name, description, parameters, handler, timeout, requires)`. |
+| Tool registry | `ai/tools.py` | 19 callable tools: `sql_query`, `lookup_person`, `reveal_sensitive_identifier`, `reveal_secret`, `gmail_send`, `calendar_list_upcoming`, `calendar_check_availability`, `calendar_find_free_slots`, `calendar_list_for_person`, `task_create / list / get / update / add_comment / add_follower / set_schedule / attach_link`, `web_search`, `telegram_invite`, plus `contacts_search` / `contacts_save` for the speaker's own address book, and the household-record writers: `household_records_list`, `goal_save`, `medication_save`, `identity_document_save`, `document_save_from_message`, `person_photo_save_from_message` and `household_record_save` (people, relationships, pets, vehicles, residences, insurance, financial accounts, medical conditions, physicians, jobs, websites, sensitive identifiers, document details, family settings — add / update only, no delete; email, phone and parent-role changes need a signed-in admin). Each is a `Tool(name, description, parameters, handler, timeout, requires)`. |
 | Monitoring scheduler | `services/monitoring_scheduler.py` | Single-process `asyncio` loop launched in the FastAPI lifespan. Every `AI_MONITORING_TICK_SECONDS` it scans for `owner_kind='ai'` + `task_kind='monitoring'` rows whose `next_run_at` has elapsed, claims them under a row lock, advances `next_run_at` from the cron schedule (interpreted in `families.timezone`), and dispatches the run through the shared agent background pool. Monitoring runs use `AI_OLLAMA_THINKING_MODEL` with Ollama's `think:true` reasoning flag and have `web_search` available (Brave or Tavily, gated by `FA_SEARCH_PROVIDER`). |
 | SQL sandbox | `ai/sql_tool.py` | Read-only Postgres role + statement-level guard; the model can write SELECTs against `llm_schema_catalog` without touching ciphertext. |
 | Authz scope | `ai/authz.py` | Per-speaker access policy (self / spouse / parent / child / unauthorized) injected into every system prompt and re-checked inside sensitive tools. |
@@ -203,6 +208,7 @@ Mac fires **zero** times instead of every 2.5 s.
 | Fast-ack | `ai/fast_ack.py` + `services/background_agent.py` | Surface-agnostic latency hider for the surfaces where the human is actively waiting. Telegram submits the heavy run to a shared `ThreadPoolExecutor` and calls `generate_contextual_ack_sync`; the live `/chat` SSE handler races the agent on the event loop with `generate_contextual_ack_async`. Either way, if the heavy model hasn't started replying after `AI_FAST_ACK_AFTER_SECONDS` (default 3 s), `gemma4:e2b` mints a one-sentence ack ("Looking up Sara's calendar.") that's delivered as a Telegram pre-message / SSE `fast_ack` event before the real reply. SMS, WhatsApp, and email deliberately skip fast-ack — carrier round-trips already mask the latency on the first two and an extra "thinking…" email would be noise on the third. |
 | Inbox pollers | `services/email_inbox.py` · `services/telegram_inbox.py` | Long-poll loops started from FastAPI's `lifespan`. Each maintains its own dedup, audit-row writes, and per-thread `LiveSession`. |
 | SMS / WhatsApp surface | `routers/sms_webhook.py` · `services/sms_inbox.py` · `integrations/twilio_sms.py` | Single Twilio inbound webhook (signature verified) handles **both** SMS and WhatsApp; the inbox service dispatches on `inbound.channel` (parsed from the `whatsapp:` prefix) for outbound sender, length cap, and live-session source. Audit rows share `sms_inbox_messages` distinguished by the `channel` column. |
+| Slack surface | `routers/slack_webhook.py` · `services/slack_inbox.py` · `integrations/slack.py` | Slack Events API webhook (signature verified, no unsigned mode). Runs the same dedup → identity → session → instant ack → triage → agent → reply pipeline as SMS / WhatsApp / Telegram. Audit rows live in `slack_inbox_messages`. See [6b-3](#6b-3-slack). |
 
 ### Frontend avatar rendering
 
@@ -558,6 +564,165 @@ unverified apps; the app owner can always click "Advanced → Go to
 3. Disconnect + reconnect from the admin UI. The new refresh token
    issued under Production status is good indefinitely.
 
+### 6b-2. Contacts (each person's own address book)
+
+Avi can add people to a family member's contacts, or update the entry
+that is already there, from whatever they send him:
+
+- a **forwarded email** ("sync this person to my contacts") — he uses
+  the original sender's address and their signature block;
+- a **shared contact card** (Telegram contact, or a `.vcf` attachment
+  on WhatsApp / SMS / email);
+- a **photo of a business card**;
+- details **pasted or typed** into any chat.
+
+He looks for name, company, role, email and phone, preferring a mobile
+number when one is given. Before saving he checks the address book for
+the same email, then the same phone number, then the same name:
+
+| Finds | Does |
+| --- | --- |
+| one entry with that email or phone | updates it — adds what's new, never removes anything |
+| nothing | creates a new contact |
+| only a name match, or several possible matches | saves nothing and asks which one is meant |
+
+**Whose contacts?** The person asking. Avi's Gmail/Calendar connection
+above belongs to *Avi's* Google account, so it can't reach anyone's
+address book. Each family member separately lets Avi into **their own**
+Google Contacts; "add her to my contacts" from Ben goes to Ben's, the
+same message from Sarah goes to Sarah's. Nobody can read or write
+another person's contacts through Avi.
+
+One-time setup, in the same Google Cloud project as 6b:
+
+1. **APIs & Services → Library** → enable **People API**.
+2. **OAuth consent screen → Scopes** → add
+   `https://www.googleapis.com/auth/contacts`. If the app is still in
+   Testing, add each family member's Google address under **Test
+   users**.
+3. **Credentials → your OAuth client → Authorized redirect URIs** →
+   add `<PUBLIC_BASE_URL>/api/contacts/google/oauth/callback` — for
+   example `https://your-name.ngrok.app/api/contacts/google/oauth/callback`,
+   or `http://localhost:8000/api/contacts/google/oauth/callback` for a
+   purely local setup. The Contacts card shows the exact address when
+   Google sign-in isn't configured; set
+   `GOOGLE_CONTACTS_OAUTH_REDIRECT_URI` to use a different one.
+4. Apply the migration (`uv run alembic upgrade head`, or
+   `scripts/restart.sh`).
+
+Then connect, either way:
+
+- **Admin console → People → a person → Contacts card → Connect Google
+  Contacts.** Sign in with *that person's* Google account.
+- **Just ask Avi.** If someone asks him to save a contact before
+  they've connected, he replies with a personal link. It requires
+  signing in to the family site as that person, so a forwarded link is
+  no use to anyone else.
+
+Google's consent screen words this permission as "See, edit, download,
+and permanently delete your contacts" — it has only one read-and-write
+contacts scope. Avi only looks contacts up, adds them and edits them;
+there is no delete in the code. The grant is stored Fernet-encrypted in
+`contact_provider_connections`, is separate from Avi's Gmail token, and
+can be removed from the same card (or at
+<https://myaccount.google.com/permissions>). The 7-day Testing-mode
+token lifetime described above applies here too.
+
+`CONTACTS_DEFAULT_PROVIDER` (default `google`) picks the address book
+Avi uses. The provider interface lives in
+`python/api/integrations/contacts/`; `apple.py` is a placeholder for
+iCloud Contacts that reports "not supported yet".
+
+### 6b-3. Slack
+
+Family members can talk to Avi in a Slack workspace exactly as they do
+over SMS or WhatsApp: questions, requests, photos and documents, and
+follow-ups in the same conversation. It is the same agent, tools,
+household context and privacy rules — Slack is only another way in.
+
+**Two ways to reach him, both work:**
+
+- **Message the Avi app** (Apps → Avi in the Slack sidebar), or
+  @-mention it in a channel it has been added to.
+- **Message Avi's own member account**, like messaging a person.
+
+The reply always comes back from whichever of the two you wrote to. A
+direct message is answered inline; a message in a thread is answered in
+that thread; a channel mention is answered in a thread under it. In a
+channel Avi only responds when mentioned, and he is told that everyone
+there can read his answer.
+
+**Who gets an answer.** Avi looks up the sender's Slack account and
+matches its email to a person's email address (or the work email on one
+of their jobs) — so a family member must have joined Slack with an
+address that is on their record. Anyone else gets no reply at all and
+is logged as `ignored_unknown_sender`. Accounts from another workspace
+(Slack Connect guests) and bot accounts are refused even if the email
+matches. Avi never answers his own messages, edits, deletions or other
+apps' posts.
+
+**Slack app settings** (<https://api.slack.com/apps> → your app):
+
+1. **Socket Mode** → off. Events are delivered over HTTP.
+2. **Event Subscriptions** → on. Request URL:
+   `<PUBLIC_BASE_URL>/api/slack/events` (e.g.
+   `https://your-name.ngrok.app/api/slack/events`). The backend must be
+   running for Slack to mark it Verified.
+   - *Subscribe to bot events*: `message.im`, `app_mention`.
+   - *Subscribe to events on behalf of users*: `message.im` (this is
+     what delivers DMs sent to Avi's member account). To have Avi's
+     member account answer @-mentions in channels too, also add
+     `message.groups` (private channels), `message.channels` (public
+     channels) and `message.mpim` (group DMs).
+3. **OAuth & Permissions**
+   - *Bot token scopes*: `chat:write`, `im:history`, `app_mentions:read`,
+     `users:read`, `users:read.email`, `files:read`.
+   - *User token scopes* (authorise while signed in to Slack **as Avi**):
+     `chat:write`, `im:history`, `files:read` — plus `groups:history`,
+     `channels:history` and `mpim:history` if you added the channel
+     events above (Slack adds them for you when you subscribe).
+   - Reinstall the app to the workspace after changing scopes, and copy
+     the tokens into `.env` again if Slack shows new ones.
+4. **App Home** → Messages Tab on, and tick "Allow users to send Slash
+   commands and messages from the messages tab".
+
+**Channels.** The Avi app only hears a mention in a channel it is a
+member of — type `/invite @<app name>` there once. Avi's member account
+hears mentions in the channels it has joined, provided the channel
+events above are subscribed; with those, Slack sends every message from
+those channels to this server, and anything that doesn't mention Avi is
+dropped without being stored.
+
+`files:read` is what lets Avi open photos and documents. Without it he
+still answers, and says he couldn't open the file.
+
+**`.env`:**
+
+```bash
+SLACK_APP_SIGNING_SECRET=...   # Basic Information → Signing Secret. Required: without it every event is refused.
+SLACK_BOT_TOKEN=xoxb-...       # the Avi app
+SLACK_USER_TOKEN=xoxp-...      # Avi's own member account (optional; omit to use the app only)
+SLACK_APP_ID=A...              # optional; events for any other app are dropped
+# AI_SLACK_INBOUND_ENABLED=true   # false = record messages but don't answer
+# AI_SLACK_REPLY_MAX_CHARS=3000
+```
+
+Then apply the migration and restart (`scripts/restart.sh`). The
+**Status** page has a Slack row that checks both tokens. It cannot see
+Slack's Event Subscriptions page, so a green row does not prove the
+Request URL is set.
+
+**If the server was down.** Slack retries a failed delivery for a few
+minutes and then gives up. On startup (and in
+`scripts/recover_inbound.py`) Avi re-reads the last
+`AI_INBOUND_RECOVERY_SMS_LOOKBACK_HOURS` of every direct message
+conversation a family member already has with him and answers anything
+he has no record of. Channel mentions missed during an outage are not
+replayed.
+
+**Not included.** Avi only replies on Slack; reminders, monitoring
+results and delivery fallbacks still go out by the existing channels.
+
 ### 6c. Authentication (browser sign-in)
 
 The HTTP surface is **locked down** behind Google sign-in. Anonymous
@@ -637,8 +802,11 @@ fill them in once):
 **Public allowlist.** These routes deliberately stay open so external
 systems can hit them without a cookie: `/`, `/legal/*`, `/api/health`,
 `/api/auth/*`, `/api/sms/twilio/inbound` (Twilio's own signature is
-the gate), and `/api/admin/google/oauth/callback` (Avi's Gmail/Calendar
-callback — Google has to be able to reach it). Everything else returns
+the gate), `/api/admin/google/oauth/callback` (Avi's Gmail/Calendar
+callback — Google has to be able to reach it) and
+`/api/contacts/google/oauth/callback` (the per-person contacts
+callback; it only accepts the single-use `state` issued to a signed-in
+user). Everything else returns
 401 unless a valid `fa_session` cookie is presented.
 
 ### 7. Run database migrations
@@ -734,7 +902,8 @@ Tables today, grouped by domain:
   `live_session_participants`, `live_session_messages`.
 - **Inbox audit** — `email_inbox_messages`, `sms_inbox_messages`,
   `sms_inbox_attachments`, `telegram_inbox_messages`,
-  `telegram_inbox_attachments`.
+  `telegram_inbox_attachments`, `slack_inbox_messages`,
+  `slack_inbox_attachments`.
 - **Telegram onboarding** — `telegram_invites` (deep-link claims),
   `telegram_contact_verifications` (SMS-2FA for contact-share linking).
 - **Tasks (kanban + monitoring)** — `tasks` (carries `owner_kind` ∈
@@ -745,7 +914,9 @@ Tables today, grouped by domain:
   added by Avi during monitoring runs).
 - **Agent audit** — `agent_tasks`, `agent_steps`.
 - **External-service credentials** — `google_oauth_credentials`
-  (Fernet-encrypted refresh tokens for Gmail + Calendar).
+  (Fernet-encrypted refresh tokens for Gmail + Calendar),
+  `contact_provider_connections` (each person's own address-book
+  grant, also Fernet-encrypted).
 
 ## Encryption of sensitive columns
 
@@ -780,9 +951,10 @@ family-assistant/
 │   │   ├── pets · pet_photos · residences · residence_photos · addresses
 │   │   ├── vehicles · insurance_policies · financial_accounts · documents
 │   │   ├── identity_documents · sensitive_identifiers · assistants
-│   │   ├── tasks · google · status · legal · media
+│   │   ├── tasks · google · contacts · status · legal · media
 │   │   ├── ai_chat · ai_face · ai_tts · live_sessions · agent_tasks
-│   │   └── sms_webhook            (public Twilio inbound)
+│   │   ├── sms_webhook            (public Twilio inbound)
+│   │   └── slack_webhook          (public Slack Events API inbound)
 │   ├── ai/
 │   │   ├── agent.py               plan/execute/observe loop, SSE event stream
 │   │   ├── tools.py               16 callable tools (SQL, calendar, email, tasks, ...)
@@ -798,12 +970,16 @@ family-assistant/
 │   │   ├── email_inbox.py         Gmail long-poll loop (lifespan task)
 │   │   ├── telegram_inbox.py      Telegram getUpdates loop + per-update agent dispatch
 │   │   ├── sms_inbox.py           inbound SMS pipeline (called by sms_webhook router)
+│   │   ├── slack_inbox.py         inbound Slack pipeline (called by slack_webhook router) + catch-up
 │   │   ├── background_agent.py    shared ThreadPoolExecutor for fast-ack race
 │   │   └── system_status.py       /api/aiassistant/status payload builder
 │   ├── integrations/
 │   │   ├── gmail.py · google_calendar.py · google_oauth.py    Google APIs
+│   │   ├── contacts/              address-book adapters: base · google (default) · apple (placeholder)
+│   │   │                          + sync (match/merge rules) · connections (per-person grants) · vcard
 │   │   ├── telegram.py            Bot API client (sendMessage, getUpdates, files)
 │   │   ├── twilio_sms.py          Twilio REST + signature verification
+│   │   ├── slack.py               Slack Web API client + event parsing + signature verification
 │   │   ├── doorbird_gate.py       LAN gate intent (scaffold)
 │   │   └── gemini.py              optional avatar image generation
 │   └── migrations/                Alembic revisions
@@ -826,7 +1002,7 @@ family-assistant/
 ├── resources/models/              Kokoro ONNX weights (gitignored)
 ├── alembic.ini                    migration config
 ├── pyproject.toml                 Python deps, managed by uv
-└── .env                           DB + Fernet + Ollama + Twilio + Telegram + Google secrets (gitignored)
+└── .env                           DB + Fernet + Ollama + Twilio + Telegram + Slack + Google secrets (gitignored)
 ```
 
 ## Common operations

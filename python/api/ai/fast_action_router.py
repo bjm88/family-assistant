@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -256,7 +257,13 @@ _CLASSIFIER_SYSTEM_PROMPT = (
     "  HEAVY         -- anything else: attachments, multi-step "
     "planning, recurring monitoring jobs, adding / changing / "
     "finishing a goal, medication, ID document, saved document, or "
-    "someone's photo / profile picture (those are NOT tasks), "
+    "someone's photo / profile picture, and adding or changing any "
+    "other household record — a family member's details, a pet, "
+    "vehicle, residence, insurance policy, financial account, medical "
+    "condition, doctor, job or website (those are NOT tasks), "
+    "looking up, adding or updating someone in the user's own "
+    "contacts / address book (a forwarded email, a shared contact, "
+    "a business card, pasted contact details), "
     "anything that needs a tool not listed "
     "above, anything ambiguous.\n"
     "\n"
@@ -347,6 +354,21 @@ _CLASSIFIER_SYSTEM_PROMPT = (
     "\n"
     "  USER: Add Layla's United MileagePlus number AB123456.\n"
     "  YOU:  HEAVY\n"
+    "\n"
+    "  USER: We got a new puppy, Biscuit, a golden retriever.\n"
+    "  YOU:  HEAVY\n"
+    "\n"
+    "  USER: The Odyssey has 48,200 miles now.\n"
+    "  YOU:  HEAVY\n"
+    "\n"
+    "  USER: Add Dr. Patel as Jackson's pediatrician, 555-0134.\n"
+    "  YOU:  HEAVY\n"
+    "\n"
+    "  USER: Fwd: Intro. Please add Dana from this email to my contacts.\n"
+    "  YOU:  HEAVY\n"
+    "\n"
+    "  USER: Save this: Dana Whitfield, Acme Corp, 415-555-0142, dana@acme.com\n"
+    "  YOU:  HEAVY\n"
 )
 
 
@@ -378,6 +400,29 @@ _LABEL_ALIASES: dict[str, str] = {
 }
 
 
+# Address-book requests ("add her to my contacts", "save this business
+# card") only the heavy agent can serve. They look a lot like things the
+# shortcuts DO handle — "what's Dana's email?" is FAMILY_QA, a forwarded
+# email reads like EMAIL_SEND — so they're recognised here by wording
+# rather than left to the classifier. A false match only costs latency.
+_CONTACTS_REQUEST_RE = re.compile(
+    r"\b(?:my|our|the)\s+(?:google\s+|phone\s+|iphone\s+)?contacts\b"
+    r"|\b(?:to|in|into|from)\s+contacts\b"
+    r"|\baddress\s?book\b"
+    r"|\b(?:contact|business)\s+card\b"
+    r"|\bv-?card\b"
+    r"|\b(?:have|got|find)\s+a\s+contact\s+(?:for|named|called)\b"
+    r"|\b(?:add|save|sync|update|create|store)\b[^.!?\n]{0,60}"
+    r"\b(?:as\s+a|a\s+new|this|that|the|her|his|their)\s+contact\b",
+    re.IGNORECASE,
+)
+
+
+def is_contacts_request(message: str) -> bool:
+    """True when the message asks to look up or manage address-book contacts."""
+    return bool(_CONTACTS_REQUEST_RE.search(message or ""))
+
+
 async def classify_triage(message: str) -> str:
     """Run the combined classifier; return one of :data:`ALL_LABELS`.
 
@@ -387,6 +432,9 @@ async def classify_triage(message: str) -> str:
     """
     text = (message or "").strip()
     if not text:
+        return LABEL_HEAVY
+    if is_contacts_request(text):
+        logger.info("[triage] contacts request — routing to HEAVY for %r", text[:80])
         return LABEL_HEAVY
     settings = get_settings()
     if not settings.AI_FAST_ACTION_SHORTCUT_ENABLED:

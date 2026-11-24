@@ -474,6 +474,9 @@ class SharedContact:
     contact_user_id: Optional[int]
     first_name: Optional[str]
     last_name: Optional[str]
+    # Full vCard text, when the sender's client included one. Present
+    # when a user shares somebody from their phone's address book.
+    vcard: Optional[str] = None
 
 
 @dataclass
@@ -596,6 +599,9 @@ def parse_inbound_update(update: Mapping[str, Any]) -> InboundTelegramMessage:
             ),
             first_name=contact_blob.get("first_name"),
             last_name=contact_blob.get("last_name"),
+            vcard=(
+                str(contact_blob["vcard"]) if contact_blob.get("vcard") else None
+            ),
         )
 
     return InboundTelegramMessage(

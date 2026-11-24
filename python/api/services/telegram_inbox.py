@@ -72,6 +72,8 @@ from ..ai import vision
 from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import telegram, twilio_sms
+from ..integrations.contacts import sync as contact_sync
+from ..integrations.contacts import vcard as contact_vcard
 from ..utils.phone import normalize_phone
 from . import attachment_intake, inbound_lock, inbound_prompts, telegram_persistence
 
@@ -350,6 +352,14 @@ def process_inbound_update(
 
     inbound = telegram.parse_inbound_update(raw_update)
 
+    # A linked family member sharing somebody ELSE's contact wants it in
+    # their address book — that is a normal message for the agent, not an
+    # attempt to link a Telegram account. Give it a text body so every
+    # later step (audit, transcript, triage, agent) sees the contact.
+    contact_for_address_book = _is_third_party_contact_share(db, inbound)
+    if contact_for_address_book:
+        inbound.body = _render_shared_contact(inbound)
+
     common = dict(
         telegram_update_id=inbound.update_id,
         telegram_chat_id=inbound.chat_id,
@@ -417,7 +427,7 @@ def process_inbound_update(
     # bind the Telegram identity to it. Same end-state as a /start
     # invite claim, just without the household admin needing to mint
     # a link first.
-    if inbound.is_contact_share:
+    if inbound.is_contact_share and not contact_for_address_book:
         contact_outcome = _try_link_via_shared_contact(
             db,
             inbound=inbound,
@@ -1236,6 +1246,55 @@ def _recently_prompted_for_contact(
         ).scalar_one_or_none()
         is not None
     )
+
+
+def _is_third_party_contact_share(
+    db: Session, inbound: telegram.InboundTelegramMessage
+) -> bool:
+    """True when an already-linked family member shares someone else's contact.
+
+    Only the stable numeric Telegram id counts as "already linked" — a
+    matching @username alone is not proof of identity, and those senders
+    still go through the auto-link checks. A member sharing their OWN
+    contact also stays on the auto-link path, as before.
+    """
+    contact = inbound.shared_contact
+    if contact is None or inbound.from_user_id is None:
+        return False
+    if contact.contact_user_id == inbound.from_user_id:
+        return False
+    sender = db.execute(
+        select(models.Person.person_id)
+        .where(models.Person.telegram_user_id == inbound.from_user_id)
+        .limit(1)
+    ).first()
+    return sender is not None
+
+
+def _render_shared_contact(inbound: telegram.InboundTelegramMessage) -> str:
+    """The shared contact as message text the agent can read fields from."""
+    contact = inbound.shared_contact
+    assert contact is not None
+    cards = contact_vcard.parse_vcards(contact.vcard) if contact.vcard else []
+    if cards:
+        details = contact_vcard.render_contacts(cards[:1])
+        # Telegram's own phone field is authoritative; make sure it's shown.
+        if not any(
+            contact_sync.phones_match(p.value, contact.phone_number)
+            for p in cards[0].phones
+        ):
+            details += f"\nPhone (unlabelled): {contact.phone_number}"
+    else:
+        name = " ".join(p for p in (contact.first_name, contact.last_name) if p)
+        details = "\n".join(
+            line
+            for line in (
+                f"Name: {name}" if name else "",
+                f"Phone (unlabelled): {contact.phone_number}",
+            )
+            if line
+        )
+    return f"[Shared contact card]\n{details}"
 
 
 def _try_link_via_shared_contact(

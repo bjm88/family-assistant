@@ -28,7 +28,7 @@ LiveSessionEndReason = Literal["timeout", "manual", "superseded"]
 # with `find_or_create_*_session` helpers in `api.ai.session` —
 # omitting a value here means /sessions/active and history endpoints
 # will 500 on any session created by that surface.
-LiveSessionSource = Literal["live", "email", "sms", "whatsapp", "telegram"]
+LiveSessionSource = Literal["live", "email", "sms", "whatsapp", "telegram", "slack"]
 
 
 # ---- nested components -----------------------------------------------------

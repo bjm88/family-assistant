@@ -147,6 +147,17 @@ class Settings(BaseSettings):
     # adjust if you serve the UI from a different origin.
     GOOGLE_OAUTH_POST_LOGIN_REDIRECT: str = "http://localhost:5173/admin"
 
+    # ---- Contacts (each family member's own address book) --------------
+    # Which provider "add them to my contacts" uses when a person hasn't
+    # picked one. 'google' is the only working provider today; 'apple'
+    # is a placeholder adapter.
+    CONTACTS_DEFAULT_PROVIDER: str = "google"
+    # Redirect URI for the per-person Google Contacts consent flow. Uses
+    # the same OAuth client as GOOGLE_OAUTH_CLIENT_ID, so this exact URI
+    # must be added to that client's Authorized redirect URIs. Leave
+    # unset to use <PUBLIC_BASE_URL>/api/contacts/google/oauth/callback.
+    GOOGLE_CONTACTS_OAUTH_REDIRECT_URI: Optional[str] = None
+
     # ---- Local models (Ollama, the offline fallback) -------------------
     # Base URL for the local Ollama daemon.
     AI_OLLAMA_HOST: str = "http://localhost:11434"
@@ -308,10 +319,11 @@ class Settings(BaseSettings):
     # Unknown senders are marked read quickly; only registered family
     # members spend an agent run.
     AI_INBOUND_RECOVERY_MAX_EMAILS: int = 100
-    # SMS / WhatsApp / Telegram messages replayed per recovery pass.
+    # SMS / WhatsApp / Telegram / Slack messages replayed per recovery pass.
     AI_INBOUND_RECOVERY_MAX_MESSAGES: int = 50
-    # How far back to ask Twilio for inbound SMS / WhatsApp that never
-    # reached the webhook. Already-audited MessageSids are skipped.
+    # How far back to ask Twilio (SMS / WhatsApp) and Slack for inbound
+    # messages that never reached the webhook. Already-audited messages
+    # are skipped.
     AI_INBOUND_RECOVERY_SMS_LOOKBACK_HOURS: int = 72
 
     # ---- SMS inbox (Twilio) --------------------------------------------
@@ -448,6 +460,25 @@ class Settings(BaseSettings):
     AI_TELEGRAM_VERIFY_TTL_MINUTES: int = 10
     AI_TELEGRAM_VERIFY_MAX_ATTEMPTS: int = 5
     AI_TELEGRAM_VERIFY_CODE_LENGTH: int = 6
+
+    # ---- Slack inbox (Events API webhook) ------------------------------
+    # Master switch. When OFF the webhook still verifies and records each
+    # message from a family member but never runs the agent or replies.
+    AI_SLACK_INBOUND_ENABLED: bool = True
+    # Signs every Events API request (Basic Information → App Credentials
+    # → Signing Secret). Without it the webhook refuses every request.
+    SLACK_APP_SIGNING_SECRET: Optional[str] = None
+    # When set, events for any other Slack app are dropped.
+    SLACK_APP_ID: Optional[str] = None
+    # Avi's two Slack identities. The bot token (xoxb-) is the app's own
+    # bot user: people DM the app. The user token (xoxp-) belongs to
+    # Avi's regular Slack account: people DM Avi like any other member.
+    # Either is enough; a reply always goes out from the identity that
+    # received the message.
+    SLACK_BOT_TOKEN: Optional[str] = None
+    SLACK_USER_TOKEN: Optional[str] = None
+    # Slack accepts far longer messages; this keeps replies chat-sized.
+    AI_SLACK_REPLY_MAX_CHARS: int = 3000
 
     # ---- Monitoring tasks (Avi's standing research jobs) ---------------
     # AI-owned tasks of kind "monitoring" run on a cron schedule. The

@@ -56,6 +56,7 @@ LIVE_SESSION_SOURCES: tuple[str, ...] = (
     "sms",
     "telegram",
     "whatsapp",
+    "slack",
 )
 
 
@@ -63,7 +64,7 @@ class LiveSession(Base, TimestampMixin):
     __tablename__ = "live_sessions"
     __table_args__ = (
         CheckConstraint(
-            "source IN ('live', 'email', 'sms', 'telegram', 'whatsapp')",
+            "source IN ('live', 'email', 'sms', 'telegram', 'whatsapp', 'slack')",
             name="ck_live_sessions_source",
         ),
         # At most one OPEN session per external thread. ``source`` is
@@ -148,8 +149,9 @@ class LiveSession(Base, TimestampMixin):
         comment=(
             "Which surface opened this session. 'live' = camera or "
             "in-page chat, 'email' = a Gmail thread routed through the "
-            "email-inbox poller, 'sms' = a Twilio thread, 'telegram' = "
-            "a Telegram chat routed through the bot poller. The UI "
+            "email-inbox poller, 'sms' / 'whatsapp' = a Twilio thread, "
+            "'telegram' = a Telegram chat routed through the bot "
+            "poller, 'slack' = a Slack conversation. The UI "
             "uses this to badge rows and the per-source pollers use "
             "it (with external_thread_id) to find the running session "
             "for an ongoing thread."
@@ -162,7 +164,8 @@ class LiveSession(Base, TimestampMixin):
             "Opaque foreign id for the conversation upstream. For "
             "source='email' this is the Gmail thread_id; for "
             "source='sms' it is the counterparty's E.164 phone; for "
-            "source='telegram' it is the chat id (stringified). Lets "
+            "source='telegram' it is the chat id (stringified); for "
+            "source='slack' it is the Slack conversation id. Lets "
             "the poller reuse one session row per multi-turn thread "
             "instead of opening a fresh session every reply. NULL for "
             "source='live'."

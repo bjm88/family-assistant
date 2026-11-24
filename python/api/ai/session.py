@@ -39,7 +39,7 @@ def _now() -> datetime:
 # Every surface shares one session concept: a session is one conversation,
 # and it ends after the surface's idle window. Email has no window — the
 # Gmail thread itself is the conversation boundary.
-THREAD_SOURCES = ("sms", "whatsapp", "telegram")
+THREAD_SOURCES = ("sms", "whatsapp", "telegram", "slack")
 
 
 def idle_minutes_for(source: str) -> Optional[int]:
@@ -315,6 +315,28 @@ def find_or_create_telegram_session(
     )
 
 
+def find_or_create_slack_session(
+    db: Session,
+    *,
+    family_id: int,
+    channel_id: str,
+) -> Tuple[models.LiveSession, bool]:
+    """Return ``(session, created)`` for a Slack conversation.
+
+    Keys on the Slack conversation id. A direct message has its own
+    conversation per person, so each member's DM with Avi is one
+    transcript; a shared channel is one transcript for everyone in it,
+    the same way a Telegram group is.
+    """
+    return _find_or_create_thread_session(
+        db,
+        family_id=family_id,
+        source="slack",
+        external_thread_id=channel_id,
+        start_context=f"slack_thread:{channel_id}",
+    )
+
+
 def touch_session(
     db: Session, session: models.LiveSession
 ) -> None:
@@ -464,7 +486,9 @@ def conversation_history(
     for row in rows:
         meta = row.meta or {}
         kind = str(meta.get("kind") or "")
-        if kind.endswith("ack") or meta.get("resend") or not (row.content or "").strip():
+        # "_ack", not "ack": the bare suffix also matches "slack" and
+        # "..._fallback", which are real turns. Resends carry `resend`.
+        if kind.endswith("_ack") or meta.get("resend") or not (row.content or "").strip():
             continue
         if len(picked) >= max_messages or used + len(row.content) > max_chars:
             break

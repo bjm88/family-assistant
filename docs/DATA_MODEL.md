@@ -20,12 +20,12 @@ document is the human-friendly companion to that catalog.
 | **Health** | `medical_conditions`, `medications`, `physicians` | Per-person medical context Avi can fetch when relevant. |
 | **Household assets** | `pets`, `pet_photos`, `residences`, `residence_photos`, `addresses`, `vehicles`, `insurance_policies`, `insurance_policy_people`, `insurance_policy_vehicles`, `financial_accounts`, `documents` | Things the family owns or insures. |
 | **Identity (encrypted)** | `identity_documents`, `sensitive_identifiers` | Passports, SSNs, ITINs, etc. Stored as Fernet ciphertext + a plaintext last-four. |
-| **AI conversation surfaces** | `live_sessions`, `live_session_participants`, `live_session_messages` | One row per continuous interaction (live, sms, whatsapp, telegram, email) and its transcript. |
-| **Inbox audit** | `email_inbox_messages`, `sms_inbox_messages` (incl. WhatsApp via the `channel` column), `sms_inbox_attachments`, `telegram_inbox_messages`, `telegram_inbox_attachments` | One row per inbound message Avi inspected, with an explicit security verdict (`processed_replied`, `ignored_unknown_sender`, etc.). |
+| **AI conversation surfaces** | `live_sessions`, `live_session_participants`, `live_session_messages` | One row per continuous interaction (live, sms, whatsapp, telegram, slack, email) and its transcript. |
+| **Inbox audit** | `email_inbox_messages`, `sms_inbox_messages` (incl. WhatsApp via the `channel` column), `sms_inbox_attachments`, `telegram_inbox_messages`, `telegram_inbox_attachments`, `slack_inbox_messages`, `slack_inbox_attachments` | One row per inbound message Avi inspected, with an explicit security verdict (`processed_replied`, `ignored_unknown_sender`, etc.). |
 | **Telegram onboarding** | `telegram_invites`, `telegram_contact_verifications` | Deep-link invites + the SMS-2FA challenge that confirms a contact-share before binding `Person.telegram_user_id`. |
 | **Tasks (kanban)** | `tasks`, `task_comments`, `task_followers`, `task_attachments` | User-facing household to-do board. Avi can create / update tasks via tools. |
 | **Agent audit** | `agent_tasks`, `agent_steps` | One row per agent invocation + per-step transcript (thinking, tool_call, tool_result, final). |
-| **External-service credentials** | `google_oauth_credentials` | Fernet-encrypted refresh tokens for Gmail + Calendar. |
+| **External-service credentials** | `google_oauth_credentials`, `contact_provider_connections` | Fernet-encrypted refresh tokens: Avi's Gmail + Calendar, and each person's own address-book grant. |
 
 Total: **~40 tables** + the `llm_schema_catalog` read-only view.
 
@@ -56,6 +56,7 @@ erDiagram
     families ||--o{ people : "has"
     families ||--o| assistants : "has one"
     assistants ||--o| google_oauth_credentials : "Gmail/Calendar tokens"
+    people ||--o{ contact_provider_connections : "own address book"
 
     people ||--o{ person_relationships : "from_person"
     people ||--o{ person_relationships : "to_person"
@@ -82,6 +83,8 @@ erDiagram
     people ||--o{ telegram_contact_verifications : "subject"
     families ||--o{ telegram_inbox_messages : "audit"
     telegram_inbox_messages ||--o{ telegram_inbox_attachments : ""
+    families ||--o{ slack_inbox_messages : "audit"
+    slack_inbox_messages ||--o{ slack_inbox_attachments : ""
     families ||--o{ sms_inbox_messages : "audit"
     sms_inbox_messages ||--o{ sms_inbox_attachments : ""
     families ||--o{ email_inbox_messages : "audit"
@@ -227,13 +230,15 @@ the family hold?" without decrypting anything.
 **One row per continuous interaction**, regardless of which surface
 opened it. Key columns:
 
-- `source` — `'live' | 'sms' | 'telegram' | 'email'`. Drives the UI
-  badge and is part of the per-surface lookup key.
+- `source` — `'live' | 'sms' | 'whatsapp' | 'telegram' | 'slack' |
+  'email'`. Drives the UI badge and is part of the per-surface lookup
+  key.
 - `external_thread_id` — opaque foreign id for the upstream
   conversation:
   - `live` → `NULL`
   - `sms` → counterparty's E.164 phone
   - `telegram` → chat id (stringified)
+  - `slack` → Slack conversation id (a DM or a channel)
   - `email` → Gmail thread id
 - `started_at`, `last_activity_at`, `ended_at`, `end_reason`
   (`'timeout' | 'manual' | 'superseded'`).
@@ -267,7 +272,7 @@ the audit trail mirrors what the user actually saw.
 
 ## Inbox audit
 
-Three structurally identical tables — one per inbound transport —
+Four structurally similar tables — one per inbound transport —
 give the family a tamper-evident receipt of **every message Avi
 looked at and what he decided to do about it**. They share the same
 status vocabulary (`processed_replied`, `ignored_unknown_sender`,
@@ -280,6 +285,15 @@ upstream message id so retries can't double-process.
 | `email_inbox_messages` | `(assistant_id, gmail_message_id)` | `ignored_bulk` (auto-replies / mailing lists) |
 | `sms_inbox_messages` (+ `sms_inbox_attachments`) — also holds Twilio WhatsApp rows, distinguished by the `channel` column (`'sms' \| 'whatsapp'`) | `twilio_message_sid` | `ignored_stop` (STOP keyword) |
 | `telegram_inbox_messages` (+ `telegram_inbox_attachments`) | `telegram_update_id` | `ignored_non_message` (edits / channel posts), `prompted_for_contact_share` |
+| `slack_inbox_messages` (+ `slack_inbox_attachments`) | `(slack_team_id, slack_channel_id, slack_message_ts)` | none — only `processed_replied`, `ignored_unknown_sender`, `failed` |
+
+Slack rows also record `via` (`'bot'` = the Avi app, `'user'` = Avi's
+own member account), which decides whose token sends the reply, and the
+`sender_email` Slack reported, which is what matched the sender to a
+person. Unlike the other tables, Slack events that are not a person
+speaking to Avi — his own messages echoing back, edits, deletions,
+other apps' posts, channel chatter that doesn't mention him — are
+logged to the backend log only and leave no row.
 
 `status_reason` is a free-form string for human investigation when
 something failed.
@@ -436,6 +450,27 @@ The plaintext columns are intentional:
   mint a new access token before the next API call.
 
 The refresh token never appears in the API response or any log line.
+
+### `contact_provider_connections`
+
+One row per `person` per address-book `provider` (`google` today;
+`apple` is reserved). This is the grant that lets Avi look up and save
+contacts in **that person's own** address book — it is deliberately
+separate from `google_oauth_credentials`, which belongs to the
+assistant's Google account and carries Gmail/Calendar scopes only.
+
+Like the assistant's row, the whole credentials payload is a single
+Fernet-encrypted blob (`credentials_encrypted`). Plaintext columns:
+
+- `account_identifier` — the account that was linked ("Connected as
+  ben@example.com"), and how the UI spots a wrong-account mix-up.
+- `scopes` — to confirm the contacts permission was actually granted.
+- `token_expires_at` — access-token expiry.
+- `needs_reconnect` — set when the provider rejects the grant (revoked
+  or expired), so the UI and Avi can ask the person to connect again
+  instead of failing on every request.
+
+Rows are removed when the person disconnects or is deleted.
 
 ---
 

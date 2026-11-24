@@ -275,24 +275,44 @@ def _document_out(d: models.Document) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-HOUSEHOLD_RECORDS_LIST_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "kind": {"type": "string", "enum": list(RECORD_KINDS)},
-        "person_id": {
-            "type": "integer",
-            "description": "Whose records. Defaults to the speaker.",
+def _household():
+    """The generic record kinds. Imported late: that module imports this one."""
+    from . import household
+
+    return household
+
+
+def household_records_list_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": list(RECORD_KINDS) + list(_household().LISTABLE_KINDS),
+            },
+            "person_id": {
+                "type": "integer",
+                "description": (
+                    "Whose records, for kinds that belong to one person. "
+                    "Defaults to the speaker. Ignored for household-wide "
+                    "kinds (person, pet, vehicle, residence, "
+                    "insurance_policy, financial_account)."
+                ),
+            },
         },
-    },
-    "required": ["kind"],
-}
+        "required": ["kind"],
+    }
 
 
 async def handle_household_records_list(
     ctx: ToolContext, kind: str, person_id: Optional[int] = None
 ) -> Dict[str, Any]:
+    if kind in _household().LISTABLE_KINDS:
+        return _household().list_records(ctx, kind, person_id)
     if kind not in RECORD_KINDS:
-        raise ToolError(f"kind must be one of {list(RECORD_KINDS)}.")
+        raise ToolError(
+            f"kind must be one of {list(RECORD_KINDS) + list(_household().LISTABLE_KINDS)}."
+        )
     person = _subject_for_new(ctx, person_id)
 
     if kind in ("medication", "identity_document"):
@@ -824,7 +844,13 @@ PERSON_PHOTO_SAVE_FROM_MESSAGE_SCHEMA: Dict[str, Any] = {
 }
 
 
-_CHANNEL_LABELS = {"whatsapp": "WhatsApp", "sms": "SMS", "telegram": "Telegram", "email": "email"}
+_CHANNEL_LABELS = {
+    "whatsapp": "WhatsApp",
+    "sms": "SMS",
+    "telegram": "Telegram",
+    "slack": "Slack",
+    "email": "email",
+}
 
 
 def _schedule_face_enrollment(photo_ids: List[int]) -> None:

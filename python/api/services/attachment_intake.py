@@ -7,6 +7,9 @@ OCR'd and classified (:mod:`api.ai.document_intake`) and then filed:
   row on the holder, with the photo as the front / back scan;
 * anything else document-like → a ``documents`` row linked to the person
   it is about, or a household document when it isn't about anyone;
+* a business card or a shared contact card (``.vcf``) → not filed here:
+  the contact details are handed to the agent, which saves them to the
+  sender's own address book with ``contacts_save``;
 * anything Avi isn't sure about (ordinary photo, unreadable or unclear
   file, holder / subject not in the family, several people named) is not
   filed: Avi asks, and the question plus the file are kept in
@@ -34,9 +37,10 @@ from sqlalchemy.orm import Session
 
 from .. import crypto, models, storage
 from ..ai import authz, document_intake
-from ..ai.document_intake import DocumentAnalysis, IdentityFields
+from ..ai.document_intake import ContactFields, DocumentAnalysis, IdentityFields
 from ..ai.tools import InboundAttachmentRef
 from ..config import get_settings
+from ..integrations.contacts import vcard
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,7 @@ _CHANNEL_LABELS = {
     "sms": "text message",
     "whatsapp": "WhatsApp message",
     "telegram": "Telegram message",
+    "slack": "Slack message",
     "email": "email",
 }
 
@@ -58,12 +63,17 @@ FILED = "filed"
 ASK = "ask"
 DENIED = "denied"
 SKIPPED = "skipped"
+# Someone's contact details. Nothing is saved by the intake: the agent
+# adds them to the sender's address book (which may first need the
+# sender to grant access — the tool handles that).
+CONTACT = "contact"
 
 _OUTCOME_LABELS = {
     FILED: "FILED",
     ASK: "ASK THE SENDER",
     DENIED: "NOT FILED",
     SKIPPED: "NOT FILED",
+    CONTACT: "CONTACT CARD",
 }
 
 PENDING_TTL = timedelta(days=3)
@@ -160,7 +170,10 @@ def render_report(results: List[FiledAttachment]) -> str:
             "whom. For ASK THE SENDER ones nothing was saved: ask the question in "
             "your reply, short and specific (one question per file). Their answer "
             "will come back to you with the file attached again. For NOT FILED "
-            "ones, say why."
+            "ones, say why. For CONTACT CARD ones nothing is saved yet: call "
+            "`contacts_save` with exactly the details listed (one call per "
+            "person), then tell the sender what was added or updated in their "
+            "contacts."
         ),
     ]
     for r in results:
@@ -280,10 +293,12 @@ def _file_one(
     ref: InboundAttachmentRef,
     requestor_is_admin: bool,
 ) -> FiledAttachment:
+    path = get_settings().storage_root / ref.stored_path
+    if vcard.is_vcard(ref.mime_type, ref.filename):
+        return _shared_contact(ref, path)
     mime = _effective_mime(ref.mime_type, ref.filename)
     if mime is None:
         return _result(ref, SKIPPED, "not a photo or PDF, so it was not filed.")
-    path = get_settings().storage_root / ref.stored_path
     try:
         analysis = document_intake.analyze(
             path, mime_type=mime, family_names=[_full_name(p) for p in people]
@@ -311,6 +326,14 @@ def _file_one(
             f"an ordinary photo, not a document{about}. Ask what they'd like "
             "done with it — e.g. save it as someone's photo.",
         )
+    if not analysis.confident and analysis.kind == document_intake.KIND_BUSINESS_CARD:
+        # A misread digit becomes a wrong number in someone's address book.
+        return _result(
+            ref, ASK,
+            f"what looks like a business card{about}, but parts of it aren't "
+            "clearly readable. Ask them to send a sharper photo or type the "
+            "name, number and email — don't save details you'd be guessing.",
+        )
     if not analysis.confident:
         return _result(
             ref, ASK,
@@ -318,10 +341,66 @@ def _file_one(
             "Ask what it is and whose it is before filing.",
         )
 
+    if analysis.kind == document_intake.KIND_BUSINESS_CARD and analysis.contact is not None:
+        return _result(
+            ref, CONTACT,
+            "a business card. " + _contact_details(analysis.contact),
+        )
+
     ctx = _Ctx(db, family_id, sender, people, ref, requestor_is_admin, mime, path)
     if analysis.kind == document_intake.KIND_IDENTITY and analysis.identity is not None:
         return _file_identity(ctx, analysis, analysis.identity)
     return _file_document(ctx, analysis)
+
+
+def _contact_details(contact: ContactFields) -> str:
+    """The card's fields, named after the ``contacts_save`` arguments."""
+    pairs = [
+        ("full_name", contact.full_name),
+        ("company", contact.company),
+        ("job_title", contact.job_title),
+        ("mobile_phone", contact.mobile_phone),
+        ("work_phone", contact.work_phone),
+        ("other_phone", contact.other_phone),
+        ("email", contact.emails[0] if contact.emails else None),
+        ("additional_emails", ", ".join(contact.emails[1:]) or None),
+    ]
+    return "; ".join(f"{key}: {value}" for key, value in pairs if value) + "."
+
+
+def _shared_contact(ref: InboundAttachmentRef, path: Path) -> FiledAttachment:
+    """A contact shared from the sender's phone (vCard)."""
+    try:
+        contacts = vcard.parse_vcards(vcard.decode_bytes(path.read_bytes()))
+    except OSError as e:
+        return _result(ref, ASK, f"a contact card I couldn't open ({e}). Ask them to resend it.")
+    if not contacts:
+        return _result(
+            ref, ASK,
+            "a contact card with no readable details. Ask them to resend it or "
+            "type the name and number.",
+        )
+    people = []
+    for c in contacts[:10]:
+        phones = {label: None for label in ("mobile", "work", None)}
+        for phone in c.phones:
+            slot = phone.label if phone.label in ("mobile", "work") else None
+            phones[slot] = phones[slot] or phone.value
+        people.append(
+            _contact_details(
+                ContactFields(
+                    full_name=c.name if (c.given_name or c.family_name or c.display_name) else None,
+                    company=c.company,
+                    job_title=c.job_title,
+                    emails=[e.value for e in c.emails],
+                    mobile_phone=phones["mobile"],
+                    work_phone=phones["work"],
+                    other_phone=phones[None],
+                )
+            )
+        )
+    count = "a shared contact" if len(people) == 1 else f"{len(people)} shared contacts"
+    return _result(ref, CONTACT, f"{count}. " + " | ".join(people))
 
 
 @dataclass

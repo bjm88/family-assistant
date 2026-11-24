@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..config import get_settings
+from ..integrations.contacts import vcard as contact_vcard
 
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,10 @@ _VISION_PROMPT = (
     "'a tabby cat with green eyes', 'a 2019 Honda Civic, blue, MA "
     "plate', 'a screenshot of a credit-card statement showing $42.18'). "
     "If readable text is present, transcribe the most important lines "
-    "verbatim. Do not speculate or add commentary."
+    "verbatim. If it is a business card or shows someone's contact "
+    "details, transcribe ALL of it exactly — name, company, job title, "
+    "every phone number with its label (mobile, office, fax), email and "
+    "website — one item per line. Do not speculate or add commentary."
 )
 
 
@@ -98,7 +102,8 @@ class AttachmentDescription:
     """
 
     text: str
-    kind: str  # "image_caption" | "pdf_text" | "docx_text" | "skipped" | "error"
+    # "image_caption" | "pdf_text" | "docx_text" | "vcard_text" | "skipped" | "error"
+    kind: str
     model_used: Optional[str] = None
     error: Optional[str] = None
     truncated: bool = False
@@ -116,6 +121,18 @@ def describe_attachment(
     already knows it), otherwise we guess from the file extension.
     """
     label = filename or path.name
+    # Shared contact cards are plain text parsed locally — no model call,
+    # so they are read even when vision is switched off.
+    if contact_vcard.is_vcard(mime_type, filename or path.name):
+        result = _read_vcard(path)
+        logger.info(
+            "[vision] describe vcard done name=%s kind=%s text_chars=%d error=%s",
+            label,
+            result.kind,
+            len(result.text),
+            result.error,
+        )
+        return result
     if not get_settings().AI_VISION_ENABLED:
         logger.info(
             "[vision] describe skipped name=%s reason=disabled "
@@ -277,6 +294,25 @@ def gemini_generate(
     if not text:
         raise VisionCallError("Gemini returned an empty response", model=model)
     return text, model
+
+
+def _read_vcard(path: Path) -> AttachmentDescription:
+    """Turn a shared contact card (.vcf) into labelled text for the agent."""
+    try:
+        contacts = contact_vcard.parse_vcards(
+            contact_vcard.decode_bytes(path.read_bytes())
+        )
+    except OSError as e:
+        return AttachmentDescription(text="", kind="error", error=f"file not found: {e}")
+    if not contacts:
+        return AttachmentDescription(
+            text="", kind="error", error="contact card had no readable details"
+        )
+    text = contact_vcard.render_contacts(contacts)
+    truncated = len(text) > MAX_DOC_TEXT_CHARS
+    return AttachmentDescription(
+        text=text[:MAX_DOC_TEXT_CHARS], kind="vcard_text", truncated=truncated
+    )
 
 
 def _caption_image(path: Path, *, mime_type: str) -> AttachmentDescription:
@@ -454,6 +490,8 @@ def is_describable(mime_type: Optional[str], filename: Optional[str] = None) -> 
         return True
     if mt in DOCX_MIME_TYPES:
         return True
+    if contact_vcard.is_vcard(mt, filename):
+        return True
     return False
 
 
@@ -534,6 +572,7 @@ def _kind_label(desc: AttachmentDescription) -> str:
         "image_caption": "Description",
         "pdf_text": "Extracted text",
         "docx_text": "Extracted text",
+        "vcard_text": "Shared contact card",
     }.get(desc.kind, "Description")
     suffix = []
     if desc.model_used:

@@ -332,6 +332,28 @@ def save_telegram_attachment(
     )
 
 
+def save_slack_attachment(
+    family_id: int,
+    slack_inbox_message_id: int,
+    file_bytes: bytes,
+    extension: str,
+    original_filename: str | None = None,
+) -> Tuple[str, int]:
+    """Store a file shared on Slack: ``family_<id>/slack/<msg_id>/<uuid>.<ext>``.
+
+    Slack tells us the original filename, so its extension wins over the
+    one guessed from the MIME type.
+    """
+    return save_message_attachment(
+        family_id=family_id,
+        channel="slack",
+        message_id=slack_inbox_message_id,
+        file_bytes=file_bytes,
+        extension=extension,
+        original_filename=original_filename,
+    )
+
+
 def absolute_path(relative_path: str) -> Path:
     root = get_settings().storage_root
     p = (root / relative_path).resolve()

@@ -1,9 +1,10 @@
 """Read an inbound photo / PDF and work out what it is.
 
 One Gemini call per file returns structured JSON: a classification
-(identity document, other document, ordinary photo), the people it is
-about, a title / category, redacted OCR text and — for identity
-documents — the fields that go on an ``identity_documents`` row.
+(identity document, business card, other document, ordinary photo), the
+people it is about, a title / category, redacted OCR text and — for
+identity documents — the fields that go on an ``identity_documents``
+row, or — for business cards — the contact details printed on the card.
 
 Filing the result is :mod:`api.services.attachment_intake`'s job; this
 module only reads.
@@ -31,6 +32,9 @@ MAX_OCR_CHARS = 20_000
 KIND_IDENTITY = "identity_document"
 KIND_DOCUMENT = "document"
 KIND_PHOTO = "photo"
+# Someone else's business / contact card. Not filed as a household
+# document: the details go to the sender's address book instead.
+KIND_BUSINESS_CARD = "business_card"
 
 
 _PROMPT = """\
@@ -38,7 +42,7 @@ You are filing a file a family member sent to their household assistant.
 Read it carefully (OCR every readable line) and answer with ONE JSON object:
 
 {{
-  "kind": "identity_document" | "document" | "photo",
+  "kind": "identity_document" | "business_card" | "document" | "photo",
   "confidence": "high" | "low" — low when the file is blurry, cut off, or you can't tell what it is,
   "title": short human title, e.g. "ConEd electric bill — Oct 2026", "Paisley's passport",
   "summary": 1-2 factual sentences: what it is, key dates and amounts,
@@ -77,6 +81,16 @@ Read it carefully (OCR every readable line) and answer with ONE JSON object:
       for character, [] if there are none,
     "other_fields": object of any other printed label -> value pairs (not numbers
       that identify the person or the card)
+  }},
+  "contact": null, or for business cards {{
+    "full_name": the person's name as printed, or null,
+    "company": string or null,
+    "job_title": string or null,
+    "emails": every email address printed, [] if none,
+    "mobile_phone": the number labelled mobile / cell / M, or null,
+    "work_phone": the number labelled office / direct / tel / T / O, or null,
+    "other_phone": a number with no label (never a fax number), or null,
+    "website": string or null
   }}
 }}
 
@@ -85,6 +99,11 @@ Rules:
   state ID, birth certificate, green card, Global Entry / NEXUS card,
   military ID, airline loyalty card. Insurance cards, bills, statements,
   receipts, forms, letters, report cards, prescriptions = "document".
+- "business_card" = a business / contact card, or a photo or screenshot whose
+  whole point is one person's contact details (name plus phone or email).
+  Copy phone numbers and email addresses character for character; use null
+  rather than guessing a digit you can't read, and set "confidence" to "low"
+  if any part of a number or address is unclear.
 - "photo" = an ordinary picture (people, pets, places, things) with no document in it.
 - In "ocr_text" and "summary", replace every SSN, full bank / card account
   number and government ID number with only its last four characters,
@@ -134,6 +153,26 @@ class IdentityFields:
 
 
 @dataclass(frozen=True)
+class ContactFields:
+    """What a business card says about the person it belongs to."""
+
+    full_name: Optional[str] = None
+    company: Optional[str] = None
+    job_title: Optional[str] = None
+    emails: list[str] = field(default_factory=list)
+    mobile_phone: Optional[str] = None
+    work_phone: Optional[str] = None
+    other_phone: Optional[str] = None
+    website: Optional[str] = None
+
+    @property
+    def usable(self) -> bool:
+        """Enough to make a contact: someone to name and a way to reach them."""
+        reachable = self.emails or self.mobile_phone or self.work_phone or self.other_phone
+        return bool((self.full_name or self.company) and reachable)
+
+
+@dataclass(frozen=True)
 class DocumentAnalysis:
     kind: str
     title: str
@@ -145,6 +184,7 @@ class DocumentAnalysis:
     model: Optional[str] = None
     confident: bool = True
     key_facts: list[str] = field(default_factory=list)
+    contact: Optional[ContactFields] = None
 
 
 class AnalysisError(RuntimeError):
@@ -232,10 +272,18 @@ def parse_analysis(data: dict[str, Any], *, model: Optional[str] = None) -> Docu
             mrz_verified="document_number" in mrz,
             number_legible=identity_raw.get("number_legible") is True,
         )
-    if kind not in (KIND_IDENTITY, KIND_DOCUMENT, KIND_PHOTO):
+    contact = _parse_contact(data.get("contact"))
+    if kind not in (KIND_IDENTITY, KIND_BUSINESS_CARD, KIND_DOCUMENT, KIND_PHOTO):
         kind = KIND_IDENTITY if identity else KIND_DOCUMENT
     if kind == KIND_IDENTITY and identity is None:
         kind = KIND_DOCUMENT
+    if kind == KIND_BUSINESS_CARD:
+        identity = None
+        if contact is None or not contact.usable:
+            # Nothing to put in an address book — treat it as paperwork.
+            kind = KIND_DOCUMENT
+    if kind != KIND_BUSINESS_CARD:
+        contact = None
 
     category = _s(data.get("document_category"))
     category = category.lower() if category else None
@@ -266,6 +314,25 @@ def parse_analysis(data: dict[str, Any], *, model: Optional[str] = None) -> Docu
             f.strip() for f in (data.get("key_facts") or [])
             if isinstance(f, str) and f.strip()
         ][:8],
+        contact=contact,
+    )
+
+
+def _parse_contact(raw: Any) -> Optional[ContactFields]:
+    if not isinstance(raw, dict):
+        return None
+    emails = raw.get("emails") or []
+    if isinstance(emails, str):
+        emails = [emails]
+    return ContactFields(
+        full_name=_s(raw.get("full_name")),
+        company=_s(raw.get("company")),
+        job_title=_s(raw.get("job_title")),
+        emails=[e.strip() for e in emails if isinstance(e, str) and "@" in e],
+        mobile_phone=_s(raw.get("mobile_phone")),
+        work_phone=_s(raw.get("work_phone")),
+        other_phone=_s(raw.get("other_phone")),
+        website=_s(raw.get("website")),
     )
 
 
@@ -452,8 +519,10 @@ def _d(v: Any) -> Optional[date]:
 
 __all__ = [
     "AnalysisError",
+    "ContactFields",
     "DocumentAnalysis",
     "IdentityFields",
+    "KIND_BUSINESS_CARD",
     "KIND_DOCUMENT",
     "KIND_IDENTITY",
     "KIND_PHOTO",

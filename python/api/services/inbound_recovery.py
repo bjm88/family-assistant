@@ -10,6 +10,9 @@ Email uses Gmail's unread inbox (anything we didn't mark read is still
 waiting). SMS and WhatsApp use Twilio's message list, because a webhook
 Twilio gave up on never becomes "unread" on our side. Telegram uses a
 short ``getUpdates`` drain of whatever the Bot API is still holding.
+Slack re-reads the recent history of each direct message a family
+member already has with Avi, since Slack stops retrying a webhook after
+a few minutes.
 
 The live pollers take the same advisory lock, so a batch run and a
 poller tick cannot both reply to one message.
@@ -22,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 from ..config import get_settings
-from . import email_inbox, inbound_lock, sms_inbox, telegram_inbox
+from . import email_inbox, inbound_lock, slack_inbox, sms_inbox, telegram_inbox
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +38,7 @@ class RecoveryReport:
     emails_examined: int = 0
     messages_replayed: int = 0
     telegram_updates: int = 0
+    slack_messages: int = 0
     errors: List[str] = field(default_factory=list)
     disabled: bool = False
 
@@ -44,7 +48,8 @@ class RecoveryReport:
         text = (
             f"Inbound recovery: {self.emails_examined} email(s), "
             f"{self.messages_replayed} SMS/WhatsApp message(s), "
-            f"{self.telegram_updates} Telegram update(s)."
+            f"{self.telegram_updates} Telegram update(s), "
+            f"{self.slack_messages} Slack message(s)."
         )
         if self.errors:
             text += " Errors: " + "; ".join(self.errors)
@@ -98,6 +103,15 @@ def recover_missed_inbound() -> RecoveryReport:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Inbound recovery: Telegram drain failed")
             report.errors.append(f"telegram: {exc}")
+
+        try:
+            report.slack_messages = slack_inbox.replay_missed_messages(
+                lookback_hours=settings.AI_INBOUND_RECOVERY_SMS_LOOKBACK_HOURS,
+                max_messages=settings.AI_INBOUND_RECOVERY_MAX_MESSAGES,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Inbound recovery: Slack replay failed")
+            report.errors.append(f"slack: {exc}")
 
     logger.info(report.summary())
     return report

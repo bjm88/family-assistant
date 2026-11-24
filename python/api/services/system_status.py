@@ -1322,6 +1322,123 @@ async def check_telegram_api() -> StatusCheck:
     )
 
 
+async def check_slack_api() -> StatusCheck:
+    """Verify Slack is reachable and Avi's tokens are still valid.
+
+    Calls ``auth.test`` for each configured identity — the app
+    (``SLACK_BOT_TOKEN``) and Avi's own member account
+    (``SLACK_USER_TOKEN``). It reads nothing and posts nothing. Inbound
+    messages arrive by webhook, so a green row only proves the tokens
+    work; it cannot tell whether Slack's Event Subscriptions point at
+    this server. The URL they should point at is in ``detail``.
+    """
+    settings = get_settings()
+    key, label = "slack_api", "Slack"
+    tokens = {
+        "app": settings.SLACK_BOT_TOKEN,
+        "member account": settings.SLACK_USER_TOKEN,
+    }
+    configured = {name: tok for name, tok in tokens.items() if tok}
+    events_url = (
+        f"{settings.PUBLIC_BASE_URL.rstrip('/')}/api/slack/events"
+        if settings.PUBLIC_BASE_URL
+        else "<public host>/api/slack/events"
+    )
+
+    if not configured:
+        return StatusCheck(
+            key=key,
+            label=label,
+            status="unknown",
+            summary="No SLACK_BOT_TOKEN or SLACK_USER_TOKEN set in .env.",
+            hint=(
+                "Install the Slack app to the workspace and add "
+                "SLACK_BOT_TOKEN, SLACK_APP_SIGNING_SECRET and (optionally) "
+                "SLACK_USER_TOKEN to .env, then restart the backend."
+            ),
+        )
+    if not settings.SLACK_APP_SIGNING_SECRET:
+        return StatusCheck(
+            key=key,
+            label=label,
+            status="down",
+            summary="SLACK_APP_SIGNING_SECRET not set — every Slack event is refused.",
+            hint=(
+                "Copy the Signing Secret from the Slack app's Basic "
+                "Information page into .env and restart the backend."
+            ),
+        )
+    if not settings.AI_SLACK_INBOUND_ENABLED:
+        return StatusCheck(
+            key=key,
+            label=label,
+            status="degraded",
+            summary="Tokens configured but Slack replies are switched off.",
+            detail={"inbound_enabled": False},
+            hint="Set AI_SLACK_INBOUND_ENABLED=true in .env and restart the backend.",
+        )
+
+    from ..integrations import slack
+
+    started = _now_ms()
+    identities: dict[str, Any] = {}
+    failures: dict[str, str] = {}
+    for name, token in configured.items():
+        try:
+            identity = await asyncio.wait_for(
+                asyncio.to_thread(slack.auth_test, token, timeout_seconds=6.0),
+                timeout=8.0,
+            )
+            identities[name] = {
+                "user": identity.user_name,
+                "user_id": identity.user_id,
+                "workspace": identity.team_name,
+                "team_id": identity.team_id,
+            }
+        except asyncio.TimeoutError:
+            failures[name] = "auth.test timed out after 8 s"
+        except slack.SlackError as exc:
+            failures[name] = str(exc)
+    latency = round(_now_ms() - started, 1)
+    detail = {
+        "identities": identities,
+        "failures": failures or None,
+        "events_url": events_url,
+        "app_id": settings.SLACK_APP_ID,
+    }
+
+    if failures:
+        which = ", ".join(f"{name}: {msg[:80]}" for name, msg in failures.items())
+        return StatusCheck(
+            key=key,
+            label=label,
+            status="down" if not identities else "degraded",
+            latency_ms=latency,
+            summary=f"auth.test failed — {which}",
+            detail=detail,
+            hint=(
+                "'invalid_auth' / 'token_revoked' / 'account_inactive' mean "
+                "the token must be re-issued: reinstall the app from its "
+                "OAuth & Permissions page and paste the new token into "
+                ".env. A transport error means this Mac can't reach "
+                "slack.com."
+            ),
+        )
+
+    who = " and ".join(
+        f"{info['user'] or info['user_id']} ({name})" for name, info in identities.items()
+    )
+    workspace = next(iter(identities.values()))["workspace"] or "workspace"
+    return StatusCheck(
+        key=key,
+        label=label,
+        status="ok",
+        latency_ms=latency,
+        summary=f"{who} on {workspace} in {int(latency)} ms",
+        detail=detail,
+    )
+
+
 _BACKUP_MAX_AGE_DAYS = 8
 
 
@@ -1439,6 +1556,7 @@ _CHECK_REGISTRY: list[_Registered] = [
     ),
     _Registered("google_apis", "Google APIs (Gmail + Calendar)", check_google_apis, _EDGES),
     _Registered("telegram_api", "Telegram Bot API", check_telegram_api, _EDGES),
+    _Registered("slack_api", "Slack", check_slack_api, _EDGES),
     _Registered("ngrok_local", "ngrok agent", check_ngrok_local, _EDGES),
     _Registered("ngrok_public", "ngrok public URL", check_ngrok_public, _EDGES),
     _Registered("ui", "React UI", check_ui, _EDGES),
