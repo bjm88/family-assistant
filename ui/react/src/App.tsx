@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import Layout from "./components/Layout";
 import FamiliesList from "./pages/FamiliesList";
 import FamilyDashboard from "./pages/FamilyDashboard";
+import FamilyTreePage from "./pages/FamilyTreePage";
 import FamilySettings from "./pages/FamilySettings";
 import PeoplePage from "./pages/PeoplePage";
 import PersonDetail from "./pages/PersonDetail";
@@ -57,6 +58,7 @@ export default function App() {
         }
       >
         <Route path="/admin/families/:familyId" element={<FamilyDashboard />} />
+        <Route path="/admin/families/:familyId/tree" element={<FamilyTreePage />} />
         <Route
           path="/admin/families/:familyId/settings"
           element={

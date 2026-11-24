@@ -69,5 +69,13 @@ class Goal(Base, TimestampMixin):
             "Avi surfaces the goal in daily summaries."
         ),
     )
+    completed_date: Mapped[Optional[date]] = mapped_column(
+        Date,
+        nullable=True,
+        comment=(
+            "Date the goal was completed. NULL means the goal is still "
+            "open; Avi only nudges about open goals."
+        ),
+    )
 
     person: Mapped["Person"] = relationship(back_populates="goals")  # noqa: F821

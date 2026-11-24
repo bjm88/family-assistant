@@ -40,14 +40,30 @@ def list_goals(
     if person_id is not None:
         stmt = stmt.where(models.Goal.person_id == person_id)
     goals = list(db.execute(stmt).scalars())
-    goals.sort(
+    open_goals = [g for g in goals if g.completed_date is None]
+    done_goals = [g for g in goals if g.completed_date is not None]
+    open_goals.sort(
         key=lambda g: (
             _PRIORITY_ORDER.get(g.priority, 99),
             g.start_date or _FAR_FUTURE,
             g.goal_id,
         )
     )
-    return goals
+    # Most recently completed first, after every open goal.
+    done_goals.sort(key=lambda g: (g.completed_date, g.goal_id), reverse=True)
+    return open_goals + done_goals
+
+
+def _check_dates(goal: models.Goal) -> None:
+    if (
+        goal.completed_date is not None
+        and goal.start_date is not None
+        and goal.completed_date < goal.start_date
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Completed date cannot be before the start date.",
+        )
 
 
 @router.post(
@@ -62,6 +78,7 @@ def create_goal(
     if db.get(models.Person, payload.person_id) is None:
         raise HTTPException(status_code=404, detail="Person not found")
     goal = models.Goal(**payload.model_dump())
+    _check_dates(goal)
     db.add(goal)
     db.flush()
     db.refresh(goal)
@@ -83,6 +100,7 @@ def update_goal(
         raise HTTPException(status_code=404, detail="Goal not found")
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(goal, field, value)
+    _check_dates(goal)
     db.flush()
     db.refresh(goal)
     return goal

@@ -16,6 +16,7 @@ class GoalBase(BaseModel):
     description: Optional[str] = None
     start_date: Optional[date] = None
     priority: GoalPriority = "normal"
+    completed_date: Optional[date] = None
 
 
 class GoalCreate(GoalBase):
@@ -27,6 +28,8 @@ class GoalUpdate(BaseModel):
     description: Optional[str] = None
     start_date: Optional[date] = None
     priority: Optional[GoalPriority] = None
+    # Send null to reopen a completed goal.
+    completed_date: Optional[date] = None
 
 
 class GoalRead(OrmModel):
@@ -36,5 +39,6 @@ class GoalRead(OrmModel):
     description: Optional[str]
     start_date: Optional[date]
     priority: GoalPriority
+    completed_date: Optional[date]
     created_at: datetime
     updated_at: datetime

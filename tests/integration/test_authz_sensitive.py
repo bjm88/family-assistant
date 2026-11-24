@@ -547,6 +547,8 @@ def test_sensitive_intent_classifier_ignores_routine_chitchat():
         "what time is the soccer game",
         "remind me to take out the trash",
         "what's on my calendar tomorrow",
+        "what is my address?",
+        "what's our home address",
         "thanks",
     ]
     hits = [m for m in negatives if sensitive_intent.is_sensitive_identifier_ask(m)]
@@ -639,3 +641,84 @@ def test_live_chat_skips_family_qa_shortcut_for_sensitive_asks(
         "agent's deterministic privacy gate makes the call instead. "
         f"Got kwargs={captured_kwargs[0]!r}"
     )
+
+
+async def test_address_is_public_and_only_parent_or_self_sees_ssn(
+    db, authz_family
+):
+    """A household address is ordinary context. An SSN is not.
+
+    The child can read the home address and their own SSN. They cannot
+    read a parent's SSN. The parent can read the child's SSN. The
+    address question must stay off the sensitive-intent path so it
+    doesn't get forced through the privacy gate.
+    """
+    from api.ai import rag
+    from api.ai.tools._registry import ToolError
+
+    assert sensitive_intent.is_sensitive_identifier_ask("what is my address?") is False
+    assert sensitive_intent.is_sensitive_identifier_ask("what's my child's SSN?") is True
+
+    parent_ssn = "222-33-4444"
+    db.add(
+        models.SensitiveIdentifier(
+            person_id=authz_family["parent_id"],
+            identifier_type="social_security_number",
+            identifier_value_encrypted=encrypt_str(parent_ssn),
+            identifier_last_four="4444",
+        )
+    )
+    db.add(
+        models.Residence(
+            family_id=authz_family["family_id"],
+            label="Main house",
+            street_line_1="18 Maple Lane",
+            city="Princeton",
+            state_or_region="NJ",
+            country="United States",
+            is_primary_residence=True,
+        )
+    )
+    db.commit()
+
+    family = db.get(models.Family, authz_family["family_id"])
+    assert family is not None
+
+    child_view = rag.build_family_overview(
+        db, family, requestor_person_id=authz_family["child_id"]
+    )
+    assert "18 Maple Lane" in child_view
+    assert authz_family["ssn_plain"] in child_view
+    assert parent_ssn not in child_view
+
+    parent_view = rag.build_family_overview(
+        db, family, requestor_person_id=authz_family["parent_id"]
+    )
+    assert "18 Maple Lane" in parent_view
+    assert authz_family["ssn_plain"] in parent_view
+    assert parent_ssn in parent_view
+
+    child_ctx = _ctx(
+        db,
+        family_id=authz_family["family_id"],
+        person_id=authz_family["child_id"],
+    )
+    with pytest.raises(ToolError):
+        await secrets_tools.handle_reveal_sensitive(
+            child_ctx,
+            person_id=authz_family["parent_id"],
+            identifier_type="social_security_number",
+        )
+
+    parent_ctx = _ctx(
+        db,
+        family_id=authz_family["family_id"],
+        person_id=authz_family["parent_id"],
+    )
+    revealed = await secrets_tools.handle_reveal_sensitive(
+        parent_ctx,
+        person_id=authz_family["child_id"],
+        identifier_type="social_security_number",
+    )
+    assert revealed["access_label"] == "parent"
+    assert revealed["results"][0]["value"] == authz_family["ssn_plain"]

@@ -148,3 +148,96 @@ def test_jobs_crud_round_trip_for_a_person(client, test_family, db):
         for jid in job_ids:
             client.delete(f"/api/admin/jobs/{jid}")
         client.delete(f"/api/admin/people/{person_id}")
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/goals — completion
+# ---------------------------------------------------------------------------
+
+
+def test_goal_complete_and_reopen(client, test_family, db):
+    """completed_date marks a goal done, sorts it last, and null reopens it."""
+    person_id = test_family["person_id"]
+    done = client.post(
+        "/api/admin/goals",
+        json={
+            "person_id": person_id,
+            "goal_name": "CrudSmoke finished goal",
+            "priority": "urgent",
+            "start_date": "2026-01-01",
+        },
+    )
+    open_ = client.post(
+        "/api/admin/goals",
+        json={"person_id": person_id, "goal_name": "CrudSmoke open goal", "priority": "low"},
+    )
+    assert done.status_code == 201, done.text
+    assert open_.status_code == 201, open_.text
+    done_id, open_id = done.json()["goal_id"], open_.json()["goal_id"]
+    assert done.json()["completed_date"] is None
+
+    try:
+        patched = client.patch(
+            f"/api/admin/goals/{done_id}", json={"completed_date": "2026-11-20"}
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["completed_date"] == "2026-11-20"
+        db.expire_all()
+        assert str(db.get(models.Goal, done_id).completed_date) == "2026-11-20"
+
+        # Completed goals come after every open goal, even a low-priority one.
+        ids = [g["goal_id"] for g in client.get(f"/api/admin/goals?person_id={person_id}").json()]
+        assert ids.index(open_id) < ids.index(done_id)
+
+        before_start = client.patch(
+            f"/api/admin/goals/{done_id}", json={"completed_date": "2025-12-31"}
+        )
+        assert before_start.status_code == 422
+
+        reopened = client.patch(f"/api/admin/goals/{done_id}", json={"completed_date": None})
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["completed_date"] is None
+    finally:
+        client.delete(f"/api/admin/goals/{done_id}")
+        client.delete(f"/api/admin/goals/{open_id}")
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/identity-documents — plaintext identifier
+# ---------------------------------------------------------------------------
+
+
+def test_identity_document_identifier_round_trip(client, test_family, db):
+    """identifier is stored and returned in full; document_number stays masked."""
+    created = client.post(
+        "/api/admin/identity-documents",
+        json={
+            "person_id": test_family["person_id"],
+            "document_type": "united_mileage_plus",
+            "identifier": "AB123456",
+            "document_number": "SECRET9876",
+            "issuing_authority": "United Airlines",
+        },
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    doc_id = body["identity_document_id"]
+    try:
+        assert body["identifier"] == "AB123456"
+        assert body["document_number_last_four"] == "9876"
+        assert "document_number" not in body
+        assert db.get(models.IdentityDocument, doc_id).identifier == "AB123456"
+
+        patched = client.patch(
+            f"/api/admin/identity-documents/{doc_id}", json={"identifier": "CD7890"}
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["identifier"] == "CD7890"
+        assert patched.json()["document_number_last_four"] == "9876"
+
+        cleared = client.patch(
+            f"/api/admin/identity-documents/{doc_id}", json={"identifier": None}
+        )
+        assert cleared.json()["identifier"] is None
+    finally:
+        client.delete(f"/api/admin/identity-documents/{doc_id}")

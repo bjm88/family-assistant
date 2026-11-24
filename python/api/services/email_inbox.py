@@ -65,6 +65,7 @@ from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import gmail
 from ..integrations import google_oauth
+from . import inbound_lock
 from . import inbound_prompts
 
 
@@ -76,12 +77,30 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def run_email_inbox_loop(stop_event: asyncio.Event) -> None:
+async def run_email_inbox_loop(
+    stop_event: asyncio.Event,
+    *,
+    start_gate: Optional[asyncio.Event] = None,
+) -> None:
     """Forever-running poller. Cancel with ``stop_event.set()``.
 
     Sleeps in small increments rather than one big ``asyncio.sleep`` so
     a graceful shutdown takes at most ~1 s, not the full poll interval.
+
+    ``start_gate`` is the startup recovery check-in. The loop waits for
+    it so the first live tick doesn't race the catch-up pass over the
+    same unread mail.
     """
+    if start_gate is not None:
+        ready = await inbound_lock.wait_until_set_or_stopped(
+            start_gate, stop_event
+        )
+        if not ready:
+            logger.info(
+                "Email inbox poller stopped before the recovery check-in finished."
+            )
+            return
+
     settings = get_settings()
     interval = max(15, int(settings.AI_EMAIL_INBOX_POLL_SECONDS))
     logger.info(
@@ -119,15 +138,12 @@ async def _sleep_with_stop(seconds: float, stop_event: asyncio.Event) -> None:
             continue
 
 
-async def _run_one_tick() -> None:
-    """One scan of every assistant with a connected Google account."""
-    settings = get_settings()
-    if not settings.AI_EMAIL_INBOX_ENABLED:
-        return
+def _connected_assistants() -> List[Tuple[int, str, int]]:
+    """``(assistant_id, granted_email, family_id)`` for Gmail-modify grants.
 
-    # Snapshot the candidate (assistant_id, granted_email, family_id)
-    # tuples in a short read-only transaction so we don't hold a session
-    # open across the (slow) Gmail calls.
+    Short read-only transaction so we don't hold a session open across
+    the (slow) Gmail calls that follow.
+    """
     candidates: List[Tuple[int, str, int]] = []
     with _session() as db:
         rows = db.execute(
@@ -143,26 +159,69 @@ async def _run_one_tick() -> None:
             has_modify = any(s.endswith("/gmail.modify") for s in scopes)
             if not has_modify:
                 # Old grant with only gmail.send — can't read the inbox.
-                # We log once at INFO so the operator notices.
                 continue
             candidates.append(
                 (assistant.assistant_id, cred.granted_email, assistant.family_id)
             )
+    return candidates
 
-    for assistant_id, granted_email, family_id in candidates:
+
+def drain_unread_inboxes(*, max_messages: int) -> int:
+    """Process unread Gmail until each inbox is caught up or the cap hits.
+
+    Used by the downtime recovery check-in. Returns how many message
+    ids were examined (including ones Avi ignores and marks read).
+    """
+    settings = get_settings()
+    if not settings.AI_EMAIL_INBOX_ENABLED:
+        return 0
+    total = 0
+    for assistant_id, granted_email, family_id in _connected_assistants():
         try:
             with _session() as db:
-                await asyncio.to_thread(
-                    process_assistant_inbox,
+                examined = process_assistant_inbox(
                     db,
                     assistant_id=assistant_id,
                     granted_email=granted_email,
                     family_id=family_id,
+                    max_messages=max_messages,
+                    drain=True,
                 )
+                total += len(examined)
         except Exception:  # noqa: BLE001 - per-assistant isolation
             logger.exception(
-                "Email inbox processing failed for assistant_id=%s", assistant_id
+                "Email recovery failed for assistant_id=%s", assistant_id
             )
+    return total
+
+
+async def _run_one_tick() -> None:
+    """One scan of every assistant with a connected Google account."""
+    settings = get_settings()
+    if not settings.AI_EMAIL_INBOX_ENABLED:
+        return
+
+    def _scan() -> None:
+        for assistant_id, granted_email, family_id in _connected_assistants():
+            try:
+                with _session() as db:
+                    process_assistant_inbox(
+                        db,
+                        assistant_id=assistant_id,
+                        granted_email=granted_email,
+                        family_id=family_id,
+                    )
+            except Exception:  # noqa: BLE001 - per-assistant isolation
+                logger.exception(
+                    "Email inbox processing failed for assistant_id=%s",
+                    assistant_id,
+                )
+
+    # Recovery holds this lock for its whole pass. Waiting here means a
+    # live tick never replies to a message the catch-up pass is already
+    # handling.
+    with inbound_lock.hold_recovery_lock():
+        await asyncio.to_thread(_scan)
 
 
 def _session() -> Session:
@@ -181,82 +240,120 @@ def process_assistant_inbox(
     assistant_id: int,
     granted_email: str,
     family_id: int,
-) -> None:
+    max_messages: Optional[int] = None,
+    drain: bool = False,
+) -> List[str]:
     """Pull unread mail for one assistant, dispatch the agent, send replies.
 
     Synchronous on purpose — every call to Google's client library is
     blocking, so we let the outer ``asyncio.to_thread`` give us a
     background thread per assistant. SQLAlchemy session is also
     intrinsically synchronous, which keeps this code tidy.
+
+    Returns the Gmail ids examined. ``drain=True`` keeps listing until
+    the unread queue is empty or ``max_messages`` ids have been
+    examined, and handles each page oldest-first so a task emailed
+    during an outage is applied in arrival order. The live poller
+    leaves ``drain`` off and takes a single newest-first page.
     """
     settings = get_settings()
+    cap = (
+        settings.AI_EMAIL_INBOX_MAX_PER_TICK
+        if max_messages is None
+        else max_messages
+    )
+    cap = max(1, int(cap))
     try:
-        cred_row, creds = google_oauth.load_credentials(db, assistant_id)
+        _cred_row, creds = google_oauth.load_credentials(db, assistant_id)
     except google_oauth.GoogleNotConnected:
-        return
+        return []
     except google_oauth.GoogleOAuthError as exc:
         logger.warning(
             "Email inbox: cannot load Google creds for assistant_id=%s: %s",
             assistant_id,
             exc,
         )
-        return
+        return []
     db.commit()  # persist any token-refresh side effect right away.
 
-    try:
-        message_ids = gmail.list_unread_inbox_message_ids(
-            creds, max_results=settings.AI_EMAIL_INBOX_MAX_PER_TICK
-        )
-    except gmail.GmailReadError as exc:
-        logger.warning(
-            "Email inbox: list_unread failed for assistant_id=%s: %s",
-            assistant_id,
-            exc,
-        )
-        return
-
-    if not message_ids:
-        return
-
-    logger.info(
-        "Email inbox tick: assistant_id=%s found %d unread message(s)",
-        assistant_id,
-        len(message_ids),
-    )
-
-    for message_id in message_ids:
-        # Dedup at the storage layer FIRST so we never re-spend an LLM
-        # call for a message we already settled in a previous tick. We
-        # still mark it read defensively to keep the unread queue clean.
-        if _already_processed(db, assistant_id, message_id):
-            try:
-                gmail.mark_message_read(creds, message_id)
-            except gmail.GmailReadError:
-                pass
-            continue
-
+    examined: List[str] = []
+    examined_set: set[str] = set()
+    while len(examined) < cap:
+        batch = min(25, cap - len(examined)) if drain else min(cap, 500)
         try:
-            _handle_one_message(
-                db,
-                assistant_id=assistant_id,
-                granted_email=granted_email.lower(),
-                family_id=family_id,
-                creds=creds,
-                gmail_message_id=message_id,
+            message_ids = gmail.list_unread_inbox_message_ids(
+                creds, max_results=batch
             )
         except gmail.GmailReadError as exc:
-            # Common race: between ``list_unread`` and ``fetch_message``
-            # the user (or another mail client) deleted, archived, or
-            # moved the message. Gmail returns 404 and there is nothing
-            # we can do, but it is NOT an Avi-side failure — log a
-            # one-line INFO and record a clean audit row so the same id
-            # never re-enters the loop.
-            text = str(exc)
-            if "HTTP 404" in text or "not found" in text.lower():
-                logger.info(
-                    "Email inbox: message %s vanished before we could "
-                    "fetch it (likely deleted/moved by the user); "
-                    "skipping. assistant_id=%s",
+            logger.warning(
+                "Email inbox: list_unread failed for assistant_id=%s: %s",
+                assistant_id,
+                exc,
+            )
+            return examined
+
+        fresh = [mid for mid in message_ids if mid not in examined_set]
+        if not fresh:
+            break
+
+        # Gmail lists newest-first. A recovery pass flips each page so
+        # "add this task" then "add the next one" land in send order.
+        ordered = list(reversed(fresh)) if drain else fresh
+        logger.info(
+            "Email inbox tick: assistant_id=%s found %d unread message(s)",
+            assistant_id,
+            len(ordered),
+        )
+        for message_id in ordered:
+            # Dedup at the storage layer FIRST so we never re-spend an LLM
+            # call for a message we already settled in a previous tick. We
+            # still mark it read defensively to keep the unread queue clean.
+            if _already_processed(db, assistant_id, message_id):
+                try:
+                    gmail.mark_message_read(creds, message_id)
+                except gmail.GmailReadError:
+                    pass
+                continue
+
+            try:
+                _handle_one_message(
+                    db,
+                    assistant_id=assistant_id,
+                    granted_email=granted_email.lower(),
+                    family_id=family_id,
+                    creds=creds,
+                    gmail_message_id=message_id,
+                )
+            except gmail.GmailReadError as exc:
+                # Common race: between ``list_unread`` and ``fetch_message``
+                # the user (or another mail client) deleted, archived, or
+                # moved the message. Gmail returns 404 and there is nothing
+                # we can do, but it is NOT an Avi-side failure — log a
+                # one-line INFO and record a clean audit row so the same id
+                # never re-enters the loop.
+                text = str(exc)
+                if "HTTP 404" in text or "not found" in text.lower():
+                    logger.info(
+                        "Email inbox: message %s vanished before we could "
+                        "fetch it (likely deleted/moved by the user); "
+                        "skipping. assistant_id=%s",
+                        message_id,
+                        assistant_id,
+                    )
+                    try:
+                        _record_failure(
+                            db,
+                            assistant_id=assistant_id,
+                            gmail_message_id=message_id,
+                            reason="Gmail 404 on fetch — message no longer exists.",
+                        )
+                    except Exception:  # noqa: BLE001
+                        db.rollback()
+                    continue
+                # Other Gmail read errors (5xx, auth, quota) ARE worth a
+                # full traceback so we can investigate.
+                logger.exception(
+                    "Email inbox: Gmail read failed for message %s assistant_id=%s",
                     message_id,
                     assistant_id,
                 )
@@ -265,44 +362,33 @@ def process_assistant_inbox(
                         db,
                         assistant_id=assistant_id,
                         gmail_message_id=message_id,
-                        reason="Gmail 404 on fetch — message no longer exists.",
+                        reason=text,
                     )
                 except Exception:  # noqa: BLE001
                     db.rollback()
-                continue
-            # Other Gmail read errors (5xx, auth, quota) ARE worth a
-            # full traceback so we can investigate.
-            logger.exception(
-                "Email inbox: Gmail read failed for message %s assistant_id=%s",
-                message_id,
-                assistant_id,
-            )
-            try:
-                _record_failure(
-                    db,
-                    assistant_id=assistant_id,
-                    gmail_message_id=message_id,
-                    reason=text,
+            except Exception as exc:  # noqa: BLE001 - per-message isolation
+                logger.exception(
+                    "Email inbox: failed to handle message %s for assistant_id=%s",
+                    message_id,
+                    assistant_id,
                 )
-            except Exception:  # noqa: BLE001
-                db.rollback()
-        except Exception as exc:  # noqa: BLE001 - per-message isolation
-            logger.exception(
-                "Email inbox: failed to handle message %s for assistant_id=%s",
-                message_id,
-                assistant_id,
-            )
-            # Best-effort failure receipt, then leave the message UNREAD
-            # so a future code fix can reprocess it.
-            try:
-                _record_failure(
-                    db,
-                    assistant_id=assistant_id,
-                    gmail_message_id=message_id,
-                    reason=str(exc),
-                )
-            except Exception:  # noqa: BLE001 - don't mask original
-                db.rollback()
+                # Best-effort failure receipt, then leave the message UNREAD
+                # so a future code fix can reprocess it.
+                try:
+                    _record_failure(
+                        db,
+                        assistant_id=assistant_id,
+                        gmail_message_id=message_id,
+                        reason=str(exc),
+                    )
+                except Exception:  # noqa: BLE001 - don't mask original
+                    db.rollback()
+
+        examined.extend(fresh)
+        examined_set.update(fresh)
+        if not drain:
+            break
+    return examined
 
 
 def _already_processed(
@@ -524,6 +610,7 @@ def _handle_one_message(
         surface_label="email",
         agent_task_kind="email",
         allow_action=not bool(msg.attachments),
+        allow_family_qa=not bool(msg.attachments),
     )
     if triage.reply:
         logger.info(
@@ -1063,6 +1150,7 @@ def _run_agent_to_completion(
 
 
 __all__ = [
+    "drain_unread_inboxes",
     "run_email_inbox_loop",
     "process_assistant_inbox",
 ]

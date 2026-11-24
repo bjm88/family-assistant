@@ -177,6 +177,7 @@ export interface IdentityDocument {
   identity_document_id: number;
   person_id: number;
   document_type: string;
+  identifier: string | null;
   document_number_last_four: string | null;
   issuing_authority: string | null;
   country_of_issue: string;
@@ -267,6 +268,7 @@ export interface Goal {
   description: string | null;
   start_date: string | null;
   priority: GoalPriority;
+  completed_date: string | null;
 }
 
 export interface MedicalCondition {

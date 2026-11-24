@@ -150,24 +150,33 @@ def list_unread_inbox_message_ids(
 
     Filters with the same query a human would type into the Gmail
     search bar — ``in:inbox is:unread`` — so promotional / spam mail
-    that Gmail already filed elsewhere never reaches Avi.
+    that Gmail already filed elsewhere never reaches Avi. Pages until
+    ``max_results`` ids are collected or Gmail runs out. Results are
+    newest-first, which is Gmail's list order.
     """
-    try:
-        resp = (
-            _service(creds)
-            .users()
-            .messages()
-            .list(
-                userId="me",
-                q="in:inbox is:unread",
-                maxResults=max_results,
-            )
-            .execute()
+    service = _service(creds)
+    ids: List[str] = []
+    page_token: Optional[str] = None
+    while len(ids) < max_results:
+        page_size = min(500, max_results - len(ids))
+        try:
+            kwargs = {
+                "userId": "me",
+                "q": "in:inbox is:unread",
+                "maxResults": page_size,
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = service.users().messages().list(**kwargs).execute()
+        except HttpError as exc:
+            raise GmailReadError(_summarise_http_error(exc)) from exc
+        ids.extend(
+            m["id"] for m in (resp.get("messages") or []) if m.get("id")
         )
-    except HttpError as exc:
-        raise GmailReadError(_summarise_http_error(exc)) from exc
-    msgs = resp.get("messages") or []
-    return [m["id"] for m in msgs if m.get("id")]
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return ids[:max_results]
 
 
 def fetch_message(creds: Credentials, message_id: str) -> "FetchedMessage":

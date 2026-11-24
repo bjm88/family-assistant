@@ -73,7 +73,7 @@ from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import telegram, twilio_sms
 from ..utils.phone import normalize_phone
-from . import inbound_prompts, telegram_persistence
+from . import inbound_lock, inbound_prompts, telegram_persistence
 
 
 logger = logging.getLogger(__name__)
@@ -90,13 +90,31 @@ def _utcnow():
 # ---------------------------------------------------------------------------
 
 
-async def run_telegram_inbox_loop(stop_event: asyncio.Event) -> None:
+async def run_telegram_inbox_loop(
+    stop_event: asyncio.Event,
+    *,
+    start_gate: Optional[asyncio.Event] = None,
+) -> None:
     """Forever-running long-poll loop. Cancel with ``stop_event.set()``.
 
     Long-polls the Bot API for new updates and dispatches each one to
     :func:`process_inbound_update` on a worker thread (so the agent's
     blocking ``asyncio.run`` doesn't collide with our own event loop).
+
+    ``start_gate`` is the startup recovery check-in. Waiting for it
+    keeps this loop from pulling the same queued updates the catch-up
+    pass is already dispatching.
     """
+    if start_gate is not None:
+        ready = await inbound_lock.wait_until_set_or_stopped(
+            start_gate, stop_event
+        )
+        if not ready:
+            logger.info(
+                "Telegram inbox loop stopped before the recovery check-in finished."
+            )
+            return
+
     settings = get_settings()
     if not settings.TELEGRAM_BOT_TOKEN:
         logger.warning(
@@ -169,17 +187,16 @@ async def run_telegram_inbox_loop(stop_event: asyncio.Event) -> None:
             except (TypeError, ValueError):
                 pass
 
-            try:
-                await asyncio.to_thread(
-                    _dispatch_one_update,
-                    raw_update,
-                    bot_user_id,
-                )
-            except Exception:  # noqa: BLE001 - per-update isolation
-                logger.exception(
-                    "Telegram inbox: per-update dispatch crashed (update_id=%s)",
-                    raw_update.get("update_id"),
-                )
+        # Hold the recovery lock across the whole batch so a catch-up
+        # pass can't run the agent on an update we're about to handle.
+        try:
+            await asyncio.to_thread(
+                _dispatch_updates_locked,
+                updates,
+                bot_user_id,
+            )
+        except Exception:  # noqa: BLE001 - never let the loop die
+            logger.exception("Telegram inbox: batch dispatch crashed")
 
     logger.info("Telegram inbox loop stopped.")
 
@@ -220,6 +237,77 @@ def _dispatch_one_update(raw_update: dict, bot_user_id: Optional[int]) -> None:
     """Open a fresh DB session and run the per-update pipeline."""
     with SessionLocal() as db:
         process_inbound_update(db, raw_update, bot_user_id=bot_user_id)
+
+
+def _dispatch_updates_locked(
+    updates: List[dict], bot_user_id: Optional[int]
+) -> None:
+    """Dispatch a getUpdates batch while holding the recovery lock."""
+    with inbound_lock.hold_recovery_lock():
+        for raw_update in updates:
+            try:
+                _dispatch_one_update(raw_update, bot_user_id)
+            except Exception:  # noqa: BLE001 - per-update isolation
+                logger.exception(
+                    "Telegram inbox: per-update dispatch crashed (update_id=%s)",
+                    raw_update.get("update_id"),
+                )
+
+
+def drain_pending_updates(*, max_updates: int) -> int:
+    """Pull queued Bot API updates with a short poll and dispatch them.
+
+    The live loop already does this on its first tick. Recovery calls
+    it too so a batch run catches messages that piled up while the
+    process was down, before that loop exists. Returns how many
+    updates were dispatched.
+    """
+    settings = get_settings()
+    if not settings.AI_TELEGRAM_INBOUND_ENABLED or not settings.TELEGRAM_BOT_TOKEN:
+        return 0
+
+    bot_token = settings.TELEGRAM_BOT_TOKEN
+    bot_user_id: Optional[int] = None
+    try:
+        identity = telegram.get_me(bot_token)
+        bot_user_id = identity.user_id or None
+    except telegram.TelegramReadError as exc:
+        logger.warning("Inbound recovery: Telegram getMe failed: %s", exc)
+
+    offset = _initial_offset_from_db()
+    dispatched = 0
+    while dispatched < max_updates:
+        try:
+            updates = telegram.get_updates(
+                bot_token=bot_token,
+                offset=offset,
+                timeout_seconds=0,
+                limit=min(
+                    settings.AI_TELEGRAM_INBOX_MAX_PER_TICK,
+                    max_updates - dispatched,
+                ),
+            )
+        except telegram.TelegramReadError as exc:
+            logger.warning("Inbound recovery: Telegram getUpdates failed: %s", exc)
+            break
+        if not updates:
+            break
+        for raw_update in updates:
+            try:
+                offset = max(offset or 0, int(raw_update.get("update_id") or 0)) + 1
+            except (TypeError, ValueError):
+                pass
+            try:
+                _dispatch_one_update(raw_update, bot_user_id)
+            except Exception:  # noqa: BLE001 - per-update isolation
+                logger.exception(
+                    "Inbound recovery: Telegram dispatch crashed (update_id=%s)",
+                    raw_update.get("update_id"),
+                )
+            dispatched += 1
+            if dispatched >= max_updates:
+                break
+    return dispatched
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +615,7 @@ def process_inbound_update(
         surface_label="Telegram",
         agent_task_kind="telegram",
         allow_action=not bool(inbound.attachments),
+        allow_family_qa=not bool(inbound.attachments),
     )
     if triage.reply:
         logger.info(
@@ -2313,6 +2402,7 @@ def _run_agent_to_completion(
 
 
 __all__ = [
+    "drain_pending_updates",
     "process_inbound_update",
     "run_telegram_inbox_loop",
 ]

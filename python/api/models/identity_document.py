@@ -36,7 +36,17 @@ class IdentityDocument(Base, TimestampMixin):
         nullable=False,
         comment=(
             "One of: drivers_license, passport, state_id, birth_certificate, "
-            "permanent_resident_card, global_entry, military_id, other."
+            "permanent_resident_card, global_entry, military_id, "
+            "united_mileage_plus, other."
+        ),
+    )
+    identifier: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+        comment=(
+            "Plaintext, non-secret identifier shown in full, e.g. a United "
+            "MileagePlus or Known Traveler number. Secret numbers belong in "
+            "document_number_encrypted instead."
         ),
     )
     document_number_encrypted: Mapped[Optional[bytes]] = mapped_column(

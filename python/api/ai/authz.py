@@ -301,6 +301,88 @@ def _decide_sensitive(
 
 
 # ---------------------------------------------------------------------------
+# Record edits (goals, medications, identity documents, documents)
+# ---------------------------------------------------------------------------
+
+
+# ``people.primary_family_relationship`` values that make someone a
+# head of the household for write purposes.
+PRIMARY_PARENT_ROLES: frozenset[str] = frozenset({"parent", "guardian"})
+
+
+def is_primary_parent(person: Optional[models.Person]) -> bool:
+    role = (getattr(person, "primary_family_relationship", None) or "").strip().lower()
+    return role in PRIMARY_PARENT_ROLES
+
+
+def can_edit_person_records(
+    db: Session,
+    *,
+    requestor_person_id: Optional[int],
+    subject_person_id: Optional[int],
+    family_id: int,
+    requestor_is_admin: bool = False,
+) -> AccessDecision:
+    """Decide whether ``requestor`` may add / change ``subject``'s records.
+
+    Deliberately not the read matrix: relationship edges reach outside
+    the core household (a grandparent is ``parent_of`` an adult child),
+    so writes key off the household role instead.
+
+    * ``primary_parent`` — a ``parent`` / ``guardian`` of the household
+      may edit anyone in the same family, plus family-level records
+      (``subject_person_id=None``).
+    * ``self`` — any other identified family member may edit only
+      their own records.
+    * everything else (anonymous, cross-family, someone else's record)
+      → DENY.
+    """
+    subject_key = subject_person_id if subject_person_id is not None else 0
+    if requestor_is_admin:
+        decision = AccessDecision(True, "admin", requestor_person_id, subject_key)
+        _log(decision, scope="write")
+        return decision
+    decision = _decide_write(
+        db,
+        requestor_person_id=requestor_person_id,
+        subject_person_id=subject_person_id,
+        family_id=family_id,
+    )
+    _log(decision, scope="write")
+    return decision
+
+
+def _decide_write(
+    db: Session,
+    *,
+    requestor_person_id: Optional[int],
+    subject_person_id: Optional[int],
+    family_id: int,
+) -> AccessDecision:
+    subject_key = subject_person_id if subject_person_id is not None else 0
+    if requestor_person_id is None:
+        return AccessDecision(False, "anonymous", None, subject_key)
+    requestor = db.get(models.Person, requestor_person_id)
+    if requestor is None or requestor.family_id != family_id:
+        return AccessDecision(False, "cross_family", requestor_person_id, subject_key)
+    if subject_person_id is not None:
+        subject = db.get(models.Person, subject_person_id)
+        if subject is None:
+            return AccessDecision(
+                False, "unknown_subject", requestor_person_id, subject_key
+            )
+        if subject.family_id != family_id:
+            return AccessDecision(
+                False, "cross_family", requestor_person_id, subject_key
+            )
+    if is_primary_parent(requestor):
+        return AccessDecision(True, "primary_parent", requestor_person_id, subject_key)
+    if subject_person_id == requestor_person_id:
+        return AccessDecision(True, "self", requestor_person_id, subject_key)
+    return AccessDecision(False, "unauthorized", requestor_person_id, subject_key)
+
+
+# ---------------------------------------------------------------------------
 # Speaker scope summary (for the system prompt)
 # ---------------------------------------------------------------------------
 
@@ -704,6 +786,9 @@ def log_scope_summary(
 __all__ = [
     "AccessDecision",
     "OWNER_COLUMN_BY_TABLE",
+    "PRIMARY_PARENT_ROLES",
+    "can_edit_person_records",
+    "is_primary_parent",
     "REDACTED_PLACEHOLDER",
     "SENSITIVE_COLUMNS_BY_TABLE",
     "SENSITIVE_TABLES",

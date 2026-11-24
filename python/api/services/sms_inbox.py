@@ -62,7 +62,7 @@ What this code DELIBERATELY does not do
   unknown-sender reply is a register-here pointer, not an agent
   conversation.
 * Reply to STOP / OPTOUT / CANCEL / END / QUIT / UNSUBSCRIBE /
-  REVOKE / STOPALL. Those flip ``people.sms_opted_out`` when the
+  REVOKE / STOPALL over SMS. Those flip ``people.sms_opted_out`` when the
   number matches a household member and never get an Avi SMS.
 * Send any SMS (ack, agent reply, campaign HELP, Telegram
   verification) to a person whose ``sms_opted_out`` flag is set.
@@ -79,7 +79,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -325,12 +325,13 @@ def process_inbound_sms(
             **common,
         )
 
-    # ---- Opt-out keyword --------------------------------------------
+    # ---- Opt-out keyword (SMS only) --------------------------------
     # STOP / OPTOUT / … flip people.sms_opted_out when we know who
     # it is. We never send a reply — Twilio's carrier handler may
     # already confirm STOP, and the household asked us not to text
-    # opted-out numbers at all.
-    if _is_opt_out(inbound.body):
+    # opted-out numbers at all. WhatsApp has no carrier opt-out chain,
+    # so a one-word "Cancel" there is a normal message for the agent.
+    if chan.channel == "sms" and _is_opt_out(inbound.body):
         return _handle_opt_out(
             db,
             from_phone_bare=from_phone_bare,
@@ -530,8 +531,9 @@ def process_inbound_sms(
     # action-intent / heavy. Inbound attachments always escalate to
     # the heavy agent because none of the fast paths know how to
     # handle ``task_attach_message_attachment``; we pass the gate
-    # via ``allow_action=False`` so the classifier can still pick
-    # WEB / FAMILY_QA when appropriate.
+    # via ``allow_action=False`` / ``allow_family_qa=False`` (a caption
+    # like "make this Paisley's profile picture" reads as a household
+    # question) so only WEB can still short-circuit.
     agent_failed = False
     final_text: Optional[str] = None
     shortcut_used: Optional[str] = None
@@ -546,6 +548,7 @@ def process_inbound_sms(
         agent_task_kind=chan.agent_task_kind,
         # Attachments need the heavy agent's full tool set.
         allow_action=not bool(inbound.media),
+        allow_family_qa=not bool(inbound.media),
     )
     if triage.reply:
         logger.info(
@@ -965,30 +968,37 @@ def _lookup_family_member_by_phone(
     historic "(415) 555-1234" / "415-555-1234" / "+14155551234"
     variants without needing a migration.
 
-    If two family members share a number (e.g. shared landline) we
-    return the first one — the audit row still records the actual
-    inbound number so the operator can disambiguate later.
+    A mobile-number match wins over home / work. If two family members
+    share a number (e.g. shared landline) we return the lowest
+    person_id — the audit row still records the actual inbound number
+    so the operator can disambiguate later.
     """
     target = normalize_phone(phone)
     if target is None:
         return None
-    last10 = target[-10:]  # cheap pre-filter regardless of formatting
+    last10 = target[-10:]
+
+    def _digits(col):
+        # Stored numbers keep their user-typed punctuation, so the
+        # pre-filter must compare digits only.
+        return func.regexp_replace(col, r"\D", "", "g").like(f"%{last10}")
+
     candidates = db.execute(
-        select(models.Person).where(
+        select(models.Person)
+        .where(
             or_(
-                models.Person.mobile_phone_number.ilike(f"%{last10}%"),
-                models.Person.home_phone_number.ilike(f"%{last10}%"),
-                models.Person.work_phone_number.ilike(f"%{last10}%"),
+                _digits(models.Person.mobile_phone_number),
+                _digits(models.Person.home_phone_number),
+                _digits(models.Person.work_phone_number),
             )
         )
+        .order_by(models.Person.person_id)
     ).scalars().all()
-    for p in candidates:
-        for raw in (
-            p.mobile_phone_number,
-            p.home_phone_number,
-            p.work_phone_number,
-        ):
-            if normalize_phone(raw) == target:
+    # Mobile first: a shared home line must not shadow the person whose
+    # own mobile matches.
+    for field in ("mobile_phone_number", "home_phone_number", "work_phone_number"):
+        for p in candidates:
+            if normalize_phone(getattr(p, field)) == target:
                 return p
     return None
 
@@ -1526,4 +1536,79 @@ def handle_outbound_delivery_failure(
     db.commit()
 
 
-__all__ = ["handle_outbound_delivery_failure", "process_inbound_sms"]
+def replay_missed_messages(*, lookback_hours: int, max_messages: int) -> int:
+    """Replay inbound SMS / WhatsApp that never hit the webhook.
+
+    Twilio retries a dead webhook for a while and then gives up. Those
+    messages stay on the account. This lists them, skips any MessageSid
+    we already audited, and runs the same pipeline a live webhook would.
+    Returns how many unseen messages were handed to that pipeline.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    settings = get_settings()
+    if not settings.TWILIO_ACCOUNT_SID or not settings.TWILIO_AUTH_TOKEN:
+        logger.info(
+            "Inbound recovery: Twilio credentials unset; skipping SMS/WhatsApp"
+        )
+        return 0
+
+    destinations: List[Tuple[str, str]] = []
+    if settings.TWILIO_PRIMARY_PHONE and settings.AI_SMS_INBOUND_ENABLED:
+        destinations.append((settings.TWILIO_PRIMARY_PHONE, "sms"))
+    if (
+        settings.TWILIO_WHATSAPP_SENDER_NUMBER
+        and settings.AI_WHATSAPP_INBOUND_ENABLED
+    ):
+        destinations.append(
+            (
+                twilio_sms.with_whatsapp_prefix(
+                    settings.TWILIO_WHATSAPP_SENDER_NUMBER
+                ),
+                "whatsapp",
+            )
+        )
+    if not destinations:
+        return 0
+
+    sent_after = datetime.now(timezone.utc) - timedelta(hours=max(1, lookback_hours))
+    pending: List[Tuple[datetime, twilio_sms.InboundSms]] = []
+    seen_sids: set[str] = set()
+    for to_phone, _channel in destinations:
+        listed = twilio_sms.list_inbound_messages(
+            account_sid=settings.TWILIO_ACCOUNT_SID,
+            auth_token=settings.TWILIO_AUTH_TOKEN,
+            to_phone=to_phone,
+            sent_after=sent_after,
+        )
+        for sent_at, inbound in listed:
+            if inbound.message_sid in seen_sids:
+                continue
+            seen_sids.add(inbound.message_sid)
+            pending.append((sent_at, inbound))
+
+    pending.sort(key=lambda item: item[0])
+    replayed = 0
+    for _sent_at, inbound in pending:
+        if replayed >= max_messages:
+            break
+        with SessionLocal() as db:
+            if _already_processed(db, inbound.message_sid):
+                continue
+        try:
+            with SessionLocal() as db:
+                process_inbound_sms(db, inbound)
+            replayed += 1
+        except Exception:  # noqa: BLE001 - one bad message must not stop the rest
+            logger.exception(
+                "Inbound recovery: failed to replay Twilio sid=%s",
+                inbound.message_sid,
+            )
+    return replayed
+
+
+__all__ = [
+    "handle_outbound_delivery_failure",
+    "process_inbound_sms",
+    "replay_missed_messages",
+]

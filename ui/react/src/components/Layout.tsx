@@ -3,6 +3,7 @@ import {
   NavLink,
   Outlet,
   useLocation,
+  useMatch,
   useParams,
 } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -12,6 +13,7 @@ import {
   Building2,
   Car,
   FileText,
+  GitFork,
   History,
   Home,
   Landmark,
@@ -37,6 +39,7 @@ import { UserPill } from "@/components/UserPill";
 // not a static admin record like People or Vehicles.
 const NAV = [
   { to: "", label: "Overview", icon: Home, end: true, adminOnly: false },
+  { to: "tree", label: "Family tree", icon: GitFork, adminOnly: false },
   { to: "people", label: "People", icon: Users, adminOnly: true },
   { to: "relationships", label: "Relationships", icon: Network, adminOnly: true },
   { to: "assistant", label: "Assistant", icon: Bot, adminOnly: true },
@@ -73,6 +76,10 @@ export default function Layout() {
   // links that would 403 on click. The backend is the source of truth
   // for access — this is purely a UX cleanup.
   const visibleNav = NAV.filter((item) => isAdmin || !item.adminOnly);
+
+  // Canvas-style pages use the whole content column (no max width) and
+  // a fixed viewport height so they scroll internally.
+  const fullBleed = useMatch("/admin/families/:familyId/tree") !== null;
 
   const sidebar = (
     <>
@@ -231,9 +238,15 @@ export default function Layout() {
         </div>
 
         <div className="flex-1 min-w-0">
-          <div className="max-w-6xl mx-auto p-4 sm:p-6 lg:p-8">
-            <Outlet />
-          </div>
+          {fullBleed ? (
+            <div className="h-[calc(100dvh-3.5rem)] flex flex-col p-3 sm:p-4">
+              <Outlet />
+            </div>
+          ) : (
+            <div className="max-w-6xl mx-auto p-4 sm:p-6 lg:p-8">
+              <Outlet />
+            </div>
+          )}
         </div>
       </main>
     </div>

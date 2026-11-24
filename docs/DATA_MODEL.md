@@ -168,9 +168,11 @@ gallery never drifts out of sync.
 
 ### `goals`
 
-Per-person goals (`urgent · high · normal · low · future_idea`). Avi
-surfaces them in greetings ("how's that gymnastics meet tomorrow?")
-and uses them for follow-up questions.
+Per-person goals (`urgent · semi_urgent · normal · low`). Avi
+surfaces open goals in greetings ("how's that gymnastics meet tomorrow?")
+and uses them for follow-up questions. `completed_date` marks a goal
+done as of that day (NULL = still open); completed goals drop out of
+nudges and are listed separately in the person's profile.
 
 ---
 

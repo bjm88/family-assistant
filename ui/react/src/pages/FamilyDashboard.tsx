@@ -8,6 +8,7 @@ import {
   History,
   Home,
   ListTodo,
+  Maximize2,
   Network,
   PawPrint,
   Sparkles,
@@ -111,20 +112,29 @@ export default function FamilyDashboard() {
                   : "Generated from people and the relationships in your household."}
               </div>
             </div>
-            {isAdmin && (
+            <div className="flex items-center gap-3 shrink-0">
+              {isAdmin && (
+                <Link
+                  to={`/admin/families/${familyId}/relationships`}
+                  className="text-xs text-primary hover:underline"
+                >
+                  Edit →
+                </Link>
+              )}
               <Link
-                to={`/admin/families/${familyId}/relationships`}
-                className="text-xs text-primary hover:underline"
+                to={`/admin/families/${familyId}/tree`}
+                className="text-xs inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 font-medium text-foreground hover:bg-muted"
               >
-                Edit →
+                <Maximize2 className="h-3 w-3" /> Full view
               </Link>
-            )}
+            </div>
           </div>
           <div className="card-body">
             {people && (
               <FamilyTreeView
                 people={people}
                 edges={edges ?? []}
+                className="max-h-[32rem] overflow-auto"
                 onSelect={
                   isAdmin
                     ? (personId) =>

@@ -7,7 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { useEffect, useState } from "react";
-import { ArrowLeft, Briefcase, Camera, HeartPulse, Image as ImageIcon, Pencil, Pill, Plus, Stethoscope, Target, Trash2, Upload, X } from "lucide-react";
+import { ArrowLeft, Briefcase, Camera, CheckCircle2, Circle, HeartPulse, Image as ImageIcon, Pencil, Pill, Plus, Stethoscope, Target, Trash2, Upload, X } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   Goal,
@@ -44,8 +44,22 @@ const ID_TYPES = [
   "permanent_resident_card",
   "global_entry",
   "military_id",
+  "united_mileage_plus",
   "other",
 ];
+
+const ID_TYPE_LABELS: Record<string, string> = {
+  united_mileage_plus: "United Airlines MileagePlus",
+};
+
+function idTypeLabel(t: string): string {
+  return ID_TYPE_LABELS[t] ?? t.replace(/_/g, " ");
+}
+
+// Issuing authority filled in when left blank for these types.
+const ID_TYPE_DEFAULT_AUTHORITY: Record<string, string> = {
+  united_mileage_plus: "United Airlines",
+};
 
 const SENSITIVE_TYPES = [
   "social_security_number",
@@ -609,6 +623,7 @@ function PhotosSection({ personId }: { personId: number }) {
 
 type IdentityDocForm = {
   document_type: string;
+  identifier: string;
   document_number: string;
   issuing_authority: string;
   country_of_issue: string;
@@ -620,6 +635,7 @@ type IdentityDocForm = {
 
 const EMPTY_ID_DOC_FORM: IdentityDocForm = {
   document_type: "drivers_license",
+  identifier: "",
   document_number: "",
   issuing_authority: "",
   country_of_issue: "United States",
@@ -632,6 +648,7 @@ const EMPTY_ID_DOC_FORM: IdentityDocForm = {
 function identityDocToForm(d: IdentityDocument): IdentityDocForm {
   return {
     document_type: d.document_type,
+    identifier: d.identifier ?? "",
     document_number: "",
     issuing_authority: d.issuing_authority ?? "",
     country_of_issue: d.country_of_issue ?? "United States",
@@ -689,6 +706,7 @@ function IdentityDocumentsSection({ personId }: { personId: number }) {
               <thead className="text-xs text-muted-foreground">
                 <tr className="border-b border-border">
                   <th className="text-left py-2">Type</th>
+                  <th className="text-left">Identifier</th>
                   <th className="text-left">Number</th>
                   <th className="text-left">Issuing authority</th>
                   <th className="text-left">Expires</th>
@@ -707,8 +725,9 @@ function IdentityDocumentsSection({ personId }: { personId: number }) {
                       onClick={() => setEditingId(d.identity_document_id)}
                     >
                       <td className="py-2">
-                        {d.document_type.replace(/_/g, " ")}
+                        {idTypeLabel(d.document_type)}
                       </td>
+                      <td className="font-mono">{d.identifier ?? "—"}</td>
                       <td>
                         {d.document_number_last_four
                           ? `••••${d.document_number_last_four}`
@@ -829,6 +848,7 @@ function IdentityDocumentModal({
     onSuccess: () => {
       invalidate();
       toast.success("Identity document saved.");
+      onClose();
     },
     onError: (err: Error) =>
       toast.error(`Could not save identity document: ${err.message}`),
@@ -879,10 +899,22 @@ function IdentityDocumentModal({
           >
             {ID_TYPES.map((t) => (
               <option key={t} value={t}>
-                {t.replace(/_/g, " ")}
+                {idTypeLabel(t)}
               </option>
             ))}
           </select>
+        </Field>
+        <Field
+          label="Identifier"
+          htmlFor="identifier"
+          hint="Shown in full, e.g. a MileagePlus number. Use Document number for anything secret."
+        >
+          <input
+            id="identifier"
+            className="input"
+            autoComplete="off"
+            {...register("identifier")}
+          />
         </Field>
         <Field
           label="Document number"
@@ -968,7 +1000,11 @@ function toPayload(
   const blankToNull = (s: string) => (s.trim() === "" ? null : s);
   const payload: Record<string, unknown> = {
     document_type: v.document_type,
-    issuing_authority: blankToNull(v.issuing_authority),
+    identifier: blankToNull(v.identifier.trim()),
+    issuing_authority:
+      blankToNull(v.issuing_authority) ??
+      ID_TYPE_DEFAULT_AUTHORITY[v.document_type] ??
+      null,
     country_of_issue: v.country_of_issue.trim() || "United States",
     state_or_region_of_issue: blankToNull(v.state_or_region_of_issue),
     issue_date: blankToNull(v.issue_date),
@@ -1292,6 +1328,28 @@ function GoalsSection({ personId }: { personId: number }) {
       toast.error(`Could not remove goal: ${err.message}`),
   });
 
+  const toggleComplete = useMutation({
+    mutationFn: (g: Goal) =>
+      api.patch<Goal>(`/api/goals/${g.goal_id}`, {
+        completed_date: g.completed_date ? null : todayLocalIso(),
+      }),
+    onSuccess: (g) => {
+      qc.invalidateQueries({ queryKey: ["goals", personId] });
+      toast.success(
+        g.completed_date
+          ? `Marked "${g.goal_name}" complete.`
+          : `Reopened "${g.goal_name}".`
+      );
+    },
+    onError: (err: Error) =>
+      toast.error(`Could not update goal: ${err.message}`),
+  });
+
+  const [showCompleted, setShowCompleted] = useState(true);
+  const completedCount = goals?.filter((g) => g.completed_date).length ?? 0;
+  const visibleGoals =
+    goals?.filter((g) => showCompleted || !g.completed_date) ?? [];
+
   const editingGoal =
     typeof editingId === "number"
       ? goals?.find((g) => g.goal_id === editingId) ?? null
@@ -1301,9 +1359,19 @@ function GoalsSection({ personId }: { personId: number }) {
     <div className="card">
       <div className="card-header flex items-center justify-between">
         <div className="card-title">Goals</div>
-        <button className="btn-secondary" onClick={() => setEditingId("new")}>
-          <Plus className="h-4 w-4" /> Add goal
-        </button>
+        <div className="flex items-center gap-3">
+          {completedCount > 0 && (
+            <button
+              className="text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => setShowCompleted((v) => !v)}
+            >
+              {showCompleted ? "Hide" : "Show"} completed ({completedCount})
+            </button>
+          )}
+          <button className="btn-secondary" onClick={() => setEditingId("new")}>
+            <Plus className="h-4 w-4" /> Add goal
+          </button>
+        </div>
       </div>
       <div className="card-body">
         {!goals || goals.length === 0 ? (
@@ -1311,25 +1379,64 @@ function GoalsSection({ personId }: { personId: number }) {
             <Target className="h-4 w-4" />
             No goals yet. Capture something this person is working toward.
           </div>
+        ) : visibleGoals.length === 0 ? (
+          <div className="text-sm text-muted-foreground flex items-center gap-2">
+            <CheckCircle2 className="h-4 w-4" />
+            All goals are complete.
+          </div>
         ) : (
           <table className="w-full text-sm">
             <thead className="text-xs text-muted-foreground">
               <tr className="border-b border-border">
+                <th className="w-8" />
                 <th className="text-left py-2">Goal</th>
                 <th className="text-left">Priority</th>
                 <th className="text-left">Start date</th>
+                <th className="text-left">Completed</th>
                 <th />
               </tr>
             </thead>
             <tbody>
-              {goals.map((g) => (
+              {visibleGoals.map((g) => (
                 <tr
                   key={g.goal_id}
-                  className="border-b border-border table-row-hover cursor-pointer"
+                  className={`border-b border-border table-row-hover cursor-pointer ${
+                    g.completed_date ? "text-muted-foreground" : ""
+                  }`}
                   onClick={() => setEditingId(g.goal_id)}
                 >
                   <td className="py-2">
-                    <div className="font-medium">{g.goal_name}</div>
+                    <button
+                      className={
+                        g.completed_date
+                          ? "text-emerald-600 hover:text-emerald-700"
+                          : "text-muted-foreground hover:text-foreground"
+                      }
+                      disabled={toggleComplete.isPending}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleComplete.mutate(g);
+                      }}
+                      aria-label={
+                        g.completed_date ? "Reopen goal" : "Mark goal complete"
+                      }
+                      title={
+                        g.completed_date ? "Reopen goal" : "Mark goal complete"
+                      }
+                    >
+                      {g.completed_date ? (
+                        <CheckCircle2 className="h-5 w-5" />
+                      ) : (
+                        <Circle className="h-5 w-5" />
+                      )}
+                    </button>
+                  </td>
+                  <td className="py-2">
+                    <div
+                      className={`font-medium ${g.completed_date ? "line-through" : ""}`}
+                    >
+                      {g.goal_name}
+                    </div>
                     {g.description && (
                       <div className="text-xs text-muted-foreground line-clamp-2">
                         {g.description}
@@ -1340,6 +1447,7 @@ function GoalsSection({ personId }: { personId: number }) {
                     <PriorityBadge priority={g.priority} />
                   </td>
                   <td>{g.start_date ?? "—"}</td>
+                  <td>{g.completed_date ?? "—"}</td>
                   <td className="text-right whitespace-nowrap">
                     <button
                       className="text-muted-foreground hover:text-foreground mr-3"
@@ -1411,7 +1519,13 @@ type GoalForm = {
   description?: string;
   start_date?: string;
   priority: GoalPriority;
+  completed_date?: string;
 };
+
+// Local calendar date (YYYY-MM-DD); toISOString() would roll over at UTC midnight.
+function todayLocalIso(): string {
+  return new Date().toLocaleDateString("en-CA");
+}
 
 function GoalModal({
   open,
@@ -1428,7 +1542,7 @@ function GoalModal({
 }) {
   const qc = useQueryClient();
   const toast = useToast();
-  const { register, handleSubmit, reset } = useForm<GoalForm>({
+  const { register, handleSubmit, reset, setValue } = useForm<GoalForm>({
     defaultValues: { priority: "normal" },
   });
 
@@ -1439,6 +1553,7 @@ function GoalModal({
         description: goal.description ?? "",
         start_date: goal.start_date ?? "",
         priority: goal.priority,
+        completed_date: goal.completed_date ?? "",
       });
     } else if (mode === "create") {
       reset({
@@ -1446,6 +1561,7 @@ function GoalModal({
         description: "",
         start_date: "",
         priority: "normal",
+        completed_date: "",
       });
     }
   }, [mode, goal, reset, open]);
@@ -1466,8 +1582,8 @@ function GoalModal({
   const update = useMutation({
     mutationFn: (v: GoalForm) => {
       if (!goal) throw new Error("No goal to update");
-      const cleaned = cleanPayload(v);
-      return api.patch<Goal>(`/api/goals/${goal.goal_id}`, cleaned);
+      // emptyToNull so blanking "Completed on" reopens the goal.
+      return api.patch<Goal>(`/api/goals/${goal.goal_id}`, emptyToNull(v));
     },
     onSuccess: (g) => {
       qc.invalidateQueries({ queryKey: ["goals", personId] });
@@ -1528,6 +1644,25 @@ function GoalModal({
             className="input"
             {...register("start_date")}
           />
+        </Field>
+        <Field label="Completed on" htmlFor="completed_date">
+          <div className="flex items-center gap-2">
+            <input
+              id="completed_date"
+              type="date"
+              className="input"
+              {...register("completed_date")}
+            />
+            <button
+              type="button"
+              className="btn-secondary whitespace-nowrap"
+              onClick={() =>
+                setValue("completed_date", todayLocalIso(), { shouldDirty: true })
+              }
+            >
+              Today
+            </button>
+          </div>
         </Field>
         <div className="col-span-2">
           <Field label="Description" htmlFor="description">

@@ -292,6 +292,23 @@ class Settings(BaseSettings):
     # spawning dozens of agent runs at once if a flood arrives.
     AI_EMAIL_INBOX_MAX_PER_TICK: int = 5
 
+    # ---- Downtime recovery --------------------------------------------
+    # One shared catch-up pass for mail and messages that arrived while
+    # Avi was down. The FastAPI lifespan runs it before the live
+    # pollers start, and ``scripts/recover_inbound.py`` runs the same
+    # function on demand. The regular poller still drips through
+    # anything left past these caps.
+    AI_INBOUND_RECOVERY_ENABLED: bool = True
+    # Unread Gmail messages examined per assistant per recovery pass.
+    # Unknown senders are marked read quickly; only registered family
+    # members spend an agent run.
+    AI_INBOUND_RECOVERY_MAX_EMAILS: int = 100
+    # SMS / WhatsApp / Telegram messages replayed per recovery pass.
+    AI_INBOUND_RECOVERY_MAX_MESSAGES: int = 50
+    # How far back to ask Twilio for inbound SMS / WhatsApp that never
+    # reached the webhook. Already-audited MessageSids are skipped.
+    AI_INBOUND_RECOVERY_SMS_LOOKBACK_HOURS: int = 72
+
     # ---- SMS inbox (Twilio) --------------------------------------------
     # Master switch for the inbound SMS webhook. When OFF the
     # ``/api/sms/twilio/inbound`` endpoint still exists but returns an

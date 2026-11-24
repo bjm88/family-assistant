@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import type { Person, PersonRelationship } from "@/lib/types";
 import { ProfileAvatar } from "@/components/ProfileAvatar";
 
@@ -23,6 +23,10 @@ interface Props {
   people: Person[];
   edges: PersonRelationship[];
   onSelect?: (personId: number) => void;
+  /** Classes for the scroll container. Defaults to horizontal scroll only. */
+  className?: string;
+  /** Full-page mode: click-and-drag the background to pan, open centered. */
+  pannable?: boolean;
 }
 
 interface Couple {
@@ -35,11 +39,62 @@ const ROW_GAP = 56;
 const COUPLE_GAP = 40;
 const INTER_CARD = 8;
 
-export function FamilyTreeView({ people, edges, onSelect }: Props) {
+export function FamilyTreeView({
+  people,
+  edges,
+  onSelect,
+  className = "overflow-x-auto",
+  pannable = false,
+}: Props) {
   const { generations, parentsOf, containerWidth } = useMemo(
     () => layoutTree(people, edges),
     [people, edges]
   );
+
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const drag = useRef<{ x: number; y: number; left: number; top: number; moved: boolean } | null>(null);
+  const suppressClick = useRef(false);
+  const [panning, setPanning] = useState(false);
+
+  // Open wide trees centered rather than pinned to the left edge.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!pannable || !el) return;
+    el.scrollLeft = Math.max(0, (el.scrollWidth - el.clientWidth) / 2);
+  }, [pannable, containerWidth]);
+
+  const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
+    const el = scrollRef.current;
+    if (!pannable || !el || e.pointerType !== "mouse" || e.button !== 0) return;
+    drag.current = { x: e.clientX, y: e.clientY, left: el.scrollLeft, top: el.scrollTop, moved: false };
+  };
+  const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
+    const el = scrollRef.current;
+    const d = drag.current;
+    if (!el || !d) return;
+    const dx = e.clientX - d.x;
+    const dy = e.clientY - d.y;
+    // Small threshold so an ordinary click on a card still selects it.
+    if (!d.moved && Math.hypot(dx, dy) < 5) return;
+    if (!d.moved) {
+      d.moved = true;
+      setPanning(true);
+      el.setPointerCapture(e.pointerId);
+    }
+    el.scrollLeft = d.left - dx;
+    el.scrollTop = d.top - dy;
+  };
+  const endPan = (e: PointerEvent<HTMLDivElement>) => {
+    const d = drag.current;
+    drag.current = null;
+    if (!d?.moved) return;
+    setPanning(false);
+    scrollRef.current?.releasePointerCapture(e.pointerId);
+    suppressClick.current = true;
+    setTimeout(() => {
+      suppressClick.current = false;
+    }, 0);
+  };
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -118,11 +173,24 @@ export function FamilyTreeView({ people, edges, onSelect }: Props) {
   }
 
   return (
-    <div className="overflow-x-auto">
+    <div
+      ref={scrollRef}
+      className={`${className} ${
+        pannable ? (panning ? "cursor-grabbing select-none" : "cursor-grab") : ""
+      }`}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endPan}
+      onPointerCancel={endPan}
+    >
       <div
         ref={containerRef}
         className="relative mx-auto"
-        style={{ minWidth: containerWidth, paddingTop: 8, paddingBottom: 8 }}
+        style={{
+          minWidth: containerWidth,
+          paddingTop: pannable ? 24 : 8,
+          paddingBottom: pannable ? 24 : 8,
+        }}
       >
         <svg
           className="absolute inset-0 pointer-events-none"
@@ -175,8 +243,12 @@ export function FamilyTreeView({ people, edges, onSelect }: Props) {
                           if (el) cardRefs.current.set(id, el);
                           else cardRefs.current.delete(id);
                         }}
-                        onClick={() => onSelect?.(id)}
-                        className="border border-border rounded-lg bg-white shadow-sm hover:shadow-md hover:border-primary/40 transition-all cursor-pointer flex flex-col items-center justify-center gap-1 px-2 py-2"
+                        onClick={() => {
+                          if (!suppressClick.current) onSelect?.(id);
+                        }}
+                        className={`border border-border rounded-lg bg-white shadow-sm hover:shadow-md hover:border-primary/40 transition-all flex flex-col items-center justify-center gap-1 px-2 py-2 ${
+                          onSelect ? "cursor-pointer" : ""
+                        }`}
                         style={{ width: CARD_W, height: CARD_H }}
                         title={
                           hasParents

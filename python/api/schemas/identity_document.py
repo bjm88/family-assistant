@@ -10,6 +10,7 @@ from ._base import OrmModel
 
 class IdentityDocumentBase(BaseModel):
     document_type: str = Field(..., max_length=40)
+    identifier: Optional[str] = Field(None, max_length=100)
     issuing_authority: Optional[str] = Field(None, max_length=120)
     country_of_issue: str = Field("United States", max_length=80)
     state_or_region_of_issue: Optional[str] = Field(None, max_length=80)
@@ -28,6 +29,7 @@ class IdentityDocumentCreate(IdentityDocumentBase):
 
 class IdentityDocumentUpdate(BaseModel):
     document_type: Optional[str] = None
+    identifier: Optional[str] = Field(None, max_length=100)
     issuing_authority: Optional[str] = None
     country_of_issue: Optional[str] = None
     state_or_region_of_issue: Optional[str] = None
@@ -41,6 +43,7 @@ class IdentityDocumentRead(OrmModel):
     identity_document_id: int
     person_id: int
     document_type: str
+    identifier: Optional[str]
     document_number_last_four: Optional[str]
     issuing_authority: Optional[str]
     country_of_issue: str

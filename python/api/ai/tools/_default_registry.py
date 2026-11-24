@@ -22,6 +22,7 @@ from ...integrations import google_oauth, web_search as web_search_integration
 from ._registry import Tool, ToolRegistry
 from .handlers import calendar as _cal
 from .handlers import messaging as _msg
+from .handlers import records as _rec
 from .handlers import secrets as _sec
 from .handlers import sql as _sql
 from .handlers import tasks as _tasks
@@ -534,6 +535,147 @@ def build_default_registry() -> ToolRegistry:
                 "Make a task to review this house, details attached as a PDF.",
                 "Save the photo I just sent to the broken-fence task.",
                 "Attach all of these to the camp registration task.",
+            ),
+        )
+    )
+    _write_rule = (
+        "Permission is enforced by the tool: a parent of the household "
+        "may change anyone's records; every other family member may "
+        "change only their own. If the tool refuses, tell the user "
+        "plainly that nothing was changed — never claim it was saved."
+    )
+    reg.register(
+        Tool(
+            name="household_records_list",
+            label="List a person's goals, medications, IDs, or documents",
+            description=(
+                "List one person's goals, medications, identity "
+                "documents, or saved documents with their ids. Call "
+                "this before updating an existing record so you pass "
+                "the right *_id. Identity documents show the plain "
+                "identifier and only the last four of the secret "
+                "number."
+            ),
+            parameters=_rec.HOUSEHOLD_RECORDS_LIST_SCHEMA,
+            handler=_rec.handle_household_records_list,
+            timeout_seconds=5.0,
+            examples=(
+                "What medications is Jackson on?",
+                "What goals do I have?",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="goal_save",
+            label="Add or update a goal",
+            description=(
+                "Create a goal (omit goal_id) or update one (pass "
+                "goal_id from household_records_list). Use "
+                "mark_complete=true when the user says they finished "
+                "a goal, reopen=true to undo that. " + _write_rule
+            ),
+            parameters=_rec.GOAL_SAVE_SCHEMA,
+            handler=_rec.handle_goal_save,
+            timeout_seconds=5.0,
+            examples=(
+                "Add a goal for Paisley to read 20 books this year.",
+                "I finished my half-marathon goal!",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="medication_save",
+            label="Add or adjust a medication",
+            description=(
+                "Add a medication (omit medication_id) or change one "
+                "— dosage, dates, notes (pass medication_id from "
+                "household_records_list). Use stopped_today=true when "
+                "the user says someone stopped taking it. "
+                + _write_rule
+            ),
+            parameters=_rec.MEDICATION_SAVE_SCHEMA,
+            handler=_rec.handle_medication_save,
+            timeout_seconds=5.0,
+            examples=(
+                "Jackson started Zyrtec 10mg daily today.",
+                "Change my lisinopril to 20mg.",
+                "Nahla stopped taking amoxicillin.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="identity_document_save",
+            label="Add or update an identity document",
+            description=(
+                "Add an identity document (omit identity_document_id) "
+                "or update one: driver's license, passport, Global "
+                "Entry, United MileagePlus, etc. Put non-secret "
+                "numbers (MileagePlus, Known Traveler) in identifier "
+                "and secret ones (license, passport) in "
+                "document_number, which is encrypted. When the user "
+                "sent a photo of the card, pass front_media_index / "
+                "back_media_index to store the scan. " + _write_rule
+            ),
+            parameters=_rec.IDENTITY_DOCUMENT_SAVE_SCHEMA,
+            handler=_rec.handle_identity_document_save,
+            timeout_seconds=15.0,
+            examples=(
+                "Add Layla's United MileagePlus number AB123456.",
+                "Here's a photo of my new license, it expires 2031-05-02.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="document_save_from_message",
+            label="Save the file the user just sent as a document",
+            description=(
+                "Save an attachment on the CURRENT inbound message "
+                "into the household Documents library (tax forms, "
+                "medical records, receipts, school forms). Defaults "
+                "to the speaker's documents; pass person_id for "
+                "someone else or family_wide=true for household "
+                "paperwork. Use task_attach_message_attachment "
+                "instead when the user wants the file on a task. "
+                + _write_rule
+            ),
+            parameters=_rec.DOCUMENT_SAVE_FROM_MESSAGE_SCHEMA,
+            handler=_rec.handle_document_save_from_message,
+            timeout_seconds=15.0,
+            requires=("inbound_attachment",),
+            examples=(
+                "Save this W-2 to my documents.",
+                "File this vaccine record under Jackson.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="person_photo_save_from_message",
+            label="Save a photo the user just sent to someone's profile",
+            description=(
+                "Save an image attachment on the CURRENT inbound "
+                "message as a photo of a household member. Use "
+                "set_as_primary=true when the user wants it as their "
+                "main / profile picture; otherwise it is added to "
+                "that person's additional photos, which also teach "
+                "face recognition (pass use_for_face_recognition="
+                "false for group shots). Defaults to the speaker; "
+                "use lookup_person for the person_id of whoever is "
+                "pictured. If it's unclear who is in the photo, ask "
+                "before saving. " + _write_rule
+            ),
+            parameters=_rec.PERSON_PHOTO_SAVE_FROM_MESSAGE_SCHEMA,
+            handler=_rec.handle_person_photo_save_from_message,
+            timeout_seconds=15.0,
+            requires=("inbound_attachment",),
+            examples=(
+                "Make this Paisley's profile picture.",
+                "Add these to Jackson's photos.",
+                "Use this as my main photo.",
             ),
         )
     )

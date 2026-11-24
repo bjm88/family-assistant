@@ -189,6 +189,12 @@ const ECHO_GRACE_MS = 700;
 // message instead of firing N separate sends.
 const SUBMIT_DEBOUNCE_MS = 1800;
 
+// A tiny valid WAV (header + one silent sample). Playing it from a
+// tap unlocks the HTMLAudioElement so a later face greeting can call
+// play() without another gesture.
+const SILENT_WAV =
+  "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+
 // -------------------------------------------------------------------------
 // Audio queue — plays Kokoro WAV clips one after another without overlap.
 // Returns a handle with `enqueue(text, voiceHint)` and `mute`/`unmute`.
@@ -204,6 +210,13 @@ type AudioQueueHandle = {
   setMuted: (muted: boolean) => void;
   // True while a WAV is actively playing out of the speakers.
   isSpeaking: boolean;
+  // True when the browser refused playback (no user gesture yet) and
+  // a clip — usually the face greeting — is waiting for a tap.
+  playbackBlocked: boolean;
+  // Call from a click/tap handler so the held clip plays inside a
+  // user gesture. Also primes the element so the next greeting can
+  // start on its own.
+  unlockPlayback: () => void;
   // Real-time 0..1 audio amplitude (RMS). Drives Avi's speaking
   // animations — aura intensity, echo rings, mouth glow. The ref is
   // updated on every rAF tick for ~60 Hz consumers (the SVG mouth
@@ -261,6 +274,13 @@ function useAudioQueue(
   const skipTokenRef = useRef(0);
 
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [playbackBlocked, setPlaybackBlocked] = useState(false);
+  // Clip whose play() was rejected by the autoplay policy. Kept so
+  // the next tap can start it without another TTS round-trip.
+  const blockedClipRef = useRef<{ url: string; messageId?: string } | null>(
+    null
+  );
+  const unlockedRef = useRef(false);
   const [currentMessageId, setCurrentMessageId] = useState<string | null>(
     null
   );
@@ -402,16 +422,39 @@ function useAudioQueue(
           await audioCtxRef.current.resume().catch(() => undefined);
         }
         await audio.play();
+        unlockedRef.current = true;
+        setPlaybackBlocked(false);
         setIsSpeaking(true);
         startAmplitudeLoop();
       } catch (err) {
-        // Autoplay was blocked — surface a hint in the console so the
-        // user knows to interact with the page once.
-        console.warn("Avi: audio playback blocked until first user gesture", err);
+        const blocked =
+          err instanceof DOMException && err.name === "NotAllowedError";
+        if (blocked) {
+          // Hold the clip. The next tap calls play() inside a user
+          // gesture, which is what Chrome and Safari require before
+          // the first sound. Dropping it here is why a recognized
+          // face used to show "Hi <name>" with no voice.
+          if (
+            blockedClipRef.current &&
+            blockedClipRef.current.url !== url
+          ) {
+            URL.revokeObjectURL(blockedClipRef.current.url);
+          }
+          blockedClipRef.current = { url, messageId: next.messageId };
+          playingRef.current = false;
+          setIsSpeaking(false);
+          setCurrentMessageId(null);
+          setPlaybackBlocked(true);
+          stopAmplitudeLoop();
+          return;
+        }
+        console.warn("Avi: audio playback failed", err);
+        URL.revokeObjectURL(url);
         playingRef.current = false;
         setIsSpeaking(false);
         setCurrentMessageId(null);
         stopAmplitudeLoop();
+        void playNext();
       }
     } catch (err) {
       console.debug("Avi TTS failed", err);
@@ -451,15 +494,80 @@ function useAudioQueue(
         } catch {
           /* noop */
         }
+        if (blockedClipRef.current) {
+          URL.revokeObjectURL(blockedClipRef.current.url);
+          blockedClipRef.current = null;
+        }
         queueRef.current = [];
         playingRef.current = false;
         setIsSpeaking(false);
         setCurrentMessageId(null);
+        setPlaybackBlocked(false);
         stopAmplitudeLoop();
       }
     },
     [stopAmplitudeLoop]
   );
+
+  const unlockPlayback = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio || mutedRef.current) return;
+    if (audioCtxRef.current?.state === "suspended") {
+      void audioCtxRef.current.resume().catch(() => undefined);
+    }
+    const blocked = blockedClipRef.current;
+    if (blocked) {
+      blockedClipRef.current = null;
+      playingRef.current = true;
+      setCurrentMessageId(blocked.messageId ?? null);
+      const result = audio.play();
+      void result
+        .then(() => {
+          unlockedRef.current = true;
+          setPlaybackBlocked(false);
+          setIsSpeaking(true);
+          startAmplitudeLoop();
+        })
+        .catch(() => {
+          blockedClipRef.current = blocked;
+          playingRef.current = false;
+          setCurrentMessageId(null);
+          setPlaybackBlocked(true);
+          setIsSpeaking(false);
+        });
+      return;
+    }
+    if (unlockedRef.current) return;
+    const previous = audio.src;
+    audio.src = SILENT_WAV;
+    const result = audio.play();
+    void result
+      ?.then(() => {
+        unlockedRef.current = true;
+        setPlaybackBlocked(false);
+        // A real clip may have replaced this silent buffer while the
+        // tap's play() was resolving. Don't pause that one.
+        if (audio.src.startsWith("data:")) {
+          audio.pause();
+          if (previous && !previous.startsWith("data:")) {
+            audio.src = previous;
+          }
+        }
+        if (queueRef.current.length > 0 && !playingRef.current) {
+          void playNext();
+        }
+      })
+      .catch(() => undefined);
+  }, [playNext, startAmplitudeLoop]);
+
+  // Any tap on the page is a user gesture. Use it to release a
+  // greeting the autoplay policy held back, and to prime the audio
+  // element so the next recognized face can speak immediately.
+  useEffect(() => {
+    const onGesture = () => unlockPlayback();
+    window.addEventListener("pointerdown", onGesture, true);
+    return () => window.removeEventListener("pointerdown", onGesture, true);
+  }, [unlockPlayback]);
 
   // Stop reading the current clip but keep the rest of the queue.
   // We bump skipTokenRef so any in-flight /tts fetch (clip not yet
@@ -493,6 +601,8 @@ function useAudioQueue(
     enqueue,
     setMuted,
     isSpeaking,
+    playbackBlocked,
+    unlockPlayback,
     amplitude,
     amplitudeRef,
     audioEl,
@@ -669,27 +779,14 @@ export default function AiAssistantPage() {
     };
   }, []);
 
-  // Speaker (Avi's voice playback).
-  //
-  // Defaults are PLATFORM-AWARE, not persisted:
-  //
-  //   * Desktop  → ON. The family's home setup is a kitchen iMac with
-  //                speakers — they expect to walk up and hear Avi greet
-  //                them without clicking anything.
-  //   * Mobile   → OFF. Phones are used in quiet/private contexts
-  //                (bed, couch, school pickup line) where blasting
-  //                "Hi Sam!" is the wrong default. Also mitigates the
-  //                mobile-only TTS jitter where iOS' audio routing
-  //                kept restarting the clip when SpeechRecognition
-  //                also wanted the audio session.
-  //
-  // We deliberately do NOT seed from localStorage in either case — a
-  // stale "0" from a previous testing session was silently muting
-  // Avi on reload, and on a freshly-opened tab the platform-aware
-  // default is what the user actually wants. The toggle still works
-  // mid-session for a deliberate "shh" / "talk to me"; it just
-  // doesn't survive a refresh.
-  const [speakerOn, setSpeakerOn] = useState<boolean>(!isMobile);
+  // Speaker starts ON on every device. The face greeting ("Hi <name>")
+  // is the point of the live page — a phone that stays muted never
+  // says it. The toggle still works for a deliberate mute; it is not
+  // persisted, so a leftover "off" from an old session can't stick.
+  const [speakerOn, setSpeakerOn] = useState<boolean>(true);
+  // Phones don't fit Avi, the camera, and the chat at a useful size
+  // all at once. Face is the default; Chat swaps in the thread.
+  const [mobilePane, setMobilePane] = useState<"face" | "chat">("face");
 
   // The page used to support a second "advanced" rendering mode that
   // mounted a rigged Live2D character. It was pulled because the basic
@@ -734,7 +831,14 @@ export default function AiAssistantPage() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-background to-muted">
+    <div
+      className={cn(
+        "bg-gradient-to-br from-background to-muted",
+        isMobile
+          ? "h-dvh flex flex-col overflow-hidden"
+          : "min-h-screen"
+      )}
+    >
       <header className="border-b border-border bg-white">
         {/* Top row: back link, family + assistant title, UserPill.
             Padding shrinks on mobile so the title + user pill fit on
@@ -787,6 +891,16 @@ export default function AiAssistantPage() {
             )}
             {speakerOn ? "Voice on" : "Voice off"}
           </button>
+          {speakerOn && audio.playbackBlocked && (
+            <button
+              type="button"
+              onClick={() => audio.unlockPlayback()}
+              className="inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs border shrink-0 bg-amber-100 text-amber-900 border-amber-300"
+            >
+              <Volume2 className="h-3.5 w-3.5" />
+              Tap to hear Avi
+            </button>
+          )}
           {/* Operational diagnostics (Ollama health, face embedding
               count, TTS engine, "Re-enroll faces" admin tool). They're
               busy and only meaningful to maintainers, so members get
@@ -803,12 +917,68 @@ export default function AiAssistantPage() {
         <LiveSessionPill session={liveSession} familyId={familyId} />
       </header>
 
+      {isMobile && (
+        <div
+          className="shrink-0 px-3 py-2 bg-white border-b border-border"
+          role="tablist"
+          aria-label="Live view"
+        >
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mobilePane === "face"}
+              onClick={() => setMobilePane("face")}
+              className={cn(
+                "h-11 rounded-full text-sm font-medium inline-flex items-center justify-center gap-2",
+                mobilePane === "face"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground"
+              )}
+            >
+              <Camera className="h-4 w-4" />
+              Face
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mobilePane === "chat"}
+              onClick={() => setMobilePane("chat")}
+              className={cn(
+                "h-11 rounded-full text-sm font-medium inline-flex items-center justify-center gap-2",
+                mobilePane === "chat"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground"
+              )}
+            >
+              <Bot className="h-4 w-4" />
+              Chat
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Grid items default to ``align-items: stretch``, so giving the
           right-hand cell ``min-h-0`` lets the chat panel match the
           left column's natural height (Avi + camera) and scroll its
-          message list internally rather than push the row taller. */}
-      <main className="max-w-7xl mx-auto p-3 sm:p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-4 sm:gap-6 lg:items-stretch">
-        <div className="flex flex-col gap-3 sm:gap-6 min-h-0">
+          message list internally rather than push the row taller.
+          On a phone the Face / Chat toggle shows one pane at a time
+          and that pane fills the screen. */}
+      <main
+        className={cn(
+          "max-w-7xl mx-auto w-full min-h-0",
+          isMobile
+            ? "flex-1 flex flex-col p-3 overflow-hidden"
+            : "p-3 sm:p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-4 sm:gap-6 lg:items-stretch"
+        )}
+      >
+        <div
+          className={cn(
+            "flex flex-col gap-3 min-h-0",
+            isMobile ? "flex-1" : "sm:gap-6",
+            isMobile && mobilePane !== "face" && "hidden"
+          )}
+        >
           <AviStage
             assistant={assistant}
             assistantName={assistantName}
@@ -817,17 +987,30 @@ export default function AiAssistantPage() {
             amplitude={audio.amplitude}
             isMobile={isMobile}
           />
-          <LiveCameraPanel familyId={familyId} liveSessionId={liveSessionId} />
+          <LiveCameraPanel
+            familyId={familyId}
+            liveSessionId={liveSessionId}
+            fill={isMobile}
+            active={!isMobile || mobilePane === "face"}
+          />
         </div>
-        <ChatPanel
-          familyId={familyId}
-          assistantName={assistantName}
-          llmStatus={llmStatus}
-          audio={audio}
-          voiceGender={voiceGender}
-          liveSessionId={liveSessionId}
-          isMobile={isMobile}
-        />
+        <div
+          className={cn(
+            "min-h-0 lg:h-full",
+            isMobile && "flex-1 flex flex-col",
+            isMobile && mobilePane !== "chat" && "hidden"
+          )}
+        >
+          <ChatPanel
+            familyId={familyId}
+            assistantName={assistantName}
+            llmStatus={llmStatus}
+            audio={audio}
+            voiceGender={voiceGender}
+            liveSessionId={liveSessionId}
+            isMobile={isMobile}
+          />
+        </div>
       </main>
     </div>
   );
@@ -854,9 +1037,8 @@ function AviStage({
   isSpeaking: boolean;
   isWaving: boolean;
   amplitude: number;
-  // On mobile we collapse Avi into a short banner (~120px tall) so the
-  // camera + chat both stay visible above the fold. On desktop we keep
-  // the cinematic 5:3 portrait stage.
+  // On mobile Avi is a tall portrait above a camera that fills the
+  // rest of the Face tab. On desktop we keep the cinematic stage.
   isMobile: boolean;
 }) {
   // Clamp + ease the raw RMS so the glow doesn't feel jittery.
@@ -871,11 +1053,10 @@ function AviStage({
         className={cn(
           "relative flex items-center justify-center",
           "bg-gradient-to-br from-indigo-50 via-background to-fuchsia-50",
-          // Mobile: a slim banner so the camera + chat both stay
-          // on screen without scrolling. Desktop: the original
-          // cinematic stage.
+          // Mobile: a tall portrait so the face reads at arm's length.
+          // Desktop: the original cinematic stage.
           isMobile
-            ? "h-[140px]"
+            ? "h-[34vh] min-h-[220px]"
             : "aspect-[16/10] lg:aspect-[5/3]"
         )}
       >
@@ -950,40 +1131,20 @@ function AviStage({
           </div>
         )}
 
-        {/* Bottom caption — desktop centres a chip; mobile pins a
-            compact name + status to the right of the small avatar so
-            the banner doesn't waste vertical space stacking the two. */}
-        {isMobile ? (
-          <div className="absolute inset-y-0 right-3 z-20 flex flex-col justify-center gap-0.5 text-right">
-            <div className="font-semibold text-sm flex items-center justify-end gap-1.5">
-              <Bot className="h-4 w-4 text-primary" />
-              {assistantName}
-            </div>
-            <div
+        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20">
+          <div className="inline-flex items-center gap-2 bg-white/90 backdrop-blur px-4 py-1.5 rounded-full shadow-sm text-sm">
+            <Bot className="h-4 w-4 text-primary" />
+            <span className="font-semibold">{assistantName}</span>
+            <span
               className={cn(
-                "text-[11px] transition-colors",
+                "text-xs transition-colors",
                 isSpeaking ? "text-primary" : "text-muted-foreground"
               )}
             >
               {isSpeaking ? "speaking…" : "listening"}
-            </div>
+            </span>
           </div>
-        ) : (
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20">
-            <div className="inline-flex items-center gap-2 bg-white/90 backdrop-blur px-4 py-1.5 rounded-full shadow-sm text-sm">
-              <Bot className="h-4 w-4 text-primary" />
-              <span className="font-semibold">{assistantName}</span>
-              <span
-                className={cn(
-                  "text-xs transition-colors",
-                  isSpeaking ? "text-primary" : "text-muted-foreground"
-                )}
-              >
-                {isSpeaking ? "speaking…" : "listening"}
-              </span>
-            </div>
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );
@@ -1013,11 +1174,9 @@ function StaticAvatarFallback({
 }) {
   const amp = amplitude;
   const hasImage = !!assistant?.profile_image_path;
-  // Mobile: ~110 px (fits the 140 px banner). Desktop: original sizing.
-  const avatarSize = isMobile ? "110px" : "min(44vh, 360px)";
-  // Mobile aligns the avatar left so the caption + status chip we
-  // pin to the right have room. Desktop keeps the centred portrait.
-  const containerJustify = isMobile ? "justify-start pl-4" : "justify-center";
+  // Mobile stage is ~34vh, so the portrait can be most of that height.
+  const avatarSize = isMobile ? "min(28vh, 240px)" : "min(44vh, 360px)";
+  const containerJustify = "justify-center";
 
   return (
     <div
@@ -1403,6 +1562,8 @@ function Badge({
 function LiveCameraPanel({
   familyId,
   liveSessionId,
+  fill = false,
+  active = true,
 }: {
   familyId: number;
   // Threaded down so the recognition loop can flush its per-person
@@ -1411,6 +1572,12 @@ function LiveCameraPanel({
   // 90-second suppression silently swallows the first greet attempt
   // of every fresh session, leaving the user staring at a quiet page.
   liveSessionId: number | null;
+  // Phone face pane: the camera grows to fill whatever is left under
+  // Avi instead of staying a short 16:9 strip.
+  fill?: boolean;
+  // False while the phone is showing Chat. Coming back to Face has
+  // to resume the video element, which pauses under display:none.
+  active?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -1534,10 +1701,28 @@ function LiveCameraPanel({
     };
   }, [cameraOn]);
 
+  // display:none (the Chat tab) pauses the element. Play again when
+  // Face comes back so recognition doesn't sit on a frozen frame.
+  useEffect(() => {
+    if (!active || !cameraOn) return;
+    const v = videoRef.current;
+    if (v?.srcObject) void v.play().catch(() => undefined);
+  }, [active, cameraOn]);
+
   return (
-    <div className="space-y-4">
-      <div className="card overflow-hidden">
-        <div className="relative bg-black aspect-video">
+    <div className={cn("space-y-4", fill && "flex-1 min-h-0 flex flex-col")}>
+      <div
+        className={cn(
+          "card overflow-hidden",
+          fill && "flex-1 min-h-0 flex flex-col"
+        )}
+      >
+        <div
+          className={cn(
+            "relative bg-black",
+            fill ? "flex-1 min-h-[240px]" : "aspect-video"
+          )}
+        >
           <video
             ref={videoRef}
             className="absolute inset-0 h-full w-full object-cover"
@@ -2901,7 +3086,12 @@ function ChatPanel({
     // internally instead of pushing the row taller. On narrow
     // screens the column stack has no parent to inherit from, so we
     // fall back to a fixed floor.
-    <div className="card flex flex-col min-h-[500px] lg:min-h-0 lg:h-full">
+    <div
+      className={cn(
+        "card flex flex-col min-h-[500px] lg:min-h-0 lg:h-full",
+        isMobile && "h-full min-h-0"
+      )}
+    >
       <div className="card-header shrink-0">
         <div className="card-title flex items-center gap-2">
           <Bot className="h-4 w-4 text-primary" /> Chat with {assistantName}

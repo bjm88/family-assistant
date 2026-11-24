@@ -37,7 +37,12 @@ from .auth import (
     verify_session,
 )
 from .config import get_settings
-from .services import email_inbox, monitoring_scheduler, telegram_inbox
+from .services import (
+    email_inbox,
+    inbound_recovery,
+    monitoring_scheduler,
+    telegram_inbox,
+)
 
 
 # Wire up Python logging the FIRST thing we do, so every ``logger.info``
@@ -102,18 +107,40 @@ async def _lifespan(app: FastAPI):
     """Start + cleanly stop the long-lived background services.
 
     Currently runs the email-inbox poller (Avi auto-replies to mail
-    from registered family members). Add more services here as they
-    arrive — every one should accept a stop event so shutdown is
-    deterministic instead of hanging on a sleep.
+    from registered family members) and a one-shot recovery check-in
+    that drains unread email and missed messages before those pollers
+    start. Add more services here as they arrive — every one should
+    accept a stop event so shutdown is deterministic instead of
+    hanging on a sleep.
     """
     settings = get_settings()
     stop_event = asyncio.Event()
+    # The live pollers wait on this so they don't race the catch-up
+    # pass over the same unread mail. It is set even when recovery
+    # fails, otherwise the pollers would never start.
+    recovery_gate = asyncio.Event()
     background_tasks: list[asyncio.Task] = []
+
+    async def _startup_recovery() -> None:
+        try:
+            await asyncio.to_thread(inbound_recovery.recover_missed_inbound)
+        except Exception:  # noqa: BLE001 - pollers must still start
+            logging.getLogger(__name__).exception(
+                "Startup inbound recovery failed"
+            )
+        finally:
+            recovery_gate.set()
+
+    background_tasks.append(
+        asyncio.create_task(_startup_recovery(), name="inbound_recovery")
+    )
 
     if settings.AI_EMAIL_INBOX_ENABLED:
         background_tasks.append(
             asyncio.create_task(
-                email_inbox.run_email_inbox_loop(stop_event),
+                email_inbox.run_email_inbox_loop(
+                    stop_event, start_gate=recovery_gate
+                ),
                 name="email_inbox_poller",
             )
         )
@@ -125,7 +152,9 @@ async def _lifespan(app: FastAPI):
     if settings.AI_TELEGRAM_INBOUND_ENABLED:
         background_tasks.append(
             asyncio.create_task(
-                telegram_inbox.run_telegram_inbox_loop(stop_event),
+                telegram_inbox.run_telegram_inbox_loop(
+                    stop_event, start_gate=recovery_gate
+                ),
                 name="telegram_inbox_poller",
             )
         )

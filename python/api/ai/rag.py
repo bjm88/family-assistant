@@ -131,7 +131,7 @@ def build_person_context(
     # Goals (ordered by priority).
     priority_rank = {"urgent": 0, "semi_urgent": 1, "normal": 2, "low": 3}
     goals = sorted(
-        person.goals or [],
+        (g for g in person.goals or [] if g.completed_date is None),
         key=lambda g: (priority_rank.get(g.priority, 9), g.goal_name or ""),
     )
     if goals:
@@ -146,6 +146,17 @@ def build_person_context(
                 line += f" — {g.description}"
             line += f" ({', '.join(extra)})"
             lines.append(line)
+    completed = sorted(
+        (g for g in person.goals or [] if g.completed_date is not None),
+        key=lambda g: g.completed_date,
+        reverse=True,
+    )
+    if completed:
+        lines.append("Completed goals:")
+        for g in completed[:3]:
+            lines.append(
+                f"  - {g.goal_name} (completed {g.completed_date.isoformat()})"
+            )
 
     # Interests / hobbies — free-form line the user maintains in the
     # admin console specifically so Avi has something concrete to riff
@@ -407,7 +418,7 @@ def build_family_overview(
                 lines.append(
                     "    interests: " + _short(p.interests_and_activities, 200)
                 )
-            goals = p.goals or []
+            goals = [g for g in p.goals or [] if g.completed_date is None]
             if goals:
                 priority_rank = {"urgent": 0, "semi_urgent": 1, "normal": 2, "low": 3}
                 top = sorted(
@@ -704,8 +715,8 @@ def _short(s: str, limit: int = 240) -> str:
 
 
 def pick_goal_for_question(person: models.Person) -> Optional[models.Goal]:
-    """Choose the most salient goal for an opening question."""
-    goals = person.goals or []
+    """Choose the most salient open goal for an opening question."""
+    goals = [g for g in person.goals or [] if g.completed_date is None]
     if not goals:
         return None
     priority_rank = {"urgent": 0, "semi_urgent": 1, "normal": 2, "low": 3}

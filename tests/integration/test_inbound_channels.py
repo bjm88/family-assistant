@@ -762,6 +762,92 @@ def test_whatsapp_instant_ack_then_agent_reply(client, test_family, db):
     assert wa_calls[1]["body"] == AGENT_REPLY
 
 
+def _post_whatsapp(client, sid: str, *, from_phone: str, body: str):
+    """POST one WhatsApp inbound with the agent + sender mocked."""
+    wa_calls: list[dict[str, Any]] = []
+    with patch(
+        "api.services.sms_inbox._run_agent_to_completion",
+        return_value=AGENT_REPLY,
+    ) as agent_mock, patch(
+        "api.services.sms_inbox.fast_action_router.try_triage_sync",
+        return_value=_heavy_triage(),
+    ), patch(
+        "api.integrations.twilio_sms.send_whatsapp",
+        side_effect=lambda **kw: wa_calls.append(kw) or f"SMwa{len(wa_calls)}",
+    ):
+        resp = client.post(
+            "/api/sms/twilio/inbound",
+            data=_twilio_form(
+                sid,
+                from_phone=f"whatsapp:{from_phone}",
+                to_phone="whatsapp:+15550002222",
+                body=body,
+            ),
+        )
+    assert resp.status_code in (200, 204), resp.text
+    return agent_mock, wa_calls
+
+
+def test_whatsapp_unknown_sender_is_ignored(client, db):
+    """Anyone can message Avi on WhatsApp, but strangers get silence."""
+    sid = f"SM_test_wa_unk_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    agent_mock, wa_calls = _post_whatsapp(
+        client, sid, from_phone="+15559990003", body="Who is in this family?"
+    )
+
+    agent_mock.assert_not_called()
+    assert wa_calls == []
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == sid)
+    ).scalar_one()
+    assert audit.channel == "whatsapp"
+    assert audit.status == "ignored_unknown_sender"
+    assert audit.person_id is None
+
+
+def test_whatsapp_matches_formatted_stored_number(client, test_family, db):
+    """A number saved as "(555) 867-5309" still matches the E.164 sender."""
+    person = db.get(models.Person, test_family["person_id"])
+    original = person.mobile_phone_number
+    digits = "".join(ch for ch in original if ch.isdigit())[-10:]
+    person.mobile_phone_number = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    db.commit()
+
+    sid = f"SM_test_wa_fmt_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    try:
+        agent_mock, wa_calls = _post_whatsapp(
+            client, sid, from_phone=f"+1{digits}", body="Hi Avi"
+        )
+    finally:
+        person = db.get(models.Person, test_family["person_id"])
+        person.mobile_phone_number = original
+        db.commit()
+
+    agent_mock.assert_called_once()
+    assert [c["body"] for c in wa_calls][-1] == AGENT_REPLY
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == sid)
+    ).scalar_one()
+    assert audit.status == "processed_replied"
+    assert audit.person_id == test_family["person_id"]
+
+
+def test_whatsapp_single_word_cancel_is_not_sms_opt_out(client, test_family, db):
+    """SMS opt-out keywords are ordinary messages on WhatsApp."""
+    sid = f"SM_test_wa_cancel_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    agent_mock, wa_calls = _post_whatsapp(
+        client, sid, from_phone=test_family["person_phone"], body="Cancel"
+    )
+
+    agent_mock.assert_called_once()
+    assert [c["body"] for c in wa_calls][-1] == AGENT_REPLY
+    db.expire_all()
+    person = db.get(models.Person, test_family["person_id"])
+    assert person.sms_opted_out is False
+
+
 # ---------------------------------------------------------------------------
 # Telegram — direct service call (bypasses the polling loop)
 # ---------------------------------------------------------------------------

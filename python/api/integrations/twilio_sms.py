@@ -37,6 +37,8 @@ import logging
 import mimetypes
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Iterable, List, Mapping, Optional, Tuple
 
 import httpx
@@ -47,6 +49,10 @@ logger = logging.getLogger(__name__)
 
 class TwilioSendError(RuntimeError):
     """Raised when Twilio's REST API rejects the outbound message."""
+
+
+class TwilioReadError(RuntimeError):
+    """Raised when listing inbound messages from Twilio fails."""
 
 
 class TwilioMediaError(RuntimeError):
@@ -458,6 +464,182 @@ class InboundSms:
 
 
 # ---------------------------------------------------------------------------
+# Inbox listing (downtime recovery — webhooks Twilio gave up on)
+# ---------------------------------------------------------------------------
+
+
+def _parse_twilio_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _message_resource_to_inbound(item: Mapping[str, object]) -> Optional[InboundSms]:
+    """Map one Twilio Message resource onto :class:`InboundSms`.
+
+    Returns None for outbound traffic. Media URLs are filled separately
+    — the list endpoint does not inline them.
+    """
+    direction = str(item.get("direction") or "")
+    if not direction.startswith("inbound"):
+        return None
+    sid = str(item.get("sid") or "")
+    if not sid:
+        return None
+    raw_from = str(item.get("from") or "")
+    raw_to = str(item.get("to") or "")
+    try:
+        num_media = int(item.get("num_media") or 0)
+    except (TypeError, ValueError):
+        num_media = 0
+    channel = (
+        "whatsapp"
+        if is_whatsapp_address(raw_from) or is_whatsapp_address(raw_to)
+        else "sms"
+    )
+    messaging_service_sid = item.get("messaging_service_sid")
+    return InboundSms(
+        message_sid=sid,
+        messaging_service_sid=(
+            str(messaging_service_sid) if messaging_service_sid else None
+        ),
+        account_sid=str(item.get("account_sid") or ""),
+        from_phone=raw_from,
+        to_phone=raw_to,
+        body=str(item.get("body") or ""),
+        num_media=num_media,
+        media=[],
+        channel=channel,
+    )
+
+
+def _attach_media_urls(
+    inbound: InboundSms,
+    *,
+    account_sid: str,
+    auth_token: str,
+    timeout_seconds: float,
+) -> None:
+    """Best-effort Media list. A failure leaves the text body usable."""
+    if inbound.num_media <= 0 or not inbound.message_sid:
+        return
+    url = (
+        f"{_TWILIO_API_BASE}/Accounts/{account_sid}/Messages/"
+        f"{inbound.message_sid}/Media.json"
+    )
+    try:
+        resp = httpx.get(
+            url, auth=(account_sid, auth_token), timeout=timeout_seconds
+        )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Twilio media list failed for %s: %s", inbound.message_sid, exc
+        )
+        return
+    if resp.status_code >= 400:
+        logger.warning(
+            "Twilio media list HTTP %s for %s",
+            resp.status_code,
+            inbound.message_sid,
+        )
+        return
+    media: List[Tuple[int, str, str]] = []
+    for index, item in enumerate(resp.json().get("media_list") or []):
+        uri = str(item.get("uri") or "")
+        if not uri:
+            continue
+        if uri.endswith(".json"):
+            uri = uri[: -len(".json")]
+        content_url = uri if uri.startswith("http") else f"https://api.twilio.com{uri}"
+        media.append(
+            (index, content_url, str(item.get("content_type") or "application/octet-stream"))
+        )
+    inbound.media = media
+
+
+def list_inbound_messages(
+    *,
+    account_sid: str,
+    auth_token: str,
+    to_phone: str,
+    sent_after: datetime,
+    page_size: int = 50,
+    max_pages: int = 20,
+    timeout_seconds: float = 20.0,
+) -> List[Tuple[datetime, InboundSms]]:
+    """List inbound messages Twilio delivered to ``to_phone`` since ``sent_after``.
+
+    Pages newest-first and stops once a page crosses the cutoff. Each
+    item is ``(sent_at, inbound)``. Media URLs are attached when Twilio
+    still has them; a media-list failure does not drop the message.
+    """
+    if not account_sid or not auth_token:
+        raise TwilioReadError("Twilio credentials missing.")
+    if sent_after.tzinfo is None:
+        sent_after = sent_after.replace(tzinfo=timezone.utc)
+
+    url: Optional[str] = f"{_TWILIO_API_BASE}/Accounts/{account_sid}/Messages.json"
+    params: Optional[dict] = {"To": to_phone, "PageSize": int(page_size)}
+    found: List[Tuple[datetime, InboundSms]] = []
+
+    for _page in range(max_pages):
+        if not url:
+            break
+        try:
+            resp = httpx.get(
+                url,
+                params=params,
+                auth=(account_sid, auth_token),
+                timeout=timeout_seconds,
+            )
+        except httpx.HTTPError as exc:
+            raise TwilioReadError(f"transport error: {exc}") from exc
+        # next_page_uri already carries the query string.
+        params = None
+        if resp.status_code >= 400:
+            raise TwilioReadError(
+                f"HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+        payload = resp.json()
+        stop = False
+        for item in payload.get("messages") or []:
+            sent_at = _parse_twilio_timestamp(
+                item.get("date_sent") or item.get("date_created")
+            )
+            if sent_at is not None and sent_at < sent_after:
+                stop = True
+                continue
+            inbound = _message_resource_to_inbound(item)
+            if inbound is None:
+                continue
+            _attach_media_urls(
+                inbound,
+                account_sid=account_sid,
+                auth_token=auth_token,
+                timeout_seconds=timeout_seconds,
+            )
+            found.append((sent_at or sent_after, inbound))
+        if stop:
+            break
+        next_uri = payload.get("next_page_uri")
+        if not next_uri:
+            break
+        next_uri = str(next_uri)
+        url = (
+            next_uri
+            if next_uri.startswith("http")
+            else f"https://api.twilio.com{next_uri}"
+        )
+    return found
+
+
+# ---------------------------------------------------------------------------
 # TwiML helpers
 # ---------------------------------------------------------------------------
 
@@ -494,7 +676,9 @@ __all__ = [
     "DownloadedMedia",
     "InboundSms",
     "TwilioMediaError",
+    "TwilioReadError",
     "TwilioSendError",
+    "list_inbound_messages",
     "WHATSAPP_PREFIX",
     "compute_twilio_signature",
     "download_media",
