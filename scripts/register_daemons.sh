@@ -24,6 +24,10 @@
 #                        login and every hour after. It only dumps when the
 #                        newest backup is a week old, so it stays weekly but
 #                        catches up after the Mac was asleep or powered off.
+#   * Cursor worker   — our own LaunchAgent (com.familyassistant.agentworker)
+#                        running ``agent worker start`` in AGENT_WORKER_DIR, so
+#                        this Mac shows under "My Machines" in the Cursor
+#                        mobile app. Needs a one-time ``agent login``.
 #
 # The always-on daemons above use ``RunAtLoad=true`` + ``KeepAlive=true`` so a
 # crash is resurrected by launchd within a few seconds. The DB-backup agent
@@ -67,6 +71,10 @@ USER_NAME="$(id -un)"
 UV_BIN="$(resolve_cmd uv)"
 NGROK_BIN="$(resolve_cmd ngrok)"
 NPM_BIN="$(resolve_cmd npm)"
+# The installer drops a self-updating symlink here; it's often not on
+# the interactive PATH yet right after install.
+AGENT_BIN="$(resolve_cmd agent)"
+[[ -z "${AGENT_BIN}" && -x "${HOME}/.local/bin/agent" ]] && AGENT_BIN="${HOME}/.local/bin/agent"
 
 # launchd inherits PATH=/usr/bin:/bin:/usr/sbin:/sbin by default, which
 # is too small for a Homebrew install. Build a sane PATH that covers
@@ -257,6 +265,51 @@ XML
     }
 }
 
+build_agentworker_plist() {
+    # The worker exits 0 every time it is "released" (agent finished,
+    # idle timeout, stale claim) and expects a supervisor to start a
+    # fresh one, so unlike plist_close this restarts on every exit.
+    local label="$1"
+    {
+        plist_open "${label}"
+        cat <<XML
+  <key>ProgramArguments</key>
+  <array>
+    <string>${AGENT_BIN}</string>
+    <string>worker</string>
+    <string>--name</string>
+    <string>${AGENT_WORKER_NAME}</string>
+    <string>--worker-dir</string>
+    <string>${AGENT_WORKER_DIR}</string>
+    <string>start</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${AGENT_WORKER_DIR}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${USER_HOME}</string>
+    <key>USER</key>
+    <string>${USER_NAME}</string>
+    <key>PATH</key>
+    <string>${DAEMON_PATH}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>${AGENT_WORKER_LOG}</string>
+  <key>StandardErrorPath</key>
+  <string>${AGENT_WORKER_LOG}</string>
+</dict>
+</plist>
+XML
+    }
+}
+
 build_frontend_plist() {
     local label="$1"
     {
@@ -294,7 +347,7 @@ XML
 print_status() {
     log_step "LaunchAgent registration status"
     printf "  %-12s %-10s %s\n" "service" "agent" "plist"
-    for short in ngrok backend frontend dbbackup; do
+    for short in ngrok backend frontend dbbackup agentworker; do
         local state path
         state="$(launchagent_status "${short}")"
         path="$(launchagent_path "${short}")"
@@ -463,6 +516,24 @@ launchagent_install "dbbackup" \
 log_info "  Schedule : at login + hourly check; backs up when the newest is 7 days old"
 log_info "  Script   : scripts/db_backup_to_gdrive.py --keep 8 --if-due-days 7"
 log_info "  Logs     : ${DB_BACKUP_LOG}"
+
+# ---- Cursor My Machines worker (our LaunchAgent) -------------------------
+log_step "Cursor agent worker (My Machines)"
+if [[ -z "${AGENT_BIN}" ]]; then
+    log_warn "Cursor CLI not installed — skipping."
+    log_warn "  Install: curl https://cursor.com/install -fsS | bash, then re-run."
+elif [[ ! -d "${AGENT_WORKER_DIR}/.git" ]]; then
+    log_warn "${AGENT_WORKER_DIR} is not a git checkout — skipping."
+    log_warn "  git clone git@github.com:bjm88/family-assistant.git ${AGENT_WORKER_DIR}"
+else
+    launchagent_install "agentworker" \
+        "$(build_agentworker_plist "$(launchagent_label agentworker)")"
+    log_info "  Worker  : ${AGENT_WORKER_NAME} → ${AGENT_WORKER_DIR}"
+    log_info "  Logs    : ${AGENT_WORKER_LOG}"
+    if "${AGENT_BIN}" status 2>&1 | grep -qi "not logged in"; then
+        log_warn "  Not logged in yet: run 'agent login' once; the worker connects within a minute."
+    fi
+fi
 
 echo ""
 log_success "Done."

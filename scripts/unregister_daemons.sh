@@ -4,8 +4,8 @@
 # ----------------------------------------------------------------------------
 # Removes everything ``register_daemons.sh`` installed.
 #
-# * Tears down the three LaunchAgents we own
-#     (com.familyassistant.{ngrok,backend,frontend}.plist).
+# * Tears down the LaunchAgents we own
+#     (com.familyassistant.{ngrok,backend,frontend,dbbackup,agentworker}.plist).
 # * Optionally stops the brew-managed Postgres + Ollama services.
 #   By default we LEAVE THEM RUNNING because other tools on this Mac
 #   may rely on them; pass --include-brew to also disable those.
@@ -38,7 +38,7 @@ done
 
 log_step "family-assistant · unregister LaunchAgents"
 
-for short in ngrok backend frontend dbbackup; do
+for short in ngrok backend frontend dbbackup agentworker; do
     log_step "Removing ${short}"
     launchagent_unload "${short}"
 done

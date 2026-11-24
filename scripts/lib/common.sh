@@ -44,6 +44,12 @@ OLLAMA_LOG="${LOG_DIR}/ollama.log"
 # `tail logs/db_backup.log` is the diagnostic for "did Sunday's
 # backup run?".
 DB_BACKUP_LOG="${LOG_DIR}/db_backup.log"
+# Cursor "My Machines" worker: lets agents started from the Cursor
+# mobile app / cursor.com/agents run on this Mac, in a dedicated clone
+# so they never edit the checkout the live app runs from.
+AGENT_WORKER_LOG="${LOG_DIR}/agent_worker.log"
+AGENT_WORKER_DIR="${AGENT_WORKER_DIR:-${HOME}/dev/family-assistant-agent}"
+AGENT_WORKER_NAME="${AGENT_WORKER_NAME:-mac-studio}"
 
 # macOS LaunchAgent layout.
 LAUNCHAGENTS_DIR="${HOME}/Library/LaunchAgents"
