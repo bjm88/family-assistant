@@ -283,7 +283,7 @@ async def run_agent(
             # converts a noisy "agent crashed" into a 1-2s blip the
             # user never sees. We do NOT retry hard errors (4xx, 5xx,
             # ConnectError) because those won't get better in 2 s.
-            # ``retry_attempts`` is shared by the OllamaTimeout retry and
+            # ``retry_attempts`` is shared by the LLMTimeout retry and
             # the _EmptyModelReply retry — both are recoverable transient
             # failure modes from the same root cause (model stalled / model
             # spent its budget on hidden thinking), so giving the cycle
@@ -449,27 +449,10 @@ async def run_agent(
 
                 # Now execute them and record results. We append a
                 # ``tool`` role message per call so the next LLM turn
-                # sees the result in the conversation history.
-                # For Ollama compatibility we mirror the calls into the
-                # assistant message's ``tool_calls`` field; the same
-                # information also lives in the prior step rows.
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": turn.content or "",
-                        "tool_calls": [
-                            {
-                                "id": c.id or f"call_{step_index}_{i}",
-                                "type": "function",
-                                "function": {
-                                    "name": c.name,
-                                    "arguments": c.arguments,
-                                },
-                            }
-                            for i, c in enumerate(turn.tool_calls)
-                        ],
-                    }
-                )
+                # sees the result in the conversation history. The next
+                # turn may run on a different provider after a
+                # failover, so the history uses the shared shape.
+                messages.append(turn.history_message())
 
                 for call in turn.tool_calls:
                     result = await registry.execute(call.name, call.arguments, ctx)
@@ -495,7 +478,7 @@ async def run_agent(
                         {
                             "role": "tool",
                             "name": call.name,
-                            "tool_call_id": call.id or f"call_{step_index}",
+                            "tool_call_id": call.id,
                             "content": json.dumps(
                                 result.to_payload(), default=str, ensure_ascii=False
                             ),

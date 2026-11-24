@@ -53,7 +53,7 @@ from .. import models
 from ..ai import agent as agent_loop
 from ..ai import agent_drain, authz
 from ..ai import assistants as _assistants
-from ..ai import ollama, prompts, rag, schema_catalog
+from ..ai import persona, prompts, rag, schema_catalog
 from ..ai import tools as agent_tools
 from ..config import get_settings
 from ..db import SessionLocal
@@ -457,7 +457,7 @@ def _build_monitoring_system_prompt(
     capabilities_block = agent_tools.describe_capabilities(registry, capabilities)
 
     parts = [
-        ollama.system_prompt_for_avi(assistant_name, family_name),
+        persona.system_prompt_for_avi(assistant_name, family_name),
         "--- What you can do ---\n" + capabilities_block,
     ]
     house_context = prompts.render_context_blocks()
@@ -541,18 +541,14 @@ def _resolve_family_timezone(db: Session, family_id: int) -> str:
 
 
 def _thinking_model() -> str:
-    """Resolve the model used for monitoring runs.
+    """Model override for monitoring runs.
 
-    Grok (the live default) uses :setting:`GROK_MODEL`. The Ollama
-    thinking-model override only applies when the local provider is
-    active.
+    An Ollama tag here is only used if the run lands on the local
+    backend; cloud backends treat it as the heavy tier.
     """
     from ..ai import llm
 
-    settings = get_settings()
-    if llm.provider() == "grok":
-        return settings.GROK_MODEL
-    return (settings.AI_OLLAMA_THINKING_MODEL or settings.AI_OLLAMA_MODEL).strip()
+    return get_settings().AI_OLLAMA_THINKING_MODEL.strip() or llm.resolve_model()
 
 
 __all__ = [

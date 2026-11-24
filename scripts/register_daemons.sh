@@ -20,14 +20,15 @@
 #   * Vite frontend   — our own LaunchAgent (com.familyassistant.frontend.plist)
 #   * DB backup       — our own scheduled LaunchAgent
 #                        (com.familyassistant.dbbackup.plist) that runs
-#                        scripts/db_backup_to_gdrive.py every Sunday at 23:55
-#                        local time. Unlike the daemons above this one is
-#                        single-shot (StartCalendarInterval, no KeepAlive).
+#                        scripts/db_backup_to_gdrive.py --if-due-days 7 at
+#                        login and every hour after. It only dumps when the
+#                        newest backup is a week old, so it stays weekly but
+#                        catches up after the Mac was asleep or powered off.
 #
 # The always-on daemons above use ``RunAtLoad=true`` + ``KeepAlive=true`` so a
 # crash is resurrected by launchd within a few seconds. The DB-backup agent
-# uses ``RunAtLoad=false`` + ``StartCalendarInterval`` instead so it fires
-# exactly once on its weekly schedule and then exits.
+# uses ``RunAtLoad=true`` + ``StartInterval`` and no KeepAlive: each run is a
+# quick "is a backup due?" check that exits.
 #
 # Re-running this script is safe: existing agents are torn down and rebuilt
 # with the latest paths/env vars.
@@ -123,39 +124,25 @@ plist_close() {
 XML
 }
 
-# plist_close_scheduled — variant of plist_close for cron-like jobs.
+# plist_close_periodic — variant of plist_close for "is it due?" jobs.
 #
-# Long-running daemons (backend, ngrok, frontend) want RunAtLoad=true +
-# KeepAlive so launchd resurrects them on crash. A weekly backup is the
-# opposite: it should fire ONCE on a fixed schedule and exit cleanly.
-# RunAtLoad=true would re-fire every login; KeepAlive would relaunch
-# the script in a tight loop after each successful exit. So we emit
-# StartCalendarInterval (Weekday/Hour/Minute) + RunAtLoad=false and
-# omit KeepAlive entirely.
+# A StartCalendarInterval job is skipped entirely if the Mac is powered
+# off at that minute, which is how a weekly backup silently goes missing.
+# Instead we run at every login (RunAtLoad) and every N seconds after
+# (StartInterval); the script decides whether work is due and exits.
+# No KeepAlive: that would relaunch it in a loop after each clean exit.
 #
 # Args:
 #   1: stdout/stderr log path
-#   2: weekday (0 = Sunday, 1 = Monday, …, 7 = Sunday — launchd
-#      historically accepted both 0 and 7 for Sunday; we use 0)
-#   3: hour (0-23, local time)
-#   4: minute (0-59)
-plist_close_scheduled() {
+#   2: interval in seconds
+plist_close_periodic() {
     local stdout_log="$1"
-    local weekday="$2"
-    local hour="$3"
-    local minute="$4"
+    local interval="$2"
     cat <<XML
   <key>RunAtLoad</key>
-  <false/>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Weekday</key>
-    <integer>${weekday}</integer>
-    <key>Hour</key>
-    <integer>${hour}</integer>
-    <key>Minute</key>
-    <integer>${minute}</integer>
-  </dict>
+  <true/>
+  <key>StartInterval</key>
+  <integer>${interval}</integer>
   <key>StandardOutPath</key>
   <string>${stdout_log}</string>
   <key>StandardErrorPath</key>
@@ -232,12 +219,11 @@ XML
 }
 
 build_dbbackup_plist() {
-    # Weekly DB backup → Google Drive uploader. Fires every Sunday at
-    # 23:55 local time (the user's family is east coast — adjust the
-    # Hour/Minute args here if you ever need a different cadence).
-    # The Python script handles its own success/failure logging; the
-    # LaunchAgent just supplies a working dir + PATH so ``uv`` and
-    # ``pg_dump`` resolve.
+    # Weekly DB + media backup → Google Drive uploader. Checked at login
+    # and hourly; the script only dumps once the newest backup is 7 days
+    # old. The Python script handles its own success/failure logging;
+    # the LaunchAgent just supplies a working dir + PATH so ``uv``,
+    # ``pg_dump`` and ``tar`` resolve.
     local label="$1"
     {
         plist_open "${label}"
@@ -250,6 +236,8 @@ build_dbbackup_plist() {
     <string>scripts/db_backup_to_gdrive.py</string>
     <string>--keep</string>
     <string>8</string>
+    <string>--if-due-days</string>
+    <string>7</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${PROJECT_ROOT}</string>
@@ -265,10 +253,7 @@ build_dbbackup_plist() {
     <string>1</string>
   </dict>
 XML
-        # Sunday (0) at 23:55 — the latest reasonable slot before the
-        # week rolls over so the dump captures everything that
-        # happened during the week.
-        plist_close_scheduled "${DB_BACKUP_LOG}" 0 23 55
+        plist_close_periodic "${DB_BACKUP_LOG}" 3600
     }
 }
 
@@ -467,17 +452,16 @@ else
     log_info "  Logs    : ${FRONTEND_LOG}"
 fi
 
-# ---- Weekly DB backup → Google Drive (scheduled LaunchAgent) -------------
-# Unlike the always-on daemons above, this one is launched once a week
-# by launchd's StartCalendarInterval (Sun 23:55) and exits when done.
-# We register it unconditionally; the script itself logs and exits 2
-# if DB_BACKUP_GDRIVE isn't set in .env, so a missing folder URL is a
-# soft fail rather than a registration-time error.
-log_step "Weekly DB backup → Drive (scheduled LaunchAgent)"
+# ---- Weekly DB + media backup → Google Drive (periodic LaunchAgent) ------
+# Unlike the always-on daemons above, this one runs at login and hourly,
+# backs up only when the newest dump is 7 days old, and exits. We
+# register it unconditionally; without DB_BACKUP_GDRIVE in .env the
+# script still backs up locally and just skips the Drive upload.
+log_step "Weekly DB + media backup → Drive (periodic LaunchAgent)"
 launchagent_install "dbbackup" \
     "$(build_dbbackup_plist "$(launchagent_label dbbackup)")"
-log_info "  Schedule : every Sunday at 23:55 local time"
-log_info "  Script   : scripts/db_backup_to_gdrive.py --keep 8"
+log_info "  Schedule : at login + hourly check; backs up when the newest is 7 days old"
+log_info "  Script   : scripts/db_backup_to_gdrive.py --keep 8 --if-due-days 7"
 log_info "  Logs     : ${DB_BACKUP_LOG}"
 
 echo ""

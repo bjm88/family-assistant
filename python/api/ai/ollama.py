@@ -1,162 +1,166 @@
-"""Thin HTTP client for a local Ollama daemon.
+"""Local Ollama backend — Avi's offline fallback.
 
-Only implements the two calls we actually need:
+Last in the default :setting:`AI_LLM_PROVIDERS` chain, so it answers
+when the cloud backends are unreachable (internet down, xAI outage,
+rate limits). Each tier lists a primary and a backup local model:
 
-* ``generate()``  — one-shot completion used for the opening greeting.
-* ``chat_stream()`` — streaming SSE-style conversation used by the chat
-  endpoint.
+* heavy: :setting:`AI_OLLAMA_MODEL` (Gemma 4 31B) then
+  :setting:`AI_OLLAMA_BACKUP_MODEL` (Meta Muse Glimmer 30B)
+* fast: :setting:`AI_OLLAMA_FAST_MODEL` (Gemma 4 E2B) then the heavy model
 
-Both calls accept a plain dict prompt and yield text chunks; we keep the
-surface area intentionally tiny so the rest of the app doesn't have to
-care that Ollama is behind it.
+Callers should go through :mod:`api.ai.llm`, which handles the chain.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 import time
-from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 
 from ..config import get_settings
+from .llm_types import (
+    ChatWithToolsResult,
+    LLMError,
+    LLMModelMissing,
+    LLMTimeout,
+    LLMUnavailable,
+    ToolCall,
+    canonical_history,
+    parse_arguments,
+    public_keys,
+)
 
 logger = logging.getLogger(__name__)
 
+NAME = "ollama"
 
-class OllamaError(RuntimeError):
+
+class OllamaError(LLMError):
     """Base for anything Ollama-related that went wrong."""
 
 
-class OllamaUnavailable(OllamaError):
-    """Daemon isn't listening or the requested model isn't pulled."""
+class OllamaUnavailable(OllamaError, LLMUnavailable):
+    """Daemon isn't listening."""
 
 
-class OllamaTimeout(OllamaError):
-    """Raised when the LLM doesn't respond within the per-call budget.
+class OllamaModelMissing(OllamaUnavailable, LLMModelMissing):
+    """Daemon is up but the model isn't pulled."""
 
-    Subclasses :class:`OllamaError` so generic ``except OllamaError``
-    blocks (e.g. fast-ack) keep catching it, but is split out so the
-    agent loop can recognise *transient* read-timeouts and retry once
-    before failing the whole task. A naked ``httpx.ReadTimeout`` used
-    to escape :func:`chat_with_tools` and crash the agent loop with a
-    confusing httpcore stack trace; this typed exception lets the
-    loop emit a clean error step + auto-retry.
-    """
+
+class OllamaTimeout(OllamaError, LLMTimeout):
+    """The model accepted the request but didn't answer in time."""
+
+
+# ---------------------------------------------------------------------------
+# Backend interface used by api.ai.llm
+# ---------------------------------------------------------------------------
+
+
+def is_configured() -> bool:
+    return bool(get_settings().AI_OLLAMA_MODEL)
+
+
+def owns_model(tag: str) -> bool:
+    low = tag.lower()
+    return not (low.startswith("grok") or low.startswith("claude"))
+
+
+def tier_models(tier: str) -> List[str]:
+    s = get_settings()
+    if tier == "fast":
+        tags = [s.AI_OLLAMA_FAST_MODEL, s.AI_OLLAMA_MODEL, s.AI_OLLAMA_BACKUP_MODEL]
+    else:
+        tags = [s.AI_OLLAMA_MODEL, s.AI_OLLAMA_BACKUP_MODEL]
+    out: List[str] = []
+    for t in tags:
+        t = (t or "").strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def warm_models() -> List[str]:
+    """Models kept resident so a failover answers without a cold load."""
+    s = get_settings()
+    return [t for t in dict.fromkeys((s.AI_OLLAMA_MODEL, s.AI_OLLAMA_FAST_MODEL)) if t]
+
+
+# ---------------------------------------------------------------------------
+# HTTP plumbing
+# ---------------------------------------------------------------------------
 
 
 def _base() -> str:
     return get_settings().AI_OLLAMA_HOST.rstrip("/")
 
 
-def _model() -> str:
-    return get_settings().AI_OLLAMA_MODEL
+def _timeout(read_s: float) -> httpx.Timeout:
+    # Localhost: anything slower than a few seconds to connect means
+    # the daemon is dead.
+    return httpx.Timeout(connect=5.0, read=read_s, write=read_s, pool=5.0)
 
 
-def fast_model() -> str:
-    """Lightweight Gemma tag used for structured/planner-style calls.
-
-    Falls back to the main chat model when no fast model is configured
-    so callers never have to handle a None case. Operators tier the
-    workload by setting :envvar:`AI_OLLAMA_FAST_MODEL` to a small
-    model (``gemma4:e2b``) and leaving :envvar:`AI_OLLAMA_MODEL` on
-    the heavyweight one (``gemma4:26b``).
-
-    Note: this returns the configured tag even when it isn't actually
-    pulled in Ollama. Callers route around the resulting
-    :class:`OllamaUnavailable` via :func:`generate_with_fallback` so
-    a missing fast model never breaks live chat.
-    """
-    s = get_settings()
-    return s.AI_OLLAMA_FAST_MODEL or s.AI_OLLAMA_MODEL
+def _transport_error(exc: Exception, model: str, timeout_s: float) -> OllamaError:
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return OllamaUnavailable(f"Ollama at {_base()} is not responding: {exc}")
+    if isinstance(exc, httpx.TimeoutException):
+        return OllamaTimeout(
+            f"Ollama {model!r} did not respond within {timeout_s:.0f}s "
+            f"({type(exc).__name__})."
+        )
+    return OllamaError(str(exc))
 
 
-# Models we've already warned about being unpulled — keeps the log
-# clean when the fast tag is intentionally absent (e.g. user is still
-# pulling it, or running on a small dev box).
-_warned_unavailable: set[str] = set()
+def _raise_for_status(status: int, body: str, model: str) -> None:
+    if status == 404:
+        raise OllamaModelMissing(f"Model '{model}' is not pulled. Run `ollama pull {model}`.")
+    if status >= 400:
+        raise OllamaError(f"Ollama returned {status}: {body[:400]}")
 
 
-async def generate_with_fallback(
-    prompt: str,
-    *,
-    primary_model: str,
-    fallback_model: Optional[str] = None,
-    system: Optional[str] = None,
-    temperature: float = 0.7,
-    max_tokens: int = 300,
-) -> tuple[str, str]:
-    """Try ``primary_model`` and transparently fall back if it's not
-    pulled. Returns ``(text, model_actually_used)``.
-
-    Designed for the tiered-model workload where we *prefer* the
-    lightweight Gemma but still want the request to succeed against
-    the main model when the fast tag isn't installed yet.
-    """
-    fb = fallback_model or _model()
+async def _post(path: str, payload: Dict[str, Any], model: str, timeout_s: float) -> Dict[str, Any]:
     try:
-        text_value = await generate(
-            prompt,
-            system=system,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            model=primary_model,
-        )
-        return text_value, primary_model
-    except OllamaUnavailable as e:
-        if primary_model == fb:
-            raise
-        if primary_model not in _warned_unavailable:
-            _warned_unavailable.add(primary_model)
-            logger.warning(
-                "Fast model %r is unavailable (%s) — falling back to %r. "
-                "Run `ollama pull %s` to enable the tiered path.",
-                primary_model,
-                e,
-                fb,
-                primary_model,
-            )
-        text_value = await generate(
-            prompt,
-            system=system,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            model=fb,
-        )
-        return text_value, fb
+        async with httpx.AsyncClient(timeout=_timeout(timeout_s)) as client:
+            r = await client.post(f"{_base()}{path}", json=payload)
+    except httpx.HTTPError as exc:
+        raise _transport_error(exc, model, timeout_s) from exc
+    _raise_for_status(r.status_code, r.text, model)
+    return r.json()
+
+
+def _to_wire(messages: List[Dict[str, Any]], system: Optional[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if system:
+        out.append({"role": "system", "content": system})
+    for m in canonical_history(messages):
+        msg = public_keys(m)
+        if msg["role"] == "tool" and msg.get("name"):
+            msg["tool_name"] = msg["name"]
+        out.append(msg)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Warmup / health
+# ---------------------------------------------------------------------------
 
 
 async def warmup_model(
     model: str,
     *,
     keep_alive: str = "1h",
-    timeout_seconds: float = 90.0,
+    timeout_seconds: float = 120.0,
 ) -> bool:
-    """Force-load ``model`` into Ollama and pin it in memory.
+    """Force-load ``model`` into memory and pin it for ``keep_alive``.
 
-    Why this exists
-    ---------------
-    A cold Ollama model takes 1–10 s just to mmap into VRAM before it
-    can produce a single token. That cold-start is the dominant cause
-    of the *"the live-chat fast-ack didn't fire"* class of bugs:
-    `gemma4:e2b` is the lightweight ack model, but if the very first
-    chat of the day arrives while e2b is unloaded, the ack call needs
-    ~3–4 s just to load the weights — easily exceeding the
-    :setting:`AI_FAST_ACK_TIMEOUT_SECONDS` cap and silently dropping
-    the ack.
-
-    Sending ``num_predict=0`` with a one-word prompt makes Ollama
-    load the model and immediately return without doing real
-    inference. Combined with ``keep_alive="1h"`` (vs. the default
-    5 min) it stays resident across long quiet periods so the next
-    real call is instant.
-
-    Returns ``True`` on success; ``False`` if Ollama is unreachable
-    or the model isn't pulled. Never raises — callers (lifespan
-    startup) treat warmup as best-effort.
+    A cold model takes seconds to load before its first token, which
+    would blow the fast-ack budget and make the first offline reply
+    slow. ``num_predict=1`` loads the weights and returns immediately.
+    Returns ``False`` (never raises) when Ollama is down or the model
+    isn't pulled.
     """
     payload: Dict[str, object] = {
         "model": model,
@@ -166,70 +170,28 @@ async def warmup_model(
         "options": {"num_predict": 1, "temperature": 0.0},
     }
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            r = await client.post(f"{_base()}/api/generate", json=payload)
-    except httpx.ConnectError as exc:
-        logger.warning(
-            "Ollama warmup: %s is not responding (%s) — skipping warmup",
-            _base(),
-            exc,
-        )
+        await _post("/api/generate", payload, model, timeout_seconds)
+    except OllamaError as exc:
+        logger.warning("Ollama warmup of %r skipped: %s", model, exc)
         return False
-    except httpx.TimeoutException:
-        logger.warning(
-            "Ollama warmup: %r exceeded %.0fs while loading — skipping",
-            model,
-            timeout_seconds,
-        )
-        return False
-    if r.status_code == 404:
-        logger.warning(
-            "Ollama warmup: model %r is not pulled. Run `ollama pull %s`.",
-            model,
-            model,
-        )
-        return False
-    if r.status_code >= 400:
-        logger.warning(
-            "Ollama warmup: %r returned %s: %s",
-            model,
-            r.status_code,
-            r.text[:200],
-        )
-        return False
-    logger.info(
-        "Ollama warmup: model %r loaded and pinned for %s", model, keep_alive
-    )
+    logger.info("Ollama warmup: model %r loaded and pinned for %s", model, keep_alive)
     return True
 
 
-async def health() -> Dict[str, object]:
-    """Report whether Ollama is reachable and whether the model is pulled."""
-    out: Dict[str, object] = {
-        "host": _base(),
-        "model": _model(),
-        "available": False,
-        "model_pulled": False,
-        "installed_models": [],
-    }
+async def installed_models() -> List[str]:
+    """Tags pulled into the local daemon. Raises OllamaUnavailable if down."""
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
             r = await client.get(f"{_base()}/api/tags")
-            r.raise_for_status()
-            data = r.json()
-    except Exception as e:  # noqa: BLE001
-        out["error"] = str(e)
-        return out
+    except httpx.HTTPError as exc:
+        raise _transport_error(exc, "tags", 4.0) from exc
+    _raise_for_status(r.status_code, r.text, "tags")
+    return [str(m.get("name")) for m in (r.json().get("models") or []) if m.get("name")]
 
-    out["available"] = True
-    names = [m.get("name", "") for m in data.get("models", [])]
-    out["installed_models"] = names
-    # Ollama model names can include tags; match on the bare name too.
-    want = _model()
-    out["model_pulled"] = any(
-        n == want or n.split(":")[0] == want.split(":")[0] for n in names
-    )
-    return out
+
+# ---------------------------------------------------------------------------
+# Calls
+# ---------------------------------------------------------------------------
 
 
 async def generate(
@@ -238,59 +200,18 @@ async def generate(
     system: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 300,
-    model: Optional[str] = None,
+    model: str,
+    timeout_seconds: float = 60.0,
 ) -> str:
-    """One-shot, non-streaming completion.
-
-    ``model`` defaults to :envvar:`AI_OLLAMA_MODEL`; pass a different
-    tag (typically the value returned by :func:`fast_model`) to route
-    a quick structured-output call to a cheaper model.
-    """
-    target_model = model or _model()
-    payload: Dict[str, object] = {
-        "model": target_model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_tokens,
-        },
-    }
-    if system:
-        payload["system"] = system
-
-    call_started = time.monotonic()
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(f"{_base()}/api/generate", json=payload)
-    except httpx.ConnectError as e:
-        raise OllamaUnavailable(
-            f"Ollama at {_base()} is not responding: {e}"
-        ) from e
-
-    if r.status_code == 404:
-        raise OllamaUnavailable(
-            f"Model '{target_model}' is not pulled. "
-            f"Run `ollama pull {target_model}`."
-        )
-    if r.status_code >= 400:
-        raise OllamaError(
-            f"Ollama returned {r.status_code}: {r.text[:400]}"
-        )
-    data = r.json()
-    text_out = (data.get("response") or "").strip()
-    duration_ms = int((time.monotonic() - call_started) * 1000)
-    logger.info(
-        "[ollama] generate done model=%s duration_ms=%d "
-        "prompt_chars=%d out_chars=%d max_tokens=%d temp=%.2f",
-        target_model,
-        duration_ms,
-        len(prompt),
-        len(text_out),
-        max_tokens,
-        temperature,
+    """One-shot completion with thinking off so the budget goes to the answer."""
+    return await chat_oneshot(
+        system=system or "",
+        user=prompt,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout_s=timeout_seconds,
     )
-    return text_out
 
 
 async def chat_oneshot(
@@ -302,159 +223,32 @@ async def chat_oneshot(
     max_tokens: int = 8,
     timeout_s: float = 10.0,
 ) -> str:
-    """Minimal non-streaming ``/api/chat`` used by classifiers and acks.
+    """Non-streaming ``/api/chat`` used by classifiers, acks and planners.
 
-    Uses ``think=False`` so Gemma 4 does not burn the token budget on
-    the hidden thinking channel.
+    ``think=False`` stops Gemma 4 from spending the whole token budget
+    on its hidden thinking channel.
     """
+    messages = [{"role": "user", "content": user}]
+    if system:
+        messages.insert(0, {"role": "system", "content": system})
     payload: Dict[str, Any] = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        "messages": messages,
         "stream": False,
         "think": False,
         "keep_alive": "1h",
-        "options": {
-            "num_predict": max_tokens,
-            "temperature": temperature,
-        },
+        "options": {"num_predict": max_tokens, "temperature": temperature},
     }
-    request_timeout = httpx.Timeout(
-        connect=5.0, read=timeout_s, write=timeout_s, pool=2.0
-    )
-    try:
-        async with httpx.AsyncClient(timeout=request_timeout) as client:
-            r = await client.post(f"{_base()}/api/chat", json=payload)
-    except httpx.ConnectError as exc:
-        raise OllamaUnavailable(
-            f"Ollama at {_base()} is not responding: {exc}"
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise OllamaTimeout(
-            f"Ollama {model!r} did not respond within {timeout_s:.1f}s "
-            f"({type(exc).__name__})."
-        ) from exc
-    if r.status_code == 404:
-        raise OllamaUnavailable(
-            f"Model '{model}' is not pulled. Run `ollama pull {model}`."
-        )
-    if r.status_code >= 400:
-        raise OllamaError(f"Ollama returned {r.status_code}: {r.text[:400]}")
-    data = r.json()
-    message = data.get("message") or {}
-    return (message.get("content") or "").strip()
-
-
-async def chat_stream(
-    messages: List[Dict[str, str]],
-    *,
-    system: Optional[str] = None,
-    temperature: float = 0.7,
-) -> AsyncIterator[str]:
-    """Stream a chat response token-by-token. Yields plain text chunks."""
-    ollama_messages: List[Dict[str, str]] = []
-    if system:
-        ollama_messages.append({"role": "system", "content": system})
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if not content:
-            continue
-        ollama_messages.append({"role": role, "content": content})
-
-    target_model = _model()
-    payload = {
-        "model": target_model,
-        "messages": ollama_messages,
-        "stream": True,
-        "options": {"temperature": temperature},
-    }
-
+    started = time.monotonic()
+    data = await _post("/api/chat", payload, model, timeout_s)
+    text_out = ((data.get("message") or {}).get("content") or "").strip()
     logger.info(
-        "[ollama] chat_stream start model=%s msgs=%d sys_chars=%d temp=%.2f",
-        target_model,
-        len(messages),
-        len(system) if system else 0,
-        temperature,
+        "[ollama] oneshot done model=%s duration_ms=%d out_chars=%d",
+        model,
+        int((time.monotonic() - started) * 1000),
+        len(text_out),
     )
-    call_started = time.monotonic()
-    total_chars = 0
-    try:
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "POST", f"{_base()}/api/chat", json=payload
-            ) as r:
-                if r.status_code == 404:
-                    raise OllamaUnavailable(
-                        f"Model '{target_model}' is not pulled. "
-                        f"Run `ollama pull {target_model}`."
-                    )
-                if r.status_code >= 400:
-                    body = await r.aread()
-                    raise OllamaError(
-                        f"Ollama returned {r.status_code}: "
-                        f"{body.decode(errors='replace')[:400]}"
-                    )
-                async for line in r.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    msg = obj.get("message") or {}
-                    chunk = msg.get("content") or ""
-                    if chunk:
-                        total_chars += len(chunk)
-                        yield chunk
-                    if obj.get("done"):
-                        break
-    except httpx.ConnectError as e:
-        raise OllamaUnavailable(
-            f"Ollama at {_base()} is not responding: {e}"
-        ) from e
-    finally:
-        logger.info(
-            "[ollama] chat_stream done model=%s duration_ms=%d out_chars=%d",
-            target_model,
-            int((time.monotonic() - call_started) * 1000),
-            total_chars,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Tool calling — used by the agent loop (api.ai.agent).
-#
-# Ollama supports a native ``tools`` parameter on /api/chat for models
-# that publish a tool-call template (gemma3, llama3.1+, qwen2.5, …). When
-# the model emits a tool call it shows up as ``message.tool_calls`` in
-# the response. For models that don't support that channel the assistant
-# will instead emit a JSON object inside its prose; :func:`_parse_tool_calls_from_text`
-# tries to recover those so we don't completely lose the tool-call path.
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ToolCall:
-    """Single tool invocation requested by the LLM."""
-
-    name: str
-    arguments: Dict[str, Any]
-    # OpenAI-compatible providers (Grok) require this id on the
-    # subsequent ``role=tool`` message. Ollama ignores it.
-    id: str = ""
-
-
-@dataclass
-class ChatWithToolsResult:
-    """Outcome of one round-trip to :func:`chat_with_tools`."""
-
-    content: str  # natural-language portion of the model's reply (often empty when tool_calls are present)
-    tool_calls: List[ToolCall] = field(default_factory=list)
-    model: str = ""
-    raw_message: Dict[str, Any] = field(default_factory=dict)
+    return text_out
 
 
 async def chat_with_tools(
@@ -462,7 +256,7 @@ async def chat_with_tools(
     *,
     tools: List[Dict[str, Any]],
     system: Optional[str] = None,
-    model: Optional[str] = None,
+    model: str,
     temperature: float = 0.2,
     timeout_seconds: float = 90.0,
     think: Optional[bool] = False,
@@ -471,64 +265,21 @@ async def chat_with_tools(
     top_k: int = 40,
     top_p: float = 0.9,
 ) -> ChatWithToolsResult:
-    """Single non-streaming chat turn with tool-calling enabled.
+    """Single non-streaming chat turn with tool calling.
 
-    ``tools`` follows OpenAI/Ollama function-tool schema:
-    ``[{"type": "function", "function": {"name": ..., "description": ..., "parameters": {...}}}, ...]``.
+    ``think`` defaults to ``False`` because Gemma 4 thinks by default
+    and can spend its whole budget on the hidden channel, returning no
+    content and no tool calls; the monitoring scheduler opts in.
 
-    The agent loop calls this in a tight loop, appending the model's
-    ``tool_calls`` and our tool results to ``messages`` between turns.
-    Temperature defaults low because tool selection is a structured
-    decision; bump it for the final answer if you want more flair.
-
-    ``think`` is forwarded to Ollama's ``/api/chat`` as the top-level
-    ``think`` flag. The default is ``False`` because Gemma 4's modelfile
-    enables thinking by default — without an explicit ``think=False``
-    the model can spend its entire ``num_predict`` budget on the
-    hidden ``message.thinking`` channel and return zero
-    ``message.content`` AND zero ``tool_calls`` (the "empty reply"
-    failure mode :class:`api.ai.agent._EmptyModelReply` was added to
-    catch). The monitoring scheduler — the one caller that genuinely
-    benefits from extended reasoning — passes ``think=True`` explicitly.
-    Pass ``None`` to omit the flag entirely (legacy behaviour, useful
-    only for models that crash on an unknown key). Models that don't
-    expose the flag silently ignore it.
-
-    Hot-cache options
-    -----------------
-    * ``keep_alive`` pins the model in VRAM for an hour between calls
-      so successive agent cycles (and back-to-back inbound messages)
-      don't pay a cold-load penalty. Warmup already pins both models
-      at startup; this keeps them pinned as activity continues.
-    * ``num_ctx`` fixes the KV-cache slot size. Without it Ollama
-      auto-expands the context window per request to fit the prompt,
-      and a change in prompt size between two adjacent calls forces
-      a full KV-cache rebuild — murdering our cross-cycle cache
-      reuse. 32 K accommodates the trimmed inbound prompt (~8-12 K
-      tokens for a typical household) PLUS room for the model to
-      think, emit tool calls, and read tool results without
-      hitting the ceiling. Set to 16 K in earlier revisions —
-      bumped after we observed Gemma 4 silently producing the
-      "empty reply" failure mode when prompt + tools shoved the
-      window flush to the limit (see
-      :class:`api.ai.agent._EmptyModelReply`). The cost is roughly
-      2× KV-cache memory per pinned model; on a Mac Studio with
-      both gemma4:e2b and gemma4:26b kept warm this is well within
-      budget.
-    * ``top_k`` / ``top_p`` trim Gemma's modelfile defaults (top_k=64,
-      top_p=0.95) which are tuned for creative writing; a tool-pick
-      decision wants tighter sampling so the model is more likely to
-      reach for the same tool name twice in similar situations.
+    Hot-cache options: ``keep_alive`` keeps the model resident between
+    agent cycles; a fixed ``num_ctx`` stops Ollama re-sizing (and
+    rebuilding) the KV cache whenever the prompt length changes, with
+    32K leaving room for the inbound prompt plus tool results; tighter
+    ``top_k`` / ``top_p`` make tool picks more repeatable.
     """
-    target_model = model or _model()
-    ollama_messages: List[Dict[str, Any]] = []
-    if system:
-        ollama_messages.append({"role": "system", "content": system})
-    ollama_messages.extend(messages)
-
     payload: Dict[str, Any] = {
-        "model": target_model,
-        "messages": ollama_messages,
+        "model": model,
+        "messages": _to_wire(messages, system),
         "stream": False,
         "tools": tools,
         "keep_alive": keep_alive,
@@ -542,127 +293,103 @@ async def chat_with_tools(
     if think is not None:
         payload["think"] = bool(think)
 
-    logger.info(
-        "[ollama] chat_with_tools start model=%s msgs=%d sys_chars=%d "
-        "tools=%d temp=%.2f think=%s timeout=%.0fs",
-        target_model,
-        len(messages),
-        len(system) if system else 0,
-        len(tools),
-        temperature,
-        think,
-        timeout_seconds,
-    )
-
-    # Structured timeout: connect fast (Ollama is on localhost so anything
-    # >5 s usually means the daemon is dead), but allow the full per-turn
-    # budget for read/write since the actual inference is the slow part.
-    # Without an explicit ``connect`` cap a stuck DNS/TCP would burn the
-    # whole 90 s before failing.
-    request_timeout = httpx.Timeout(
-        connect=10.0, read=timeout_seconds, write=timeout_seconds, pool=5.0
-    )
-    call_started = time.monotonic()
-    try:
-        async with httpx.AsyncClient(timeout=request_timeout) as client:
-            r = await client.post(f"{_base()}/api/chat", json=payload)
-    except httpx.ConnectError as e:
-        raise OllamaUnavailable(
-            f"Ollama at {_base()} is not responding: {e}"
-        ) from e
-    except httpx.TimeoutException as e:
-        # Read/write timeout — the daemon accepted the request but the
-        # response stalled. Surface as a typed exception so the agent
-        # loop can retry once before failing the whole task.
-        raise OllamaTimeout(
-            f"Ollama {target_model!r} did not respond within "
-            f"{timeout_seconds:.0f}s ({type(e).__name__})."
-        ) from e
-
-    if r.status_code == 404:
-        raise OllamaUnavailable(
-            f"Model '{target_model}' is not pulled. "
-            f"Run `ollama pull {target_model}`."
-        )
-    if r.status_code >= 400:
-        raise OllamaError(
-            f"Ollama returned {r.status_code}: {r.text[:400]}"
-        )
-
-    data = r.json()
+    started = time.monotonic()
+    data = await _post("/api/chat", payload, model, timeout_seconds)
     message = data.get("message") or {}
     content = (message.get("content") or "").strip()
-
-    # Native tool calls (preferred path when the model template supports it).
-    raw_calls = message.get("tool_calls") or []
-    calls: List[ToolCall] = []
-    for c in raw_calls:
-        fn = (c or {}).get("function") or {}
-        name = fn.get("name") or ""
-        args = fn.get("arguments")
-        # Ollama returns ``arguments`` as either a dict or a JSON string
-        # depending on the model. Normalize to dict.
-        if isinstance(args, str):
-            try:
-                args = json.loads(args) if args else {}
-            except json.JSONDecodeError:
-                args = {"_raw": args}
-        if not isinstance(args, dict):
-            args = {}
-        if name:
-            calls.append(ToolCall(name=name, arguments=args))
-
-    # Fallback: model didn't use the tool channel but stuffed a JSON
-    # object into the prose. Try to recover. Only used when there were
-    # no native tool_calls.
+    calls = [
+        ToolCall(name=fn["name"], arguments=parse_arguments(fn.get("arguments")))
+        for c in message.get("tool_calls") or []
+        for fn in [(c or {}).get("function") or {}]
+        if fn.get("name")
+    ]
+    # Some local models write the call as JSON in prose instead of using
+    # the tool channel; recover it so the agent loop still acts.
     if not calls and content:
         recovered = _parse_tool_calls_from_text(content, [t["function"]["name"] for t in tools])
         if recovered:
             calls = recovered
-            # Strip the JSON tool-call block from the user-visible content.
             content = ""
 
-    duration_ms = int((time.monotonic() - call_started) * 1000)
-    eval_count = data.get("eval_count")
-    prompt_eval_count = data.get("prompt_eval_count")
     logger.info(
-        "[ollama] chat_with_tools done model=%s duration_ms=%d "
-        "tool_calls=%d content_chars=%d prompt_tokens=%s out_tokens=%s",
-        target_model,
-        duration_ms,
+        "[ollama] chat_with_tools done model=%s duration_ms=%d msgs=%d tools=%d "
+        "think=%s tool_calls=%d content_chars=%d prompt_tokens=%s out_tokens=%s",
+        model,
+        int((time.monotonic() - started) * 1000),
+        len(messages),
+        len(tools),
+        think,
         len(calls),
         len(content),
-        prompt_eval_count,
-        eval_count,
+        data.get("prompt_eval_count"),
+        data.get("eval_count"),
     )
-
     return ChatWithToolsResult(
         content=content,
         tool_calls=calls,
-        model=target_model,
+        model=model,
         raw_message=message,
+        provider=NAME,
     )
 
 
-_TOOL_JSON_BLOCK_RE = re.compile(r"\{[^{}]*\"(?:tool|name|function)\"[^{}]*\}", re.DOTALL)
+async def chat_stream(
+    messages: List[Dict[str, Any]],
+    *,
+    system: Optional[str] = None,
+    temperature: float = 0.7,
+    model: str,
+) -> AsyncIterator[str]:
+    """Stream a chat response token-by-token. Yields plain text chunks."""
+    payload = {
+        "model": model,
+        "messages": [m for m in _to_wire(messages, system) if m.get("content")],
+        "stream": True,
+        "think": False,
+        "keep_alive": "1h",
+        "options": {"temperature": temperature},
+    }
+    started = time.monotonic()
+    total_chars = 0
+    try:
+        async with httpx.AsyncClient(timeout=_timeout(120.0)) as client:
+            async with client.stream("POST", f"{_base()}/api/chat", json=payload) as r:
+                if r.status_code >= 400:
+                    body = (await r.aread()).decode(errors="replace")
+                    _raise_for_status(r.status_code, body, model)
+                async for line in r.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = (obj.get("message") or {}).get("content") or ""
+                    if chunk:
+                        total_chars += len(chunk)
+                        yield chunk
+                    if obj.get("done"):
+                        break
+    except httpx.HTTPError as exc:
+        raise _transport_error(exc, model, 120.0) from exc
+    finally:
+        logger.info(
+            "[ollama] chat_stream done model=%s duration_ms=%d out_chars=%d",
+            model,
+            int((time.monotonic() - started) * 1000),
+            total_chars,
+        )
 
 
-def _parse_tool_calls_from_text(
-    text: str, tool_names: List[str]
-) -> List[ToolCall]:
-    """Best-effort recovery of tool calls from prose-only model replies.
+def _parse_tool_calls_from_text(text: str, tool_names: List[str]) -> List[ToolCall]:
+    """Best-effort recovery of tool calls written as JSON in the prose.
 
-    Some local models won't emit ``message.tool_calls`` even when given
-    tools — they instead write something like
-    ``{"tool": "gmail_send", "arguments": {...}}`` inline. We scan for
-    JSON objects, validate the tool name, and reconstruct
-    :class:`ToolCall`s. Returns ``[]`` if nothing parseable is found.
+    Accepts ``{tool|name, arguments|args|parameters}`` and
+    ``{function: {name, arguments}}`` shapes; ignores unknown tool names.
     """
     if not text or not tool_names:
         return []
     candidates: List[str] = []
-    # Pull every {...} the model may have written; a balanced parser is
-    # overkill — the repair loop below tolerates JSON failures.
     depth = 0
     start = -1
     for i, ch in enumerate(text):
@@ -670,14 +397,14 @@ def _parse_tool_calls_from_text(
             if depth == 0:
                 start = i
             depth += 1
-        elif ch == "}":
+        elif ch == "}" and depth:
             depth -= 1
             if depth == 0 and start != -1:
                 candidates.append(text[start : i + 1])
                 start = -1
 
-    out: List[ToolCall] = []
     valid = set(tool_names)
+    out: List[ToolCall] = []
     for blob in candidates:
         try:
             obj = json.loads(blob)
@@ -685,101 +412,30 @@ def _parse_tool_calls_from_text(
             continue
         if not isinstance(obj, dict):
             continue
-        # Accept several shapes: {tool, arguments} | {name, arguments} | {function: {...}}
         name = obj.get("tool") or obj.get("name")
         args = obj.get("arguments") or obj.get("args") or obj.get("parameters") or {}
         if not name and isinstance(obj.get("function"), dict):
             name = obj["function"].get("name")
             args = obj["function"].get("arguments", args)
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {"_raw": args}
-        if name in valid and isinstance(args, dict):
-            out.append(ToolCall(name=name, arguments=args))
+        if name in valid:
+            out.append(ToolCall(name=name, arguments=parse_arguments(args)))
     return out
 
 
-def system_prompt_for_avi(assistant_name: str, family_name: Optional[str]) -> str:
-    """Personality prompt shared by greet + chat endpoints.
-
-    Persona + non-negotiable response-style rules. The chat UI feeds
-    every reply straight into Kokoro TTS, so anything the model writes
-    is also what the user hears out loud. Markdown noise (``**bold**``,
-    ``*emphasis*``, ``# headings``, ``- bullets``) gets read literally
-    as "asterisk asterisk…" and makes Avi sound robotic — so we ban
-    those characters here at the source rather than stripping them
-    after the fact (which would also mean stripping them out of
-    transcripts).
-    """
-    family_bit = f" the {family_name} family" if family_name else " this family"
-    return (
-        f"You are {assistant_name}, the friendly live-in AI assistant for"
-        f"{family_bit}. You are warm, concise, and genuinely interested "
-        f"in the people you talk to. You have access to structured notes "
-        f"about each person (name, goals, relationships, residences, "
-        f"pets).\n\n"
-        "RESPONSE STYLE — your replies are read aloud by a TTS voice "
-        "AND shown in a chat bubble. Follow these rules every turn:\n"
-        "* Be brief by default — 1 to 3 short sentences. The user can "
-        "  ask for more detail; do not pre-emptively dump everything "
-        "  you know.\n"
-        "* Speak in natural spoken English. Plain prose only.\n"
-        "* NEVER use Markdown formatting in your spoken reply — no "
-        "  asterisks for bold (**...**), no underscores for italics, "
-        "  no leading dashes for bullet lists, no '#' headings, no "
-        "  backticks. These get read out loud literally and sound "
-        "  awful. If you must enumerate, say 'first', 'second', etc.\n"
-        "* For multi-item answers (calendar listings, search results, "
-        "  contact lists, summaries with many rows), give the headline "
-        "  out loud — the count plus the most important one or two "
-        "  items — and then OFFER to email the full details. Example: "
-        "  'You've got six events this week. The next one is the "
-        "  parent-teacher meeting Tuesday at 4. Want me to email you "
-        "  the full list?' Only send the email after the user confirms.\n"
-        "* Never invent facts that aren't in the provided context or "
-        "  in a tool result you actually called. If you're not sure, "
-        "  say so plainly.\n"
-        "* Do not sign off ('Let me know if…', 'Hope this helps!') on "
-        "  every reply — those add noise when the audio plays back."
-    )
-
-
-# Tiny helper used by tests / the status endpoint.
-def sync_health() -> Dict[str, object]:
-    """Blocking variant of ``health()`` for places that aren't async."""
-    import asyncio
-
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Shouldn't happen — we're only calling this from sync code.
-            raise RuntimeError("sync_health called from running loop")
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(health())
-
-
 __all__ = [
-    "ChatWithToolsResult",
+    "NAME",
     "OllamaError",
+    "OllamaModelMissing",
     "OllamaTimeout",
     "OllamaUnavailable",
-    "ToolCall",
     "chat_oneshot",
     "chat_stream",
     "chat_with_tools",
-    "fast_model",
     "generate",
-    "generate_with_fallback",
-    "health",
-    "sync_health",
-    "system_prompt_for_avi",
+    "installed_models",
+    "is_configured",
+    "owns_model",
+    "tier_models",
+    "warm_models",
     "warmup_model",
 ]
-
-
-# Silence an unused-import warning when type-checkers squint.
-_ = Iterable

@@ -59,9 +59,10 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
+import httpx
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -148,6 +149,13 @@ class GoogleOAuthError(RuntimeError):
 class GoogleNotConnected(RuntimeError):
     """Raised when an integration call is made for an assistant that
     hasn't gone through the OAuth flow yet.
+    """
+
+
+class GoogleRefreshRevoked(GoogleOAuthError):
+    """Google rejected the stored refresh token (``invalid_grant`` etc.).
+
+    Permanent: retrying won't help, a human has to reconnect Google.
     """
 
 
@@ -376,6 +384,97 @@ def load_credentials(
         db.flush()
 
     return row, creds
+
+
+_TOKEN_URI = "https://oauth2.googleapis.com/token"
+_TOKENINFO_URI = "https://oauth2.googleapis.com/tokeninfo"
+# Errors on the refresh grant that mean the refresh token itself is dead.
+_REVOKED_ERRORS = {"invalid_grant", "unauthorized_client", "invalid_client"}
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    access_expires_at: datetime
+    # Only set when Google gave the grant a fixed lifetime — e.g. the
+    # OAuth app is in "Testing" (7 days) or the user picked time-limited
+    # access. None means the refresh token lives until revoked.
+    refresh_token_expires_at: Optional[datetime]
+    email: Optional[str]
+    scopes: Tuple[str, ...]
+
+
+def force_refresh(db: Session, assistant_id: int) -> RefreshResult:
+    """Mint a new access token now and verify it with Google's tokeninfo.
+
+    Talks to the token endpoint directly instead of ``creds.refresh()``
+    because google-auth drops ``refresh_token_expires_in``, which is how
+    we spot a refresh token that will die on a schedule. Raises
+    :class:`GoogleRefreshRevoked` when a reconnect is needed and
+    :class:`GoogleOAuthError` for transient failures.
+    """
+    row = load_credentials_row(db, assistant_id)
+    if row is None:
+        raise GoogleNotConnected("Assistant has not connected a Google account yet.")
+    creds = _blob_to_credentials(row.token_payload_encrypted)
+    if not creds.refresh_token:
+        raise GoogleRefreshRevoked("No refresh token is stored; reconnect Google.")
+
+    try:
+        resp = httpx.post(
+            creds.token_uri or _TOKEN_URI,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": creds.refresh_token,
+                "client_id": creds.client_id,
+                "client_secret": creds.client_secret,
+            },
+            timeout=15.0,
+        )
+    except httpx.HTTPError as exc:
+        raise GoogleOAuthError(f"Token endpoint unreachable: {exc}") from exc
+
+    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    if resp.status_code != 200:
+        error = str(data.get("error") or resp.status_code)
+        reason = f"{error}: {data.get('error_description') or resp.text[:200]}"
+        if error in _REVOKED_ERRORS:
+            raise GoogleRefreshRevoked(reason)
+        raise GoogleOAuthError(f"Token refresh failed ({reason})")
+
+    now = datetime.now(timezone.utc)
+    creds.token = data["access_token"]
+    # google-auth compares expiry as naive UTC.
+    creds.expiry = (now + timedelta(seconds=int(data.get("expires_in", 3600)))).replace(
+        tzinfo=None
+    )
+    if data.get("refresh_token"):
+        creds._refresh_token = data["refresh_token"]
+    rt_expires_in = data.get("refresh_token_expires_in")
+    refresh_expires_at = (
+        now + timedelta(seconds=int(rt_expires_in)) if rt_expires_in else None
+    )
+
+    row.token_payload_encrypted = _credentials_to_blob(creds)
+    row.token_expires_at = _expiry_to_aware(creds)
+    db.flush()
+
+    try:
+        info = httpx.get(
+            _TOKENINFO_URI, params={"access_token": creds.token}, timeout=15.0
+        )
+    except httpx.HTTPError as exc:
+        raise GoogleOAuthError(f"tokeninfo unreachable: {exc}") from exc
+    if info.status_code != 200:
+        raise GoogleOAuthError(
+            f"Google did not accept the fresh token (tokeninfo {info.status_code})"
+        )
+    payload = info.json()
+    return RefreshResult(
+        access_expires_at=_expiry_to_aware(creds) or now,
+        refresh_token_expires_at=refresh_expires_at,
+        email=payload.get("email"),
+        scopes=tuple((payload.get("scope") or "").split()),
+    )
 
 
 def delete_credentials(db: Session, assistant_id: int) -> bool:

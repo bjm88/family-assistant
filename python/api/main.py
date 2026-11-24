@@ -39,6 +39,7 @@ from .auth import (
 from .config import get_settings
 from .services import (
     email_inbox,
+    google_keepalive,
     inbound_recovery,
     monitoring_scheduler,
     telegram_inbox,
@@ -174,18 +175,24 @@ async def _lifespan(app: FastAPI):
         )
     )
 
+    if settings.GOOGLE_KEEPALIVE_ENABLED:
+        background_tasks.append(
+            asyncio.create_task(
+                google_keepalive.run_google_keepalive_loop(stop_event),
+                name="google_keepalive",
+            )
+        )
+
     logging.getLogger(__name__).info(
-        "LLM provider=%s heavy=%s fast=%s ollama_warmup=%s",
-        ai_llm.provider(),
+        "LLM chain=%s heavy=%s fast=%s local_warmup=%s",
+        ",".join(b.NAME for b in ai_llm.chain()),
         ai_llm._model(),
         ai_llm.fast_model(),
         ai_llm.ollama_warmup_enabled(),
     )
 
-    # Pre-warm local Ollama models only when they are actually in
-    # use. The default live path is Grok (remote), so pinning 26B
-    # weights in VRAM is wasted RAM until a household fine-tune is
-    # re-enabled via AI_LLM_PROVIDER=ollama.
+    # Keep the local fallback models resident whenever Ollama is in the
+    # chain, so a failover (internet down) answers without a cold load.
     async def _ollama_warmup_loop() -> None:
         if not ai_llm.ollama_warmup_enabled():
             return
@@ -193,8 +200,7 @@ async def _lifespan(app: FastAPI):
         while not stop_event.is_set():
             try:
                 await asyncio.gather(
-                    ai_ollama.warmup_model(settings.AI_OLLAMA_MODEL),
-                    ai_ollama.warmup_model(settings.AI_OLLAMA_FAST_MODEL),
+                    *(ai_ollama.warmup_model(m) for m in ai_ollama.warm_models()),
                     return_exceptions=True,
                 )
             except Exception:  # noqa: BLE001 - warmup must never crash the loop

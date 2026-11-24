@@ -35,7 +35,7 @@ from ..ai import assistants as _assistants
 from ..ai import chat_prompts
 from ..ai import fast_ack
 from ..ai import fast_action_router
-from ..ai import llm, ollama
+from ..ai import llm, ollama, persona
 from ..ai import planner as ai_planner
 from ..ai import prompts
 from ..ai import rag
@@ -136,18 +136,33 @@ _assistant_id_for = _assistants.assistant_id_for_family
 
 @router.get("/status", response_model=StatusResponse)
 async def status(_: CurrentUser = Depends(require_user)) -> StatusResponse:
-    if llm.provider() == "grok":
-        key_ok = bool(get_settings().grok_api_key)
+    """The provider that would answer right now and its heavy model.
+
+    ``host`` is the provider name; after a failover (internet down)
+    this reports the local Ollama model that is covering.
+    """
+    primary = llm.provider()
+    model = llm._model()
+    if primary != ollama.NAME:
         return StatusResponse(
-            host=get_settings().GROK_API_BASE,
-            model=llm._model(),
-            available=key_ok,
-            model_pulled=key_ok,
-            installed_models=[llm._model(), llm.fast_model()],
-            error=None if key_ok else "GROK_API_KEY is not set",
+            host=primary,
+            model=model,
+            available=True,
+            model_pulled=True,
+            installed_models=[model, llm.fast_model()],
         )
-    info = await ollama.health()
-    return StatusResponse(**info)  # type: ignore[arg-type]
+    try:
+        installed = await ollama.installed_models()
+    except llm.LLMError as exc:
+        return StatusResponse(
+            host=primary, model=model, available=False, model_pulled=False,
+            installed_models=[], error=str(exc),
+        )
+    pulled = any(n == model or n.startswith(model + ":") for n in installed)
+    return StatusResponse(
+        host=primary, model=model, available=True, model_pulled=pulled,
+        installed_models=installed,
+    )
 
 
 # ---------- Warmup --------------------------------------------------------
@@ -191,23 +206,22 @@ async def warmup(_: CurrentUser = Depends(require_user)) -> WarmupResponse:
 
     No DB session, no auth — pure Ollama plumbing.
     """
-    heavy_tag = llm._model()
-    fast_tag = llm.fast_model()
+    settings = get_settings()
     if not llm.ollama_warmup_enabled():
         return WarmupResponse(
-            heavy=heavy_tag,
-            fast=fast_tag,
+            heavy=llm._model(),
+            fast=llm.fast_model(),
             heavy_loaded=True,
             fast_loaded=True,
         )
     heavy_loaded, fast_loaded = await asyncio.gather(
-        ollama.warmup_model(get_settings().AI_OLLAMA_MODEL),
-        ollama.warmup_model(get_settings().AI_OLLAMA_FAST_MODEL),
+        ollama.warmup_model(settings.AI_OLLAMA_MODEL),
+        ollama.warmup_model(settings.AI_OLLAMA_FAST_MODEL),
         return_exceptions=False,
     )
     return WarmupResponse(
-        heavy=heavy_tag,
-        fast=fast_tag,
+        heavy=settings.AI_OLLAMA_MODEL,
+        fast=settings.AI_OLLAMA_FAST_MODEL,
         heavy_loaded=bool(heavy_loaded),
         fast_loaded=bool(fast_loaded),
     )
@@ -465,7 +479,7 @@ async def followup(
     )
 
     system = prompts.with_safety(
-        ollama.system_prompt_for_avi(assistant_name, family_name)
+        persona.system_prompt_for_avi(assistant_name, family_name)
     )
 
     # One-sentence follow-up — perfect fit for the lightweight model.

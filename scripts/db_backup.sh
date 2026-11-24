@@ -3,7 +3,8 @@
 # scripts/db_backup.sh
 # ====================
 #
-# Full backup of the family-assistant Postgres database.
+# Full backup of the family-assistant Postgres database AND the media
+# files it points at (person photos, documents, attachments).
 #
 # - Reads connection details from the project's ``.env`` (FA_DB_HOST,
 #   FA_DB_PORT, FA_DB_USER, FA_DB_PWD, FA_DB_NAME) so this script
@@ -15,6 +16,10 @@
 # - Also drops a checksum + summary into ``backups/<dump>.meta`` so the
 #   matching restore script can verify the file before clobbering live
 #   data.
+# - Archives ``FA_STORAGE_ROOT`` (photos, docs, inbound attachments) into
+#   ``backups/<dump-name>.media.tar.gz``. The DB only stores paths to
+#   these files, so a dump without them can't bring the photos back.
+#   ``tts_cache/`` is skipped: it's regenerable speech audio.
 # - Optionally takes a label as the first argument (e.g. ``./scripts/db_backup.sh
 #   pre-refactor``) which gets included in the filename.
 #
@@ -58,7 +63,12 @@ FA_DB_PORT="$(read_env FA_DB_PORT)"
 FA_DB_USER="$(read_env FA_DB_USER)"
 FA_DB_PWD="$(read_env FA_DB_PWD)"
 FA_DB_NAME="$(read_env FA_DB_NAME)"
+FA_STORAGE_ROOT="$(read_env FA_STORAGE_ROOT)"
 
+: "${FA_STORAGE_ROOT:=./resources/family}"
+if [[ "$FA_STORAGE_ROOT" != /* ]]; then
+  FA_STORAGE_ROOT="$REPO_ROOT/${FA_STORAGE_ROOT#./}"
+fi
 : "${FA_DB_HOST:=localhost}"
 : "${FA_DB_PORT:=5432}"
 : "${FA_DB_USER:=family_assistant}"
@@ -117,6 +127,7 @@ else
 fi
 DUMP_PATH="$BACKUP_DIR/$FILENAME"
 META_PATH="$DUMP_PATH.meta"
+MEDIA_PATH="${DUMP_PATH%.dump}.media.tar.gz"
 
 echo "================================================================"
 echo "family-assistant DB BACKUP"
@@ -126,6 +137,8 @@ echo "  host:port     : $FA_DB_HOST:$FA_DB_PORT"
 echo "  user          : $FA_DB_USER"
 echo "  output file   : $DUMP_PATH"
 echo "  format        : custom (-Fc) + gzip (level 6)"
+echo "  media source  : $FA_STORAGE_ROOT (minus tts_cache/)"
+echo "  media archive : $MEDIA_PATH"
 echo "================================================================"
 
 # ---------------------------------------------------------------------------
@@ -144,6 +157,25 @@ PGPASSWORD="$FA_DB_PWD" pg_dump \
   --no-owner \
   --no-privileges \
   --file="$DUMP_PATH"
+
+# ---------------------------------------------------------------------------
+# Media archive (photos, documents, attachments)
+# ---------------------------------------------------------------------------
+
+if [[ -d "$FA_STORAGE_ROOT" ]]; then
+  # Paths in the archive are relative to FA_STORAGE_ROOT, so restore is
+  # ``tar -xzf <archive> -C <FA_STORAGE_ROOT>``.
+  tar -czf "$MEDIA_PATH" \
+    -C "$FA_STORAGE_ROOT" \
+    --exclude './tts_cache' \
+    .
+  MEDIA_BYTES=$(stat -f%z "$MEDIA_PATH" 2>/dev/null || stat -c%s "$MEDIA_PATH")
+  MEDIA_SHA=$(shasum -a 256 "$MEDIA_PATH" | awk '{print $1}')
+  MEDIA_FILES=$(tar -tzf "$MEDIA_PATH" | grep -vc '/$' || true)
+else
+  echo "WARNING: media dir $FA_STORAGE_ROOT not found; backing up the DB only." >&2
+  MEDIA_PATH=""
+fi
 
 # ---------------------------------------------------------------------------
 # Sidecar metadata (size + sha256 + summary) — used by db_restore.sh to
@@ -180,10 +212,23 @@ row_counts (families|people|jobs|tasks|agent_tasks|live_session_messages):
   $ROW_SUMMARY
 META
 
+if [[ -n "$MEDIA_PATH" ]]; then
+  cat >> "$META_PATH" <<META
+media_file: $(basename "$MEDIA_PATH")
+media_source: $FA_STORAGE_ROOT
+media_size_bytes: $MEDIA_BYTES
+media_sha256: $MEDIA_SHA
+media_file_count: $MEDIA_FILES
+META
+fi
+
 echo
 echo "Backup complete."
 echo "  size   : $DUMP_BYTES bytes"
 echo "  sha256 : $DUMP_SHA"
+if [[ -n "$MEDIA_PATH" ]]; then
+  echo "  media  : $MEDIA_PATH ($MEDIA_FILES files, $MEDIA_BYTES bytes)"
+fi
 echo "  meta   : $META_PATH"
 
 # ---------------------------------------------------------------------------
@@ -202,7 +247,7 @@ if [[ -n "$KEEP" ]]; then
       echo "Pruning to newest $KEEP backup(s):"
       while IFS= read -r f; do
         echo "  rm $f"
-        rm -f "$f" "$f.meta"
+        rm -f "$f" "$f.meta" "$f.uploaded" "${f%.dump}.media.tar.gz"
       done <<< "$OLD_DUMPS"
     fi
   fi

@@ -42,7 +42,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ..config import get_settings
+from ..config import PROJECT_ROOT, get_settings
 from ..db import SessionLocal, engine
 
 logger = logging.getLogger(__name__)
@@ -261,18 +261,27 @@ async def _ollama_get_tags(client: httpx.AsyncClient, host: str) -> list[dict[st
     return list(payload.get("models", []))
 
 
+def _chain_names() -> list[str]:
+    return [
+        n.strip().lower()
+        for n in (get_settings().AI_LLM_PROVIDERS or "").split(",")
+        if n.strip()
+    ]
+
+
 def _ollama_is_parked() -> bool:
-    settings = get_settings()
-    return settings.llm_provider == "grok" and not settings.AI_OLLAMA_ENABLED
+    """True when Ollama isn't in the provider chain at all."""
+    return "ollama" not in _chain_names()
+
+
+def _ollama_problem_level() -> StatusLevel:
+    # Avi still answers through the cloud providers; only the offline
+    # fallback is lost.
+    return "unknown" if _ollama_is_parked() else "degraded"
 
 
 async def check_ollama_daemon() -> StatusCheck:
-    """Verify the Ollama HTTP server itself responds at all.
-
-    When Grok is the live provider this row is informational — a
-    missing daemon is ``unknown`` (parked), not ``down``, so it
-    does not turn the whole status page red.
-    """
+    """Verify the Ollama HTTP server (the offline fallback) responds."""
     settings = get_settings()
     host = settings.AI_OLLAMA_HOST
     parked = _ollama_is_parked()
@@ -284,23 +293,15 @@ async def check_ollama_daemon() -> StatusCheck:
         return StatusCheck(
             key="ollama_daemon",
             label="Ollama daemon",
-            status="unknown" if parked else "down",
+            status=_ollama_problem_level(),
             latency_ms=round(_now_ms() - started, 1),
             summary=(
-                f"Parked (live LLM is Grok). Daemon not running at {host}."
+                f"Not in AI_LLM_PROVIDERS. Daemon not running at {host}."
                 if parked
-                else f"No response from {host}"
+                else f"No response from {host} — no offline fallback"
             ),
             detail={"host": host, "error": str(exc), "parked": parked},
-            hint=(
-                "Local models are kept for a future fine-tune. Start "
-                "Ollama only when you flip AI_LLM_PROVIDER=ollama."
-                if parked
-                else (
-                    "Start Ollama: open the Ollama app, or run "
-                    "`OLLAMA_HOST=0.0.0.0 ollama serve` in a terminal."
-                )
-            ),
+            hint="Start Ollama: `brew services start ollama`.",
         )
 
     return StatusCheck(
@@ -309,9 +310,9 @@ async def check_ollama_daemon() -> StatusCheck:
         status="ok",
         latency_ms=round(_now_ms() - started, 1),
         summary=(
-            f"Parked for future fine-tune; reachable at {host}"
+            f"Reachable at {host} (not in AI_LLM_PROVIDERS)"
             if parked
-            else f"Reachable at {host}"
+            else f"Reachable at {host} — offline fallback ready"
         ),
         detail={"host": host, "parked": parked},
     )
@@ -327,7 +328,9 @@ async def check_ollama_models() -> StatusCheck:
     settings = get_settings()
     host = settings.AI_OLLAMA_HOST
     required = [t for t in (settings.AI_OLLAMA_MODEL,) if t]
-    optional = [t for t in (settings.AI_OLLAMA_FAST_MODEL,) if t]
+    optional = [
+        t for t in (settings.AI_OLLAMA_FAST_MODEL, settings.AI_OLLAMA_BACKUP_MODEL) if t
+    ]
 
     started = _now_ms()
     try:
@@ -338,19 +341,11 @@ async def check_ollama_models() -> StatusCheck:
         return StatusCheck(
             key="ollama_models",
             label="Ollama models",
-            status="unknown" if parked else "down",
+            status=_ollama_problem_level(),
             latency_ms=round(_now_ms() - started, 1),
-            summary=(
-                "Parked (live LLM is Grok). Could not list local models."
-                if parked
-                else "Could not list models — daemon unreachable."
-            ),
+            summary="Could not list models — daemon unreachable.",
             detail={"error": str(exc), "parked": parked},
-            hint=(
-                "Local models are kept for a future fine-tune."
-                if parked
-                else "Fix the Ollama daemon first; this check derives from /api/tags."
-            ),
+            hint="Fix the Ollama daemon first; this check derives from /api/tags.",
         )
 
     installed = sorted({str(m.get("name", "")) for m in models if m.get("name")})
@@ -367,11 +362,10 @@ async def check_ollama_models() -> StatusCheck:
     missing_optional = [t for t in optional if not _present(t)]
 
     if missing_required:
-        parked = _ollama_is_parked()
         return StatusCheck(
             key="ollama_models",
             label="Ollama models",
-            status="unknown" if parked else "down",
+            status=_ollama_problem_level(),
             latency_ms=round(_now_ms() - started, 1),
             summary=f"Missing required model: {', '.join(missing_required)}",
             detail={
@@ -395,7 +389,7 @@ async def check_ollama_models() -> StatusCheck:
             status="unknown" if parked else "degraded",
             latency_ms=round(_now_ms() - started, 1),
             summary=(
-                f"{len(installed)} models installed · fast model "
+                f"{len(installed)} models installed · "
                 f"'{missing_optional[0]}' missing"
             ),
             detail={
@@ -405,8 +399,8 @@ async def check_ollama_models() -> StatusCheck:
                 "missing_optional": missing_optional,
             },
             hint=(
-                f"Optional speed boost: `ollama pull {missing_optional[0]}`. "
-                "The agent will fall back to the main chat model in the meantime."
+                f"`ollama pull {missing_optional[0]}`. Offline calls use "
+                "the main local model in the meantime."
             ),
         )
 
@@ -415,10 +409,14 @@ async def check_ollama_models() -> StatusCheck:
         label="Ollama models",
         status="ok",
         latency_ms=round(_now_ms() - started, 1),
-        summary=f"{len(installed)} model(s) installed; chat + fast both present.",
+        summary=(
+            f"{len(installed)} model(s) installed; "
+            f"{', '.join(required + optional)} present."
+        ),
         detail={
             "installed": installed,
             "chat_model": settings.AI_OLLAMA_MODEL,
+            "backup_model": settings.AI_OLLAMA_BACKUP_MODEL,
             "fast_model": settings.AI_OLLAMA_FAST_MODEL,
         },
     )
@@ -432,9 +430,9 @@ async def check_grok_api() -> StatusCheck:
         return StatusCheck(
             key="grok_api",
             label="Grok API",
-            status="down" if settings.llm_provider == "grok" else "unknown",
+            status="degraded" if "grok" in _chain_names() else "unknown",
             summary="GROK_API_KEY (or XAI_API_KEY) is not set in .env.",
-            detail={"provider": settings.llm_provider},
+            detail={"chain": _chain_names()},
             hint="Add GROK_API_KEY from https://console.x.ai to .env.",
         )
 
@@ -447,7 +445,7 @@ async def check_grok_api() -> StatusCheck:
         return StatusCheck(
             key="grok_api",
             label="Grok API",
-            status="down",
+            status="degraded",
             latency_ms=round(_now_ms() - started, 1),
             summary=f"Could not reach {settings.GROK_API_BASE}",
             detail={"error": str(exc)},
@@ -474,93 +472,67 @@ async def check_grok_api() -> StatusCheck:
     )
 
 
-async def check_ai_agent() -> StatusCheck:
-    """End-to-end ping of the *live* LLM provider.
+async def check_claude_api() -> StatusCheck:
+    """Verify ANTHROPIC_API_KEY can list models at api.anthropic.com."""
+    from ..ai import claude
 
-    Grok (default): one cheap generate on the fast model.
-    Ollama: the original /api/chat warmup ping.
-    """
     settings = get_settings()
-    if settings.llm_provider == "grok":
-        from ..ai import llm
-
-        started = _now_ms()
-        model = llm.fast_model()
-        try:
-            text = await llm.generate(
-                "Reply with the single word: ok. No explanation.",
-                temperature=0.0,
-                max_tokens=8,
-                model=model,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return StatusCheck(
-                key="ai_agent",
-                label="AI agent",
-                status="down",
-                latency_ms=round(_now_ms() - started, 1),
-                summary=f"Grok chat failed: {exc.__class__.__name__}",
-                detail={"model": model, "error": str(exc)},
-                hint="Check GROK_API_KEY and GROK_FAST_MODEL in .env.",
-            )
-        latency = round(_now_ms() - started, 1)
-        preview = (text or "").replace("\n", " ").strip()[:60]
+    if not claude.is_configured():
         return StatusCheck(
-            key="ai_agent",
-            label="AI agent",
-            status="ok" if preview else "degraded",
-            latency_ms=latency,
-            summary=(
-                f'Model "{model}" replied with "{preview}" in {int(latency)} ms'
-                if preview
-                else f'Model "{model}" returned an empty reply.'
-            ),
-            detail={"model": model, "provider": "grok", "response": text},
+            key="claude_api",
+            label="Claude API",
+            status="unknown",
+            summary="ANTHROPIC_API_KEY is not set (Claude is skipped in the chain).",
+            detail={"chain": _chain_names()},
+            hint="Add ANTHROPIC_API_KEY from https://platform.claude.com to .env.",
         )
-
-    host = settings.AI_OLLAMA_HOST
-    model = settings.AI_OLLAMA_MODEL
     started = _now_ms()
-
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "Reply with the single word: ok. "
-                    "No explanation."
-                ),
-            }
-        ],
-        "stream": False,
-        # 64 tokens is enough headroom for a small thinking budget +
-        # the actual reply on every model family we ship today
-        # (Gemma 4 26B, Llama 3.1, Qwen 2.5, …).
-        "options": {"num_predict": 64, "temperature": 0.0},
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(f"{host.rstrip('/')}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as exc:
+        models = await claude.list_models()
+    except Exception as exc:  # noqa: BLE001
         return StatusCheck(
-            key="ai_agent",
-            label="AI agent",
-            status="down",
+            key="claude_api",
+            label="Claude API",
+            status="degraded",
             latency_ms=round(_now_ms() - started, 1),
-            summary=f"HTTP {exc.response.status_code} from /api/chat",
-            detail={
-                "model": model,
-                "host": host,
-                "body": exc.response.text[:400],
-            },
-            hint=(
-                f"Ollama could not serve the model. Try "
-                f"`ollama run {model}` to see the full error."
-            ),
+            summary=f"Could not reach {settings.CLAUDE_API_BASE}",
+            detail={"error": str(exc)},
+            hint="Check ANTHROPIC_API_KEY and network access to api.anthropic.com.",
+        )
+    wanted = [settings.CLAUDE_MODEL, settings.CLAUDE_FAST_MODEL]
+    return StatusCheck(
+        key="claude_api",
+        label="Claude API",
+        status="ok",
+        latency_ms=round(_now_ms() - started, 1),
+        summary=(
+            f"Key accepted · live={settings.CLAUDE_MODEL} "
+            f"fast={settings.CLAUDE_FAST_MODEL}"
+        ),
+        detail={
+            "base": settings.CLAUDE_API_BASE,
+            "configured": wanted,
+            "configured_visible": [t for t in wanted if t in models],
+        },
+    )
+
+
+async def check_ai_agent() -> StatusCheck:
+    """End-to-end ping through the provider chain (fast tier).
+
+    Reports which model actually answered, so a failover to the local
+    models (internet or a cloud vendor down) shows up here as degraded.
+    """
+    from ..ai import llm
+
+    started = _now_ms()
+    chain = [b.NAME for b in llm.chain()]
+    try:
+        text, model = await llm.generate_with_fallback(
+            "Reply with the single word: ok. No explanation.",
+            primary_model=llm.fast_model(),
+            temperature=0.0,
+            max_tokens=16,
         )
     except Exception as exc:  # noqa: BLE001
         return StatusCheck(
@@ -568,68 +540,37 @@ async def check_ai_agent() -> StatusCheck:
             label="AI agent",
             status="down",
             latency_ms=round(_now_ms() - started, 1),
-            summary=f"Chat call failed: {exc.__class__.__name__}",
-            detail={"model": model, "host": host, "error": str(exc)},
-            hint=f"Run `ollama run {model}` and confirm it loads.",
+            summary=f"No provider answered: {exc.__class__.__name__}",
+            detail={"chain": chain, "error": str(exc)},
+            hint="Check the Grok/Claude keys, internet access, and `ollama list`.",
         )
-
     latency = round(_now_ms() - started, 1)
-    message = data.get("message") or {}
-    content = (message.get("content") or "").strip()
-    thinking = (message.get("thinking") or "").strip()
-    eval_count = int(data.get("eval_count") or 0)
-
-    if not content and not thinking and eval_count == 0:
-        return StatusCheck(
-            key="ai_agent",
-            label="AI agent",
-            status="degraded",
-            latency_ms=latency,
-            summary="Model loaded but produced 0 tokens.",
-            detail={"model": model, "raw": data},
-            hint=(
-                "Try restarting Ollama (`ollama stop` / restart the app) — "
-                "weights may be in a bad state."
-            ),
-        )
-
-    # Pick the most useful preview to show in the summary line.
-    preview = (content or thinking).replace("\n", " ").strip()
-    if len(preview) > 60:
-        preview = preview[:57] + "…"
-    flavor = "" if content else " (thinking only)"
-
-    # Anything north of ~8 s on a tiny prompt is suspicious — usually a
-    # cold-start, GPU contention, or the wrong execution provider.
-    level: StatusLevel = "ok" if latency < 8000 else "degraded"
+    preview = (text or "").replace("\n", " ").strip()[:60]
+    primary_models = llm.BACKENDS[chain[0]].tier_models(llm.FAST) if chain else []
+    on_fallback = bool(primary_models) and model not in primary_models
+    if not preview:
+        level: StatusLevel = "degraded"
+    elif on_fallback:
+        level = "degraded"
+    else:
+        level = "ok"
     return StatusCheck(
         key="ai_agent",
         label="AI agent",
         status=level,
         latency_ms=latency,
         summary=(
-            f'Model "{model}" replied with "{preview}"{flavor} '
-            f"in {int(latency)} ms"
+            f'Model "{model}" replied with "{preview}" in {int(latency)} ms'
+            + (" (fallback — primary provider unavailable)" if on_fallback else "")
+            if preview
+            else f'Model "{model}" returned an empty reply.'
         ),
         detail={
             "model": model,
-            "host": host,
-            "response": content,
-            "thinking_preview": thinking[:200] if thinking else None,
-            "eval_count": eval_count,
-            "prompt_eval_count": data.get("prompt_eval_count"),
-            "total_duration_ms": (
-                round(int(data["total_duration"]) / 1_000_000, 1)
-                if "total_duration" in data
-                else None
-            ),
+            "chain": chain,
+            "providers": llm.backend_states(),
+            "response": text,
         },
-        hint=(
-            "Latency is high — the first call after a long idle period "
-            "warms the model. Re-check after the next request."
-            if level == "degraded"
-            else None
-        ),
     )
 
 
@@ -1153,6 +1094,28 @@ async def check_google_apis() -> StatusCheck:
                     f"({'; '.join(r['errors']) or 'no detail'})"
                 )
 
+    from . import google_keepalive
+
+    for r in per_assistant:
+        ka = google_keepalive.keepalive_state().get(r["assistant_id"])
+        if ka is None:
+            continue
+        r["keepalive"] = {
+            "last_checked_at": ka.last_checked_at,
+            "last_ok_at": ka.last_ok_at,
+            "last_error": ka.last_error,
+            "refresh_token_expires_at": ka.refresh_token_expires_at,
+        }
+        if ka.refresh_token_expires_at is not None:
+            if level == "ok":
+                level = "degraded"
+            hints.append(
+                f"{r.get('granted_email')}: Google connection expires "
+                f"{ka.refresh_token_expires_at:%Y-%m-%d %H:%M} UTC — the OAuth app "
+                "is in Testing mode; publish it in Google Cloud console and "
+                "reconnect once."
+            )
+
     return StatusCheck(
         key="google_apis",
         label="Google APIs (Gmail + Calendar)",
@@ -1313,6 +1276,78 @@ async def check_telegram_api() -> StatusCheck:
     )
 
 
+_BACKUP_MAX_AGE_DAYS = 8
+
+
+async def check_backups() -> StatusCheck:
+    """Newest DB + media backup under backups/: is it fresh, complete, on Drive?"""
+    started = _now_ms()
+    backups_dir = PROJECT_ROOT / "backups"
+    dumps = sorted(
+        backups_dir.glob("*.dump"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    if not dumps:
+        return StatusCheck(
+            key="backups",
+            label="Backups (DB + media)",
+            status="down",
+            latency_ms=round(_now_ms() - started, 1),
+            summary="No backups found.",
+            detail={"dir": str(backups_dir)},
+            hint="uv run python scripts/db_backup_to_gdrive.py --keep 8",
+        )
+
+    newest = dumps[0]
+    age_s = time.time() - newest.stat().st_mtime
+    media = newest.with_name(newest.name[: -len(".dump")] + ".media.tar.gz")
+    uploaded = newest.with_suffix(".dump.uploaded").exists()
+    sync_dir = get_settings().backup_sync_dir
+    synced = sync_dir is not None and (sync_dir / newest.name).exists()
+    detail = {
+        "newest": newest.name,
+        "age": _format_duration(age_s),
+        "local_copies": len(dumps),
+        "media_archive": media.name if media.exists() else None,
+        "sync_folder": str(sync_dir) if sync_dir else None,
+        "in_sync_folder": synced,
+        "uploaded_to_drive": uploaded,
+    }
+
+    problems: list[str] = []
+    hint: Optional[str] = None
+    if age_s > _BACKUP_MAX_AGE_DAYS * 86400:
+        problems.append(f"newest is {_format_duration(age_s)} old")
+        hint = (
+            "Check logs/db_backup.log and that the agent is loaded: "
+            "scripts/register_daemons.sh --status"
+        )
+    if not media.exists():
+        problems.append("no media archive (photos/docs)")
+    if not (synced or uploaded):
+        problems.append("only on this Mac (no off-machine copy)")
+        hint = hint or (
+            "Install Google Drive for desktop (or set DB_BACKUP_SYNC_DIR), "
+            "or reconnect Google on the AI Assistant settings page. The "
+            "next hourly run copies the pending backup."
+        )
+
+    copies = [name for name, ok in (("sync folder", synced), ("Drive API", uploaded)) if ok]
+    summary = "; ".join(problems)
+    return StatusCheck(
+        key="backups",
+        label="Backups (DB + media)",
+        status="degraded" if problems else "ok",
+        latency_ms=round(_now_ms() - started, 1),
+        summary=(
+            summary[0].upper() + summary[1:]
+            if problems
+            else f"Last backup {_format_duration(age_s)} ago; copies: {', '.join(copies)}"
+        ),
+        detail=detail,
+        hint=hint,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -1325,7 +1360,9 @@ async def check_telegram_api() -> StatusCheck:
 _CHECK_REGISTRY: list[tuple[str, str, Callable[[], Awaitable[StatusCheck]]]] = [
     ("api", "FastAPI backend", check_api),
     ("postgres", "Postgres", check_postgres),
+    ("backups", "Backups (DB + media)", check_backups),
     ("grok_api", "Grok API", check_grok_api),
+    ("claude_api", "Claude API", check_claude_api),
     ("ollama_daemon", "Ollama daemon", check_ollama_daemon),
     ("ollama_models", "Ollama models", check_ollama_models),
     ("ai_agent", "AI agent", check_ai_agent),

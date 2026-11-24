@@ -784,6 +784,11 @@ export default function AiAssistantPage() {
   // says it. The toggle still works for a deliberate mute; it is not
   // persisted, so a leftover "off" from an old session can't stick.
   const [speakerOn, setSpeakerOn] = useState<boolean>(true);
+  // Whether Avi's microphone is listening. Shared by the header Mute
+  // button and the chat panel's mic button. Desktop starts ON (kitchen
+  // iMac: walk up and talk); mobile starts OFF (quiet/private places).
+  // Not persisted, so a stale "off" from an old session can't stick.
+  const [listening, setListening] = useState<boolean>(!isMobile);
   // Phones don't fit Avi, the camera, and the chat at a useful size
   // all at once. Face is the default; Chat swaps in the thread.
   const [mobilePane, setMobilePane] = useState<"face" | "chat">("face");
@@ -871,6 +876,31 @@ export default function AiAssistantPage() {
             widths instead of forcing the page to grow. */}
         <div className="max-w-7xl mx-auto px-3 sm:px-6 pb-2 flex items-center gap-2 overflow-x-auto no-scrollbar">
           <button
+            type="button"
+            onClick={() => setListening((l) => !l)}
+            aria-pressed={!listening}
+            data-testid="mic-toggle"
+            className={cn(
+              "inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs border shrink-0",
+              listening
+                ? "bg-rose-500/10 text-rose-700 border-rose-300 hover:bg-rose-500/20"
+                : "bg-muted text-muted-foreground border-border hover:bg-muted/70"
+            )}
+            title={
+              listening
+                ? `${assistantName} is listening. Click to mute the microphone.`
+                : `Microphone muted — ${assistantName} is not listening. Click to unmute.`
+            }
+          >
+            {listening ? (
+              <Mic className="h-3.5 w-3.5" />
+            ) : (
+              <MicOff className="h-3.5 w-3.5" />
+            )}
+            {listening ? "Listening" : "Muted"}
+          </button>
+          <button
+            type="button"
             onClick={() => setSpeakerOn((s) => !s)}
             className={cn(
               "inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs border shrink-0",
@@ -880,8 +910,8 @@ export default function AiAssistantPage() {
             )}
             title={
               speakerOn
-                ? "Avi speaks out loud. Click to mute."
-                : "Avi is muted. Click to enable voice."
+                ? `${assistantName} speaks out loud. Click to silence the voice.`
+                : `${assistantName}'s voice is off. Click to turn it on.`
             }
           >
             {speakerOn ? (
@@ -986,6 +1016,7 @@ export default function AiAssistantPage() {
             isWaving={isWaving}
             amplitude={audio.amplitude}
             isMobile={isMobile}
+            listening={listening}
           />
           <LiveCameraPanel
             familyId={familyId}
@@ -1009,6 +1040,8 @@ export default function AiAssistantPage() {
             voiceGender={voiceGender}
             liveSessionId={liveSessionId}
             isMobile={isMobile}
+            listening={listening}
+            onListeningChange={setListening}
           />
         </div>
       </main>
@@ -1031,12 +1064,14 @@ function AviStage({
   isWaving,
   amplitude,
   isMobile,
+  listening,
 }: {
   assistant: Assistant | undefined;
   assistantName: string;
   isSpeaking: boolean;
   isWaving: boolean;
   amplitude: number;
+  listening: boolean;
   // On mobile Avi is a tall portrait above a camera that fills the
   // rest of the Face tab. On desktop we keep the cinematic stage.
   isMobile: boolean;
@@ -1141,7 +1176,7 @@ function AviStage({
                 isSpeaking ? "text-primary" : "text-muted-foreground"
               )}
             >
-              {isSpeaking ? "speaking…" : "listening"}
+              {isSpeaking ? "speaking…" : listening ? "listening" : "muted"}
             </span>
           </div>
         </div>
@@ -1460,10 +1495,10 @@ function StatusBadges({
           llm === undefined
             ? undefined
             : !llm.available
-            ? `Ollama at ${llm.host} is not responding.`
+            ? `No LLM provider is answering (${llm.error ?? llm.host}).`
             : !llm.model_pulled
-            ? `Run 'ollama pull ${llm.model}' to enable chat.`
-            : `Ollama ${llm.host} — installed: ${
+            ? `Run 'ollama pull ${llm.model}' to enable offline chat.`
+            : `Answering via ${llm.host} — models: ${
                 llm.installed_models.join(", ") || "(none)"
               }`
         }
@@ -2247,6 +2282,8 @@ function ChatPanel({
   voiceGender,
   liveSessionId,
   isMobile,
+  listening,
+  onListeningChange,
 }: {
   familyId: number;
   assistantName: string;
@@ -2254,10 +2291,11 @@ function ChatPanel({
   audio: AudioQueueHandle;
   voiceGender: "male" | "female";
   liveSessionId: number | null;
-  // Drives the "mic default OFF on phones, ON on desktops" UX rule.
-  // Members on mobile usually want to type quietly (school pickup,
-  // bedtime, in-public); the kitchen iMac wants to walk-up-and-talk.
   isMobile: boolean;
+  // Owned by the page so the header Mute button and the mic button
+  // here always agree.
+  listening: boolean;
+  onListeningChange: (listening: boolean) => void;
 }) {
   const toast = useToast();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -2266,23 +2304,6 @@ function ChatPanel({
   const [recognizedPersonId, setRecognizedPersonId] = useState<number | null>(
     null
   );
-  // Mic default is PLATFORM-AWARE, not persisted:
-  //
-  //   * Desktop  → ON. Family iMac in the kitchen — they want to walk
-  //                up and start talking without having to click a mic
-  //                button first.
-  //   * Mobile   → OFF. Phones get used in quiet/private contexts
-  //                (bed, library, school pickup) where auto-listening
-  //                is rude AND it conflicts with the device's audio
-  //                routing while Avi is also speaking. Toggle still
-  //                works mid-session for "OK, listen now".
-  //
-  // We deliberately do NOT seed from localStorage; an old "0" value
-  // from a previous testing session was the reason the mic appeared
-  // dead on refresh. Note: the browser still requires a user gesture
-  // for the permission prompt the first time, which happens
-  // automatically when the effect below attempts to `rec.start()`.
-  const [listening, setListening] = useState<boolean>(!isMobile);
   const [speechSupported, setSpeechSupported] = useState(false);
   const messagesRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -2718,12 +2739,17 @@ function ChatPanel({
   //   * Errors toast at most ONCE per kind per page load.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recRef = useRef<any | null>(null);
-  // What the user *wants*: read by the recognizer's onend callback so
-  // it knows whether to restart itself after each chunk.
+  // What the user *wants*. Updated during render (not in an effect) so
+  // a result or timer that lands between the Mute click and the next
+  // effect already sees the mic as off.
   const shouldListenRef = useRef(listening);
-  useEffect(() => {
-    shouldListenRef.current = listening;
-  }, [listening]);
+  shouldListenRef.current = listening;
+  // Set by the mount-once effect: abort the recognizer and drop any
+  // captured-but-unsent speech, pending auto-submit and restart.
+  const muteRecognizerRef = useRef<() => void>(() => undefined);
+  // Counterpart for unmute / end of Avi's speech: start fresh, without
+  // the error backoff left over from before the mute.
+  const resumeRecognizerRef = useRef<(origin: string) => void>(() => undefined);
 
   // Mount-once: create the recognizer the moment we detect support.
   useEffect(() => {
@@ -2745,6 +2771,9 @@ function ChatPanel({
     // so we concatenate until the user pauses *and* Avi isn't
     // speaking — only then do we submit and clear.
     let pendingFinal = "";
+    // True while the input box holds speech (not typed text), so muting
+    // clears dictation without wiping something the user typed.
+    let inputFromSpeech = false;
     // Debounced auto-submit: armed when we see an `isFinal`, cancelled
     // by any subsequent speech (interim or final). See SUBMIT_DEBOUNCE_MS.
     let submitTimer: number | null = null;
@@ -2805,6 +2834,13 @@ function ChatPanel({
         [k: number]: { transcript: string };
       }[];
     }) => {
+      // Muted: the engine can still flush audio it captured before the
+      // abort landed. None of it may reach the chat.
+      if (!shouldListenRef.current) {
+        cancelSubmitTimer();
+        pendingFinal = "";
+        return;
+      }
       // Belt-and-suspenders echo cancellation. The combined effect
       // below stops the recognizer during TTS playback so this
       // branch should rarely fire — but if Avi's voice still leaks
@@ -2818,7 +2854,8 @@ function ChatPanel({
       ) {
         cancelSubmitTimer();
         pendingFinal = "";
-        setInput("");
+        if (inputFromSpeech) setInput("");
+        inputFromSpeech = false;
         return;
       }
       let interim = "";
@@ -2841,6 +2878,7 @@ function ChatPanel({
         cancelSubmitTimer();
       }
       setInput((pendingFinal + " " + interim).trim());
+      inputFromSpeech = true;
       if (!sawFinal) return;
       if (isStreamingRef.current) return;
       // Arm (or re-arm) the debounce. The actual submit fires only
@@ -2849,6 +2887,7 @@ function ChatPanel({
       submitTimer = window.setTimeout(() => {
         submitTimer = null;
         if (
+          !shouldListenRef.current ||
           audioSpeakingRef.current ||
           Date.now() < wasSpeakingUntilRef.current ||
           isStreamingRef.current
@@ -2859,6 +2898,7 @@ function ChatPanel({
         if (!toSend) return;
         pendingFinal = "";
         setInput("");
+        inputFromSpeech = false;
         sendUserMessageRef.current(toSend);
       }, SUBMIT_DEBOUNCE_MS);
     };
@@ -2899,12 +2939,31 @@ function ChatPanel({
       const inEchoWindow =
         audioSpeakingRef.current ||
         Date.now() < wasSpeakingUntilRef.current;
-      if (tail && !inEchoWindow && !isStreamingRef.current) {
+      if (tail && shouldListenRef.current && !inEchoWindow && !isStreamingRef.current) {
         pendingFinal = "";
         setInput("");
+        inputFromSpeech = false;
         sendUserMessageRef.current(tail);
       }
       scheduleRestart();
+    };
+
+    muteRecognizerRef.current = () => {
+      if (restartTimer !== null) {
+        clearTimeout(restartTimer);
+        restartTimer = null;
+      }
+      cancelSubmitTimer();
+      pendingFinal = "";
+      if (inputFromSpeech) setInput("");
+      inputFromSpeech = false;
+      try {
+        // abort(), unlike stop(), discards audio already captured
+        // instead of delivering it as a final result.
+        rec.abort();
+      } catch {
+        /* not running — ignore */
+      }
     };
 
     // Single helper: attempt to start the recognizer iff the user
@@ -2914,12 +2973,25 @@ function ChatPanel({
     const tryStart = (origin: string) => {
       if (!shouldListenRef.current) return;
       if (running) return;
+      // Page clicks call this too; never open the mic over Avi's voice.
+      if (audioSpeakingRef.current || Date.now() < wasSpeakingUntilRef.current) return;
       try {
         rec.start();
         console.info(`[speech] start() called from ${origin}`);
       } catch (err) {
         console.warn(`[speech] start() threw from ${origin}:`, err);
       }
+    };
+
+    resumeRecognizerRef.current = (origin: string) => {
+      consecutiveErrors = 0;
+      if (restartTimer !== null) {
+        clearTimeout(restartTimer);
+        restartTimer = null;
+      }
+      // Still winding down from the mute's abort(): onend will call
+      // scheduleRestart, which now sees shouldListen and restarts.
+      tryStart(origin);
     };
 
     recRef.current = rec;
@@ -2974,9 +3046,12 @@ function ChatPanel({
         restartTimer = null;
       }
       cancelSubmitTimer();
+      muteRecognizerRef.current = () => undefined;
+      resumeRecognizerRef.current = () => undefined;
       try {
         rec.onend = null;
-        rec.stop();
+        rec.onresult = null;
+        rec.abort();
       } catch {
         /* noop */
       }
@@ -3012,17 +3087,16 @@ function ChatPanel({
         /* already stopped — ignore */
       }
     };
-    const start = () => {
-      if (!shouldListenRef.current) return;
-      try {
-        rec.start();
-      } catch {
-        /* already started — ignore */
-      }
-    };
+    const start = () => resumeRecognizerRef.current("listen-effect");
 
     const wasSpeaking = prevIsSpeakingRef.current;
     prevIsSpeakingRef.current = audio.isSpeaking;
+
+    if (!listening) {
+      muteRecognizerRef.current();
+      console.info("[speech] muted (listening toggled off)");
+      return;
+    }
 
     if (audio.isSpeaking) {
       // Push the until-time out so onresult drops anything that
@@ -3044,12 +3118,6 @@ function ChatPanel({
     // Avi's own last words.
     if (wasSpeaking) {
       wasSpeakingUntilRef.current = Date.now() + ECHO_GRACE_MS;
-    }
-
-    if (!listening) {
-      stop();
-      console.info("[speech] stopped (listening toggled off)");
-      return;
     }
 
     const remaining = Math.max(
@@ -3146,7 +3214,9 @@ function ChatPanel({
                 : "Start listening"
               : "Speech recognition not supported in this browser"
           }
-          onClick={() => setListening((l) => !l)}
+          aria-pressed={listening}
+          data-testid="chat-mic-toggle"
+          onClick={() => onListeningChange(!listening)}
         >
           {listening ? (
             <Mic className="h-4 w-4" />

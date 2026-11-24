@@ -93,13 +93,13 @@ os.environ.setdefault("ADMIN_EMAILS", "integration-admin@example.com")
 # fine-tune tag is set. Force it off in tests so a stray un-mocked
 # triage path can't try to reach Ollama.
 os.environ.setdefault("AI_FAMILY_QA_SHORTCUT_ENABLED", "false")
-# Live LLM is Grok. Tests mock the brain, so a dummy key is enough
-# to construct settings without touching api.x.ai.
-os.environ.setdefault("AI_LLM_PROVIDER", "grok")
+# Tests mock the brain, so a dummy key is enough to construct settings
+# without touching api.x.ai. Grok-only so an un-mocked path can't fall
+# through to the real local Ollama or Claude; chain tests patch this.
+os.environ["AI_LLM_PROVIDERS"] = "grok"
 os.environ.setdefault("GROK_API_KEY", "test-grok-key-not-for-prod")
 os.environ.setdefault("GROK_MODEL", "grok-4.6")
 os.environ.setdefault("GROK_FAST_MODEL", "grok-4.3")
-os.environ.setdefault("AI_OLLAMA_ENABLED", "false")
 
 # ---------------------------------------------------------------------------
 # Now safe to import the app + DB layer. Everything below runs with the

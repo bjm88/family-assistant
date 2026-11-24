@@ -78,8 +78,8 @@ from .llm import (
     LLMError,
     LLMUnavailable,
     fast_model,
-    system_prompt_for_avi,
 )
+from .persona import system_prompt_for_avi
 
 
 logger = logging.getLogger(__name__)

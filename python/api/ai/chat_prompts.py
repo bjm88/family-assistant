@@ -16,7 +16,7 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 
 from .. import models
-from . import authz, ollama, prompts, rag, schema_catalog
+from . import authz, persona, prompts, rag, schema_catalog
 
 
 def build_rag_block(
@@ -100,7 +100,7 @@ def build_system_prompt(
     be overridden by anything appended later in the conversation.
     """
     parts: List[str] = [
-        ollama.system_prompt_for_avi(assistant_name, family_name)
+        persona.system_prompt_for_avi(assistant_name, family_name)
     ]
     if capabilities_block:
         parts.append("--- What you can do ---\n" + capabilities_block)

@@ -1,109 +1,240 @@
-"""Provider-agnostic LLM facade.
+"""The one LLM adapter: every model call in the app goes through here.
 
-Callers (agent loop, triage, family Q&A, planner, fast-ack) import
-from this module instead of talking to Ollama or Grok directly.
+:setting:`AI_LLM_PROVIDERS` is an ordered chain (default
+``grok,claude,ollama``). Each call tries the first provider and falls
+through to the next when it fails, so Avi keeps answering on the local
+Ollama models when the internet (or a cloud vendor) is down:
 
-``AI_LLM_PROVIDER`` selects the backend:
+* Unconfigured providers (no key, placeholder key) are skipped.
+* A provider that is unreachable, rejects its key, or is overloaded is
+  marked down for :setting:`AI_LLM_FAILOVER_COOLDOWN_S` so later calls
+  go straight to the next one instead of each paying a connect timeout.
+  If every provider is marked down they are all tried anyway.
+* A missing model only skips that model; the provider's next model for
+  the tier is tried (e.g. Gemma 4 31B, then Muse Glimmer).
+* A timeout or a bad-request error moves on to the next provider
+  without marking the failing one down.
 
-* ``grok`` (default) — xAI Chat Completions. Used for every LLM task
-  except web search.
-* ``ollama`` — local daemon. Parked until a household fine-tune is
-  ready; flip the env var to re-enable.
+Calls come in two tiers. ``heavy`` (agent loop, streaming chat,
+greetings) and ``fast`` (classifiers, acks, planners, family Q&A); each
+backend maps a tier to its own models via ``tier_models``. A ``model``
+override is honoured only by the backend that owns that tag — a Grok
+id is never sent to Ollama and vice versa — and otherwise just selects
+the tier.
 
-Gemini is intentionally *not* a provider here. Web search stays on
-Gemini via :mod:`api.integrations.web_search`.
+Backends (:mod:`.grok`, :mod:`.claude`, :mod:`.ollama`) share the types
+in :mod:`.llm_types` and raise its error classes, so callers only ever
+catch :class:`LLMError` and friends from this module.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional
+import time
+from types import ModuleType
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from ..config import get_settings
-from . import grok, ollama
-from .ollama import ChatWithToolsResult, ToolCall, system_prompt_for_avi
+from . import claude, grok, ollama
+from .llm_types import (
+    ChatWithToolsResult,
+    LLMError,
+    LLMModelMissing,
+    LLMTimeout,
+    LLMUnavailable,
+    ToolCall,
+    new_call_id,
+)
 
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
 
-class LLMError(RuntimeError):
-    """Base for anything the live LLM backend raised."""
+HEAVY = "heavy"
+FAST = "fast"
+
+BACKENDS: Dict[str, ModuleType] = {
+    grok.NAME: grok,
+    claude.NAME: claude,
+    ollama.NAME: ollama,
+}
+
+# Backend name -> monotonic time until which it is considered down.
+_down_until: Dict[str, float] = {}
 
 
-class LLMUnavailable(LLMError):
-    """Key missing, daemon down, or model not available."""
+# ---------------------------------------------------------------------------
+# Chain + health bookkeeping
+# ---------------------------------------------------------------------------
 
 
-class LLMTimeout(LLMError):
-    """Backend accepted the request but did not answer in time."""
+def chain() -> List[ModuleType]:
+    """Configured backends in priority order."""
+    out: List[ModuleType] = []
+    for raw in (get_settings().AI_LLM_PROVIDERS or "").split(","):
+        backend = BACKENDS.get(raw.strip().lower())
+        if backend is not None and backend not in out and backend.is_configured():
+            out.append(backend)
+    return out or [ollama]
+
+
+def _attempt_order() -> List[ModuleType]:
+    now = time.monotonic()
+    configured = chain()
+    up = [b for b in configured if _down_until.get(b.NAME, 0.0) <= now]
+    return up or configured
+
+
+def _mark_down(backend: ModuleType, exc: BaseException) -> None:
+    cooldown = max(0.0, float(get_settings().AI_LLM_FAILOVER_COOLDOWN_S))
+    was_up = _down_until.get(backend.NAME, 0.0) <= time.monotonic()
+    _down_until[backend.NAME] = time.monotonic() + cooldown
+    if was_up:
+        logger.warning(
+            "[llm] %s marked down for %.0fs: %s", backend.NAME, cooldown, exc
+        )
+
+
+def _mark_up(backend: ModuleType) -> None:
+    if _down_until.pop(backend.NAME, None) is not None:
+        logger.info("[llm] %s is answering again", backend.NAME)
+
+
+def reset_health() -> None:
+    """Forget every down mark (tests, manual retry from the status page)."""
+    _down_until.clear()
+
+
+def backend_states() -> List[Dict[str, Any]]:
+    """Chain snapshot for the status page."""
+    now = time.monotonic()
+    active = chain()
+    names = [n.strip().lower() for n in (get_settings().AI_LLM_PROVIDERS or "").split(",") if n.strip()]
+    out = []
+    for name in dict.fromkeys(names):
+        backend = BACKENDS.get(name)
+        if backend is None:
+            continue
+        down_for = _down_until.get(name, 0.0) - now
+        out.append(
+            {
+                "name": name,
+                "configured": backend.is_configured(),
+                "in_chain": backend in active,
+                "down_for_s": round(down_for, 1) if down_for > 0 else 0.0,
+                "heavy_models": backend.tier_models(HEAVY),
+                "fast_models": backend.tier_models(FAST),
+            }
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Model selection
+# ---------------------------------------------------------------------------
+
+
+def _tier_of(override: Optional[str], default: str) -> str:
+    tag = (override or "").strip()
+    if not tag:
+        return default
+    for backend in BACKENDS.values():
+        fast = backend.tier_models(FAST)
+        heavy = backend.tier_models(HEAVY)
+        if fast and tag == fast[0]:
+            return FAST
+        if heavy and tag == heavy[0]:
+            return HEAVY
+    return default
+
+
+def _models_for(backend: ModuleType, tier: str, override: Optional[str]) -> List[str]:
+    tier_list = backend.tier_models(tier)
+    tag = (override or "").strip()
+    if tag and backend.owns_model(tag):
+        return [tag] + [m for m in tier_list if m != tag]
+    return tier_list
 
 
 def provider() -> str:
-    return get_settings().llm_provider
-
-
-def _looks_like_grok(tag: str) -> bool:
-    return tag.lower().startswith("grok")
-
-
-def _model() -> str:
-    settings = get_settings()
-    if provider() == "ollama":
-        return settings.AI_OLLAMA_MODEL
-    return settings.GROK_MODEL
-
-
-def fast_model() -> str:
-    settings = get_settings()
-    if provider() == "ollama":
-        return settings.AI_OLLAMA_FAST_MODEL or settings.AI_OLLAMA_MODEL
-    return settings.GROK_FAST_MODEL or settings.GROK_MODEL
+    """Name of the backend that will be tried first right now."""
+    return _attempt_order()[0].NAME
 
 
 def resolve_model(override: Optional[str] = None, *, fast: bool = False) -> str:
-    """Pick a model tag, ignoring leftover Ollama tags when Grok is live.
+    """The model the first backend would use for this call (for logs/UI)."""
+    tier = _tier_of(override, FAST if fast else HEAVY)
+    models = _models_for(_attempt_order()[0], tier, override)
+    return models[0] if models else (override or "")
 
-    ``AI_FAMILY_QA_MODEL=llama3.2:3b`` (or any other local tag) is
-    still sitting in some .env files from the fine-tune pipeline.
-    Sending that string to api.x.ai 404s, so we drop any override
-    that doesn't match the active provider.
-    """
-    tag = (override or "").strip()
-    fallback = fast_model() if fast else _model()
-    if not tag:
-        return fallback
-    if provider() == "grok" and not _looks_like_grok(tag):
-        return fallback
-    if provider() == "ollama" and _looks_like_grok(tag):
-        return fallback
-    return tag
+
+def _model() -> str:
+    return resolve_model()
+
+
+def fast_model() -> str:
+    return resolve_model(fast=True)
 
 
 def ollama_warmup_enabled() -> bool:
-    """True only when local inference is actually in use."""
-    settings = get_settings()
-    return provider() == "ollama" or bool(settings.AI_OLLAMA_ENABLED)
+    """True when the local models are part of the chain and should stay warm."""
+    return ollama in chain()
 
 
-def _wrap_ollama(exc: BaseException) -> LLMError:
-    if isinstance(exc, ollama.OllamaTimeout):
-        return LLMTimeout(str(exc))
-    if isinstance(exc, ollama.OllamaUnavailable):
-        return LLMUnavailable(str(exc))
-    if isinstance(exc, ollama.OllamaError):
-        return LLMError(str(exc))
-    return LLMError(str(exc))
+# ---------------------------------------------------------------------------
+# Failover core
+# ---------------------------------------------------------------------------
 
 
-def _wrap_grok(exc: BaseException) -> LLMError:
-    if isinstance(exc, grok.GrokTimeout):
-        return LLMTimeout(str(exc))
-    if isinstance(exc, grok.GrokUnavailable):
-        return LLMUnavailable(str(exc))
-    if isinstance(exc, grok.GrokError):
-        return LLMError(str(exc))
-    return LLMError(str(exc))
+def _combined_error(op: str, errors: List[Tuple[str, str, LLMError]]) -> LLMError:
+    detail = "; ".join(f"{name}/{model}: {exc}" for name, model, exc in errors)
+    message = f"All LLM providers failed for {op}: {detail}"
+    excs = [e for _, _, e in errors]
+    if excs and all(isinstance(e, LLMTimeout) for e in excs):
+        return LLMTimeout(message)
+    if excs and all(isinstance(e, LLMUnavailable) for e in excs):
+        return LLMUnavailable(message)
+    return LLMError(message)
+
+
+async def _call(
+    op: str,
+    tier: str,
+    override: Optional[str],
+    fn: Callable[[ModuleType, str], Awaitable[T]],
+) -> Tuple[T, ModuleType, str]:
+    errors: List[Tuple[str, str, LLMError]] = []
+    for backend in _attempt_order():
+        for model in _models_for(backend, tier, override):
+            try:
+                result = await fn(backend, model)
+            except LLMModelMissing as exc:
+                errors.append((backend.NAME, model, exc))
+                continue
+            except LLMUnavailable as exc:
+                errors.append((backend.NAME, model, exc))
+                _mark_down(backend, exc)
+                break
+            except LLMError as exc:
+                errors.append((backend.NAME, model, exc))
+                break
+            _mark_up(backend)
+            if errors:
+                logger.warning(
+                    "[llm] %s answered by fallback %s/%s after: %s",
+                    op,
+                    backend.NAME,
+                    model,
+                    "; ".join(f"{n}/{m}: {type(e).__name__}" for n, m, e in errors),
+                )
+            return result, backend, model
+    raise _combined_error(op, errors)
+
+
+# ---------------------------------------------------------------------------
+# Public calls
+# ---------------------------------------------------------------------------
 
 
 async def generate(
@@ -114,25 +245,15 @@ async def generate(
     max_tokens: int = 300,
     model: Optional[str] = None,
 ) -> str:
-    target = resolve_model(model)
-    try:
-        if provider() == "ollama":
-            return await ollama.generate(
-                prompt,
-                system=system,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                model=target,
-            )
-        return await grok.generate(
-            prompt,
-            system=system,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            model=target,
-        )
-    except (ollama.OllamaError, grok.GrokError) as exc:
-        raise (_wrap_ollama(exc) if isinstance(exc, ollama.OllamaError) else _wrap_grok(exc)) from exc
+    text, _, _ = await _call(
+        "generate",
+        _tier_of(model, HEAVY),
+        model,
+        lambda b, m: b.generate(
+            prompt, system=system, temperature=temperature, max_tokens=max_tokens, model=m
+        ),
+    )
+    return text
 
 
 async def generate_with_fallback(
@@ -143,34 +264,21 @@ async def generate_with_fallback(
     system: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 300,
-) -> tuple[str, str]:
-    primary = resolve_model(primary_model, fast=True)
-    fallback = resolve_model(fallback_model) if fallback_model else _model()
-    try:
-        text = await generate(
-            prompt,
-            system=system,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            model=primary,
-        )
-        return text, primary
-    except LLMUnavailable:
-        if primary == fallback:
-            raise
-        logger.warning(
-            "Primary model %r unavailable — falling back to %r",
-            primary,
-            fallback,
-        )
-        text = await generate(
-            prompt,
-            system=system,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            model=fallback,
-        )
-        return text, fallback
+) -> Tuple[str, str]:
+    """Fast-tier generate that also reports which model answered.
+
+    ``fallback_model`` is accepted for older callers; the provider chain
+    already falls back across models and backends.
+    """
+    text, _, used = await _call(
+        "generate",
+        _tier_of(primary_model, FAST),
+        primary_model,
+        lambda b, m: b.generate(
+            prompt, system=system, temperature=temperature, max_tokens=max_tokens, model=m
+        ),
+    )
+    return text, used
 
 
 async def chat_oneshot(
@@ -182,27 +290,20 @@ async def chat_oneshot(
     max_tokens: int = 8,
     timeout_s: float = 10.0,
 ) -> str:
-    target = resolve_model(model, fast=True)
-    try:
-        if provider() == "ollama":
-            return await ollama.chat_oneshot(
-                system=system,
-                user=user,
-                model=target,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout_s=timeout_s,
-            )
-        return await grok.chat_oneshot(
+    text, _, _ = await _call(
+        "chat_oneshot",
+        _tier_of(model, FAST),
+        model,
+        lambda b, m: b.chat_oneshot(
             system=system,
             user=user,
-            model=target,
+            model=m,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_s=timeout_s,
-        )
-    except (ollama.OllamaError, grok.GrokError) as exc:
-        raise (_wrap_ollama(exc) if isinstance(exc, ollama.OllamaError) else _wrap_grok(exc)) from exc
+        ),
+    )
+    return text
 
 
 async def chat_with_tools(
@@ -216,57 +317,76 @@ async def chat_with_tools(
     think: Optional[bool] = False,
     **_ignored: Any,
 ) -> ChatWithToolsResult:
-    target = resolve_model(model)
-    try:
-        if provider() == "ollama":
-            return await ollama.chat_with_tools(
-                messages,
-                tools=tools,
-                system=system,
-                model=target,
-                temperature=temperature,
-                timeout_seconds=timeout_seconds,
-                think=think,
-            )
-        return await grok.chat_with_tools(
+    result, _, _ = await _call(
+        "chat_with_tools",
+        _tier_of(model, HEAVY),
+        model,
+        lambda b, m: b.chat_with_tools(
             messages,
             tools=tools,
             system=system,
-            model=target,
+            model=m,
             temperature=temperature,
             timeout_seconds=timeout_seconds,
-        )
-    except (ollama.OllamaError, grok.GrokError) as exc:
-        raise (_wrap_ollama(exc) if isinstance(exc, ollama.OllamaError) else _wrap_grok(exc)) from exc
+            think=think,
+        ),
+    )
+    # The next turn may run on a different backend; every call needs an
+    # id so its tool result can be paired with it.
+    for call in result.tool_calls:
+        if not call.id:
+            call.id = new_call_id()
+    return result
 
 
 async def chat_stream(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     *,
     system: Optional[str] = None,
     temperature: float = 0.7,
 ) -> AsyncIterator[str]:
-    if provider() == "ollama":
-        async for chunk in ollama.chat_stream(
-            messages, system=system, temperature=temperature
-        ):
-            yield chunk
-        return
-    async for chunk in grok.chat_stream(
-        messages,
-        system=system,
-        temperature=temperature,
-        model=_model(),
-    ):
-        yield chunk
+    """Stream a heavy-tier reply. Falls back only before the first chunk."""
+    errors: List[Tuple[str, str, LLMError]] = []
+    for backend in _attempt_order():
+        for model in _models_for(backend, HEAVY, None):
+            started = False
+            try:
+                async for chunk in backend.chat_stream(
+                    messages, system=system, temperature=temperature, model=model
+                ):
+                    started = True
+                    yield chunk
+            except LLMError as exc:
+                if started:
+                    raise
+                errors.append((backend.NAME, model, exc))
+                if isinstance(exc, LLMModelMissing):
+                    continue
+                if isinstance(exc, LLMUnavailable):
+                    _mark_down(backend, exc)
+                break
+            else:
+                _mark_up(backend)
+                if errors:
+                    logger.warning(
+                        "[llm] chat_stream answered by fallback %s/%s", backend.NAME, model
+                    )
+                return
+    raise _combined_error("chat_stream", errors)
 
 
 __all__ = [
+    "BACKENDS",
     "ChatWithToolsResult",
+    "FAST",
+    "HEAVY",
     "LLMError",
+    "LLMModelMissing",
     "LLMTimeout",
     "LLMUnavailable",
     "ToolCall",
+    "backend_states",
+    "chain",
     "chat_oneshot",
     "chat_stream",
     "chat_with_tools",
@@ -275,7 +395,6 @@ __all__ = [
     "generate_with_fallback",
     "ollama_warmup_enabled",
     "provider",
+    "reset_health",
     "resolve_model",
-    "system_prompt_for_avi",
-    "_model",
 ]

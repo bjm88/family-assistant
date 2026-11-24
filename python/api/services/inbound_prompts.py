@@ -45,7 +45,7 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..ai import authz, ollama, prompts, rag
+from ..ai import authz, persona, prompts, rag
 from ..ai.assistants import assistant_id_for_family
 
 
@@ -209,7 +209,7 @@ def build_inbound_system_prompt(
         assistant_id = assistant_id_for_family(db, family_id)
 
     parts: List[str] = [
-        ollama.system_prompt_for_avi(assistant_name, family_name),
+        persona.system_prompt_for_avi(assistant_name, family_name),
         _TOOL_PREFERENCE_HINT,
     ]
     house_context = prompts.render_context_blocks()

@@ -98,32 +98,36 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_PROJECT_ID: Optional[str] = None
 
-    # xAI Grok — the default live LLM for every non-search task
-    # (agent loop, triage, family Q&A, planner, fast actions, acks).
-    # ``GROK_API_KEY`` is the preferred name; ``XAI_API_KEY`` is
-    # accepted as an alias so a key minted in the xAI console works
+    # ---- LLM provider chain (api.ai.llm) ------------------------------
+    # Ordered, comma-separated. Every LLM call tries the first provider
+    # and falls through to the next on failure, so ``ollama`` last means
+    # Avi keeps answering on local models when the internet is down.
+    # Providers without credentials are skipped. Gemini is not a value
+    # here — it is only used for web search via FA_SEARCH_PROVIDER.
+    AI_LLM_PROVIDERS: str = "grok,claude,ollama"
+    # After a provider is unreachable / rejects its key / is overloaded,
+    # skip it for this many seconds before probing it again.
+    AI_LLM_FAILOVER_COOLDOWN_S: float = 60.0
+
+    # xAI Grok. ``GROK_API_KEY`` is the preferred name; ``XAI_API_KEY``
+    # is accepted as an alias so a key minted in the xAI console works
     # without renaming.
     GROK_API_KEY: Optional[str] = None
     XAI_API_KEY: Optional[str] = None
     GROK_API_BASE: str = "https://api.x.ai/v1"
-    # Flagship conversational / tool-calling model. Override in .env
-    # when xAI ships a newer stable alias.
+    # Heavy tier: agent loop, streaming chat, greetings.
     GROK_MODEL: str = "grok-4.6"
-    # Cheaper / faster sibling used for one-token classifiers, family
-    # recall, the SQL planner, and the action micro-loop. Still Grok
-    # — never Ollama, never Gemini — unless AI_LLM_PROVIDER=ollama.
+    # Fast tier: one-token classifiers, family recall, the SQL planner,
+    # the action micro-loop, acks.
     GROK_FAST_MODEL: str = "grok-4.3"
 
-    # Which backend drives Avi's LLM calls. ``grok`` (default) talks
-    # to xAI; ``ollama`` is the parked local path for a future
-    # household fine-tune. Gemini is *not* a value here — it is only
-    # used for web search via FA_SEARCH_PROVIDER.
-    AI_LLM_PROVIDER: str = "grok"
-    # When false (default) the Ollama warmup loop is skipped and
-    # status checks treat a missing daemon as parked rather than
-    # down. Flip true only when you intend to actually run inference
-    # on the local models (or when AI_LLM_PROVIDER=ollama).
-    AI_OLLAMA_ENABLED: bool = False
+    # Anthropic Claude. Skipped while the key is unset or a placeholder.
+    ANTHROPIC_API_KEY: Optional[str] = None
+    CLAUDE_API_BASE: str = "https://api.anthropic.com/v1"
+    CLAUDE_MODEL: str = "claude-sonnet-5-5"
+    CLAUDE_FAST_MODEL: str = "claude-haiku-5-5"
+    # output_config.effort for agent turns: low | medium | high.
+    CLAUDE_EFFORT: str = "medium"
 
     # ---- Google OAuth (Gmail + Calendar for the assistant) -------------
     # Created in Google Cloud Console under
@@ -143,28 +147,20 @@ class Settings(BaseSettings):
     # adjust if you serve the UI from a different origin.
     GOOGLE_OAUTH_POST_LOGIN_REDIRECT: str = "http://localhost:5173/admin"
 
-    # ---- Local AI assistant (Avi) --------------------------------------
-    # Base URL for the local Ollama daemon that hosts the chat LLM.
+    # ---- Local models (Ollama, the offline fallback) -------------------
+    # Base URL for the local Ollama daemon.
     AI_OLLAMA_HOST: str = "http://localhost:11434"
-    # Model pulled via ``ollama pull <name>``. Default matches what the
-    # user has running (``gemma4``); override in .env to point at any
-    # other tag like ``gemma3:27b`` or a custom local model.
-    AI_OLLAMA_MODEL: str = "gemma4"
-    # Lightweight companion model for fast/structured tasks: the RAG
-    # planner ("which SELECTs should I run?"), greeting follow-up
-    # generation, query classification, etc. Pick something an order
-    # of magnitude faster than the main chat model — ``gemma4:e2b`` is
-    # the natural choice when the user has pulled it; falls back to
-    # the main model if this one isn't installed in Ollama.
+    # Heavy tier offline: Google Gemma 4 31B (dense, 256K context).
+    AI_OLLAMA_MODEL: str = "gemma4:31b"
+    # Tried when the heavy model is missing or errors: Meta Muse
+    # Glimmer 30B, tuned for tool use. Empty disables the backup.
+    AI_OLLAMA_BACKUP_MODEL: str = "muse-glimmer"
+    # Fast tier offline (classifiers, acks, planner). Falls back to the
+    # heavy model when it isn't pulled.
     AI_OLLAMA_FAST_MODEL: str = "gemma4:e2b"
-    # Optional third tier — used by AI-owned monitoring tasks
-    # (`task_kind="monitoring"`, `owner_kind="ai"`) where a single run
-    # can spend 30+ s reasoning over web-search results. Defaults to
-    # the heavy model so a fresh install needs no extra `ollama pull`,
-    # but you can point this at a beefier reasoner (e.g.
-    # ``gpt-oss:120b``, ``qwen2.5:72b``) once it's installed and
-    # monitoring runs will use it instead of the conversational model.
-    # Empty string means "fall back to AI_OLLAMA_MODEL".
+    # Optional local model for AI-owned monitoring runs, which can
+    # spend 30+ s reasoning over web-search results. Only used when the
+    # run lands on Ollama; empty means the heavy tier.
     AI_OLLAMA_THINKING_MODEL: str = ""
     # When true the monitoring agent loop sends ``"think": true`` on
     # /api/chat so Ollama runs the model's extended-reasoning path
@@ -560,10 +556,10 @@ class Settings(BaseSettings):
     AI_FAST_ACTION_SHORTCUT_ENABLED: bool = True
     # Ollama tag used for both the classifier AND the per-intent
     # micro-agent loop. Empty (default) falls back to
-    # ``AI_OLLAMA_FAST_MODEL`` (typically gemma4:e2b) so a fresh install
-    # works without extra config. Override to ``llama3.2:3b`` or similar
-    # if you find one model picks tools more reliably than another for
-    # your household's phrasing.
+    # the fast tier of whichever provider answers. A provider-specific
+    # tag (``grok-…``, ``claude-…`` or an Ollama tag) is only used by
+    # that provider, if one model picks tools more reliably for your
+    # household's phrasing.
     AI_FAST_ACTION_MODEL: str = ""
     # Hard cap on the classifier call. Same shape as the web-search
     # classifier — single-token reply, warm e2b in <500 ms; cap is the
@@ -620,16 +616,32 @@ class Settings(BaseSettings):
     # scope, so Avi can only access files it creates inside the folder
     # (not anything else in your Drive).
     DB_BACKUP_GDRIVE: Optional[str] = None
+    # Background refresh + verify of Avi's Google grant (see
+    # services/google_keepalive.py). Parents are alerted when it dies.
+    GOOGLE_KEEPALIVE_ENABLED: bool = True
+    GOOGLE_KEEPALIVE_INTERVAL_S: float = 3600.0
+    # Local folder that a desktop sync client (Google Drive for desktop,
+    # iCloud, an external disk) carries off this machine. Each backup is
+    # copied here after the dump, independent of Avi's Google OAuth.
+    # Unset = auto-detect Google Drive for desktop's "My Drive".
+    DB_BACKUP_SYNC_DIR: Optional[str] = None
+    DB_BACKUP_SYNC_KEEP: int = 4
+
+    @property
+    def backup_sync_dir(self) -> Optional[Path]:
+        if self.DB_BACKUP_SYNC_DIR and self.DB_BACKUP_SYNC_DIR.strip():
+            return Path(self.DB_BACKUP_SYNC_DIR.strip()).expanduser()
+        my_drives = sorted(
+            Path.home().glob("Library/CloudStorage/GoogleDrive-*/My Drive")
+        )
+        if not my_drives:
+            return None
+        return my_drives[0] / "Family Assistant Backups"
 
     @property
     def grok_api_key(self) -> Optional[str]:
         """Prefer ``GROK_API_KEY``; fall back to the xAI console alias."""
         return (self.GROK_API_KEY or self.XAI_API_KEY or "").strip() or None
-
-    @property
-    def llm_provider(self) -> str:
-        raw = (self.AI_LLM_PROVIDER or "grok").strip().lower()
-        return raw if raw in ("grok", "ollama") else "grok"
 
     @property
     def database_url(self) -> str:

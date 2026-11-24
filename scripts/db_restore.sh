@@ -20,6 +20,11 @@
 #
 #     ./scripts/db_restore.sh backups/family_assistant_<timestamp>.dump
 #     ./scripts/db_restore.sh backups/family_assistant_<timestamp>.dump --yes
+#     ./scripts/db_restore.sh backups/family_assistant_<timestamp>.dump --with-media
+#
+# ``--with-media`` also extracts the matching ``.media.tar.gz`` (photos,
+# documents, attachments) into FA_STORAGE_ROOT. Files present in the
+# archive are overwritten; files that only exist on disk are kept.
 #
 # Common gotcha: the user reading .env (``family_assistant``) must have
 # the privilege to DROP its own schema. On Homebrew Postgres the role
@@ -39,10 +44,12 @@ DUMP_PATH="$1"
 shift || true
 
 ASSUME_YES=0
+WITH_MEDIA=0
 TARGET_DB_OVERRIDE=""
 while (( "$#" )); do
   case "$1" in
     --yes|-y) ASSUME_YES=1; shift ;;
+    --with-media) WITH_MEDIA=1; shift ;;
     --db) TARGET_DB_OVERRIDE="${2:-}"; shift 2 ;;
     --db=*) TARGET_DB_OVERRIDE="${1#--db=}"; shift ;;
     -h|--help)
@@ -75,7 +82,12 @@ FA_DB_PORT="$(read_env FA_DB_PORT)"
 FA_DB_USER="$(read_env FA_DB_USER)"
 FA_DB_PWD="$(read_env FA_DB_PWD)"
 FA_DB_NAME="$(read_env FA_DB_NAME)"
+FA_STORAGE_ROOT="$(read_env FA_STORAGE_ROOT)"
 
+: "${FA_STORAGE_ROOT:=./resources/family}"
+if [[ "$FA_STORAGE_ROOT" != /* ]]; then
+  FA_STORAGE_ROOT="$REPO_ROOT/${FA_STORAGE_ROOT#./}"
+fi
 : "${FA_DB_HOST:=localhost}"
 : "${FA_DB_PORT:=5432}"
 : "${FA_DB_USER:=family_assistant}"
@@ -104,6 +116,23 @@ else
   echo "WARNING: $META_PATH not found; skipping integrity check." >&2
 fi
 
+MEDIA_PATH="${DUMP_PATH%.dump}.media.tar.gz"
+if [[ "$WITH_MEDIA" -eq 1 ]]; then
+  if [[ ! -f "$MEDIA_PATH" ]]; then
+    echo "ERROR: --with-media given but $MEDIA_PATH not found." >&2
+    exit 2
+  fi
+  if [[ -f "$META_PATH" ]] && grep -qE '^media_sha256: ' "$META_PATH"; then
+    EXPECTED_MEDIA_SHA=$(grep -E '^media_sha256: ' "$META_PATH" | awk '{print $2}')
+    ACTUAL_MEDIA_SHA=$(shasum -a 256 "$MEDIA_PATH" | awk '{print $1}')
+    if [[ "$EXPECTED_MEDIA_SHA" != "$ACTUAL_MEDIA_SHA" ]]; then
+      echo "ERROR: sha256 mismatch — media archive appears corrupted." >&2
+      exit 3
+    fi
+    echo "Media archive integrity verified (sha256 OK)."
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # Show what's about to happen + confirm.
 # ---------------------------------------------------------------------------
@@ -116,6 +145,10 @@ echo "  dump file     : $DUMP_PATH"
 echo "  target DB     : $FA_DB_NAME"
 echo "  host:port     : $FA_DB_HOST:$FA_DB_PORT"
 echo "  user          : $FA_DB_USER"
+if [[ "$WITH_MEDIA" -eq 1 ]]; then
+  echo "  media archive : $MEDIA_PATH"
+  echo "  media target  : $FA_STORAGE_ROOT"
+fi
 echo
 echo "  This will DROP every table in '$FA_DB_NAME.public'"
 echo "  and recreate them from the dump. ALL CURRENT DATA WILL BE LOST."
@@ -147,6 +180,12 @@ PGPASSWORD="$FA_DB_PWD" pg_restore \
   --no-owner --no-privileges \
   --exit-on-error \
   "$DUMP_PATH"
+
+if [[ "$WITH_MEDIA" -eq 1 ]]; then
+  mkdir -p "$FA_STORAGE_ROOT"
+  tar -xzf "$MEDIA_PATH" -C "$FA_STORAGE_ROOT"
+  echo "Media restored into $FA_STORAGE_ROOT."
+fi
 
 echo
 echo "Restore complete. '$FA_DB_NAME' now reflects the dump."

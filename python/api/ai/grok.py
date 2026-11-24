@@ -1,12 +1,9 @@
-"""xAI Grok client (OpenAI-compatible Chat Completions).
+"""xAI Grok backend (OpenAI-compatible Chat Completions).
 
-Used as Avi's live LLM when :setting:`AI_LLM_PROVIDER` is ``grok``
-(the default). Gemini stays reserved for web search; Ollama stays
-parked for a future household fine-tune.
-
-We talk to ``https://api.x.ai/v1/chat/completions`` with the same
-messages + tools shape the agent loop already uses, so the rest of
-the app does not have to know which vendor is behind the call.
+First in the default :setting:`AI_LLM_PROVIDERS` chain. Talks to
+``https://api.x.ai/v1/chat/completions`` with the shared history shape
+from :mod:`api.ai.llm_types`. Callers should go through
+:mod:`api.ai.llm`, which handles fallback to the next backend.
 """
 
 from __future__ import annotations
@@ -19,30 +16,68 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import httpx
 
 from ..config import get_settings
-from .ollama import ChatWithToolsResult, ToolCall
+from .llm_types import (
+    ChatWithToolsResult,
+    LLMError,
+    LLMModelMissing,
+    LLMTimeout,
+    LLMUnavailable,
+    ToolCall,
+    canonical_history,
+    parse_arguments,
+)
 
 
 logger = logging.getLogger(__name__)
 
+NAME = "grok"
 
-class GrokError(RuntimeError):
+
+class GrokError(LLMError):
     """Anything Grok-related that went wrong."""
 
 
-class GrokUnavailable(GrokError):
-    """Missing API key, auth failure, or xAI unreachable."""
+class GrokUnavailable(GrokError, LLMUnavailable):
+    """Missing API key, auth failure, xAI unreachable or overloaded."""
 
 
-class GrokTimeout(GrokError):
-    """Read/connect timeout talking to api.x.ai."""
+class GrokModelMissing(GrokUnavailable, LLMModelMissing):
+    """xAI doesn't know the requested model id."""
+
+
+class GrokTimeout(GrokError, LLMTimeout):
+    """Read timeout talking to api.x.ai."""
+
+
+# ---------------------------------------------------------------------------
+# Backend interface used by api.ai.llm
+# ---------------------------------------------------------------------------
+
+
+def is_configured() -> bool:
+    return bool(get_settings().grok_api_key)
+
+
+def owns_model(tag: str) -> bool:
+    return tag.lower().startswith("grok")
+
+
+def tier_models(tier: str) -> List[str]:
+    s = get_settings()
+    if tier == "fast":
+        return [m for m in (s.GROK_FAST_MODEL or s.GROK_MODEL,) if m]
+    return [m for m in (s.GROK_MODEL,) if m]
+
+
+# ---------------------------------------------------------------------------
+# HTTP plumbing
+# ---------------------------------------------------------------------------
 
 
 def _api_key() -> str:
     key = get_settings().grok_api_key
     if not key:
-        raise GrokUnavailable(
-            "GROK_API_KEY (or XAI_API_KEY) is not set in .env."
-        )
+        raise GrokUnavailable("GROK_API_KEY (or XAI_API_KEY) is not set in .env.")
     return key
 
 
@@ -57,69 +92,80 @@ def _headers() -> Dict[str, str]:
     }
 
 
-def _normalize_messages(
-    messages: List[Dict[str, Any]],
-    *,
-    system: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Rewrite our mixed Ollama/OpenAI history into Chat Completions form."""
+def _timeout(read_s: float) -> httpx.Timeout:
+    return httpx.Timeout(connect=5.0, read=read_s, write=read_s, pool=5.0)
+
+
+def _transport_error(exc: Exception, model: str, timeout_s: float) -> GrokError:
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return GrokUnavailable(f"xAI at {_base()} is not reachable: {exc}")
+    if isinstance(exc, httpx.TimeoutException):
+        return GrokTimeout(
+            f"Grok {model!r} did not respond within {timeout_s:.0f}s "
+            f"({type(exc).__name__})."
+        )
+    if isinstance(exc, httpx.TransportError):
+        return GrokUnavailable(f"xAI transport error: {exc}")
+    return GrokError(str(exc))
+
+
+def _raise_for_status(status: int, body: str, model: str) -> None:
+    if status in (401, 403):
+        raise GrokUnavailable(f"Grok rejected the API key (HTTP {status}).")
+    if status == 404:
+        raise GrokModelMissing(f"Grok model {model!r} is not available: {body[:300]}")
+    if status == 429 or status >= 500:
+        raise GrokUnavailable(f"Grok returned {status}: {body[:300]}")
+    if status >= 400:
+        raise GrokError(f"Grok returned {status}: {body[:400]}")
+
+
+async def _post(payload: Dict[str, Any], model: str, timeout_s: float) -> Dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=_timeout(timeout_s)) as client:
+            r = await client.post(
+                f"{_base()}/chat/completions", headers=_headers(), json=payload
+            )
+    except httpx.HTTPError as exc:
+        raise _transport_error(exc, model, timeout_s) from exc
+    _raise_for_status(r.status_code, r.text, model)
+    return r.json()
+
+
+def _to_wire(messages: List[Dict[str, Any]], system: Optional[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if system:
         out.append({"role": "system", "content": system})
-    for i, raw in enumerate(messages):
-        role = raw.get("role") or "user"
-        msg: Dict[str, Any] = {"role": role}
-        content = raw.get("content")
-        if content is None:
-            content = ""
-        msg["content"] = content
-        if role == "assistant" and raw.get("tool_calls"):
-            calls = []
-            for j, c in enumerate(raw["tool_calls"]):
-                fn = (c or {}).get("function") or {}
-                args = fn.get("arguments")
-                if isinstance(args, dict):
-                    args = json.dumps(args, default=str)
-                elif args is None:
-                    args = "{}"
-                call_id = (c or {}).get("id") or f"call_{i}_{j}"
-                calls.append(
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": fn.get("name") or "",
-                            "arguments": args,
-                        },
-                    }
-                )
-            msg["tool_calls"] = calls
-        if role == "tool":
-            tool_call_id = raw.get("tool_call_id") or raw.get("id")
-            if not tool_call_id:
-                # Best-effort: pair with the most recent assistant
-                # tool_call of the same name.
-                tool_call_id = f"call_{i}"
-            msg["tool_call_id"] = tool_call_id
-            if raw.get("name"):
-                msg["name"] = raw["name"]
+    for m in canonical_history(messages):
+        msg: Dict[str, Any] = {"role": m["role"], "content": m.get("content") or ""}
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            msg["tool_calls"] = [
+                {
+                    "id": c["id"],
+                    "type": "function",
+                    "function": {
+                        "name": c["function"]["name"],
+                        "arguments": json.dumps(c["function"]["arguments"], default=str),
+                    },
+                }
+                for c in m["tool_calls"]
+            ]
+        if m["role"] == "tool":
+            msg["tool_call_id"] = m["tool_call_id"]
+            if m.get("name"):
+                msg["name"] = m["name"]
         out.append(msg)
     return out
 
 
-def _raise_for_status(r: httpx.Response, model: str) -> None:
-    if r.status_code in (401, 403):
-        raise GrokUnavailable(
-            f"Grok rejected the API key (HTTP {r.status_code})."
-        )
-    if r.status_code == 404:
-        raise GrokUnavailable(
-            f"Grok model {model!r} is not available: {r.text[:300]}"
-        )
-    if r.status_code >= 400:
-        raise GrokError(
-            f"Grok returned {r.status_code}: {r.text[:400]}"
-        )
+def _message(data: Dict[str, Any]) -> Dict[str, Any]:
+    choice = ((data.get("choices") or [{}])[0]) or {}
+    return choice.get("message") or {}
+
+
+# ---------------------------------------------------------------------------
+# Calls
+# ---------------------------------------------------------------------------
 
 
 async def generate(
@@ -131,46 +177,22 @@ async def generate(
     model: str,
     timeout_seconds: float = 60.0,
 ) -> str:
-    messages: List[Dict[str, Any]] = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
     payload: Dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": _to_wire([{"role": "user", "content": prompt}], system),
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False,
     }
-    call_started = time.monotonic()
-    request_timeout = httpx.Timeout(
-        connect=10.0, read=timeout_seconds, write=timeout_seconds, pool=5.0
-    )
-    try:
-        async with httpx.AsyncClient(timeout=request_timeout) as client:
-            r = await client.post(
-                f"{_base()}/chat/completions",
-                headers=_headers(),
-                json=payload,
-            )
-    except httpx.ConnectError as exc:
-        raise GrokUnavailable(f"xAI at {_base()} is not responding: {exc}") from exc
-    except httpx.TimeoutException as exc:
-        raise GrokTimeout(
-            f"Grok {model!r} did not respond within {timeout_seconds:.0f}s "
-            f"({type(exc).__name__})."
-        ) from exc
-    _raise_for_status(r, model)
-    data = r.json()
-    text_out = _content_from_completion(data)
+    started = time.monotonic()
+    data = await _post(payload, model, timeout_seconds)
+    text_out = (_message(data).get("content") or "").strip()
     logger.info(
-        "[grok] generate done model=%s duration_ms=%d "
-        "prompt_chars=%d out_chars=%d max_tokens=%d",
+        "[grok] generate done model=%s duration_ms=%d prompt_chars=%d out_chars=%d",
         model,
-        int((time.monotonic() - call_started) * 1000),
+        int((time.monotonic() - started) * 1000),
         len(prompt),
         len(text_out),
-        max_tokens,
     )
     return text_out
 
@@ -202,10 +224,11 @@ async def chat_with_tools(
     model: str,
     temperature: float = 0.2,
     timeout_seconds: float = 90.0,
+    think: Optional[bool] = False,
 ) -> ChatWithToolsResult:
     payload: Dict[str, Any] = {
         "model": model,
-        "messages": _normalize_messages(messages, system=system),
+        "messages": _to_wire(messages, system),
         "temperature": temperature,
         "stream": False,
     }
@@ -213,66 +236,27 @@ async def chat_with_tools(
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
 
-    logger.info(
-        "[grok] chat_with_tools start model=%s msgs=%d sys_chars=%d "
-        "tools=%d temp=%.2f timeout=%.0fs",
-        model,
-        len(messages),
-        len(system) if system else 0,
-        len(tools),
-        temperature,
-        timeout_seconds,
-    )
-    request_timeout = httpx.Timeout(
-        connect=10.0, read=timeout_seconds, write=timeout_seconds, pool=5.0
-    )
-    call_started = time.monotonic()
-    try:
-        async with httpx.AsyncClient(timeout=request_timeout) as client:
-            r = await client.post(
-                f"{_base()}/chat/completions",
-                headers=_headers(),
-                json=payload,
-            )
-    except httpx.ConnectError as exc:
-        raise GrokUnavailable(f"xAI at {_base()} is not responding: {exc}") from exc
-    except httpx.TimeoutException as exc:
-        raise GrokTimeout(
-            f"Grok {model!r} did not respond within {timeout_seconds:.0f}s "
-            f"({type(exc).__name__})."
-        ) from exc
-    _raise_for_status(r, model)
-
-    data = r.json()
-    choice = ((data.get("choices") or [{}])[0]) or {}
-    message = choice.get("message") or {}
+    started = time.monotonic()
+    data = await _post(payload, model, timeout_seconds)
+    message = _message(data)
     content = (message.get("content") or "").strip()
-    calls: List[ToolCall] = []
-    for c in message.get("tool_calls") or []:
-        fn = (c or {}).get("function") or {}
-        name = fn.get("name") or ""
-        args = fn.get("arguments")
-        if isinstance(args, str):
-            try:
-                args = json.loads(args) if args else {}
-            except json.JSONDecodeError:
-                args = {"_raw": args}
-        if not isinstance(args, dict):
-            args = {}
-        if name:
-            calls.append(
-                ToolCall(
-                    name=name,
-                    arguments=args,
-                    id=(c or {}).get("id") or "",
-                )
-            )
-
+    calls = [
+        ToolCall(
+            name=fn.get("name") or "",
+            arguments=parse_arguments(fn.get("arguments")),
+            id=(c or {}).get("id") or "",
+        )
+        for c in message.get("tool_calls") or []
+        for fn in [(c or {}).get("function") or {}]
+        if fn.get("name")
+    ]
     logger.info(
-        "[grok] chat_with_tools done model=%s duration_ms=%d "
+        "[grok] chat_with_tools done model=%s duration_ms=%d msgs=%d tools=%d "
         "tool_calls=%d content_chars=%d",
         model,
-        int((time.monotonic() - call_started) * 1000),
+        int((time.monotonic() - started) * 1000),
+        len(messages),
+        len(tools),
         len(calls),
         len(content),
     )
@@ -281,11 +265,12 @@ async def chat_with_tools(
         tool_calls=calls,
         model=model,
         raw_message=message,
+        provider=NAME,
     )
 
 
 async def chat_stream(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     *,
     system: Optional[str] = None,
     temperature: float = 0.7,
@@ -293,34 +278,22 @@ async def chat_stream(
 ) -> AsyncIterator[str]:
     payload: Dict[str, Any] = {
         "model": model,
-        "messages": _normalize_messages(messages, system=system),
+        "messages": _to_wire(messages, system),
         "temperature": temperature,
         "stream": True,
     }
-    logger.info(
-        "[grok] chat_stream start model=%s msgs=%d sys_chars=%d",
-        model,
-        len(messages),
-        len(system) if system else 0,
-    )
-    call_started = time.monotonic()
+    started = time.monotonic()
     total_chars = 0
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
+        async with httpx.AsyncClient(timeout=_timeout(120.0)) as client:
             async with client.stream(
-                "POST",
-                f"{_base()}/chat/completions",
-                headers=_headers(),
-                json=payload,
+                "POST", f"{_base()}/chat/completions", headers=_headers(), json=payload
             ) as r:
                 if r.status_code >= 400:
-                    body = await r.aread()
-                    raise GrokError(
-                        f"Grok returned {r.status_code}: "
-                        f"{body.decode(errors='replace')[:400]}"
-                    )
+                    body = (await r.aread()).decode(errors="replace")
+                    _raise_for_status(r.status_code, body, model)
                 async for line in r.aiter_lines():
-                    if not line or not line.startswith("data:"):
+                    if not line.startswith("data:"):
                         continue
                     chunk = line[5:].strip()
                     if not chunk or chunk == "[DONE]":
@@ -334,43 +307,40 @@ async def chat_stream(
                     if piece:
                         total_chars += len(piece)
                         yield piece
-    except httpx.ConnectError as exc:
-        raise GrokUnavailable(f"xAI at {_base()} is not responding: {exc}") from exc
+    except httpx.HTTPError as exc:
+        raise _transport_error(exc, model, 120.0) from exc
     finally:
         logger.info(
             "[grok] chat_stream done model=%s duration_ms=%d out_chars=%d",
             model,
-            int((time.monotonic() - call_started) * 1000),
+            int((time.monotonic() - started) * 1000),
             total_chars,
         )
 
 
-def _content_from_completion(data: Dict[str, Any]) -> str:
-    choice = ((data.get("choices") or [{}])[0]) or {}
-    message = choice.get("message") or {}
-    return (message.get("content") or "").strip()
-
-
 async def list_models() -> List[str]:
     """Return model ids the key can see. Used by the status page."""
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        r = await client.get(f"{_base()}/models", headers=_headers())
-    _raise_for_status(r, "models")
-    data = r.json()
-    return [
-        str(m.get("id") or "")
-        for m in (data.get("data") or [])
-        if m.get("id")
-    ]
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(f"{_base()}/models", headers=_headers())
+    except httpx.HTTPError as exc:
+        raise _transport_error(exc, "models", 8.0) from exc
+    _raise_for_status(r.status_code, r.text, "models")
+    return [str(m.get("id")) for m in (r.json().get("data") or []) if m.get("id")]
 
 
 __all__ = [
+    "NAME",
     "GrokError",
+    "GrokModelMissing",
     "GrokTimeout",
     "GrokUnavailable",
     "chat_oneshot",
     "chat_stream",
     "chat_with_tools",
     "generate",
+    "is_configured",
     "list_models",
+    "owns_model",
+    "tier_models",
 ]
