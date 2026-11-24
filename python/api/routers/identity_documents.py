@@ -88,6 +88,18 @@ def update_identity_document(
     return doc
 
 
+@router.get("/{identity_document_id}/document-number")
+def reveal_identity_document_number(
+    identity_document_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    doc = db.get(models.IdentityDocument, identity_document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Identity document not found")
+    number = crypto.decrypt_str(doc.document_number_encrypted) if doc.document_number_encrypted else None
+    return {"document_number": number}
+
+
 @router.delete("/{identity_document_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_identity_document(identity_document_id: int, db: Session = Depends(get_db)) -> None:
     doc = db.get(models.IdentityDocument, identity_document_id)

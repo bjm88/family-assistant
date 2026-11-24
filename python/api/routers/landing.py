@@ -58,6 +58,16 @@ def landing_page() -> HTMLResponse:
 
 
 @router.get(
+    "/sms",
+    response_class=HTMLResponse,
+    summary="SMS program and opt-in details (A2P 10DLC)",
+    include_in_schema=False,
+)
+def sms_program_page() -> HTMLResponse:
+    return HTMLResponse(content=_read_html("sms.html"))
+
+
+@router.get(
     "/landing/avi.png",
     response_class=FileResponse,
     include_in_schema=False,

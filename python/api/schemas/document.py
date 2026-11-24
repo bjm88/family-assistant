@@ -25,5 +25,6 @@ class DocumentRead(OrmModel):
     mime_type: Optional[str]
     file_size_bytes: Optional[int]
     notes: Optional[str]
+    extracted_text: Optional[str] = None
     created_at: datetime
     updated_at: datetime

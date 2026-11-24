@@ -809,9 +809,25 @@ function IdentityDocumentModal({
 }) {
   const qc = useQueryClient();
   const toast = useToast();
-  const { register, handleSubmit, reset } = useForm<IdentityDocForm>({
+  const { register, handleSubmit, reset, setValue } = useForm<IdentityDocForm>({
     defaultValues: EMPTY_ID_DOC_FORM,
   });
+  const [revealing, setRevealing] = useState(false);
+
+  const revealNumber = async () => {
+    if (!doc) return;
+    setRevealing(true);
+    try {
+      const res = await api.get<{ document_number: string | null }>(
+        `/api/identity-documents/${doc.identity_document_id}/document-number`
+      );
+      setValue("document_number", res.document_number ?? "");
+    } catch (err) {
+      toast.error(`Could not load the number: ${(err as Error).message}`);
+    } finally {
+      setRevealing(false);
+    }
+  };
 
   // Repopulate the form whenever the target doc changes or the modal opens.
   useEffect(() => {
@@ -849,9 +865,13 @@ function IdentityDocumentModal({
         toPayload(v, { isCreate: false })
       );
     },
-    onSuccess: () => {
+    onSuccess: (saved) => {
       invalidate();
-      toast.success("Identity document saved.");
+      toast.success(
+        saved.document_number_last_four
+          ? `Identity document saved (number ending ${saved.document_number_last_four}).`
+          : "Identity document saved."
+      );
       onClose();
     },
     onError: (err: Error) =>
@@ -929,12 +949,29 @@ function IdentityDocumentModal({
               : "Stored encrypted; only last 4 is displayed."
           }
         >
-          <input
-            id="document_number"
-            className="input"
-            autoComplete="off"
-            {...register("document_number")}
-          />
+          <div className="flex gap-2">
+            <input
+              id="document_number"
+              className="input flex-1"
+              autoComplete="off"
+              placeholder={
+                mode === "edit" && doc?.document_number_last_four
+                  ? `•••• ${doc.document_number_last_four}`
+                  : undefined
+              }
+              {...register("document_number")}
+            />
+            {mode === "edit" && doc?.document_number_last_four && (
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={revealing}
+                onClick={revealNumber}
+              >
+                {revealing ? "…" : "Reveal"}
+              </button>
+            )}
+          </div>
         </Field>
         <Field label="Issuing authority" htmlFor="issuing_authority">
           <input

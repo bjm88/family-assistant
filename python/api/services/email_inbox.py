@@ -66,7 +66,7 @@ from ..db import SessionLocal
 from ..integrations import gmail
 from ..integrations import google_oauth
 from . import inbound_lock
-from . import inbound_prompts
+from . import attachment_intake, inbound_prompts
 
 
 logger = logging.getLogger(__name__)
@@ -521,6 +521,7 @@ def _handle_one_message(
         subject=msg.subject,
     )
     live_session.upsert_participant(db, session, person_id=person.person_id)
+    history = live_session.conversation_history(db, session)
 
     # Save attachment bytes to local storage and run the vision /
     # text-extraction pipeline IN MEMORY before any DB writes for the
@@ -582,8 +583,6 @@ def _handle_one_message(
     user_message = _format_user_message_for_agent(
         msg, person, attachment_block=attachment_block
     )
-    history: List[dict] = []  # email is one-shot per turn, no in-memory history
-
     # Email is async: the sender is not staring at a chat bubble, so
     # we skip the instant "working on it" ack used on SMS / WhatsApp /
     # Telegram / live chat. One real reply is enough.
@@ -601,6 +600,8 @@ def _handle_one_message(
     agent_failed = False
     final_text: Optional[str] = None
     shortcut_used: Optional[str] = None
+    open_questions = attachment_intake.open_questions(db, person_id=person.person_id)
+    needs_heavy = bool(msg.attachments) or bool(open_questions)
     triage = fast_action_router.try_triage_sync(
         classifier_text,
         family_id=family_id,
@@ -609,8 +610,8 @@ def _handle_one_message(
         live_session_id=session.live_session_id,
         surface_label="email",
         agent_task_kind="email",
-        allow_action=not bool(msg.attachments),
-        allow_family_qa=not bool(msg.attachments),
+        allow_action=not needs_heavy,
+        allow_family_qa=not needs_heavy,
     )
     if triage.reply:
         logger.info(
@@ -645,6 +646,20 @@ def _handle_one_message(
             )
             for p in persisted_attachments
         ]
+        intake_block = attachment_intake.auto_file_attachments(
+            db,
+            family_id=family_id,
+            sender=person,
+            message_text=msg.body_text,
+            refs=inbound_attachment_refs,
+        )
+        followup_refs, followup_block = attachment_intake.followup_for_agent(
+            db, open_questions, first_index=len(inbound_attachment_refs) + 1
+        )
+        inbound_attachment_refs += followup_refs
+        for block in (intake_block, followup_block):
+            if block:
+                user_message = f"{user_message}\n\n{block}"
 
         logger.info(
             "[orch] surface=email path=heavy_agent message_id=%s task=%s "

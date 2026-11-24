@@ -474,6 +474,7 @@ export interface DocumentRecord {
   mime_type: string | null;
   file_size_bytes: number | null;
   notes: string | null;
+  extracted_text?: string | null;
   created_at: string;
   updated_at: string;
 }

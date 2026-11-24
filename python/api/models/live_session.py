@@ -66,19 +66,19 @@ class LiveSession(Base, TimestampMixin):
             "source IN ('live', 'email', 'sms', 'telegram', 'whatsapp')",
             name="ck_live_sessions_source",
         ),
-        # Partial unique index — only enforce uniqueness on rows that
-        # actually have an external thread id, so live (non-email)
-        # sessions don't collide on a shared NULL. ``source`` is part
-        # of the key so SMS and WhatsApp sessions for the same phone
-        # number don't collide (they share the E.164 string as the
-        # thread id but are distinct conversations).
+        # At most one OPEN session per external thread. ``source`` is
+        # part of the key so SMS and WhatsApp sessions for the same
+        # phone number don't collide; ended sessions are excluded so a
+        # thread can have a new conversation after the old one idles out.
         Index(
-            "uq_live_sessions_external_thread",
+            "uq_live_sessions_open_external_thread",
             "family_id",
             "source",
             "external_thread_id",
             unique=True,
-            postgresql_where=text("external_thread_id IS NOT NULL"),
+            postgresql_where=text(
+                "external_thread_id IS NOT NULL AND ended_at IS NULL"
+            ),
         ),
         {
             "comment": (

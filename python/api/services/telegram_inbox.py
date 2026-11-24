@@ -73,7 +73,7 @@ from ..config import get_settings
 from ..db import SessionLocal
 from ..integrations import telegram, twilio_sms
 from ..utils.phone import normalize_phone
-from . import inbound_lock, inbound_prompts, telegram_persistence
+from . import attachment_intake, inbound_lock, inbound_prompts, telegram_persistence
 
 
 logger = logging.getLogger(__name__)
@@ -477,6 +477,7 @@ def process_inbound_update(
         chat_id=inbound.chat_id,
     )
     live_session.upsert_participant(db, session, person_id=person.person_id)
+    history = live_session.conversation_history(db, session)
 
     # Audit row first (status='failed') so a downstream crash leaves a
     # forensic trail. We'll flip its status afterwards.
@@ -606,6 +607,8 @@ def process_inbound_update(
     # the heavy agent because none of the fast paths know how to
     # handle ``task_attach_message_attachment``.
     shortcut_used: Optional[str] = None
+    open_questions = attachment_intake.open_questions(db, person_id=person.person_id)
+    needs_heavy = bool(inbound.attachments) or bool(open_questions)
     triage = fast_action_router.try_triage_sync(
         (inbound.body or "").strip(),
         family_id=person.family_id,
@@ -614,8 +617,8 @@ def process_inbound_update(
         live_session_id=session.live_session_id,
         surface_label="Telegram",
         agent_task_kind="telegram",
-        allow_action=not bool(inbound.attachments),
-        allow_family_qa=not bool(inbound.attachments),
+        allow_action=not needs_heavy,
+        allow_family_qa=not needs_heavy,
     )
     if triage.reply:
         logger.info(
@@ -661,6 +664,20 @@ def process_inbound_update(
             )
             for m in attachments_meta
         ]
+        intake_block = attachment_intake.auto_file_attachments(
+            db,
+            family_id=person.family_id,
+            sender=person,
+            message_text=inbound.body,
+            refs=inbound_attachment_refs,
+        )
+        followup_refs, followup_block = attachment_intake.followup_for_agent(
+            db, open_questions, first_index=len(inbound_attachment_refs) + 1
+        )
+        inbound_attachment_refs += followup_refs
+        for block in (intake_block, followup_block):
+            if block:
+                user_message = f"{user_message}\n\n{block}"
 
         # No race-and-ack here: we already sent the instant ack above
         # (when the message looked like work) so a second e2b ack would
@@ -673,7 +690,7 @@ def process_inbound_update(
                 assistant_id=assistant_id_for_family,
                 person_id=person.person_id,
                 system_prompt=system_prompt,
-                history=[],
+                history=history,
                 user_message=user_message,
                 inbound_attachments=inbound_attachment_refs,
             )

@@ -41,6 +41,7 @@ from .insurance_policy import (
 )
 from .financial_account import FinancialAccount
 from .document import Document
+from .pending_attachment import PendingAttachment
 from .live_session import (
     LiveSession,
     LIVE_SESSION_END_REASONS,
@@ -131,6 +132,7 @@ __all__ = [
     "InsurancePolicyVehicle",
     "FinancialAccount",
     "Document",
+    "PendingAttachment",
     "LiveSession",
     "LIVE_SESSION_END_REASONS",
     "LIVE_SESSION_SOURCES",

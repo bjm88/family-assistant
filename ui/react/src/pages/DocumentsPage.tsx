@@ -44,6 +44,7 @@ export default function DocumentsPage() {
   const toast = useToast();
   const confirm = useConfirm();
   const [open, setOpen] = useState(false);
+  const [viewing, setViewing] = useState<DocumentRecord | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const { data } = useQuery<DocumentRecord[]>({
@@ -78,6 +79,15 @@ export default function DocumentsPage() {
       toast.success("Document uploaded.");
     },
     onError: (err: Error) => toast.error(`Upload failed: ${err.message}`),
+  });
+  const relink = useMutation({
+    mutationFn: ({ id, personId }: { id: number; personId: number | null }) =>
+      api.patch<DocumentRecord>(`/api/documents/${id}`, { person_id: personId }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["documents", familyId] });
+      toast.success("Document updated.");
+    },
+    onError: (err: Error) => toast.error(`Could not update document: ${err.message}`),
   });
   const del = useMutation({
     mutationFn: (id: number) => api.del(`/api/documents/${id}`),
@@ -125,15 +135,44 @@ export default function DocumentsPage() {
               <tbody>
                 {data.map((d) => (
                   <tr key={d.document_id} className="border-b border-border table-row-hover">
-                    <td className="py-2 font-medium">{d.title}</td>
+                    <td className="py-2">
+                      <div className="font-medium">{d.title}</div>
+                      {d.notes && (
+                        <div className="text-xs text-muted-foreground line-clamp-2">{d.notes}</div>
+                      )}
+                      {d.extracted_text && (
+                        <button
+                          className="text-xs text-primary hover:text-primary/80"
+                          onClick={() => setViewing(d)}
+                        >
+                          View extracted text
+                        </button>
+                      )}
+                    </td>
                     <td>{d.document_category ?? "—"}</td>
                     <td>
-                      {d.person_id
-                        ? (() => {
-                            const p = peopleById.get(d.person_id!);
-                            return p ? `${p.first_name} ${p.last_name}` : "—";
-                          })()
-                        : "family"}
+                      <select
+                        aria-label={`Person for ${d.title}`}
+                        className="input py-1 text-sm"
+                        value={d.person_id ?? ""}
+                        disabled={relink.isPending}
+                        onChange={(e) =>
+                          relink.mutate({
+                            id: d.document_id,
+                            personId: e.target.value ? Number(e.target.value) : null,
+                          })
+                        }
+                      >
+                        <option value="">Family-wide</option>
+                        {d.person_id && !peopleById.has(d.person_id) && (
+                          <option value={d.person_id}>Person #{d.person_id}</option>
+                        )}
+                        {(people ?? []).map((p) => (
+                          <option key={p.person_id} value={p.person_id}>
+                            {p.first_name} {p.last_name}
+                          </option>
+                        ))}
+                      </select>
                     </td>
                     <td className="text-muted-foreground">{d.original_file_name}</td>
                     <td>{new Date(d.created_at).toLocaleDateString()}</td>
@@ -239,6 +278,21 @@ export default function DocumentsPage() {
             <textarea id="notes" className="input" rows={2} {...register("notes")} />
           </Field>
         </form>
+      </Modal>
+
+      <Modal
+        open={viewing !== null}
+        onClose={() => setViewing(null)}
+        title={viewing?.title ?? "Extracted text"}
+        footer={
+          <button className="btn-secondary" onClick={() => setViewing(null)}>
+            Close
+          </button>
+        }
+      >
+        <pre className="whitespace-pre-wrap text-sm max-h-[60vh] overflow-y-auto">
+          {viewing?.extracted_text}
+        </pre>
       </Modal>
     </div>
   );

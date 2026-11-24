@@ -159,43 +159,71 @@ def test_sms_outbound_uses_messaging_service(client, test_family, db):
     )
 
 
-def test_sms_join_confirms_linked_family(client, test_family, db):
-    """JOIN from a rostered phone confirms the household by name."""
-    sid = f"SM_test_join_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
-    form = _twilio_form(
-        sid,
-        from_phone=test_family["person_phone"],
-        to_phone="+15550001111",
-        body="JOIN",
-    )
-    sms_calls: list[dict[str, Any]] = []
+def _reset_sms_consent(db, person_id: int, **values) -> models.Person:
+    person = db.get(models.Person, person_id)
+    person.sms_opted_out = values.get("sms_opted_out", False)
+    person.sms_opted_out_at = None
+    person.sms_opt_in_requested_at = None
+    person.sms_opted_in_at = None
+    db.commit()
+    return person
 
+
+def _sms(client, test_family, body: str, sms_calls: list, *, sid_tag: str) -> str:
+    sid = f"SM_test_{sid_tag}_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    form = _twilio_form(
+        sid, from_phone=test_family["person_phone"], to_phone="+15550001111", body=body
+    )
     with patch(
-        "api.services.sms_inbox._run_agent_to_completion"
-    ) as agent_mock, patch(
         "api.integrations.twilio_sms.send_sms",
-        side_effect=lambda **kw: sms_calls.append(kw) or "SMjoin-linked",
+        side_effect=lambda **kw: sms_calls.append(kw) or f"SMout-{sid}",
     ):
         resp = client.post("/api/sms/twilio/inbound", data=form)
-
     assert resp.status_code in (200, 204), resp.text
-    agent_mock.assert_not_called()
-    assert len(sms_calls) == 1
-    body = sms_calls[0]["body"]
-    assert test_family["family_name"] in body
-    assert "registered" in body.lower()
-    assert "family" in body.lower()
-    assert "STOP" in body
-    assert "HELP" in body
+    return sid
 
-    audit = db.execute(
-        select(models.SmsInboxMessage)
-        .where(models.SmsInboxMessage.twilio_message_sid == sid)
-    ).scalar_one()
-    assert audit.status == "processed_replied"
-    assert audit.person_id == test_family["person_id"]
-    assert audit.reply_message_sid == "SMjoin-linked"
-    assert "campaign join" in (audit.status_reason or "")
+
+def test_sms_double_opt_in(client, test_family, db):
+    """SUBSCRIBE → disclosures + "Reply Y" → Y enrols; a later "yes" is just chat."""
+    pid = test_family["person_id"]
+    _reset_sms_consent(db, pid)
+    sms_calls: list[dict[str, Any]] = []
+    try:
+        with patch("api.services.sms_inbox._run_agent_to_completion") as agent_mock:
+            sid = _sms(client, test_family, "SUBSCRIBE", sms_calls, sid_tag="sub")
+            agent_mock.assert_not_called()
+        body = sms_calls[0]["body"]
+        assert body.startswith("Benjamin Maisano (Avi Household Organizer):")
+        assert test_family["family_name"] in body
+        for needed in ("Msg frequency varies", "data rates may apply", "STOP", "HELP",
+                       "Terms:", "Privacy:", "Reply Y to confirm"):
+            assert needed in body, needed
+        db.expire_all()
+        person = db.get(models.Person, pid)
+        assert person.sms_opt_in_requested_at is not None and person.sms_opted_in_at is None
+        audit = db.execute(
+            select(models.SmsInboxMessage).where(models.SmsInboxMessage.twilio_message_sid == sid)
+        ).scalar_one()
+        assert audit.status == "processed_replied"
+        assert "campaign join_pending_confirm" in (audit.status_reason or "")
+
+        _sms(client, test_family, "Y", sms_calls, sid_tag="confirm")
+        assert len(sms_calls) == 2
+        assert "You're subscribed" in sms_calls[1]["body"]
+        db.expire_all()
+        person = db.get(models.Person, pid)
+        assert person.sms_opted_in_at is not None and person.sms_opt_in_requested_at is None
+
+        with patch(
+            "api.services.sms_inbox._run_agent_to_completion", return_value=AGENT_REPLY
+        ) as agent_mock, patch(
+            "api.services.sms_inbox.fast_action_router.try_triage_sync",
+            return_value=_heavy_triage(),
+        ):
+            _sms(client, test_family, "yes", sms_calls, sid_tag="plainyes")
+        agent_mock.assert_called_once()
+    finally:
+        _reset_sms_consent(db, pid)
 
 
 def test_sms_join_unknown_number_points_at_register_url(client, db):
@@ -255,7 +283,7 @@ def test_sms_subscribe_is_same_opt_in_as_join(client, test_family, db):
 
     assert resp.status_code in (200, 204), resp.text
     assert len(sms_calls) == 1
-    assert "registered" in sms_calls[0]["body"].lower()
+    assert "Reply Y to confirm" in sms_calls[0]["body"]
     assert test_family["family_name"] in sms_calls[0]["body"]
 
 
@@ -351,43 +379,24 @@ def test_sms_opted_out_person_gets_no_response(client, test_family, db):
 
 
 def test_sms_join_clears_prior_opt_out(client, test_family, db):
-    """JOIN after STOP re-enables SMS and confirms the family."""
-    person = db.get(models.Person, test_family["person_id"])
-    assert person is not None
-    person.sms_opted_out = True
-    db.commit()
-
-    sid = f"SM_test_rejoin_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
-    form = _twilio_form(
-        sid,
-        from_phone=test_family["person_phone"],
-        to_phone="+15550001111",
-        body="JOIN",
-    )
+    """After STOP, JOIN asks for Y again and only Y re-enables SMS."""
+    pid = test_family["person_id"]
+    _reset_sms_consent(db, pid, sms_opted_out=True)
     sms_calls: list[dict[str, Any]] = []
-
     try:
-        with patch(
-            "api.integrations.twilio_sms.send_sms",
-            side_effect=lambda **kw: sms_calls.append(kw) or "SMrejoin",
-        ):
-            resp = client.post("/api/sms/twilio/inbound", data=form)
-
-        assert resp.status_code in (200, 204), resp.text
-        assert len(sms_calls) == 1
-        assert "registered" in sms_calls[0]["body"].lower()
-
+        _sms(client, test_family, "JOIN", sms_calls, sid_tag="rejoin")
+        assert "Reply Y to confirm" in sms_calls[0]["body"]
         db.expire_all()
-        person = db.get(models.Person, test_family["person_id"])
-        assert person is not None
-        assert person.sms_opted_out is False
-        assert person.sms_opted_out_at is None
+        assert db.get(models.Person, pid).sms_opted_out is True
+
+        _sms(client, test_family, "y", sms_calls, sid_tag="reconfirm")
+        assert "You're subscribed" in sms_calls[1]["body"]
+        db.expire_all()
+        person = db.get(models.Person, pid)
+        assert person.sms_opted_out is False and person.sms_opted_out_at is None
+        assert person.sms_opted_in_at is not None
     finally:
-        person = db.get(models.Person, test_family["person_id"])
-        if person is not None:
-            person.sms_opted_out = False
-            person.sms_opted_out_at = None
-            db.commit()
+        _reset_sms_consent(db, pid)
 
 
 def test_sms_help_replies_to_unknown_sender(client, db):
@@ -412,7 +421,7 @@ def test_sms_help_replies_to_unknown_sender(client, db):
     body = sms_calls[0]["body"]
     from api.config import get_settings
 
-    assert "Family AI Assistant" in body or "family's AI assistant" in body
+    assert body.startswith("Benjamin Maisano (Avi Household Organizer):")
     assert "household" in body.lower()
     assert get_settings().PUBLIC_BASE_URL.rstrip("/") in body
     assert "STOP" in body
@@ -552,7 +561,7 @@ def test_sms_send_failure_without_email_stays_failed(client, test_family, db):
 def test_sms_delivery_failure_falls_back_to_email(client, test_family, db):
     """Later 30034 on the accepted reply still emails the answer."""
     inbound_sid = f"SM_test_sms_dlv_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
-    reply_sid = "SMqueued-then-undelivered"
+    reply_sid = f"SMqueued-then-undelivered-{inbound_sid}"
     form = _twilio_form(
         inbound_sid,
         from_phone=test_family["person_phone"],
@@ -678,6 +687,95 @@ def test_sms_fast_action_skips_heavy_agent(client, test_family, db):
     agent_mock.assert_not_called()
     assert len(sms_calls) == 1
     assert sms_calls[0]["body"] == fast_reply
+
+
+def test_whatsapp_delivery_failure_tries_sms_then_telegram(client, test_family, db, monkeypatch):
+    """Meta rejecting the WhatsApp reply (63112) → SMS; SMS blocked → Telegram."""
+    from api.config import get_settings
+
+    inbound_sid = f"SM_test_wa_dlv_{int(datetime.now(timezone.utc).timestamp() * 1e6)}"
+    reply_sid = f"SMwa-undelivered-{inbound_sid}"
+    sms_sid = f"SMsms-fallback-{inbound_sid}"
+    person = db.get(models.Person, test_family["person_id"])
+    original_tg, original_opt_out = person.telegram_user_id, person.sms_opted_out
+    tg_id = 9_000_000_000 + int(datetime.now().timestamp()) % 1_000_000
+    person.telegram_user_id = tg_id
+    person.sms_opted_out = False
+    original_opted_in = person.sms_opted_in_at
+    person.sms_opted_in_at = datetime.now(timezone.utc)
+    db.commit()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "test-bot-token")
+    monkeypatch.setattr(settings, "TWILIO_PRIMARY_PHONE", "+15550001111")
+    monkeypatch.setattr(settings, "AI_WHATSAPP_SMS_FALLBACK_ENABLED", True)
+    tg_calls: list[dict[str, Any]] = []
+    sms_calls: list[dict[str, Any]] = []
+    form = _twilio_form(
+        inbound_sid,
+        from_phone=f"whatsapp:{test_family['person_phone']}",
+        to_phone="whatsapp:+15550002222",
+        body="",
+    )
+    try:
+        with patch(
+            "api.services.sms_inbox._run_agent_to_completion",
+            return_value=AGENT_REPLY,
+        ), patch(
+            "api.services.sms_inbox.fast_action_router.try_triage_sync",
+            return_value=_heavy_triage(),
+        ), patch(
+            "api.integrations.twilio_sms.send_whatsapp",
+            return_value=reply_sid,
+        ):
+            client.post("/api/sms/twilio/inbound", data=form)
+
+        status_form = {
+            "MessageSid": reply_sid,
+            "MessageStatus": "failed",
+            "ErrorCode": "63112",
+            "From": "whatsapp:+15550002222",
+            "To": f"whatsapp:{test_family['person_phone']}",
+        }
+        sms_status = {
+            "MessageSid": sms_sid,
+            "MessageStatus": "undelivered",
+            "ErrorCode": "30034",
+            "From": "+15550001111",
+            "To": test_family["person_phone"],
+        }
+        with patch(
+            "api.services.sms_inbox.telegram.send_message",
+            side_effect=lambda **kw: tg_calls.append(kw) or 1,
+        ), patch(
+            "api.integrations.twilio_sms.send_sms",
+            side_effect=lambda **kw: sms_calls.append(kw) or sms_sid,
+        ):
+            client.post("/api/sms/twilio/status", data=status_form)
+            client.post("/api/sms/twilio/status", data=status_form)  # Twilio retry
+            assert len(sms_calls) == 1 and tg_calls == []
+            client.post("/api/sms/twilio/status", data=sms_status)
+            client.post("/api/sms/twilio/status", data=sms_status)  # Twilio retry
+    finally:
+        person.telegram_user_id = original_tg
+        person.sms_opted_out = original_opt_out
+        person.sms_opted_in_at = original_opted_in
+        db.commit()
+
+    assert sms_calls[0]["to_phone"] == test_family["person_phone"]
+    assert AGENT_REPLY in sms_calls[0]["body"]
+    assert len(tg_calls) == 1
+    assert tg_calls[0]["chat_id"] == tg_id
+    assert "Couldn't reach you by WhatsApp" in tg_calls[0]["text"]
+    assert AGENT_REPLY in tg_calls[0]["text"]
+    audit = db.execute(
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.twilio_message_sid == inbound_sid)
+    ).scalar_one()
+    db.refresh(audit)
+    assert audit.status == "processed_replied"
+    assert "WhatsApp undelivered (63112)" in audit.status_reason
+    assert "SMS fallback undelivered (30034)" in audit.status_reason
+    assert "Telegram fallback" in audit.status_reason
 
 
 def test_whatsapp_inbound_routes_to_agent(client, test_family, db):

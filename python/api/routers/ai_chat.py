@@ -717,6 +717,10 @@ async def chat(
         session = db.get(models.LiveSession, payload.live_session_id)
         if session is not None and session.family_id == payload.family_id:
             logged_session_id = session.live_session_id
+            if session.ended_at is None:
+                history = live_session.conversation_history(db, session)
+                if latest_user_content:
+                    history.append({"role": "user", "content": latest_user_content})
             if latest_user_content:
                 live_session.log_message(
                     db,

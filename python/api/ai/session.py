@@ -36,9 +36,29 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _idle_cutoff() -> datetime:
-    minutes = max(1, int(get_settings().AI_LIVE_SESSION_IDLE_MINUTES))
-    return _now() - timedelta(minutes=minutes)
+# Every surface shares one session concept: a session is one conversation,
+# and it ends after the surface's idle window. Email has no window — the
+# Gmail thread itself is the conversation boundary.
+THREAD_SOURCES = ("sms", "whatsapp", "telegram")
+
+
+def idle_minutes_for(source: str) -> Optional[int]:
+    settings = get_settings()
+    if source == "live":
+        return max(1, int(settings.AI_LIVE_SESSION_IDLE_MINUTES))
+    if source in THREAD_SOURCES:
+        return max(1, int(settings.AI_THREAD_SESSION_IDLE_MINUTES))
+    return None
+
+
+def _idle_cutoff(source: str = "live") -> Optional[datetime]:
+    minutes = idle_minutes_for(source)
+    return None if minutes is None else _now() - timedelta(minutes=minutes)
+
+
+def _is_idle(session: models.LiveSession) -> bool:
+    cutoff = _idle_cutoff(session.source)
+    return cutoff is not None and session.last_activity_at < cutoff
 
 
 # ---------- idle sweep ------------------------------------------------------
@@ -47,30 +67,27 @@ def _idle_cutoff() -> datetime:
 def close_stale_sessions(
     db: Session, family_id: Optional[int] = None
 ) -> int:
-    """Close any sessions whose ``last_activity_at`` is older than the
-    configured idle window.
+    """Close open sessions that have been idle longer than their surface's window.
 
     Called on every :func:`ensure_active_session` and whenever the history
     list is fetched, so the client never has to think about timeouts —
     the backend keeps the books automatically. Returns the number of
     sessions closed so callers can log it if useful.
     """
-    stmt = (
-        update(models.LiveSession)
-        .where(models.LiveSession.ended_at.is_(None))
-        .where(models.LiveSession.last_activity_at < _idle_cutoff())
-        .values(ended_at=_now(), end_reason="timeout")
-    )
-    if family_id is not None:
-        stmt = stmt.where(models.LiveSession.family_id == family_id)
-    result = db.execute(stmt)
-    count = result.rowcount or 0
-    if count:
-        logger.info(
-            "Closed %d stale live session(s) (idle threshold %d min)",
-            count,
-            get_settings().AI_LIVE_SESSION_IDLE_MINUTES,
+    count = 0
+    for source in ("live", *THREAD_SOURCES):
+        stmt = (
+            update(models.LiveSession)
+            .where(models.LiveSession.ended_at.is_(None))
+            .where(models.LiveSession.source == source)
+            .where(models.LiveSession.last_activity_at < _idle_cutoff(source))
+            .values(ended_at=_now(), end_reason="timeout")
         )
+        if family_id is not None:
+            stmt = stmt.where(models.LiveSession.family_id == family_id)
+        count += db.execute(stmt).rowcount or 0
+    if count:
+        logger.info("Closed %d idle session(s)", count)
     return count
 
 
@@ -155,9 +172,9 @@ def ensure_active_session(
 # the surface-specific ``start_context`` defaults stay close to the
 # format the existing transcripts on disk already use.
 #
-# All four surfaces deliberately skip the ``close_stale_sessions``
-# sweep that the live-page path uses — a back-and-forth that takes a
-# week is still one conversation on these surfaces.
+# Lifecycle follows :func:`idle_minutes_for`: text threads idle out like
+# the live page (the next message opens a new session on the same
+# thread), while an email session lives as long as its Gmail thread.
 
 
 def _find_or_create_thread_session(
@@ -168,13 +185,11 @@ def _find_or_create_thread_session(
     external_thread_id: str,
     start_context: str,
 ) -> Tuple[models.LiveSession, bool]:
-    """Common find-or-reactivate-or-create flow for a thread session.
+    """Common find-or-create flow for a thread session.
 
-    Returns ``(session, created)``. If a row already exists for
-    ``(family_id, source, external_thread_id)``, bumps its
-    ``last_activity_at`` and reactivates it (clears ``ended_at`` /
-    ``end_reason``) so a new reply on a previously-ended thread
-    doesn't look orphaned in the history view.
+    Returns ``(session, created)``. The thread's latest session is reused
+    (and reopened if it was closed) unless it has been idle past the
+    surface's window, in which case it is closed and a new one starts.
     """
     existing = db.execute(
         select(models.LiveSession)
@@ -184,6 +199,12 @@ def _find_or_create_thread_session(
         .order_by(models.LiveSession.started_at.desc())
         .limit(1)
     ).scalar_one_or_none()
+    if existing is not None and _is_idle(existing):
+        if existing.ended_at is None:
+            existing.ended_at = _now()
+            existing.end_reason = "timeout"
+            db.flush()
+        existing = None
     if existing is not None:
         existing.last_activity_at = _now()
         if existing.ended_at is not None:
@@ -413,6 +434,46 @@ def log_message(
     db.add(row)
     touch_session(db, session)
     return row
+
+
+def conversation_history(
+    db: Session,
+    session: models.LiveSession,
+    *,
+    max_messages: Optional[int] = None,
+    max_chars: Optional[int] = None,
+) -> list[dict[str, str]]:
+    """The session's recent user / assistant turns, oldest first, for the agent.
+
+    Every surface calls this *before* logging the new inbound message, so
+    the result is the conversation so far. Instant "working on it" acks
+    are skipped — they carry no content the agent needs.
+    """
+    settings = get_settings()
+    max_messages = max_messages or settings.AI_SESSION_HISTORY_MAX_MESSAGES
+    max_chars = max_chars or settings.AI_SESSION_HISTORY_MAX_CHARS
+    rows = db.execute(
+        select(models.LiveSessionMessage)
+        .where(models.LiveSessionMessage.live_session_id == session.live_session_id)
+        .where(models.LiveSessionMessage.role.in_(("user", "assistant")))
+        .order_by(models.LiveSessionMessage.live_session_message_id.desc())
+        .limit(max_messages * 2)
+    ).scalars()
+    picked: list[dict[str, str]] = []
+    used = 0
+    for row in rows:
+        meta = row.meta or {}
+        kind = str(meta.get("kind") or "")
+        if kind.endswith("ack") or meta.get("resend") or not (row.content or "").strip():
+            continue
+        if len(picked) >= max_messages or used + len(row.content) > max_chars:
+            break
+        picked.append({"role": row.role, "content": row.content})
+        used += len(row.content)
+    picked.reverse()
+    while picked and picked[0]["role"] != "user":
+        picked.pop(0)
+    return picked
 
 
 # ---------- read helpers (shared by list + detail views) --------------------

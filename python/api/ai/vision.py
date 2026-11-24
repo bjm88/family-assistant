@@ -14,7 +14,8 @@ Three kinds of attachments are supported in v1:
   authenticated via ``GEMINI_API_KEY``.
 * **PDFs** (``application/pdf``) — text extracted via :mod:`pypdf`.
   Returns the first ``MAX_DOC_TEXT_CHARS`` so we don't blow the
-  context window on a 200-page tax return.
+  context window on a 200-page tax return. Scans with no text layer
+  are OCR'd by Gemini instead.
 * **Word .docx** (``application/vnd.openxmlformats-officedocument.wordprocessingml.document``) —
   text extracted via :mod:`python-docx`. Old binary ``.doc`` is
   intentionally out of scope.
@@ -213,73 +214,104 @@ def describe_attachment(
 # --- Per-kind implementations ---------------------------------------------
 
 
-def _caption_image(path: Path, *, mime_type: str) -> AttachmentDescription:
-    """Send the image to Gemini and return its description.
+class VisionCallError(RuntimeError):
+    """A Gemini vision call could not produce a usable answer."""
 
-    We import google.genai lazily so the rest of the app — and unit
-    tests that don't talk to the model — don't pay the SDK init cost.
+    def __init__(self, message: str, *, model: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.model = model
+
+
+def gemini_generate(
+    path: Path,
+    *,
+    mime_type: str,
+    prompt: str,
+    json_output: bool = False,
+) -> tuple[str, str]:
+    """Send one file (image or PDF) plus ``prompt`` to Gemini.
+
+    Returns ``(text, model)``; raises :class:`VisionCallError` on any
+    failure. We import google.genai lazily so the rest of the app — and
+    unit tests that don't talk to the model — don't pay the SDK init cost.
     """
     settings = get_settings()
     api_key = settings.GEMINI_API_KEY
     if not api_key:
-        return AttachmentDescription(
-            text="",
-            kind="error",
-            error="GEMINI_API_KEY is not configured",
-        )
+        raise VisionCallError("GEMINI_API_KEY is not configured")
 
     try:
         from google import genai
         from google.genai import types as genai_types
     except Exception as e:  # noqa: BLE001
-        return AttachmentDescription(
-            text="",
-            kind="error",
-            error=f"google-genai SDK unavailable: {e}",
-        )
+        raise VisionCallError(f"google-genai SDK unavailable: {e}") from e
 
-    image_bytes = path.read_bytes()
-    if len(image_bytes) > settings.AI_ATTACHMENT_MAX_BYTES:
-        return AttachmentDescription(
-            text="",
-            kind="error",
-            error=(
-                f"image too large for vision call: "
-                f"{len(image_bytes)} > {settings.AI_ATTACHMENT_MAX_BYTES} bytes"
-            ),
+    data = path.read_bytes()
+    if len(data) > settings.AI_ATTACHMENT_MAX_BYTES:
+        raise VisionCallError(
+            f"file too large for vision call: "
+            f"{len(data)} > {settings.AI_ATTACHMENT_MAX_BYTES} bytes"
         )
 
     client = genai.Client(api_key=api_key)
     model = settings.AI_VISION_MODEL
+    config = (
+        genai_types.GenerateContentConfig(response_mime_type="application/json")
+        if json_output
+        else None
+    )
     try:
         resp = client.models.generate_content(
             model=model,
             contents=[
-                genai_types.Part.from_bytes(
-                    data=image_bytes, mime_type=mime_type
-                ),
-                _VISION_PROMPT,
+                genai_types.Part.from_bytes(data=data, mime_type=mime_type),
+                prompt,
             ],
+            config=config,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("Gemini vision call failed for %s: %s", path.name, e)
-        return AttachmentDescription(
-            text="",
-            kind="error",
-            model_used=model,
-            error=_short_genai_error(e),
-        )
+        raise VisionCallError(_short_genai_error(e), model=model) from e
 
     text = (getattr(resp, "text", None) or "").strip()
     if not text:
-        return AttachmentDescription(
-            text="",
-            kind="error",
-            model_used=model,
-            error="Gemini returned an empty caption",
-        )
+        raise VisionCallError("Gemini returned an empty response", model=model)
+    return text, model
 
+
+def _caption_image(path: Path, *, mime_type: str) -> AttachmentDescription:
+    """Send the image to Gemini and return its description."""
+    try:
+        text, model = gemini_generate(path, mime_type=mime_type, prompt=_VISION_PROMPT)
+    except VisionCallError as e:
+        return AttachmentDescription(
+            text="", kind="error", model_used=e.model, error=str(e)
+        )
     return AttachmentDescription(text=text, kind="image_caption", model_used=model)
+
+
+_SCANNED_PDF_PROMPT = (
+    "This PDF is a scan with no text layer. Transcribe its readable text "
+    "faithfully, top to bottom, as plain text. Skip decorative elements. "
+    "Do not add commentary."
+)
+
+
+def _ocr_scanned_pdf(path: Path) -> Optional[AttachmentDescription]:
+    """Vision OCR for image-only PDFs; ``None`` when Gemini can't help."""
+    try:
+        text, model = gemini_generate(
+            path, mime_type="application/pdf", prompt=_SCANNED_PDF_PROMPT
+        )
+    except VisionCallError as e:
+        logger.info("[vision] scanned-pdf OCR unavailable name=%s: %s", path.name, e)
+        return None
+    truncated = len(text) > MAX_DOC_TEXT_CHARS
+    if truncated:
+        text = text[:MAX_DOC_TEXT_CHARS].rstrip() + " …"
+    return AttachmentDescription(
+        text=text, kind="pdf_text", model_used=model, truncated=truncated
+    )
 
 
 def _extract_pdf(path: Path) -> AttachmentDescription:
@@ -327,6 +359,9 @@ def _extract_pdf(path: Path) -> AttachmentDescription:
 
     text = "\n\n".join(chunks).strip()
     if not text:
+        ocr = _ocr_scanned_pdf(path)
+        if ocr is not None:
+            return ocr
         return AttachmentDescription(
             text="",
             kind="error",

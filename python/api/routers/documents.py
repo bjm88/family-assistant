@@ -84,7 +84,12 @@ def update_document(
     doc = db.get(models.Document, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("person_id") is not None:
+        person = db.get(models.Person, changes["person_id"])
+        if person is None or person.family_id != doc.family_id:
+            raise HTTPException(status_code=400, detail="Person is not in this family")
+    for field, value in changes.items():
         setattr(doc, field, value)
     db.flush()
     db.refresh(doc)

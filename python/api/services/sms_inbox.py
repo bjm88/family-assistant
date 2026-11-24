@@ -95,9 +95,9 @@ from ..ai import tools as agent_tools
 from ..ai import vision
 from ..config import Settings, get_settings
 from ..db import SessionLocal
-from ..integrations import gmail, google_oauth, twilio_sms
+from ..integrations import gmail, google_oauth, telegram, twilio_sms
 from ..utils.phone import normalize_phone
-from . import inbound_prompts
+from . import attachment_intake, inbound_prompts
 
 
 logger = logging.getLogger(__name__)
@@ -128,12 +128,20 @@ _OPT_OUT_KEYWORDS: frozenset[str] = frozenset(
 # single-token match only — "please JOIN" still goes through the
 # normal agent / unknown-sender path.
 _OPT_IN_KEYWORDS: frozenset[str] = frozenset(
-    {"join", "subscribe", "start", "yes", "unstop"}
+    {"join", "subscribe", "start", "unstop"}
 )
+# Double opt-in: after SUBSCRIBE / JOIN, "Y" confirms enrolment. Only
+# treated as a keyword while a request is pending, so an ordinary "yes"
+# answer to Avi still reaches the agent.
+_CONFIRM_KEYWORDS: frozenset[str] = frozenset({"y", "yes"})
+_OPT_IN_CONFIRM_WINDOW_DAYS = 7
 _HELP_KEYWORDS: frozenset[str] = frozenset({"help", "info"})
 
+# Sole-proprietor A2P campaigns must name the registered person (30914).
+_CAMPAIGN_BRAND = "Benjamin Maisano (Avi Household Organizer)"
 _CAMPAIGN_FOOTER = (
-    "Msg & data rates may apply. Reply STOP to unsubscribe, HELP for help."
+    "Msg frequency varies. Msg & data rates may apply. "
+    "Reply STOP to unsubscribe, HELP for help."
 )
 
 
@@ -344,7 +352,10 @@ def process_inbound_sms(
     # a registered household member — Twilio's campaign reviewer
     # texts these from an unknown number and expects a compliant
     # canned message, not silence. JOIN also clears sms_opted_out.
-    if chan.channel == "sms" and _is_campaign_keyword(inbound.body):
+    if chan.channel == "sms" and (
+        _is_campaign_keyword(inbound.body)
+        or _is_opt_in_confirmation(db, inbound.body, from_phone_bare)
+    ):
         return _handle_campaign_keyword(
             db,
             inbound=inbound,
@@ -408,6 +419,7 @@ def process_inbound_sms(
         counterparty_phone=counterparty,
     )
     live_session.upsert_participant(db, session, person_id=person.person_id)
+    history = live_session.conversation_history(db, session)
 
     # Insert the audit row early (status='failed') so a downstream
     # crash still leaves a forensic trail. We'll flip its status
@@ -538,6 +550,8 @@ def process_inbound_sms(
     final_text: Optional[str] = None
     shortcut_used: Optional[str] = None
     assistant_id_for_fast = _assistant_id_for_family(db, person.family_id)
+    open_questions = attachment_intake.open_questions(db, person_id=person.person_id)
+    needs_heavy = bool(inbound.media) or bool(open_questions)
     triage = fast_action_router.try_triage_sync(
         (inbound.body or "").strip(),
         family_id=person.family_id,
@@ -547,8 +561,8 @@ def process_inbound_sms(
         surface_label=chan.label,
         agent_task_kind=chan.agent_task_kind,
         # Attachments need the heavy agent's full tool set.
-        allow_action=not bool(inbound.media),
-        allow_family_qa=not bool(inbound.media),
+        allow_action=not needs_heavy,
+        allow_family_qa=not needs_heavy,
     )
     if triage.reply:
         logger.info(
@@ -584,6 +598,20 @@ def process_inbound_sms(
             )
             for m in attachments_meta
         ]
+        intake_block = attachment_intake.auto_file_attachments(
+            db,
+            family_id=person.family_id,
+            sender=person,
+            message_text=inbound.body,
+            refs=inbound_attachment_refs,
+        )
+        followup_refs, followup_block = attachment_intake.followup_for_agent(
+            db, open_questions, first_index=len(inbound_attachment_refs) + 1
+        )
+        inbound_attachment_refs += followup_refs
+        for block in (intake_block, followup_block):
+            if block:
+                user_message = f"{user_message}\n\n{block}"
 
         logger.info(
             "[orch] surface=%s path=heavy_agent sid=%s task=%s "
@@ -612,7 +640,7 @@ def process_inbound_sms(
                 assistant_id=assistant_id_for_fam,
                 person_id=person.person_id,
                 system_prompt=system_prompt,
-                history=[],
+                history=history,
                 user_message=user_message,
                 inbound_attachments=inbound_attachment_refs,
             )
@@ -764,6 +792,21 @@ def _is_campaign_keyword(body: Optional[str]) -> bool:
     return _is_opt_in(body) or _is_help(body)
 
 
+def _opt_in_pending(person: Optional[models.Person]) -> bool:
+    from datetime import timedelta
+
+    requested = getattr(person, "sms_opt_in_requested_at", None) if person else None
+    return requested is not None and requested >= _utcnow() - timedelta(
+        days=_OPT_IN_CONFIRM_WINDOW_DAYS
+    )
+
+
+def _is_opt_in_confirmation(db: Session, body: Optional[str], from_phone_bare: str) -> bool:
+    if _keyword_token(body) not in _CONFIRM_KEYWORDS:
+        return False
+    return _opt_in_pending(_lookup_family_member_by_phone(db, from_phone_bare))
+
+
 def _family_short_name(family: Optional[models.Family]) -> str:
     """'Maisano Family' → 'Maisano' so we can say 'the Maisano family'."""
     raw = (family.family_name if family else "") or ""
@@ -779,16 +822,32 @@ def _register_url() -> str:
     ) + "/"
 
 
-def _campaign_join_body(*, family: Optional[models.Family]) -> str:
-    label = _family_short_name(family)
-    if label:
-        return (
-            f"You are registered with the {label} family. "
-            f"{_CAMPAIGN_FOOTER}"
-        )
+def _campaign_welcome_body(*, family: Optional[models.Family]) -> str:
+    """First reply to SUBSCRIBE / JOIN: every disclosure, then ask for Y."""
+    label = _family_short_name(family) or "your"
+    site = _register_url()
     return (
-        "This number isn't linked to a family yet. Register at "
-        f"{_register_url()} then text JOIN again. {_CAMPAIGN_FOOTER}"
+        f"{_CAMPAIGN_BRAND}: Texts with Avi for the {label} household — "
+        f"replies and the reminders you ask for. {_CAMPAIGN_FOOTER} "
+        f"Terms: {site}legal/terms Privacy: {site}legal/privacy "
+        "Reply Y to confirm."
+    )
+
+
+def _campaign_confirmed_body(*, family: Optional[models.Family]) -> str:
+    label = _family_short_name(family) or "your"
+    return (
+        f"{_CAMPAIGN_BRAND}: You're subscribed to replies and reminders "
+        f"for the {label} household. {_CAMPAIGN_FOOTER}"
+    )
+
+
+def _campaign_join_body(*, family: Optional[models.Family]) -> str:
+    """Reply to SUBSCRIBE / JOIN from a number no household has registered."""
+    return (
+        f"{_CAMPAIGN_BRAND}: This number isn't registered with a household. "
+        "Ask your household admin to add it, then text SUBSCRIBE again. "
+        f"Info: {_register_url()}sms {_CAMPAIGN_FOOTER}"
     )
 
 
@@ -843,15 +902,11 @@ def _handle_opt_out(
 def _campaign_help_body(*, family: Optional[models.Family]) -> str:
     site = _register_url()
     label = _family_short_name(family)
-    who = (
-        f"Avi is the {label} family's AI assistant"
-        if label
-        else "Avi is your Family AI Assistant"
-    )
+    who = f"the {label} household" if label else "one household"
     return (
-        f"{who} — a private household helper that answers questions, "
-        "keeps the calendar and tasks, and sends reminders over text. "
-        f"Learn more: {site} {_CAMPAIGN_FOOTER}"
+        f"{_CAMPAIGN_BRAND}: a private organizer for {who} — calendar, "
+        "reminders, documents and records. Help: benjamin.maisano@gmail.com "
+        f"or {site}sms {_CAMPAIGN_FOOTER}"
     )
 
 
@@ -889,12 +944,25 @@ def _handle_campaign_keyword(
             )
         reply = _campaign_help_body(family=family)
         kind = "help"
-    else:
-        if person is not None:
-            _set_sms_opt_out(person, opted_out=False)
-            db.commit()
-        reply = _campaign_join_body(family=family)
+    elif _keyword_token(inbound.body) in _CONFIRM_KEYWORDS:
+        # Only routed here while _opt_in_pending(person).
+        _set_sms_opt_out(person, opted_out=False)
+        person.sms_opted_in_at = _utcnow()
+        person.sms_opt_in_requested_at = None
+        db.commit()
+        reply = _campaign_confirmed_body(family=family)
+        kind = "confirm"
+    elif person is None:
+        reply = _campaign_join_body(family=None)
         kind = "join"
+    elif person.sms_opted_in_at and not person.sms_opted_out:
+        reply = _campaign_confirmed_body(family=family)
+        kind = "join_already_subscribed"
+    else:
+        person.sms_opt_in_requested_at = _utcnow()
+        db.commit()
+        reply = _campaign_welcome_body(family=family)
+        kind = "join_pending_confirm"
 
     if not chan.sender_number:
         return _save_audit(
@@ -1307,17 +1375,92 @@ class _EmailFallbackResult:
     gmail_message_id: Optional[str] = None
 
 
-def _format_sms_fallback_email(*, inbound_body: Optional[str], reply_text: str) -> Tuple[str, str]:
-    """Subject + body for the SMS→email fallback."""
-    subject = "Avi couldn't deliver a text — here's the reply"
+_CHANNEL_NOUNS = {"sms": "text", "whatsapp": "WhatsApp message"}
+
+
+def _format_sms_fallback_email(
+    *, inbound_body: Optional[str], reply_text: str, channel: str = "sms"
+) -> Tuple[str, str]:
+    """Subject + body for the SMS / WhatsApp → email fallback."""
+    noun = _CHANNEL_NOUNS.get(channel, "text")
+    subject = f"Avi couldn't deliver a {noun} — here's the reply"
     quoted = (inbound_body or "").strip() or "(no text)"
     body = (
-        "Avi here. I received your text but couldn't deliver the reply "
+        f"Avi here. I received your {noun} but couldn't deliver the reply "
         "to your phone, so I'm sending it by email instead.\n\n"
         f"You wrote:\n{quoted}\n\n"
         f"Avi's reply:\n{reply_text}"
     )
     return subject, body
+
+
+def _telegram_reply_fallback(
+    *, person: models.Person, reply_text: str, channel: str
+) -> Optional[_EmailFallbackResult]:
+    """Resend an undelivered reply on Telegram; ``None`` when not linked or it fails."""
+    token = get_settings().TELEGRAM_BOT_TOKEN
+    if not person.telegram_user_id or not token:
+        return None
+    label = "WhatsApp" if channel == "whatsapp" else "text"
+    try:
+        telegram.send_message(
+            bot_token=token,
+            chat_id=int(person.telegram_user_id),
+            text=f"(Couldn't reach you by {label}, so here's my reply.)\n\n{reply_text}",
+        )
+    except telegram.TelegramSendError:
+        logger.exception(
+            "[orch] surface=%s telegram_fallback failed person_id=%s",
+            channel, person.person_id,
+        )
+        return None
+    logger.info(
+        "[orch] surface=%s telegram_fallback person_id=%s", channel, person.person_id
+    )
+    return _EmailFallbackResult(True, "sent Telegram fallback")
+
+
+def _sms_reply_fallback(
+    *, person: models.Person, to_phone: str, reply_text: str
+) -> Optional[str]:
+    """Resend an undelivered WhatsApp reply by SMS; the new MessageSid, or ``None``."""
+    settings = get_settings()
+    if (
+        not settings.AI_WHATSAPP_SMS_FALLBACK_ENABLED
+        or getattr(person, "sms_opted_out", False)
+        or not getattr(person, "sms_opted_in_at", None)
+        or not to_phone
+        or not settings.TWILIO_PRIMARY_PHONE
+    ):
+        return None
+    extra: dict = {}
+    if settings.TWILIO_MESSAGING_SERVICE_SID:
+        extra["messaging_service_sid"] = settings.TWILIO_MESSAGING_SERVICE_SID
+    callback = settings.twilio_status_callback_url()
+    if callback:
+        extra["status_callback"] = callback
+    body = twilio_sms.truncate_for_sms(
+        f"(Couldn't reach you on WhatsApp, so here's my reply.) {reply_text}",
+        max_chars=settings.AI_SMS_REPLY_MAX_CHARS,
+    )
+    try:
+        sid = twilio_sms.send_sms(
+            account_sid=settings.TWILIO_ACCOUNT_SID or "",
+            auth_token=settings.TWILIO_AUTH_TOKEN or "",
+            from_phone=settings.TWILIO_PRIMARY_PHONE,
+            to_phone=to_phone,
+            body=body,
+            **extra,
+        )
+    except Exception:
+        logger.exception(
+            "[orch] surface=whatsapp sms_fallback failed person_id=%s", person.person_id
+        )
+        return None
+    logger.info(
+        "[orch] surface=whatsapp sms_fallback person_id=%s sid=%s", person.person_id, sid
+    )
+    return sid
 
 
 def _email_sms_reply(
@@ -1326,6 +1469,7 @@ def _email_sms_reply(
     person: models.Person,
     inbound_body: Optional[str],
     reply_text: str,
+    channel: str = "sms",
 ) -> _EmailFallbackResult:
     """Send ``reply_text`` to ``person.email_address`` via the family Gmail.
 
@@ -1345,7 +1489,7 @@ def _email_sms_reply(
     except (google_oauth.GoogleOAuthError, google_oauth.GoogleOAuthUnavailable) as exc:
         return _EmailFallbackResult(False, f"google oauth: {exc}")
     subject, body = _format_sms_fallback_email(
-        inbound_body=inbound_body, reply_text=reply_text
+        inbound_body=inbound_body, reply_text=reply_text, channel=channel
     )
     try:
         gmail_id = gmail.send_email(creds, to=email, subject=subject, body=body)
@@ -1437,14 +1581,14 @@ def _reply_body_from_session(
     kind_match: Optional[str] = None
     for row in rows:
         meta = row.meta or {}
-        if meta.get("kind") == "sms_email_fallback":
+        if meta.get("kind") in ("sms_email_fallback", "telegram_fallback"):
             # Already fell back — caller uses this as an idempotency signal
             # by seeing status_reason, but skip using this as the SMS body.
             continue
         if meta.get("twilio_message_sid") == twilio_sid:
             sid_match = row.content
             break
-        if kind_match is None and meta.get("kind") == "sms_reply":
+        if kind_match is None and meta.get("kind") in ("sms_reply", "whatsapp_reply"):
             kind_match = row.content
     return sid_match or kind_match
 
@@ -1456,24 +1600,33 @@ def handle_outbound_delivery_failure(
     error_code: Optional[str] = None,
     error_message: Optional[str] = None,
 ) -> None:
-    """Email the SMS reply if a later Twilio receipt says it never landed.
+    """Resend the reply if a later Twilio receipt says it never landed.
 
+    WhatsApp falls back to SMS first; the SMS's own SID then replaces
+    ``reply_message_sid`` so a failed SMS comes back through here and
+    moves on. After that (and for plain SMS) the reply goes out on
+    Telegram when the person has it linked, otherwise by email.
     Instant-ack SIDs are ignored (they are not stored on
-    ``reply_message_sid``). Already-emailed rows are a no-op so Twilio
-    retries do not double-send. WhatsApp receipts are ignored.
+    ``reply_message_sid``). Rows that already fell back to Telegram or
+    email are a no-op so Twilio retries do not double-send.
     """
     if not twilio_message_sid:
         return
     audit = db.execute(
-        select(models.SmsInboxMessage).where(
-            models.SmsInboxMessage.reply_message_sid == twilio_message_sid
-        )
+        select(models.SmsInboxMessage)
+        .where(models.SmsInboxMessage.reply_message_sid == twilio_message_sid)
+        .order_by(models.SmsInboxMessage.sms_inbox_message_id.desc())
+        .limit(1)
     ).scalar_one_or_none()
-    if audit is None or audit.channel != "sms":
+    if audit is None or audit.channel not in ("sms", "whatsapp"):
         return
-    if audit.status_reason and "emailed fallback" in audit.status_reason:
+    if audit.status_reason and (
+        "emailed fallback" in audit.status_reason
+        or "Telegram fallback" in audit.status_reason
+    ):
         logger.info(
-            "SMS delivery failure already emailed sid=%s; skipping.",
+            "%s delivery failure already resent sid=%s; skipping.",
+            audit.channel,
             twilio_message_sid,
         )
         return
@@ -1493,21 +1646,63 @@ def handle_outbound_delivery_failure(
             twilio_message_sid,
         )
         return
-    err = f"SMS undelivered ({error_code or 'unknown'})"
+    channel = audit.channel
+    sms_tried = "SMS fallback" in (audit.status_reason or "")
+    if sms_tried:
+        label = f"{audit.status_reason}; SMS fallback"
+    else:
+        label = "WhatsApp" if channel == "whatsapp" else "SMS"
+    err = f"{label} undelivered ({error_code or 'unknown'})"
     if error_message:
         err = f"{err}: {error_message}"
-    fallback = _email_sms_reply(
-        db,
-        person=person,
-        inbound_body=audit.body,
-        reply_text=reply_text,
-    )
     session = (
         db.get(models.LiveSession, audit.live_session_id)
         if audit.live_session_id
         else None
     )
-    if session is not None:
+    if channel == "whatsapp" and not sms_tried:
+        sms_sid = _sms_reply_fallback(
+            person=person,
+            to_phone=twilio_sms.strip_whatsapp_prefix(audit.from_phone),
+            reply_text=reply_text,
+        )
+        if sms_sid:
+            if session is not None:
+                live_session.log_message(
+                    db,
+                    session,
+                    role="assistant",
+                    content=reply_text,
+                    person_id=person.person_id,
+                    meta={
+                        "kind": "sms_fallback",
+                        "channel": "sms",
+                        "in_reply_to": audit.twilio_message_sid,
+                        "failed_twilio_message_sid": twilio_message_sid,
+                        "twilio_message_sid": sms_sid,
+                        "resend": True,
+                        "sms_error": err,
+                    },
+                )
+            audit.reply_message_sid = sms_sid
+            audit.status = "processed_replied"
+            audit.status_reason = f"{err}; sent SMS fallback"
+            db.commit()
+            return
+    fallback = _telegram_reply_fallback(
+        person=person, reply_text=reply_text, channel=channel
+    )
+    kind = "telegram_fallback"
+    if fallback is None:
+        fallback = _email_sms_reply(
+            db,
+            person=person,
+            inbound_body=audit.body,
+            reply_text=reply_text,
+            channel=channel,
+        )
+        kind = "sms_email_fallback"
+    if session is not None and fallback.sent:
         live_session.log_message(
             db,
             session,
@@ -1515,10 +1710,11 @@ def handle_outbound_delivery_failure(
             content=reply_text,
             person_id=person.person_id,
             meta={
-                "kind": "sms_email_fallback" if fallback.sent else "sms_reply",
-                "channel": "sms",
+                "kind": kind,
+                "channel": channel,
                 "in_reply_to": audit.twilio_message_sid,
                 "failed_twilio_message_sid": twilio_message_sid,
+                "resend": True,
                 "sms_error": err,
                 **(
                     {"gmail_message_id": fallback.gmail_message_id}
@@ -1532,7 +1728,7 @@ def handle_outbound_delivery_failure(
         audit.status_reason = f"{err}; {fallback.detail}"
     else:
         audit.status = "failed"
-        audit.status_reason = f"{err}; email fallback: {fallback.detail}"
+        audit.status_reason = f"{err}; fallback: {fallback.detail}"
     db.commit()
 
 

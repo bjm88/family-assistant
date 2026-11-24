@@ -242,6 +242,15 @@ class Settings(BaseSettings):
     # participant, new message, or an explicit ensure-active ping from
     # the live page. Override via env when testing: AI_LIVE_SESSION_IDLE_MINUTES=2
     AI_LIVE_SESSION_IDLE_MINUTES: int = 30
+    # Same idea for text-message threads (SMS / WhatsApp / Telegram):
+    # after this long without a message the conversation ends and the
+    # next text starts a fresh session (and fresh agent history).
+    # Email sessions follow the Gmail thread instead and never idle out.
+    AI_THREAD_SESSION_IDLE_MINUTES: int = 360
+    # How much of the current session's transcript every surface hands
+    # the agent as conversation history.
+    AI_SESSION_HISTORY_MAX_MESSAGES: int = 20
+    AI_SESSION_HISTORY_MAX_CHARS: int = 12_000
 
     # Seconds-window the /greet endpoint uses to decide whether the
     # speaker is "already mid-conversation" with Avi. If the most recent
@@ -377,6 +386,11 @@ class Settings(BaseSettings):
     # answers since WhatsApp readers expect chat-style longer messages
     # vs. SMS terseness.
     AI_WHATSAPP_REPLY_MAX_CHARS: int = 1024
+    # Resend an undelivered WhatsApp reply by SMS (TWILIO_PRIMARY_PHONE)
+    # before trying Telegram / email. SMS only lands once the A2P 10DLC
+    # campaign is approved; until then carriers block it (30034) and the
+    # failure receipt moves the reply on to Telegram / email.
+    AI_WHATSAPP_SMS_FALLBACK_ENABLED: bool = True
 
     # ---- Telegram inbox ------------------------------------------------
     # Master switch for the Telegram long-poll loop. When OFF the bot
@@ -600,6 +614,11 @@ class Settings(BaseSettings):
     # stays aware. Prevents an inbound with 30 photos from spending 60 s
     # on Gemini Vision calls before the agent even starts.
     AI_ATTACHMENT_MAX_PER_MESSAGE: int = 6
+    # When a message is nothing but photos / PDFs (no text), Avi OCRs
+    # each one, works out what it is, and files it himself: identity
+    # documents onto the holder's record, everything else into
+    # Documents (linked to the person it's about, if any).
+    AI_ATTACHMENT_AUTO_FILE_ENABLED: bool = True
 
     # ---- Database backup → Google Drive --------------------------------
     # Destination folder for the weekly pg_dump uploaded by

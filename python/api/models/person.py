@@ -142,6 +142,19 @@ class Person(Base, TimestampMixin):
             "the person is opted in (the default)."
         ),
     )
+    sms_opt_in_requested_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When they texted SUBSCRIBE / JOIN; cleared once they reply Y.",
+    )
+    sms_opted_in_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=(
+            "When they confirmed the SMS double opt-in with Y. Avi only "
+            "starts SMS conversations (e.g. WhatsApp fallback) when set."
+        ),
+    )
 
     interests_and_activities: Mapped[Optional[str]] = mapped_column(
         Text,

@@ -143,6 +143,9 @@ _COMPACT_SCHEMA_HINT = (
     "- `identity_documents` (identity_document_id): person_id, "
     "document_type, issuing_authority, expiration_date, "
     "document_number_last_four.\n"
+    "- `documents` (document_id): family_id, person_id (NULL = household), "
+    "title, document_category, notes, extracted_text (OCR'd contents — "
+    "search it with ILIKE to answer questions about a bill / form).\n"
     "- `tasks` (task_id): family_id, creator_person_id, assignee_person_id, "
     "owner_kind, task_kind, title, description, status, priority, "
     "due_date, completed_at, cron_expression.\n"
@@ -238,7 +241,13 @@ def build_inbound_system_prompt(
         "`media_index=0` to attach every file from this message in one "
         "shot. The user can SEE the chip on the kanban card, so always "
         "confirm in your reply which file(s) you attached and to which "
-        "task."
+        "task.\n"
+        "When a '--- Avi auto-filed these attachments ---' block appears, "
+        "FILED files are ALREADY saved as described — do not save them "
+        "again, just confirm briefly. For ASK THE SENDER files, ask the "
+        "question instead of guessing. A '--- Files you asked this sender "
+        "about earlier ---' block means their message may be the answer: "
+        "file those with the record tools if it is."
     )
     parts.append(how_to_reply)
     return prompts.with_safety("\n\n".join(parts))

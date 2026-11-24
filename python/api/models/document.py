@@ -59,6 +59,15 @@ class Document(Base, TimestampMixin):
     file_size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    extracted_text: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment=(
+            "Text read from the file (PDF text layer or vision OCR). "
+            "Government ID, SSN and full account numbers are reduced "
+            "to their last four characters before storage."
+        ),
+    )
 
     family: Mapped["Family"] = relationship(back_populates="documents")  # noqa: F821
     person: Mapped[Optional["Person"]] = relationship(back_populates="documents")  # noqa: F821
