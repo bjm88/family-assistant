@@ -178,14 +178,21 @@ def build_default_registry() -> ToolRegistry:
             name="calendar_check_availability",
             label="Check a person's free/busy",
             description=(
-                "Check whether one specific household member is free "
-                "or busy in a given time window. Hits Google freebusy "
-                "against BOTH the person's personal calendar "
+                "Check when one specific household member is free "
+                "or busy in a given time window — one afternoon or a "
+                "whole week. Checks "
+                "BOTH the person's personal calendar "
                 "(email_address) AND every work calendar from their jobs "
                 "when both are configured, and merges the results so "
                 "a slot only counts as free if the person is free on "
-                "both. Returns per_calendar so you can mention if a "
-                "specific calendar isn't shared with the assistant. "
+                "both. Also the tool for 'which day is X most free?' "
+                "and 'how busy is X next week?': pass the whole range "
+                "and the result's `days` and `days_least_to_most_busy` "
+                "give each date's busy hours — answer from those, "
+                "with the date. Returns per_calendar (what the "
+                "assistant can see on each calendar) and `coverage` "
+                "so you can say when a calendar isn't shared and the "
+                "answer is incomplete. "
                 "Free/busy contains NO event detail (titles, "
                 "locations) so this tool is safe to call for any "
                 "household member regardless of who is asking."
@@ -197,6 +204,7 @@ def build_default_registry() -> ToolRegistry:
             examples=(
                 "Is Ben free Friday afternoon?",
                 "Is Mom busy at 3pm tomorrow?",
+                "Which day am I most free next week?",
             ),
         )
     )
@@ -211,6 +219,9 @@ def build_default_registry() -> ToolRegistry:
                 "suggested slot is only free if the person is free "
                 "on every shared calendar. Defaults to 30-minute "
                 "slots inside 9am-6pm working hours, configurable. "
+                "Returns the FIRST openings in the window, not the "
+                "lightest day — for 'which day is X most free?' use "
+                "calendar_check_availability. "
                 "Warns if any calendar exists on the profile but "
                 "isn't shared with the assistant."
             ),

@@ -1,12 +1,13 @@
 """Shared helpers used by every ``calendar_*`` tool.
 
-Lives in its own module so :mod:`calendar` and the per-person freebusy
-tools can share the person-resolution + ISO parsing code without
-either side needing to import the other.
+Works out whose calendars a question is about (the speaker, a named
+family member, or an email address) and which calendar ids belong to
+that person, plus the ISO parsing the tools share.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
@@ -20,17 +21,98 @@ def looks_like_email(value: str) -> bool:
     return "@" in value and "." in value.split("@", 1)[1]
 
 
+# How people refer to themselves when the model passes their words
+# straight through instead of a name.
+_SELF_WORDS = frozenset(
+    {"me", "myself", "i", "my", "mine", "self", "speaker", "user", "the user"}
+)
+
+
+def _name_parts(p: models.Person) -> set[str]:
+    parts: set[str] = set()
+    for value in (p.first_name, p.preferred_name, p.middle_name, p.last_name):
+        parts.update(re.findall(r"[a-z0-9]+", (value or "").lower()))
+    return parts
+
+
+def _full_name(p: models.Person) -> str:
+    return " ".join(x for x in (p.preferred_name or p.first_name, p.last_name) if x)
+
+
+def find_family_member(ctx: ToolContext, name: str) -> Optional[models.Person]:
+    """Find the one household member a name refers to.
+
+    Tries the strictest reading first and stops at the first that
+    matches anyone:
+
+    1. the name is exactly their first or preferred name ("Sam" is Sam,
+       not Samantha);
+    2. every word is one of their names ("Benjamin Maisano", "Maisano");
+    3. every word starts one of their names ("Ben" for Benjamin);
+    4. the text appears somewhere in their full name.
+
+    Returns ``None`` when nobody matches. Raises :class:`ToolError`
+    when several people match equally well — answering about the wrong
+    person's calendar is worse than asking which one was meant.
+    """
+    needle = re.sub(r"['’]s\b", "", (name or "").strip().lower())
+    words = re.findall(r"[a-z0-9]+", needle)
+    if not words:
+        return None
+    people = (
+        ctx.db.query(models.Person)
+        .filter(models.Person.family_id == ctx.family_id)
+        .order_by(models.Person.person_id)
+        .all()
+    )
+    joined = " ".join(words)
+
+    def given_name(p: models.Person) -> bool:
+        return joined in (
+            (p.first_name or "").strip().lower(),
+            (p.preferred_name or "").strip().lower(),
+        )
+
+    def whole_words(p: models.Person) -> bool:
+        return all(w in _name_parts(p) for w in words)
+
+    def word_starts(p: models.Person) -> bool:
+        parts = _name_parts(p)
+        return all(any(part.startswith(w) for part in parts) for w in words)
+
+    def anywhere(p: models.Person) -> bool:
+        haystack = " ".join(
+            x for x in (p.first_name, p.preferred_name, p.last_name) if x
+        ).lower()
+        return joined in haystack
+
+    for rule in (given_name, whole_words, word_starts, anywhere):
+        matches = [p for p in people if rule(p)]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            names = ", ".join(_full_name(p) for p in matches)
+            raise ToolError(
+                f"More than one family member matches {name!r}: {names}. "
+                "Ask which one they mean, then call again with the full name."
+            )
+    return None
+
+
 def resolve_person_calendars(
-    ctx: ToolContext, person: str
+    ctx: ToolContext, person: Optional[str]
 ) -> tuple[Optional[models.Person], List[Tuple[str, str]]]:
     """Turn a free-form ``person`` arg into ``(Person row, [(calendar_id, label), …])``.
 
-    Returns BOTH the personal and work calendar ids (when populated)
-    so the freebusy / event tools can hit them in a single Google
-    request. The label is one of:
+    ``person`` may be a name, an email address, or empty / "me" for
+    whoever is talking.
 
-    * ``"personal"`` — ``Person.email_address``
-    * ``"work"``     — ``Person.work_email``
+    Returns BOTH the personal and work calendar ids (when populated)
+    so the availability / event tools read every calendar the person
+    keeps. The label is one of:
+
+    * ``"personal"`` — ``people.email_address``
+    * ``"work"``     — the ``work_email`` on each of the person's jobs
     * ``"direct"``   — the caller passed an email address that
       didn't match any family member (we still try it as a
       single calendar so the agent isn't useless against a
@@ -41,8 +123,13 @@ def resolve_person_calendars(
     titles, work calendar usually only shows busy" rendering rule.
     """
     needle = (person or "").strip()
-    if not needle:
-        return None, []
+    if not needle or needle.lower() in _SELF_WORDS:
+        if ctx.person_id is None:
+            return None, []
+        speaker = ctx.db.get(models.Person, ctx.person_id)
+        if speaker is None or speaker.family_id != ctx.family_id:
+            return None, []
+        return speaker, calendar_pairs_for(speaker)
 
     if looks_like_email(needle):
         # Match against EITHER the person's personal email_address OR
@@ -68,32 +155,51 @@ def resolve_person_calendars(
             return None, [(needle, "direct")]
         return match, calendar_pairs_for(match, requested_email=lowered)
 
-    rows = (
-        ctx.db.query(models.Person)
-        .filter(models.Person.family_id == ctx.family_id)
-        .all()
-    )
-    pattern = needle.lower()
-    matches: List[models.Person] = []
-    for p in rows:
-        haystack = " ".join(
-            x for x in (p.first_name, p.preferred_name, p.last_name) if x
-        ).lower()
-        if pattern in haystack:
-            matches.append(p)
-    if not matches:
+    chosen = find_family_member(ctx, needle)
+    if chosen is None:
         return None, []
-    # Prefer an exact first-name / preferred-name match when there are
-    # multiple hits ("Sam" → Sam, not Samantha) so a kid's question
-    # doesn't accidentally pull a parent.
-    exact = [
-        p
-        for p in matches
-        if (p.first_name or "").lower() == pattern
-        or (p.preferred_name or "").lower() == pattern
-    ]
-    chosen = exact[0] if exact else matches[0]
     return chosen, calendar_pairs_for(chosen)
+
+
+def resolve_calendar_subject(
+    ctx: ToolContext, person: Optional[str]
+) -> tuple[Optional[models.Person], List[Tuple[str, str]]]:
+    """Like :func:`resolve_person_calendars`, but never comes back empty.
+
+    Raises :class:`ToolError` saying exactly what is missing — who is
+    being asked about, or which email to add — so the reply to the user
+    names the real problem instead of a generic "no calendar".
+    """
+    person_row, pairs = resolve_person_calendars(ctx, person)
+    if pairs:
+        return person_row, pairs
+
+    needle = (person or "").strip()
+    if person_row is not None:
+        name = person_row.preferred_name or person_row.first_name
+        raise ToolError(
+            f"{name} has no email address on file, so I don't know which "
+            "calendar is theirs. Add a personal email on their profile, "
+            "or a work email under Jobs there, and I can check it."
+        )
+    if not needle or needle.lower() in _SELF_WORDS:
+        raise ToolError(
+            "I don't know who I'm talking to, so I can't tell whose "
+            "calendar to check. Ask whose calendar they mean and pass "
+            "that person's name."
+        )
+    known = ", ".join(
+        sorted(
+            p.preferred_name or p.first_name
+            for p in ctx.db.query(models.Person)
+            .filter(models.Person.family_id == ctx.family_id)
+            .all()
+        )
+    )
+    raise ToolError(
+        f"Nobody in this household is called {needle!r}. "
+        f"Family members: {known or 'none on file'}."
+    )
 
 
 def calendar_pairs_for(

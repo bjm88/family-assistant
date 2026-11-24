@@ -533,6 +533,27 @@ from his own Gmail address, and reading any calendar shared with him
    exposed). Avi will then see your events alongside his own when he
    queries the calendar.
 
+**How Avi answers a calendar question.** Every per-person calendar
+tool works through the same three steps:
+
+1. *Who is it about?* The person asking ("am I free…", "my week") or
+   the family member they name. A name that fits two people is asked
+   about, not guessed.
+2. *Which calendars are theirs, and what can Avi see?* The person's
+   **email address** is their personal calendar; the **work email** on
+   each entry under **Jobs** on their profile is a work calendar. Each
+   one is read as *event details*, *busy times only* (shared as
+   Free/busy — fine for availability, no titles) or *not shared*.
+3. *What does it add up to?* Busy time is merged across the calendars
+   Avi can see. For a range longer than a day it is totalled per date,
+   so "which day am I most free next week?" is answered from those
+   totals, with the date. If a calendar isn't shared, the reply says
+   the answer is incomplete.
+
+"This week" and "next week" are given to the model as dates, in the
+family's timezone. Weeks start on Sunday; set `WEEK_STARTS_ON=monday`
+in `.env` to change that.
+
 Tokens are stored Fernet-encrypted in the
 `google_oauth_credentials` table. Refresh tokens never leave the
 server, and the only plaintext columns are the granted email,

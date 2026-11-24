@@ -766,9 +766,8 @@ function GoogleAccountSection({
 }
 
 // Friendly labels + per-row colour for Google's accessRole values. We
-// also surface the "this share level can't list events" gotcha here
-// because that's the root cause of the 403 warnings the agent logs
-// when it tries to read events on a free/busy-only share.
+// also spell out what a free/busy-only share hides: Avi can tell when
+// the person is busy, but not what the event is.
 function describeAccessRole(role: string): {
   label: string;
   tone: "ok" | "warn" | "muted";
@@ -801,7 +800,7 @@ function describeAccessRole(role: string): {
         label: "Free/busy only",
         tone: "warn",
         description:
-          "Avi can only see busy/free intervals — listing individual events returns 403 (Google logs this as a warning). Re-share with 'See all event details' to expose titles, or 'Make changes to events' to also allow writes.",
+          "Avi can see when this calendar is busy, but not event titles, locations or guests. That is enough for availability checks and finding free time. Re-share with 'See all event details' to expose titles, or 'Make changes to events' to also allow writes.",
       };
     case "none":
       return {
@@ -910,7 +909,7 @@ function CalendarVisibilityPanel({
                   <th className="text-left px-3 py-2 font-medium">Calendar id</th>
                   <th className="text-left px-3 py-2 font-medium">Access</th>
                   <th className="text-left px-3 py-2 font-medium whitespace-nowrap">
-                    List events
+                    Event details
                   </th>
                   <th className="text-left px-3 py-2 font-medium whitespace-nowrap">
                     Add holds
@@ -979,7 +978,7 @@ function CalendarVisibilityPanel({
                         ) : (
                           <XCircle
                             className="h-4 w-4 text-amber-600"
-                            aria-label="Cannot list events — produces 403 in agent logs"
+                            aria-label="Busy times only — event titles and details are hidden"
                           />
                         )}
                       </td>
@@ -997,11 +996,10 @@ function CalendarVisibilityPanel({
             </table>
           </div>
           <div className="px-3 py-2 border-t border-border bg-muted/20 text-xs text-muted-foreground">
-            403 "insufficientPermissions" warnings in the API logs are
-            expected when Avi's agent tries to list events on a
-            calendar shared with "Free/busy only" — it falls back to
-            free/busy queries and the user reply still goes out. Share
-            the calendar with "See all event details" to silence them.
+            Any calendar listed here counts toward availability
+            checks, including ones shared as "Free/busy only". Avi
+            just can't say what those events are. Share the calendar
+            with "See all event details" if he should.
           </div>
         </>
       )}

@@ -9,21 +9,27 @@ credentials. The assistant sees:
 So once Ben shares his personal calendar with avi@…, every helper
 below treats Ben's calendar like a first-class one — :func:`freebusy`
 returns his busy intervals, :func:`find_free_slots` can carve out
-windows that work for him, etc. If the calendar isn't shared the
-freebusy response surfaces a per-calendar error which we propagate
+windows that work for him, etc. If the calendar isn't shared,
+:func:`freebusy` reports a per-calendar error which we propagate
 to the caller as :class:`CalendarNotShared` so the LLM can give the
 user a clear "ask Ben to share his calendar with me first" answer.
+
+Busy time is worked out from each calendar's events, not from Google's
+``freebusy.query`` endpoint: the scopes the assistant is granted
+(``calendar.events``) do not authorise that endpoint, and reading
+events works at every share level, including "see only free/busy".
 
 Public surface:
 
 * :func:`list_calendar_ids` — every calendar the assistant can see.
 * :func:`list_upcoming_events` — flat list of upcoming events sorted
   by start time, across one or many calendars.
-* :func:`freebusy` — raw Google freebusy result, busy + per-calendar
-  errors split.
+* :func:`freebusy` — busy intervals per calendar, plus per-calendar
+  errors for calendars the assistant can't see.
 * :func:`busy_for_calendar` — convenience: "is this one calendar
   busy in this window?" returning either intervals or
   :class:`CalendarNotShared`.
+* :func:`busy_by_day` — the same busy time added up per calendar day.
 * :func:`find_free_slots` — given busy intervals + a window + a
   duration, return suggested free slots (optionally clamped to a
   daily working-hours band).
@@ -31,10 +37,12 @@ Public surface:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import List, Optional, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -145,11 +153,11 @@ class VisibleCalendar:
     * ``reader`` — full read only. Events list works (titles,
       locations, organizers visible). Writes refused with 403
       insufficient_scope; we surface that as :class:`CalendarReadOnly`.
-    * ``freeBusyReader`` — only ``freebusy.query`` is permitted.
-      Calling ``events.list`` returns 403 insufficientPermissions
-      (which googleapiclient logs as a WARNING regardless of whether
-      our code catches it). This is the typical "share only my
-      busy/free, hide titles" mode used for work calendars.
+    * ``freeBusyReader`` — ``events.list`` returns each event's start
+      and end only: no title, location or attendees. Enough to work
+      out when the person is busy, nothing more. This is the typical
+      "share only my busy/free, hide titles" mode used for work
+      calendars.
     * ``none`` — Google still returns the row (the calendar was
       added to the user's list at some point) but no read of any
       kind is allowed.
@@ -280,19 +288,23 @@ def list_upcoming_events(
 
 @dataclass(frozen=True)
 class FreeBusyResult:
-    """Per-calendar freebusy outcome.
+    """Per-calendar busy outcome.
 
     ``busy`` is the list of ``{"start": iso, "end": iso}`` intervals
-    Google reports for that calendar in the requested window.
-    ``errors`` is the list of per-calendar errors Google attaches
-    when the assistant doesn't have access (e.g. ``notFound`` for an
-    un-shared calendar). The two lists are mutually exclusive in
-    practice; we keep both in the dataclass so callers can decide how
-    to render either case.
+    the calendar is occupied in the requested window, merged and
+    sorted. ``errors`` is non-empty when the assistant can't see the
+    calendar (e.g. ``[{"domain": "global", "reason": "notFound"}]``
+    for an un-shared one). The two lists are mutually exclusive; both
+    are kept so callers can decide how to render either case.
+
+    ``access_role`` is the share level Google reports for a visible
+    calendar: ``owner`` / ``writer`` / ``reader`` (event details
+    visible) or ``freeBusyReader`` (start and end times only).
     """
 
     busy: List[dict] = field(default_factory=list)
     errors: List[dict] = field(default_factory=list)
+    access_role: Optional[str] = None
 
     @property
     def shared(self) -> bool:
@@ -304,6 +316,17 @@ class FreeBusyResult:
         return not self.errors
 
 
+# Only what's needed to decide "busy or not" — titles, locations and
+# guest lists are never fetched for a free/busy question.
+_BUSY_FIELDS = (
+    "accessRole,timeZone,nextPageToken,"
+    "items(status,transparency,eventType,start,end,"
+    "attendees(self,responseStatus))"
+)
+_BUSY_PAGE_SIZE = 250
+_BUSY_MAX_PAGES = 8
+
+
 def freebusy(
     creds: Credentials,
     *,
@@ -311,14 +334,21 @@ def freebusy(
     end: datetime,
     calendar_ids: Optional[Sequence[str]] = None,
 ) -> dict[str, FreeBusyResult]:
-    """Return Google's freebusy structure for the requested window.
+    """Return when each calendar is busy inside the requested window.
 
     The shape is ``{calendar_id: FreeBusyResult(busy=[...], errors=[...])}``.
     A calendar that isn't shared with the assistant comes back with a
-    non-empty ``errors`` list (Google reports e.g.
-    ``[{"domain": "global", "reason": "notFound"}]``). Callers can
-    use :attr:`FreeBusyResult.shared` to branch on that without
-    re-parsing the dict.
+    non-empty ``errors`` list. Callers can use
+    :attr:`FreeBusyResult.shared` to branch on that.
+
+    An event counts as busy the way Google Calendar itself counts it:
+    not cancelled, marked "Busy" rather than "Free", and not declined
+    by the calendar's owner. Intervals are clipped to the window,
+    merged where they overlap, and reported in the window's timezone.
+
+    Raises :class:`CalendarError` when the failure is the assistant's
+    own Google connection (expired grant, missing permission) rather
+    than one calendar's sharing.
     """
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
@@ -326,23 +356,140 @@ def freebusy(
         end = end.replace(tzinfo=timezone.utc)
 
     targets = list(calendar_ids) if calendar_ids else list_calendar_ids(creds)
-    body = {
-        "timeMin": start.isoformat(),
-        "timeMax": end.isoformat(),
-        "items": [{"id": cid} for cid in targets],
-    }
-    try:
-        svc = _service(creds)
-        resp = svc.freebusy().query(body=body).execute()
-    except HttpError as exc:
-        raise CalendarError(_summarise_http_error(exc)) from exc
+    svc = _service(creds)
     out: dict[str, FreeBusyResult] = {}
-    for cid, bucket in (resp.get("calendars") or {}).items():
-        out[cid] = FreeBusyResult(
-            busy=list(bucket.get("busy") or []),
-            errors=list(bucket.get("errors") or []),
-        )
+    for cid in targets:
+        if cid in out:
+            continue
+        try:
+            busy, access_role = _busy_from_events(svc, cid, start=start, end=end)
+            out[cid] = FreeBusyResult(busy=busy, access_role=access_role)
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", None) if exc.resp else None
+            if status == 404:
+                reason = "notFound"
+            elif status == 403 and not _is_scope_error(exc):
+                reason = "forbidden"
+            else:
+                raise CalendarError(_summarise_http_error(exc)) from exc
+            out[cid] = FreeBusyResult(
+                errors=[{"domain": "global", "reason": reason}]
+            )
     return out
+
+
+def _busy_from_events(
+    svc, calendar_id: str, *, start: datetime, end: datetime
+) -> tuple[List[dict], Optional[str]]:
+    """Merged busy intervals for one calendar, read from its events.
+
+    Also returns the share level Google reports for the calendar.
+    """
+    intervals: List[tuple[datetime, datetime]] = []
+    page_token: Optional[str] = None
+    access_role: Optional[str] = None
+    for _page in range(_BUSY_MAX_PAGES):
+        resp = (
+            svc.events()
+            .list(
+                calendarId=calendar_id,
+                timeMin=start.isoformat(),
+                timeMax=end.isoformat(),
+                singleEvents=True,
+                orderBy="startTime",
+                showDeleted=False,
+                maxResults=_BUSY_PAGE_SIZE,
+                pageToken=page_token,
+                fields=_BUSY_FIELDS,
+            )
+            .execute()
+        )
+        cal_tz = _zone(resp.get("timeZone"))
+        access_role = resp.get("accessRole") or access_role
+        for ev in resp.get("items", []):
+            if not _blocks_time(ev):
+                continue
+            bounds = _event_bounds(ev, cal_tz)
+            if bounds is None:
+                continue
+            bs, be = max(bounds[0], start), min(bounds[1], end)
+            if be > bs:
+                intervals.append((bs, be))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    else:
+        logger.warning(
+            "Calendar %s has more than %d events in the window; busy "
+            "time after the last one read is not reflected.",
+            calendar_id,
+            _BUSY_MAX_PAGES * _BUSY_PAGE_SIZE,
+        )
+
+    intervals.sort()
+    merged: List[tuple[datetime, datetime]] = []
+    for bs, be in intervals:
+        if merged and bs <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], be))
+        else:
+            merged.append((bs, be))
+    local = start.tzinfo
+    return [
+        {
+            "start": bs.astimezone(local).isoformat(),
+            "end": be.astimezone(local).isoformat(),
+        }
+        for bs, be in merged
+    ], access_role
+
+
+def _blocks_time(ev: dict) -> bool:
+    """Does this event make its owner unavailable?"""
+    if ev.get("status") == "cancelled":
+        return False
+    # "Show as: Free" — all-day reminders, birthdays, FYI holds.
+    if ev.get("transparency") == "transparent":
+        return False
+    # "Working from home / the office" markers are not appointments.
+    if ev.get("eventType") == "workingLocation":
+        return False
+    for attendee in ev.get("attendees") or []:
+        if attendee.get("self") and attendee.get("responseStatus") == "declined":
+            return False
+    return True
+
+
+def _event_bounds(ev: dict, cal_tz: tzinfo) -> Optional[tuple[datetime, datetime]]:
+    """An event's start and end as aware datetimes.
+
+    All-day events carry a bare date; they run midnight to midnight in
+    the calendar's own timezone.
+    """
+    out: List[datetime] = []
+    for key in ("start", "end"):
+        raw = ev.get(key) or {}
+        try:
+            if raw.get("dateTime"):
+                moment = _parse_iso(raw["dateTime"])
+                if moment.tzinfo is None:
+                    moment = moment.replace(tzinfo=cal_tz)
+            elif raw.get("date"):
+                moment = datetime.combine(
+                    date.fromisoformat(raw["date"]), time.min, tzinfo=cal_tz
+                )
+            else:
+                return None
+        except ValueError:
+            return None
+        out.append(moment)
+    return out[0], out[1]
+
+
+def _zone(name: Optional[str]) -> tzinfo:
+    try:
+        return ZoneInfo(name) if name else timezone.utc
+    except (ZoneInfoNotFoundError, ValueError):
+        return timezone.utc
 
 
 def busy_for_calendar(
@@ -388,6 +535,13 @@ class PerCalendarBusy:
     shared: bool
     busy: List[dict] = field(default_factory=list)
     reason: Optional[str] = None  # filled when shared=False
+    # owner | writer | reader | freeBusyReader, when shared.
+    access_role: Optional[str] = None
+
+    @property
+    def details_visible(self) -> bool:
+        """Can the assistant see what the events are, not just when?"""
+        return self.shared and self.access_role != "freeBusyReader"
 
 
 def busy_for_calendars(
@@ -397,7 +551,7 @@ def busy_for_calendars(
     start: datetime,
     end: datetime,
 ) -> List[PerCalendarBusy]:
-    """Run a single freebusy query against one or more (calendar_id, label) pairs.
+    """Look up busy time for one or more (calendar_id, label) pairs.
 
     ``calendars`` is a list of ``(calendar_id, label)`` tuples. The
     label is opaque to Google — we just round-trip it for the caller
@@ -406,7 +560,7 @@ def busy_for_calendars(
 
     * ``shared=True``  — calendar visible, ``busy`` may be empty.
     * ``shared=False`` — calendar not shared with the assistant;
-      ``reason`` carries Google's error code (typically ``notFound``).
+      ``reason`` says why (typically ``notFound``).
 
     Returns one :class:`PerCalendarBusy` per input calendar in the
     SAME order as the input. Duplicate calendar ids (e.g. if a person
@@ -470,6 +624,7 @@ def busy_for_calendars(
                 label=label,
                 shared=True,
                 busy=list(bucket.busy),
+                access_role=bucket.access_role,
             )
         )
     return out
@@ -508,6 +663,95 @@ def merge_busy_intervals(per_calendar: Sequence[PerCalendarBusy]) -> List[dict]:
     ]
 
 
+def busy_by_day(
+    busy: Sequence[dict],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    tz: Optional[tzinfo] = None,
+) -> List[dict]:
+    """Break a merged busy list into one entry per calendar day.
+
+    Answers "which day is lightest?" without anyone having to add up
+    intervals by eye. Each entry is::
+
+        {"date": "2026-11-29", "weekday": "Sunday",
+         "busy_hours": 7.5, "busy": [{"start": "13:00", "end": "20:30"}],
+         "partial_day": False}
+
+    Days run midnight to midnight in ``tz`` (default: the window's own
+    offset). An event that crosses midnight is split between its two
+    days. ``partial_day`` marks a first or last day the window only
+    partly covers, so its total isn't compared against whole days.
+    """
+    if window_start.tzinfo is None:
+        window_start = window_start.replace(tzinfo=timezone.utc)
+    if window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=timezone.utc)
+    zone = tz or window_start.tzinfo
+    win_start = window_start.astimezone(zone)
+    win_end = window_end.astimezone(zone)
+
+    intervals: List[tuple[datetime, datetime]] = []
+    for b in busy:
+        try:
+            bs, be = _parse_iso(b["start"]), _parse_iso(b["end"])
+        except (KeyError, ValueError):
+            continue
+        bs, be = max(bs, win_start), min(be, win_end)
+        if be > bs:
+            intervals.append((bs.astimezone(zone), be.astimezone(zone)))
+
+    days: List[dict] = []
+    day = win_start.date()
+    while True:
+        day_start = datetime.combine(day, time.min, tzinfo=zone)
+        if day_start >= win_end:
+            break
+        day_end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=zone)
+        covered_from, covered_to = max(day_start, win_start), min(day_end, win_end)
+        blocks: List[dict] = []
+        seconds = 0.0
+        for bs, be in intervals:
+            cs, ce = max(bs, covered_from), min(be, covered_to)
+            if ce <= cs:
+                continue
+            seconds += ce.timestamp() - cs.timestamp()
+            blocks.append(
+                {
+                    "start": cs.strftime("%H:%M"),
+                    "end": "24:00" if ce == day_end else ce.strftime("%H:%M"),
+                }
+            )
+        days.append(
+            {
+                "date": day.isoformat(),
+                "weekday": day.strftime("%A"),
+                "busy_hours": round(seconds / 3600, 1),
+                "busy": blocks,
+                # A window ending 23:59 still covers the day.
+                "partial_day": (covered_to - covered_from)
+                < (day_end - day_start) - timedelta(minutes=1),
+            }
+        )
+        day += timedelta(days=1)
+    return days
+
+
+@dataclass(frozen=True)
+class CalendarWindow:
+    """The events on one calendar in a window, and how much of them
+    the assistant is allowed to see (``access_role`` as reported by
+    Google: owner / writer / reader / freeBusyReader)."""
+
+    events: List[CalendarEvent]
+    access_role: Optional[str] = None
+
+    @property
+    def details_visible(self) -> bool:
+        return self.access_role != "freeBusyReader"
+
+
 def events_for_calendar(
     creds: Credentials,
     *,
@@ -523,6 +767,29 @@ def events_for_calendar(
     refuses access (so the agent can surface a clean "ask them to
     share their calendar" message). Empty list means "shared and
     nothing on the calendar in that window".
+    """
+    return read_calendar_window(
+        creds,
+        calendar_id=calendar_id,
+        start=start,
+        end=end,
+        max_results=max_results,
+    ).events
+
+
+def read_calendar_window(
+    creds: Credentials,
+    *,
+    calendar_id: str,
+    start: datetime,
+    end: datetime,
+    max_results: int = 50,
+) -> CalendarWindow:
+    """:func:`events_for_calendar` plus the calendar's share level.
+
+    A calendar shared as "see only free/busy" still lists its events,
+    but with start and end only — callers use ``details_visible`` to
+    say so instead of reporting a week of untitled events.
     """
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
@@ -550,7 +817,7 @@ def events_for_calendar(
         # CalendarNotShared so the agent's user-facing copy stays
         # consistent.
         status = getattr(exc.resp, "status", None) if exc.resp else None
-        if status in (403, 404):
+        if status in (403, 404) and not _is_scope_error(exc):
             raise CalendarNotShared(
                 calendar_id, reason=f"http_{status}"
             ) from exc
@@ -575,7 +842,7 @@ def events_for_calendar(
             )
         )
     out.sort(key=lambda x: x.start)
-    return out
+    return CalendarWindow(events=out, access_role=resp.get("accessRole"))
 
 
 def create_event(
@@ -826,13 +1093,43 @@ def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
+def _error_payload(exc: HttpError) -> dict:
+    try:
+        payload = json.loads(exc.content.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - not JSON; nothing to read
+        return {}
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return error if isinstance(error, dict) else {}
+
+
+def _is_scope_error(exc: HttpError) -> bool:
+    """True when Google refused because the *token* lacks a permission.
+
+    That is a problem with the assistant's Google connection and
+    applies to every calendar — unlike an ordinary 403, which means
+    this one calendar isn't shared.
+    """
+    error = _error_payload(exc)
+    if "insufficient authentication scopes" in str(error.get("message") or "").lower():
+        return True
+    return any(
+        isinstance(d, dict) and d.get("reason") == "ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+        for d in error.get("details") or []
+    )
+
+
 def _summarise_http_error(exc: HttpError) -> str:
     status = getattr(exc.resp, "status", None) if exc.resp else None
-    try:
-        import json
-
-        payload = json.loads(exc.content.decode("utf-8"))
-        message = payload.get("error", {}).get("message") or str(exc)
-    except Exception:  # noqa: BLE001 - raw fallback
-        message = str(exc)
-    return f"Calendar HTTP {status}: {message}"
+    message = _error_payload(exc).get("message") or str(exc)
+    text = f"Calendar HTTP {status}: {message}"
+    if _is_scope_error(exc):
+        # Without this the model reads a 403 as "they haven't shared
+        # their calendar" and sends the person to fix the wrong thing.
+        text += (
+            " This is a problem with the assistant's own Google "
+            "connection (it was not granted this permission), NOT with "
+            "anyone's calendar sharing. Tell the user an admin needs to "
+            "disconnect and reconnect Google on the Assistant settings "
+            "page; do not ask them to share a calendar."
+        )
+    return text

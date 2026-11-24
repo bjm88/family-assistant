@@ -1,11 +1,26 @@
 """All ``calendar_*`` tools.
 
 * ``calendar_list_upcoming``      — what's on the assistant's calendar
-* ``calendar_check_availability`` — free/busy for one person
+* ``calendar_check_availability`` — free/busy for one person, with a
+                                    day-by-day load for longer windows
 * ``calendar_find_free_slots``    — suggest open windows
 * ``calendar_create_event``       — write an event to the speaker's own cal
 * ``calendar_list_for_person``    — events for one household member, with
                                     privacy gating on title/location
+
+Every per-person tool answers the same three questions in the same
+order, so the reply can say what it is based on:
+
+1. **Who is this about?** The speaker ("I" / "me" / no name given), a
+   named family member, or an email address
+   (:func:`resolve_calendar_subject`).
+2. **Which calendars are theirs, and what can the assistant see on
+   each?** Their personal email plus the work email on each of their
+   jobs; each comes back as event details visible, busy times only,
+   or not shared (:func:`_calendar_access`).
+3. **What does that add up to?** One merged picture across the
+   calendars the assistant can see, with ``coverage`` saying whether
+   that is all of them.
 """
 
 from __future__ import annotations
@@ -21,21 +36,29 @@ from ....integrations.google_calendar import (
     CalendarNotShared,
     CalendarReadOnly,
     PerCalendarBusy,
+    busy_by_day,
     busy_for_calendars,
     create_event as gcal_create_event,
-    events_for_calendar,
     find_free_slots,
     list_upcoming_events,
     merge_busy_intervals,
+    read_calendar_window,
 )
 from ... import authz
+from ...time_context import family_timezone
 from .._registry import ToolContext, ToolError
 from ._calendar_helpers import (
     assistant_email,
     calendar_pairs_for,
     humanize_iso,
     parse_iso_arg,
+    resolve_calendar_subject,
     resolve_person_calendars,
+)
+
+_PERSON_ARG_HINT = (
+    " Leave this out (or pass 'me') when the user is asking about "
+    "themselves — it defaults to the person you are talking to."
 )
 
 
@@ -107,7 +130,8 @@ CALENDAR_CHECK_SCHEMA: Dict[str, Any] = {
             "description": (
                 "Name (e.g. 'Ben') or email address of the household "
                 "member whose schedule you want to check. Names are "
-                "matched fuzzy against first / preferred / last."
+                "matched against first / preferred / last."
+                + _PERSON_ARG_HINT
             ),
         },
         "start": {
@@ -115,27 +139,31 @@ CALENDAR_CHECK_SCHEMA: Dict[str, Any] = {
             "description": (
                 "ISO 8601 start of the window (e.g. "
                 "2026-04-20T13:00:00-04:00). Include the timezone "
-                "offset that matches the user's intent."
+                "offset that matches the user's intent. For a "
+                "whole-day or whole-week question start at 00:00 on "
+                "the first day."
             ),
         },
         "end": {
             "type": "string",
             "description": (
-                "ISO 8601 end of the window. Must be after start."
+                "ISO 8601 end of the window. Must be after start. For "
+                "a whole-day or whole-week question end at 23:59 on "
+                "the last day."
             ),
         },
     },
-    "required": ["person", "start", "end"],
+    "required": ["start", "end"],
 }
 
 
 async def handle_calendar_check_availability(
-    ctx: ToolContext, person: str, start: str, end: str
+    ctx: ToolContext, start: str, end: str, person: Optional[str] = None
 ) -> Dict[str, Any]:
     """Answer 'is X free between A and B?' across BOTH of X's calendars.
 
-    Resolves ``person`` to their personal AND work emails, runs a
-    single freebusy query against both, and returns:
+    Resolves ``person`` to their personal AND work emails, looks up
+    busy time on both, and returns:
 
     * ``per_calendar`` — one entry per calendar with shared/busy and
       the label (``personal`` / ``work`` / ``direct``). Lets the
@@ -144,9 +172,15 @@ async def handle_calendar_check_availability(
     * ``busy`` — the merged busy intervals across all SHARED
       calendars (sorted, overlap-merged). The "is X free?" answer
       should use this list — they're free if it's empty.
+    * ``days`` / ``days_least_to_most_busy`` — for a window longer
+      than a day, the busy hours on each date, so "which day is X
+      most free?" is read off the result rather than added up from
+      raw intervals.
+    * ``coverage`` — ``complete`` / ``partial`` / ``none``: whether
+      the answer reflects all of the person's calendars.
     * ``summary`` — a short natural-language phrasing the model can
-      crib for its reply. Mentions any calendar that wasn't shared
-      so the user knows to ask for that share.
+      crib for its reply. Says which calendars it is based on and
+      mentions any that weren't shared so the user knows to ask.
 
     Free/busy intervals carry NO event detail — no titles, no
     locations — so we don't apply the calendar-detail relationship
@@ -156,19 +190,16 @@ async def handle_calendar_check_availability(
     """
     if ctx.assistant_id is None:
         raise ToolError("No assistant is configured for this family.")
-    person_row, calendar_pairs = resolve_person_calendars(ctx, person)
-    if not calendar_pairs:
-        raise ToolError(
-            f"I don't have a personal or work email on file for "
-            f"{person!r}. Add one to their profile in the admin "
-            "console (or pass an email address directly) and I can "
-            "check their calendar."
-        )
+    person_row, calendar_pairs = resolve_calendar_subject(ctx, person)
 
     start_dt = parse_iso_arg("start", start)
     end_dt = parse_iso_arg("end", end)
     if end_dt <= start_dt:
         raise ToolError("end must be strictly after start.")
+    if (end_dt - start_dt).total_seconds() > 31 * 24 * 3600:
+        raise ToolError(
+            "Window is too wide — please limit to about a month per call."
+        )
 
     try:
         _row, creds = google_oauth.load_credentials(ctx.db, ctx.assistant_id)
@@ -195,15 +226,36 @@ async def handle_calendar_check_availability(
         raise ToolError(str(e)) from e
 
     merged_busy = merge_busy_intervals(per_cal)
-    summary = _summarise_availability(display_name, per_cal, merged_busy)
+    # No visible calendar means "unknown", not "free": a breakdown of
+    # empty days would read as an open week.
+    by_day = (
+        _day_breakdown(ctx, merged_busy, start_dt, end_dt)
+        if any(b.shared for b in per_cal)
+        else {}
+    )
+    summary = _summarise_availability(
+        display_name, per_cal, merged_busy, by_day.get("sentence")
+    )
 
-    return {
+    out: Dict[str, Any] = {
         "person": display_name,
         "per_calendar": [_per_cal_payload(b) for b in per_cal],
         "any_shared": any(b.shared for b in per_cal),
+        "coverage": _coverage(per_cal),
         "busy": merged_busy,
-        "summary": summary,
     }
+    if by_day:
+        out["days"] = by_day["days"]
+        out["days_least_to_most_busy"] = by_day["ranking"]
+    out["summary"] = summary
+    return out
+
+
+def _calendar_access(b: PerCalendarBusy) -> str:
+    """What the assistant can see on one of a person's calendars."""
+    if not b.shared:
+        return "not_shared"
+    return "event_details" if b.details_visible else "busy_times_only"
 
 
 def _per_cal_payload(b: PerCalendarBusy) -> Dict[str, Any]:
@@ -211,6 +263,7 @@ def _per_cal_payload(b: PerCalendarBusy) -> Dict[str, Any]:
         "calendar_id": b.calendar_id,
         "label": b.label,
         "shared": b.shared,
+        "access": _calendar_access(b),
     }
     if b.shared:
         out["busy"] = b.busy
@@ -219,15 +272,95 @@ def _per_cal_payload(b: PerCalendarBusy) -> Dict[str, Any]:
     return out
 
 
+def _coverage(per_cal: List[PerCalendarBusy]) -> str:
+    """Does the answer reflect all, some or none of the person's calendars?"""
+    shared = sum(1 for b in per_cal if b.shared)
+    if shared == 0:
+        return "none"
+    return "complete" if shared == len(per_cal) else "partial"
+
+
+def _calendar_name(label: str, calendar_id: str, note: str = "") -> str:
+    kind = f"{label} calendar" if label in ("personal", "work") else "calendar"
+    return f"{kind} ({calendar_id}{', ' + note if note else ''})"
+
+
+def _based_on(display_name: str, per_cal: List[PerCalendarBusy]) -> str:
+    """One sentence naming the calendars an answer was drawn from."""
+    seen = [
+        _calendar_name(
+            b.label, b.calendar_id, "" if b.details_visible else "busy times only"
+        )
+        for b in per_cal
+        if b.shared
+    ]
+    text = f" Based on {display_name}'s " + " and ".join(seen) + "."
+    hidden = [_calendar_name(b.label, b.calendar_id) for b in per_cal if not b.shared]
+    if hidden:
+        text += (
+            f" Their {' and '.join(hidden)} isn't shared with me, so "
+            "anything on it is missing from this answer."
+        )
+    return text
+
+
+def _day_label(day: Dict[str, Any]) -> str:
+    return datetime.fromisoformat(day["date"]).strftime("%A, %b %-d")
+
+
+def _day_breakdown(
+    ctx: ToolContext,
+    merged_busy: List[dict],
+    start_dt: datetime,
+    end_dt: datetime,
+) -> Dict[str, Any]:
+    """Per-day busy hours for a window spanning more than one day.
+
+    Returns ``{}`` for a window inside a single day. Otherwise
+    ``days`` (in date order), ``ranking`` (least busy first, as short
+    strings) and a ``sentence`` naming the lightest and heaviest days
+    with their dates. Days are the household's local days. A first or
+    last day the window only partly covers is listed but left out of
+    the ranking.
+    """
+    days = busy_by_day(
+        merged_busy,
+        window_start=start_dt,
+        window_end=end_dt,
+        tz=family_timezone(ctx.db, ctx.family_id),
+    )
+    if len(days) < 2:
+        return {}
+    whole = [d for d in days if not d["partial_day"]] or days
+    ranked = sorted(whole, key=lambda d: (d["busy_hours"], d["date"]))
+    least, most = ranked[0]["busy_hours"], ranked[-1]["busy_hours"]
+    lightest = [d for d in ranked if d["busy_hours"] == least]
+    if least == 0:
+        sentence = "Nothing booked on " + ", ".join(_day_label(d) for d in lightest) + "."
+    else:
+        sentence = (
+            "Least booked: "
+            + ", ".join(_day_label(d) for d in lightest)
+            + f" ({least:g}h busy)."
+        )
+    if most > least:
+        sentence += f" Most booked: {_day_label(ranked[-1])} ({most:g}h busy)."
+    return {
+        "days": days,
+        "ranking": [
+            f"{_day_label(d)}: {d['busy_hours']:g}h busy" for d in ranked
+        ],
+        "sentence": sentence,
+    }
+
+
 def _summarise_availability(
     display_name: str,
     per_cal: List[PerCalendarBusy],
     merged_busy: List[dict],
+    day_sentence: Optional[str] = None,
 ) -> str:
-    shared = [b for b in per_cal if b.shared]
-    not_shared = [b for b in per_cal if not b.shared]
-
-    if not shared:
+    if not any(b.shared for b in per_cal):
         labels = ", ".join(f"{b.label} ({b.calendar_id})" for b in per_cal)
         return (
             f"None of {display_name}'s calendars are shared with me "
@@ -238,6 +371,8 @@ def _summarise_availability(
 
     if not merged_busy:
         head = f"{display_name} is free across the entire window."
+    elif day_sentence:
+        head = f"{display_name}'s schedule by day: {day_sentence}"
     else:
         first = merged_busy[0]
         more = len(merged_busy) - 1
@@ -246,14 +381,7 @@ def _summarise_availability(
             f"{humanize_iso(first['start'])} – {humanize_iso(first['end'])}"
             + (f" (and {more} more conflict(s))." if more > 0 else ".")
         )
-
-    if not_shared:
-        unshared_labels = ", ".join(b.label for b in not_shared)
-        head += (
-            f" Note: their {unshared_labels} calendar isn't shared "
-            "with me, so this only reflects the calendars I can see."
-        )
-    return head
+    return head + _based_on(display_name, per_cal)
 
 
 # ---- calendar.find_free_slots -----------------------------------------
@@ -266,6 +394,7 @@ CALENDAR_FREE_SLOTS_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "description": (
                 "Name or email of the household member to find time for."
+                + _PERSON_ARG_HINT
             ),
         },
         "window_start": {
@@ -304,15 +433,15 @@ CALENDAR_FREE_SLOTS_SCHEMA: Dict[str, Any] = {
             "maximum": 10,
         },
     },
-    "required": ["person", "window_start", "window_end"],
+    "required": ["window_start", "window_end"],
 }
 
 
 async def handle_calendar_find_free_slots(
     ctx: ToolContext,
-    person: str,
     window_start: str,
     window_end: str,
+    person: Optional[str] = None,
     duration_minutes: int = 30,
     working_hours_only: bool = True,
     max_slots: int = 5,
@@ -332,14 +461,7 @@ async def handle_calendar_find_free_slots(
     """
     if ctx.assistant_id is None:
         raise ToolError("No assistant is configured for this family.")
-    person_row, calendar_pairs = resolve_person_calendars(ctx, person)
-    if not calendar_pairs:
-        raise ToolError(
-            f"I don't have a personal or work email on file for "
-            f"{person!r}. Add one to their profile in the admin "
-            "console (or pass an email address directly) and I can "
-            "suggest a time."
-        )
+    person_row, calendar_pairs = resolve_calendar_subject(ctx, person)
 
     start_dt = parse_iso_arg("window_start", window_start)
     end_dt = parse_iso_arg("window_end", window_end)
@@ -381,6 +503,7 @@ async def handle_calendar_find_free_slots(
             "person": display_name,
             "per_calendar": [_per_cal_payload(b) for b in per_cal],
             "any_shared": False,
+            "coverage": "none",
             "slots": [],
             "summary": (
                 f"None of {display_name}'s calendars ({labels}) are "
@@ -407,7 +530,7 @@ async def handle_calendar_find_free_slots(
         tz=local_tz,
     )
 
-    not_shared = [b for b in per_cal if not b.shared]
+    by_day = _day_breakdown(ctx, merged_busy, start_dt, end_dt)
     if not slots:
         summary = (
             f"I couldn't find a {duration_minutes}-minute slot for "
@@ -426,23 +549,23 @@ async def handle_calendar_find_free_slots(
                 else "."
             )
         )
-    if not_shared:
-        unshared_labels = ", ".join(b.label for b in not_shared)
-        summary += (
-            f" Heads up: their {unshared_labels} calendar isn't "
-            "shared with me, so a hidden conflict on it could still "
-            "land in one of these suggested slots."
-        )
+    summary += _based_on(display_name, per_cal)
 
-    return {
+    out: Dict[str, Any] = {
         "person": display_name,
         "per_calendar": [_per_cal_payload(b) for b in per_cal],
         "any_shared": True,
+        "coverage": _coverage(per_cal),
         "duration_minutes": duration_minutes,
         "working_hours_only": working_hours_only,
         "slots": slots,
-        "summary": summary,
     }
+    if by_day:
+        # Slots are the first openings in the window, not the lightest
+        # day; this is what answers "which day is best?".
+        out["days_least_to_most_busy"] = by_day["ranking"]
+    out["summary"] = summary
+    return out
 
 
 # ---- calendar.create_event --------------------------------------------
@@ -677,7 +800,7 @@ CALENDAR_LIST_FOR_PERSON_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "description": (
                 "Name or email of the household member whose events "
-                "you want to list."
+                "you want to list." + _PERSON_ARG_HINT
             ),
         },
         "window_start": {
@@ -703,15 +826,15 @@ CALENDAR_LIST_FOR_PERSON_SCHEMA: Dict[str, Any] = {
             "maximum": 50,
         },
     },
-    "required": ["person", "window_start", "window_end"],
+    "required": ["window_start", "window_end"],
 }
 
 
 async def handle_calendar_list_for_person(
     ctx: ToolContext,
-    person: str,
     window_start: str,
     window_end: str,
+    person: Optional[str] = None,
     max_results_per_calendar: int = 25,
 ) -> Dict[str, Any]:
     """List events on a person's personal + work calendars.
@@ -730,17 +853,13 @@ async def handle_calendar_list_for_person(
 
     A calendar that exists on the profile but isn't shared with
     the assistant comes back as ``shared=False`` with a hint to
-    ask for the share.
+    ask for the share. One shared as "see only free/busy" comes back
+    with ``access="busy_times_only"``: its events have times but no
+    titles, whoever is asking.
     """
     if ctx.assistant_id is None:
         raise ToolError("No assistant is configured for this family.")
-    person_row, calendar_pairs = resolve_person_calendars(ctx, person)
-    if not calendar_pairs:
-        raise ToolError(
-            f"I don't have a personal or work email on file for "
-            f"{person!r}. Add one to their profile and I can list "
-            "their calendar."
-        )
+    person_row, calendar_pairs = resolve_calendar_subject(ctx, person)
     if person_row is None:
         # Direct-email lookup against a non-family calendar — refuse
         # to list events: we can't run the relationship gate without
@@ -778,11 +897,13 @@ async def handle_calendar_list_for_person(
     per_calendar_out: List[Dict[str, Any]] = []
     total_events = 0
     any_shared = False
+    times_only: List[str] = []
+    not_shared: List[str] = []
 
     for cal_id, label in calendar_pairs:
         try:
-            events = await asyncio.to_thread(
-                events_for_calendar,
+            window = await asyncio.to_thread(
+                read_calendar_window,
                 creds,
                 calendar_id=cal_id,
                 start=start_dt,
@@ -790,11 +911,13 @@ async def handle_calendar_list_for_person(
                 max_results=max_results_per_calendar,
             )
         except CalendarNotShared as e:
+            not_shared.append(_calendar_name(label, cal_id))
             per_calendar_out.append(
                 {
                     "calendar_id": cal_id,
                     "label": label,
                     "shared": False,
+                    "access": "not_shared",
                     "reason": e.reason,
                 }
             )
@@ -803,9 +926,21 @@ async def handle_calendar_list_for_person(
             raise ToolError(str(e)) from e
 
         any_shared = True
+        if not window.details_visible:
+            times_only.append(_calendar_name(label, cal_id))
         rendered: List[Dict[str, Any]] = []
-        for ev in events:
-            if show_detail:
+        for ev in window.events:
+            if not window.details_visible:
+                rendered.append(
+                    {
+                        "start": ev.start,
+                        "end": ev.end,
+                        "summary": "[busy — this calendar only shares times]",
+                        "location": None,
+                        "organizer_email": None,
+                    }
+                )
+            elif show_detail:
                 rendered.append(
                     {
                         "start": ev.start,
@@ -831,6 +966,11 @@ async def handle_calendar_list_for_person(
                 "calendar_id": cal_id,
                 "label": label,
                 "shared": True,
+                "access": (
+                    "event_details"
+                    if window.details_visible
+                    else "busy_times_only"
+                ),
                 "events": rendered,
             }
         )
@@ -860,6 +1000,17 @@ async def handle_calendar_list_for_person(
             f"{display_name} themselves (or their spouse) for "
             "specifics."
         )
+    if times_only:
+        summary += (
+            f" {display_name}'s {' and '.join(times_only)} only shares "
+            "busy times with me, so I can say when those events are "
+            "but not what they are."
+        )
+    if any_shared and not_shared:
+        summary += (
+            f" {display_name}'s {' and '.join(not_shared)} isn't shared "
+            "with me, so anything on it is missing from this list."
+        )
 
     return {
         "person": display_name,
@@ -867,6 +1018,13 @@ async def handle_calendar_list_for_person(
         "access_label": detail_decision.label,
         "per_calendar": per_calendar_out,
         "any_shared": any_shared,
+        "coverage": (
+            "none"
+            if not any_shared
+            else "partial"
+            if not_shared
+            else "complete"
+        ),
         "total_events": total_events,
         "summary": summary,
     }

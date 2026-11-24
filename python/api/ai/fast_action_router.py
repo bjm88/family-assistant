@@ -61,17 +61,16 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from typing import List, Optional, Tuple
 
 from sqlalchemy.orm import Session
-from zoneinfo import ZoneInfo
 
 from .. import models
 from ..config import get_settings
 from ..db import SessionLocal
 from . import agent as agent_loop
 from . import agent_drain, authz, family_qa_router, prompts as prompts_mod
+from . import time_context
 from . import tools as agent_tools
 from . import web_search_shortcut
 from . import llm
@@ -180,10 +179,15 @@ _INTENT_HINTS: dict[str, str] = {
     LABEL_CALENDAR_LIST: (
         "The user wants to READ the calendar. Use "
         "`calendar_list_upcoming` for 'what's coming up' or "
-        "`calendar_list_for_person` when they ask about a specific "
-        "person — call `lookup_person` first to resolve the name. "
-        "Use `calendar_check_availability` for 'is X free at …' and "
-        "`calendar_find_free_slots` for 'when can X do a …'."
+        "`calendar_list_for_person` when they ask what is on a "
+        "specific person's calendar. Use "
+        "`calendar_check_availability` for 'is X free at …' AND for "
+        "'which day is X most free' / 'how busy is X next week' — "
+        "give it the whole range and read `days` in the result. Use "
+        "`calendar_find_free_slots` for 'when can X do a …'. The "
+        "person tools take a name directly, and default to the "
+        "speaker when they say 'I' / 'me' / 'my', so `lookup_person` "
+        "is rarely needed first."
     ),
     LABEL_TASK_ADD: (
         "The user wants to ADD a task. Call `task_create` with a "
@@ -512,13 +516,6 @@ async def classify_triage(message: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_family_timezone(db: Session, family_id: int) -> str:
-    family = db.get(models.Family, family_id)
-    if family is not None and getattr(family, "timezone", None):
-        return family.timezone
-    return "America/New_York"
-
-
 def _build_fast_action_system_prompt(
     db: Session,
     *,
@@ -542,22 +539,7 @@ def _build_fast_action_system_prompt(
         else "Avi"
     )
     family_name = family.family_name if family else None
-    tz_name = _resolve_family_timezone(db, family_id)
-    try:
-        tz_info = ZoneInfo(tz_name)
-    except Exception:  # noqa: BLE001
-        tz_info = ZoneInfo("America/New_York")
-        tz_name = "America/New_York"
-    now_local = datetime.now(tz_info)
-    today_block = (
-        "--- Time / date context ---\n"
-        f"Family timezone: {tz_name}\n"
-        f"Current local datetime: {now_local.isoformat(timespec='minutes')}\n"
-        f"Today: {now_local.strftime('%A, %Y-%m-%d')}\n"
-        "When the user says 'tomorrow' / 'next Monday' / '10am', "
-        "translate to ISO 8601 in the family timezone before calling "
-        "a tool."
-    )
+    today_block = time_context.render_time_context(db, family_id)
 
     persona = system_prompt_for_avi(assistant_name, family_name)
     speaker_block = authz.render_speaker_scope_block(

@@ -666,6 +666,10 @@ class Settings(BaseSettings):
     # scope, so Avi can only access files it creates inside the folder
     # (not anything else in your Drive).
     DB_BACKUP_GDRIVE: Optional[str] = None
+    # First day of the week for this household: "sunday" (US calendars)
+    # or "monday". Decides which dates Avi means by "this week" and
+    # "next week" (see ai/time_context.py).
+    WEEK_STARTS_ON: str = "sunday"
     # Background refresh + verify of Avi's Google grant (see
     # services/google_keepalive.py). Parents are alerted when it dies.
     GOOGLE_KEEPALIVE_ENABLED: bool = True

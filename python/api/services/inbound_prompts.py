@@ -45,7 +45,7 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..ai import authz, persona, prompts, rag
+from ..ai import authz, persona, prompts, rag, time_context
 from ..ai.assistants import assistant_id_for_family
 
 
@@ -274,6 +274,7 @@ def build_inbound_system_prompt(
         "for something else, save it to their own address book with "
         "`contacts_save` and tell them what was added or updated."
     )
+    parts.append(time_context.render_time_context(db, family_id))
     parts.append(how_to_reply)
     return prompts.with_safety("\n\n".join(parts))
 

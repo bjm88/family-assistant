@@ -415,11 +415,10 @@ def test_upcoming_events(
 # ---------------------------------------------------------------------------
 # Per-calendar visibility — the Assistant settings page replaces its single
 # "Can read calendar" yes/no with the actual list of visible calendars and
-# the share level Google grants for each. Lets an admin diagnose the
-# "agent logs say 403 but the reply still went out" symptom in one glance:
-# any calendar with accessRole == 'freeBusyReader' will produce a 403
-# every time the agent tries to enumerate its events (events.list refuses;
-# only freebusy.query works for that share level).
+# the share level Google grants for each. Lets an admin see in one glance
+# why Avi can say *when* someone is busy but not *what* they're doing: a
+# calendar with accessRole == 'freeBusyReader' returns each event's start
+# and end only — no title, location or guests.
 # ---------------------------------------------------------------------------
 
 
@@ -446,8 +445,9 @@ class VisibleCalendarsResponse(BaseModel):
 def _classify_role(role: str) -> tuple[bool, bool]:
     """Return ``(can_read_events, can_write)`` from a Google accessRole.
 
-    ``freeBusyReader`` and ``none`` cannot read individual events
-    (events.list returns 403). Only ``owner``/``writer`` can insert.
+    ``can_read_events`` means "can see what the events are".
+    ``freeBusyReader`` sees only when they start and end, and ``none``
+    sees nothing. Only ``owner``/``writer`` can insert.
     """
     can_write = role in ("owner", "writer")
     can_read_events = role in ("owner", "writer", "reader")

@@ -16,7 +16,7 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 
 from .. import models
-from . import authz, persona, prompts, rag, schema_catalog
+from . import authz, persona, prompts, rag, schema_catalog, time_context
 
 
 def build_rag_block(
@@ -93,7 +93,9 @@ def build_system_prompt(
     3. House context — every ``ai_context_*.txt`` at the project root.
     4. Speaker scope — who is talking and what they're allowed to see.
     5. Household RAG context — DB-derived family overview.
-    6. Database schema + (optional) live SQL results.
+    6. Database schema.
+    7. Time / date context — today, this week and next week as dates.
+    8. (Optional) live SQL results.
 
     The whole stack is then wrapped by :func:`prompts.with_safety` so
     the unbreakable rules sit OUTSIDE everything below them and can't
@@ -135,6 +137,8 @@ def build_system_prompt(
         "use the *_last_four helper columns instead.\n\n"
         + schema_catalog.dump_text(db)
     )
+    # Changes every minute, so it sits below the long stable sections.
+    parts.append(time_context.render_time_context(db, family_id))
     if live_data_block:
         parts.append(
             "--- Live data (just queried for this turn) ---\n"
