@@ -184,9 +184,30 @@ export default function StatusPage() {
           </div>
         </div>
       ) : (
-        <div className="space-y-2">
-          {(data?.checks ?? []).map((check) => (
-            <CheckRow key={check.key} check={check} />
+        <div className="space-y-6">
+          {groupChecks(data?.checks ?? []).map((section) => (
+            <section key={section.name}>
+              <div className="flex items-center gap-2 mb-2">
+                <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                  {section.name}
+                </h2>
+                <SectionPill checks={section.groups.flatMap((g) => g.checks)} />
+              </div>
+              <div className="space-y-4">
+                {section.groups.map((group) => (
+                  <div key={group.name ?? "_"} className="space-y-2">
+                    {group.name && (
+                      <div className="text-xs font-medium text-muted-foreground pl-1">
+                        {group.name}
+                      </div>
+                    )}
+                    {group.checks.map((check) => (
+                      <CheckRow key={check.key} check={check} />
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </section>
           ))}
         </div>
       )}
@@ -197,6 +218,50 @@ export default function StatusPage() {
 // ---------------------------------------------------------------------------
 // Subcomponents
 // ---------------------------------------------------------------------------
+
+interface CheckSection {
+  name: string;
+  groups: { name: string | null; checks: SystemStatusCheck[] }[];
+}
+
+/** Sections and sub-groups in the order the backend sent the checks. */
+function groupChecks(checks: SystemStatusCheck[]): CheckSection[] {
+  const sections: CheckSection[] = [];
+  for (const check of checks) {
+    const sectionName = check.section ?? "Other";
+    let section = sections.find((s) => s.name === sectionName);
+    if (!section) {
+      section = { name: sectionName, groups: [] };
+      sections.push(section);
+    }
+    let group = section.groups.find((g) => g.name === check.group);
+    if (!group) {
+      group = { name: check.group, checks: [] };
+      section.groups.push(group);
+    }
+    group.checks.push(check);
+  }
+  return sections;
+}
+
+const LEVEL_RANK: SystemStatusLevel[] = ["down", "degraded", "unknown", "ok"];
+
+function SectionPill({ checks }: { checks: SystemStatusCheck[] }) {
+  const worst =
+    LEVEL_RANK.find((level) => checks.some((c) => c.status === level)) ??
+    "unknown";
+  const meta = LEVEL_META[worst];
+  return (
+    <span
+      className={cn(
+        "text-[10px] px-1.5 py-0.5 rounded border uppercase tracking-wide",
+        meta.pillClass,
+      )}
+    >
+      {meta.label}
+    </span>
+  );
+}
 
 function CountChip({
   n,

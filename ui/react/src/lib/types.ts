@@ -480,6 +480,8 @@ export interface SystemStatusCheck {
   detail: Record<string, unknown>;
   hint: string | null;
   checked_at: string;
+  section: string | null;
+  group: string | null;
 }
 
 export interface SystemStatusReport {

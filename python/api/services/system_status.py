@@ -30,9 +30,11 @@ dict the UI renders as a key/value table beneath each row.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Literal, Optional
 from urllib.parse import urlparse
@@ -70,6 +72,13 @@ class StatusCheck(BaseModel):
         description="If status != 'ok', a short fix tip (shell command, URL, …).",
     )
     checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    section: Optional[str] = Field(
+        default=None, description="Page section, e.g. 'AI models'."
+    )
+    group: Optional[str] = Field(
+        default=None,
+        description="Sub-heading within the section, e.g. 'Internet APIs'.",
+    )
 
 
 class SystemStatusReport(BaseModel):
@@ -280,19 +289,68 @@ def _ollama_problem_level() -> StatusLevel:
     return "unknown" if _ollama_is_parked() else "degraded"
 
 
-async def check_ollama_daemon() -> StatusCheck:
-    """Verify the Ollama HTTP server (the offline fallback) responds."""
+def _local_model_roles() -> list[tuple[str, str, str]]:
+    """(role key, human role, tag) for each configured local model."""
+    s = get_settings()
+    roles = [
+        ("main", "main local model", s.AI_OLLAMA_MODEL),
+        ("backup", "local backup model", s.AI_OLLAMA_BACKUP_MODEL),
+        ("fast", "fast local model", s.AI_OLLAMA_FAST_MODEL),
+    ]
+    return [(k, label, tag) for k, label, tag in roles if tag]
+
+
+def _tag_matches(configured: str, name: str) -> bool:
+    # ``muse-glimmer`` in .env is ``muse-glimmer:latest`` in Ollama.
+    if name in (configured, f"{configured}:latest"):
+        return True
+    return ":" not in configured and name.startswith(configured + ":")
+
+
+async def _ollama_snapshot(host: str) -> dict[str, Any]:
+    """One round of /api/version + /api/tags + /api/ps, shared by the
+    runtime row and every per-model row in the same report."""
+    async with httpx.AsyncClient() as client:
+        tags = await _ollama_get_tags(client, host)
+        version = (await client.get(f"{host}/api/version", timeout=4.0)).json()
+        ps = (await client.get(f"{host}/api/ps", timeout=4.0)).json()
+    return {
+        "version": version.get("version"),
+        "installed": {str(m["name"]): m for m in tags if m.get("name")},
+        "loaded": {str(m["name"]): m for m in ps.get("models", []) or []},
+    }
+
+
+async def _pulls_in_progress() -> list[str]:
+    """Model tags an ``ollama pull`` process is currently downloading."""
+    proc = await asyncio.create_subprocess_exec(
+        "ps", "-Ao", "args=", stdout=asyncio.subprocess.PIPE
+    )
+    out, _ = await proc.communicate()
+    tags = []
+    for line in out.decode(errors="ignore").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].endswith("ollama") and parts[1] == "pull":
+            tags.append(parts[2])
+    return tags
+
+
+def _gb(n: Optional[int]) -> Optional[str]:
+    return f"{n / 1e9:.1f} GB" if n else None
+
+
+async def check_ollama_runtime() -> StatusCheck:
+    """The one local runtime every local model runs on."""
     settings = get_settings()
-    host = settings.AI_OLLAMA_HOST
+    host = settings.AI_OLLAMA_HOST.rstrip("/")
     parked = _ollama_is_parked()
     started = _now_ms()
     try:
-        async with httpx.AsyncClient() as client:
-            await _ollama_get_tags(client, host)
-    except (httpx.HTTPError, httpx.HTTPStatusError) as exc:
+        snap = await _ollama_snapshot(host)
+    except Exception as exc:  # noqa: BLE001
         return StatusCheck(
-            key="ollama_daemon",
-            label="Ollama daemon",
+            key="ollama_runtime",
+            label="Ollama runtime",
             status=_ollama_problem_level(),
             latency_ms=round(_now_ms() - started, 1),
             summary=(
@@ -300,124 +358,109 @@ async def check_ollama_daemon() -> StatusCheck:
                 if parked
                 else f"No response from {host} — no offline fallback"
             ),
-            detail={"host": host, "error": str(exc), "parked": parked},
+            detail={"host": host, "error": str(exc), "in_chain": not parked},
             hint="Start Ollama: `brew services start ollama`.",
         )
 
+    configured = [tag for _, _, tag in _local_model_roles()]
+    unused = sorted(
+        name
+        for name in snap["installed"]
+        if not any(_tag_matches(tag, name) for tag in configured)
+    )
+    loaded = sorted(snap["loaded"])
     return StatusCheck(
-        key="ollama_daemon",
-        label="Ollama daemon",
+        key="ollama_runtime",
+        label="Ollama runtime",
         status="ok",
         latency_ms=round(_now_ms() - started, 1),
         summary=(
-            f"Reachable at {host} (not in AI_LLM_PROVIDERS)"
-            if parked
-            else f"Reachable at {host} — offline fallback ready"
+            f"v{snap['version']} at {host} · {len(snap['installed'])} model(s) on disk"
+            f" · in memory: {', '.join(loaded) or 'none'}"
+            + (" · not in AI_LLM_PROVIDERS" if parked else "")
         ),
-        detail={"host": host, "parked": parked},
+        detail={
+            "host": host,
+            "version": snap["version"],
+            "in_chain": not parked,
+            "loaded_in_memory": {
+                name: _gb(m.get("size_vram") or m.get("size")) for name, m in snap["loaded"].items()
+            },
+            "installed": {
+                name: _gb(m.get("size")) for name, m in sorted(snap["installed"].items())
+            },
+            "installed_but_unused": unused,
+        },
+        hint=(
+            f"Free disk: `ollama rm {' '.join(unused)}`" if unused else None
+        ),
     )
 
 
-async def check_ollama_models() -> StatusCheck:
-    """Confirm the configured chat + fast models are actually pulled.
-
-    A common foot-gun is changing ``AI_OLLAMA_MODEL`` in .env and
-    forgetting to ``ollama pull`` the new tag — every chat then 404s
-    inside the agent loop. This check makes that mismatch obvious.
-    """
+async def check_local_model(role: str) -> StatusCheck:
+    """One configured local model: on disk? loaded? still downloading?"""
     settings = get_settings()
-    host = settings.AI_OLLAMA_HOST
-    required = [t for t in (settings.AI_OLLAMA_MODEL,) if t]
-    optional = [
-        t for t in (settings.AI_OLLAMA_FAST_MODEL, settings.AI_OLLAMA_BACKUP_MODEL) if t
-    ]
-
+    host = settings.AI_OLLAMA_HOST.rstrip("/")
+    match = next((r for r in _local_model_roles() if r[0] == role), None)
+    key = f"local_model_{role}"
+    if match is None:
+        return StatusCheck(
+            key=key, label=f"Local {role} model", status="unknown",
+            summary="Not configured in .env.",
+        )
+    _, role_label, tag = match
+    label = f"{tag} ({role_label})"
     started = _now_ms()
     try:
-        async with httpx.AsyncClient() as client:
-            models = await _ollama_get_tags(client, host)
+        snap = await _ollama_snapshot(host)
     except Exception as exc:  # noqa: BLE001
-        parked = _ollama_is_parked()
         return StatusCheck(
-            key="ollama_models",
-            label="Ollama models",
-            status=_ollama_problem_level(),
+            key=key, label=label, status=_ollama_problem_level(),
             latency_ms=round(_now_ms() - started, 1),
-            summary="Could not list models — daemon unreachable.",
-            detail={"error": str(exc), "parked": parked},
-            hint="Fix the Ollama daemon first; this check derives from /api/tags.",
+            summary="Ollama runtime unreachable.",
+            detail={"error": str(exc)},
         )
 
-    installed = sorted({str(m.get("name", "")) for m in models if m.get("name")})
-    # A pulled tag in Ollama always carries a trailing version, e.g.
-    # ``gemma4:26b``. Users sometimes type just ``gemma4`` in .env, so
-    # we accept either an exact match or a "name starts with the
-    # configured tag plus ':'" prefix match.
-    def _present(tag: str) -> bool:
-        if tag in installed:
-            return True
-        return any(name == tag or name.startswith(tag + ":") for name in installed)
+    installed = next(
+        (m for name, m in snap["installed"].items() if _tag_matches(tag, name)), None
+    )
+    loaded = next(
+        (m for name, m in snap["loaded"].items() if _tag_matches(tag, name)), None
+    )
+    downloading = any(_tag_matches(tag, t) or t == tag for t in await _pulls_in_progress())
+    latency = round(_now_ms() - started, 1)
 
-    missing_required = [t for t in required if not _present(t)]
-    missing_optional = [t for t in optional if not _present(t)]
-
-    if missing_required:
+    if installed is None:
         return StatusCheck(
-            key="ollama_models",
-            label="Ollama models",
-            status=_ollama_problem_level(),
-            latency_ms=round(_now_ms() - started, 1),
-            summary=f"Missing required model: {', '.join(missing_required)}",
-            detail={
-                "installed": installed,
-                "required": required,
-                "optional": optional,
-                "missing_required": missing_required,
-                "missing_optional": missing_optional,
-            },
-            hint=(
-                f"Pull it: `ollama pull {missing_required[0]}` "
-                "(then refresh this page)."
-            ),
+            key=key, label=label,
+            status="unknown" if _ollama_is_parked() else "degraded",
+            latency_ms=latency,
+            summary="Downloading…" if downloading else "Not downloaded.",
+            detail={"tag": tag, "downloading": downloading},
+            hint=None if downloading else f"`ollama pull {tag}`",
         )
 
-    if missing_optional:
-        parked = _ollama_is_parked()
-        return StatusCheck(
-            key="ollama_models",
-            label="Ollama models",
-            status="unknown" if parked else "degraded",
-            latency_ms=round(_now_ms() - started, 1),
-            summary=(
-                f"{len(installed)} models installed · "
-                f"'{missing_optional[0]}' missing"
-            ),
-            detail={
-                "installed": installed,
-                "required": required,
-                "optional": optional,
-                "missing_optional": missing_optional,
-            },
-            hint=(
-                f"`ollama pull {missing_optional[0]}`. Offline calls use "
-                "the main local model in the meantime."
-            ),
-        )
-
+    details = installed.get("details") or {}
+    parts = [
+        f"{details['parameter_size']} params" if details.get("parameter_size") else None,
+        details.get("quantization_level") or None,
+        _gb(installed.get("size")),
+        "loaded in memory" if loaded else "on disk (loads on first use)",
+        "update downloading" if downloading else None,
+    ]
     return StatusCheck(
-        key="ollama_models",
-        label="Ollama models",
-        status="ok",
-        latency_ms=round(_now_ms() - started, 1),
-        summary=(
-            f"{len(installed)} model(s) installed; "
-            f"{', '.join(required + optional)} present."
-        ),
+        key=key, label=label, status="ok", latency_ms=latency,
+        summary=" · ".join(p for p in parts if p),
         detail={
-            "installed": installed,
-            "chat_model": settings.AI_OLLAMA_MODEL,
-            "backup_model": settings.AI_OLLAMA_BACKUP_MODEL,
-            "fast_model": settings.AI_OLLAMA_FAST_MODEL,
+            "tag": tag,
+            "family": details.get("family"),
+            "parameters": details.get("parameter_size"),
+            "quantization": details.get("quantization_level"),
+            "format": details.get("format"),
+            "size_on_disk": _gb(installed.get("size")),
+            "loaded_in_memory": bool(loaded),
+            "memory_used": _gb((loaded or {}).get("size_vram")),
+            "modified_at": installed.get("modified_at"),
         },
     )
 
@@ -560,10 +603,13 @@ async def check_ai_agent() -> StatusCheck:
         status=level,
         latency_ms=latency,
         summary=(
-            f'Model "{model}" replied with "{preview}" in {int(latency)} ms'
-            + (" (fallback — primary provider unavailable)" if on_fallback else "")
-            if preview
-            else f'Model "{model}" returned an empty reply.'
+            f"Order: {' → '.join(chain)} · "
+            + (
+                f'"{model}" answered in {int(latency)} ms'
+                + (" (fallback — primary provider unavailable)" if on_fallback else "")
+                if preview
+                else f'"{model}" returned an empty reply.'
+            )
         ),
         detail={
             "model": model,
@@ -1353,25 +1399,49 @@ async def check_backups() -> StatusCheck:
 # ---------------------------------------------------------------------------
 
 
-# Order matters: the UI renders rows top-to-bottom in this sequence. We
-# group by "infrastructure" first (API, DB, models) then "edges" (ngrok,
-# UI) since that mirrors the dependency graph — if Postgres is down,
-# nothing above it can possibly work.
-_CHECK_REGISTRY: list[tuple[str, str, Callable[[], Awaitable[StatusCheck]]]] = [
-    ("api", "FastAPI backend", check_api),
-    ("postgres", "Postgres", check_postgres),
-    ("backups", "Backups (DB + media)", check_backups),
-    ("grok_api", "Grok API", check_grok_api),
-    ("claude_api", "Claude API", check_claude_api),
-    ("ollama_daemon", "Ollama daemon", check_ollama_daemon),
-    ("ollama_models", "Ollama models", check_ollama_models),
-    ("ai_agent", "AI agent", check_ai_agent),
-    ("gemini_api", "Gemini API (web search)", check_gemini_api),
-    ("google_apis", "Google APIs (Gmail + Calendar)", check_google_apis),
-    ("telegram_api", "Telegram Bot API", check_telegram_api),
-    ("ngrok_local", "ngrok agent", check_ngrok_local),
-    ("ngrok_public", "ngrok public URL", check_ngrok_public),
-    ("ui", "React UI", check_ui),
+_CORE = "Core services"
+_AI = "AI models"
+_EDGES = "Integrations & network"
+
+
+@dataclass(frozen=True)
+class _Registered:
+    key: str
+    label: str
+    factory: Callable[[], Awaitable[StatusCheck]]
+    section: str
+    group: Optional[str] = None
+
+
+# Order matters: the UI renders sections, and rows within them, in this
+# sequence. Core infra first (if Postgres is down nothing else works),
+# then every LLM in one place — the failover chain, the internet APIs
+# in chain order, then the local runtime and its models — then the
+# edges (messaging, tunnels, UI).
+_CHECK_REGISTRY: list[_Registered] = [
+    _Registered("api", "FastAPI backend", check_api, _CORE),
+    _Registered("postgres", "Postgres", check_postgres, _CORE),
+    _Registered("backups", "Backups (DB + media)", check_backups, _CORE),
+    _Registered("ai_agent", "Failover chain (end-to-end)", check_ai_agent, _AI, "Failover chain"),
+    _Registered("grok_api", "Grok (xAI)", check_grok_api, _AI, "Internet APIs"),
+    _Registered("claude_api", "Claude (Anthropic)", check_claude_api, _AI, "Internet APIs"),
+    _Registered("gemini_api", "Gemini (web search tool)", check_gemini_api, _AI, "Internet APIs"),
+    _Registered("ollama_runtime", "Ollama runtime", check_ollama_runtime, _AI, "Local on this Mac"),
+    *(
+        _Registered(
+            f"local_model_{role}",
+            f"Local {role} model",
+            functools.partial(check_local_model, role),
+            _AI,
+            "Local on this Mac",
+        )
+        for role in ("main", "backup", "fast")
+    ),
+    _Registered("google_apis", "Google APIs (Gmail + Calendar)", check_google_apis, _EDGES),
+    _Registered("telegram_api", "Telegram Bot API", check_telegram_api, _EDGES),
+    _Registered("ngrok_local", "ngrok agent", check_ngrok_local, _EDGES),
+    _Registered("ngrok_public", "ngrok public URL", check_ngrok_public, _EDGES),
+    _Registered("ui", "React UI", check_ui, _EDGES),
 ]
 
 
@@ -1392,10 +1462,15 @@ def _roll_up(checks: list[StatusCheck]) -> StatusLevel:
 
 async def gather_status_report() -> SystemStatusReport:
     """Run every registered check concurrently and collect the results."""
-    coros = [
-        _safe(key, label, factory) for key, label, factory in _CHECK_REGISTRY
-    ]
-    results = await asyncio.gather(*coros)
+    results = await asyncio.gather(
+        *(_safe(r.key, r.label, r.factory) for r in _CHECK_REGISTRY)
+    )
+    for reg, check in zip(_CHECK_REGISTRY, results):
+        check.section = reg.section
+        check.group = reg.group
+        # Local-model rows name themselves after the configured tag.
+        if not reg.key.startswith("local_model_"):
+            check.label = reg.label
     return SystemStatusReport(
         overall=_roll_up(list(results)),
         generated_at=datetime.now(timezone.utc),
