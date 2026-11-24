@@ -117,6 +117,13 @@ async def handle_lookup_person(ctx: ToolContext, name: str) -> List[Dict[str, An
                         }
                         for j in (p.jobs or [])
                     ],
+                    "websites": [
+                        {
+                            "name": w.name,
+                            "url": w.url,
+                        }
+                        for w in (p.websites or [])
+                    ],
                     "gender": p.gender,
                 }
             )
