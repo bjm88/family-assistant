@@ -7,7 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { useEffect, useState } from "react";
-import { ArrowLeft, Briefcase, Camera, CheckCircle2, Circle, HeartPulse, Image as ImageIcon, Pencil, Pill, Plus, Stethoscope, Target, Trash2, Upload, X } from "lucide-react";
+import { ArrowLeft, Briefcase, Camera, CheckCircle2, Circle, Globe, HeartPulse, Image as ImageIcon, Pencil, Pill, Plus, Stethoscope, Target, Trash2, Upload, X } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   Goal,
@@ -19,6 +19,7 @@ import type {
   Medication,
   Person,
   PersonPhoto,
+  PersonWebsite,
   Physician,
   SensitiveIdentifier,
 } from "@/lib/types";
@@ -361,7 +362,7 @@ export default function PersonDetail() {
                       await confirm({
                         title: `Delete ${person?.first_name ?? "this person"}?`,
                         message:
-                          "This will permanently remove the person and all of their photos, documents, jobs, goals, medical records, and identifiers. This cannot be undone.",
+                          "This will permanently remove the person and all of their photos, documents, jobs, websites, goals, medical records, and identifiers. This cannot be undone.",
                         destructive: true,
                         confirmLabel: "Delete person",
                       })
@@ -399,6 +400,9 @@ export default function PersonDetail() {
         </div>
         <div className="lg:col-span-3">
           <JobsSection personId={Number(personId)} />
+        </div>
+        <div className="lg:col-span-3">
+          <WebsitesSection personId={Number(personId)} />
         </div>
         <div className="lg:col-span-3">
           <MedicalConditionsSection personId={Number(personId)} />
@@ -2620,6 +2624,264 @@ function PhysicianModal({
             />
           </Field>
         </div>
+      </form>
+    </Modal>
+  );
+}
+
+
+// ---------- Websites -----------------------------------------------------
+
+function WebsitesSection({ personId }: { personId: number }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const confirm = useConfirm();
+  const [editingId, setEditingId] = useState<number | "new" | null>(null);
+
+  const { data: websites } = useQuery<PersonWebsite[]>({
+    queryKey: ["person-websites", personId],
+    queryFn: () =>
+      api.get<PersonWebsite[]>(`/api/person-websites?person_id=${personId}`),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => api.del(`/api/person-websites/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["person-websites", personId] });
+      toast.success("Website removed.");
+    },
+    onError: (err: Error) =>
+      toast.error(`Could not remove website: ${err.message}`),
+  });
+
+  const editing =
+    typeof editingId === "number"
+      ? websites?.find((w) => w.person_website_id === editingId) ?? null
+      : null;
+
+  return (
+    <div className="card">
+      <div className="card-header flex items-center justify-between">
+        <div className="card-title flex items-center gap-2">
+          <Globe className="h-4 w-4 text-sky-500" /> Websites
+        </div>
+        <button className="btn-secondary" onClick={() => setEditingId("new")}>
+          <Plus className="h-4 w-4" /> Add website
+        </button>
+      </div>
+      <div className="card-body">
+        {!websites || websites.length === 0 ? (
+          <div className="text-sm text-muted-foreground">
+            No websites on file. Add LinkedIn, a personal site, GitHub, or
+            any other named link for this person.
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="text-xs text-muted-foreground">
+              <tr className="border-b border-border">
+                <th className="text-left py-2">Name</th>
+                <th className="text-left">URL</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {websites.map((w) => (
+                <tr
+                  key={w.person_website_id}
+                  className="border-b border-border table-row-hover cursor-pointer"
+                  onClick={() => setEditingId(w.person_website_id)}
+                >
+                  <td className="py-2 font-medium">{w.name}</td>
+                  <td>
+                    <a
+                      href={
+                        /^https?:\/\//i.test(w.url)
+                          ? w.url
+                          : `https://${w.url}`
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-sky-600 hover:underline break-all"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {w.url}
+                    </a>
+                  </td>
+                  <td className="text-right whitespace-nowrap">
+                    <button
+                      className="text-muted-foreground hover:text-foreground mr-3"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditingId(w.person_website_id);
+                      }}
+                      aria-label="Edit website"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </button>
+                    <button
+                      className="text-destructive hover:text-destructive/80"
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        if (
+                          await confirm({
+                            title: "Delete this website?",
+                            message: `${w.name} (${w.url}) will be removed.`,
+                            destructive: true,
+                            confirmLabel: "Delete website",
+                          })
+                        ) {
+                          del.mutate(w.person_website_id);
+                        }
+                      }}
+                      aria-label="Delete website"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <WebsiteModal
+        open={editingId !== null}
+        mode={editingId === "new" ? "create" : "edit"}
+        website={editing}
+        personId={personId}
+        onClose={() => setEditingId(null)}
+      />
+    </div>
+  );
+}
+
+type WebsiteForm = {
+  name: string;
+  url: string;
+};
+
+const emptyWebsiteForm = (): WebsiteForm => ({
+  name: "",
+  url: "",
+});
+
+function WebsiteModal({
+  open,
+  mode,
+  website,
+  personId,
+  onClose,
+}: {
+  open: boolean;
+  mode: "create" | "edit";
+  website: PersonWebsite | null;
+  personId: number;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { register, handleSubmit, reset } = useForm<WebsiteForm>({
+    defaultValues: emptyWebsiteForm(),
+  });
+
+  useEffect(() => {
+    if (mode === "edit" && website) {
+      reset({
+        name: website.name,
+        url: website.url,
+      });
+    } else if (mode === "create") {
+      reset(emptyWebsiteForm());
+    }
+  }, [mode, website, reset, open]);
+
+  const create = useMutation({
+    mutationFn: (v: WebsiteForm) =>
+      api.post<PersonWebsite>(
+        "/api/person-websites",
+        cleanPayload({ ...v, person_id: personId })
+      ),
+    onSuccess: (w) => {
+      qc.invalidateQueries({ queryKey: ["person-websites", personId] });
+      toast.success(`Added ${w.name}.`);
+      onClose();
+    },
+    onError: (err: Error) =>
+      toast.error(`Could not add website: ${err.message}`),
+  });
+
+  const update = useMutation({
+    mutationFn: (v: WebsiteForm) => {
+      if (!website) throw new Error("No website to update");
+      return api.patch<PersonWebsite>(
+        `/api/person-websites/${website.person_website_id}`,
+        cleanPayload(v)
+      );
+    },
+    onSuccess: (w) => {
+      qc.invalidateQueries({ queryKey: ["person-websites", personId] });
+      toast.success(`Saved ${w.name}.`);
+      onClose();
+    },
+    onError: (err: Error) => toast.error(`Save failed: ${err.message}`),
+  });
+
+  const pending = create.isPending || update.isPending;
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={mode === "create" ? "Add website" : "Edit website"}
+      footer={
+        <>
+          <button className="btn-secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn-primary"
+            disabled={pending}
+            onClick={handleSubmit((v) =>
+              mode === "create" ? create.mutate(v) : update.mutate(v)
+            )}
+          >
+            {pending
+              ? "Saving…"
+              : mode === "create"
+              ? "Add website"
+              : "Save changes"}
+          </button>
+        </>
+      }
+    >
+      <form className="grid grid-cols-1 gap-4" onSubmit={(e) => e.preventDefault()}>
+        <Field
+          label="Name"
+          htmlFor="website_name"
+          hint="Short label — e.g. LinkedIn, Personal site, GitHub."
+        >
+          <input
+            id="website_name"
+            className="input"
+            placeholder="LinkedIn"
+            required
+            {...register("name", { required: true })}
+          />
+        </Field>
+        <Field
+          label="URL"
+          htmlFor="website_url"
+          hint="Store exactly what you'd type into a browser."
+        >
+          <input
+            id="website_url"
+            className="input"
+            placeholder="https://linkedin.com/in/…"
+            required
+            {...register("url", { required: true })}
+          />
+        </Field>
       </form>
     </Modal>
   );

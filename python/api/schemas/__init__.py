@@ -15,6 +15,11 @@ from .person_relationship import (
 )
 from .goal import GoalCreate, GoalUpdate, GoalRead, GoalPriority
 from .job import JobCreate, JobUpdate, JobRead
+from .person_website import (
+    PersonWebsiteCreate,
+    PersonWebsiteUpdate,
+    PersonWebsiteRead,
+)
 from .medical_condition import (
     MedicalConditionCreate,
     MedicalConditionUpdate,
@@ -123,6 +128,9 @@ __all__ = [
     "JobCreate",
     "JobUpdate",
     "JobRead",
+    "PersonWebsiteCreate",
+    "PersonWebsiteUpdate",
+    "PersonWebsiteRead",
     "MedicalConditionCreate",
     "MedicalConditionUpdate",
     "MedicalConditionRead",

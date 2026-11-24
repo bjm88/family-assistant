@@ -26,6 +26,15 @@ export interface Job {
   description: string | null;
 }
 
+export interface PersonWebsite {
+  person_website_id: number;
+  person_id: number;
+  name: string;
+  url: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Person {
   person_id: number;
   family_id: number;

@@ -173,6 +173,9 @@ class Person(Base, TimestampMixin):
     jobs: Mapped[List["Job"]] = relationship(  # noqa: F821
         back_populates="person", cascade="all, delete-orphan"
     )
+    websites: Mapped[List["PersonWebsite"]] = relationship(  # noqa: F821
+        back_populates="person", cascade="all, delete-orphan"
+    )
     medical_conditions: Mapped[List["MedicalCondition"]] = relationship(  # noqa: F821
         back_populates="person", cascade="all, delete-orphan"
     )

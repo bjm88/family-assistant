@@ -151,6 +151,77 @@ def test_jobs_crud_round_trip_for_a_person(client, test_family, db):
 
 
 # ---------------------------------------------------------------------------
+# /api/admin/person-websites (Person → Website 1:N)
+# ---------------------------------------------------------------------------
+
+
+def test_person_websites_crud_round_trip(client, test_family, db):
+    """Create a person, hang two websites off it, list, patch, delete.
+
+    List endpoint should return websites sorted by lowercased name.
+    """
+    person_resp = client.post(
+        "/api/admin/people",
+        json={
+            "family_id": test_family["family_id"],
+            "first_name": "WebsitesSmoke",
+            "last_name": "Person",
+        },
+    )
+    assert person_resp.status_code == 201
+    person_id = person_resp.json()["person_id"]
+
+    website_ids: list[int] = []
+    try:
+        for name, url in [
+            ("Zeta Blog", "https://zeta.example/blog"),
+            ("LinkedIn", "https://linkedin.com/in/example"),
+        ]:
+            r = client.post(
+                "/api/admin/person-websites",
+                json={
+                    "person_id": person_id,
+                    "name": name,
+                    "url": url,
+                },
+            )
+            assert r.status_code == 201, r.text
+            website_ids.append(r.json()["person_website_id"])
+
+        listed = client.get(f"/api/admin/person-websites?person_id={person_id}")
+        assert listed.status_code == 200
+        names = [w["name"] for w in listed.json()]
+        assert names == ["LinkedIn", "Zeta Blog"], (
+            f"Websites should list lowercased-alphabetical, got {names!r}"
+        )
+
+        rows = (
+            db.execute(
+                select(models.PersonWebsite).where(
+                    models.PersonWebsite.person_id == person_id
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert {r.url for r in rows} == {
+            "https://zeta.example/blog",
+            "https://linkedin.com/in/example",
+        }
+
+        patched = client.patch(
+            f"/api/admin/person-websites/{website_ids[0]}",
+            json={"name": "Personal blog"},
+        )
+        assert patched.status_code == 200
+        assert patched.json()["name"] == "Personal blog"
+    finally:
+        for wid in website_ids:
+            client.delete(f"/api/admin/person-websites/{wid}")
+        client.delete(f"/api/admin/people/{person_id}")
+
+
+# ---------------------------------------------------------------------------
 # /api/admin/goals — completion
 # ---------------------------------------------------------------------------
 
