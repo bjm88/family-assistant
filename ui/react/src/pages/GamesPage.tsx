@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Crown, Gamepad2, Mail, MessageSquare, Play, Share2, Trophy, UserPlus } from "lucide-react";
+import { Bot, Crown, Gamepad2, Link2, Mail, MessageSquare, Play, Share2, Trophy, UserPlus } from "lucide-react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { PageHeader } from "@/components/PageHeader";
@@ -9,8 +9,9 @@ import { Modal } from "@/components/Modal";
 import { useConfirm } from "@/components/ConfirmDialog";
 import { useToast } from "@/components/Toast";
 import { Turkey } from "@/games/Turkey";
-import { shareJoinLink } from "@/games/share";
+import { copyLink, shareJoinLink } from "@/games/share";
 import type {
+  AiLevel,
   GameCatalogEntry,
   GamePerson,
   GamesOverview,
@@ -27,6 +28,12 @@ const STATUS_LABEL: Record<GameSummary["status"], string> = {
   playing: "Playing now",
   round_over: "Between rounds",
   ended: "Finished",
+};
+
+const AI_LEVEL_BLURB: Record<AiLevel, string> = {
+  easy: "Misses a lot. Good for young players.",
+  medium: "Plays to win and blocks most of the time, but slips up now and then.",
+  hard: "Doesn't miss a thing.",
 };
 
 type Dialog =
@@ -71,6 +78,15 @@ export default function GamesPage() {
     if (how === "failed") toast.error("Couldn't copy the link");
   };
 
+  const copyInvite = async (game: GameSummary) => {
+    if (!game.invite_url) return;
+    if (await copyLink(game.invite_url)) {
+      toast.success("Invite link copied. Anyone who opens it types their name and joins.");
+    } else {
+      toast.error("Couldn't copy the link");
+    }
+  };
+
   return (
     <div>
       <PageHeader title="Games" description="Quick games to play together, each on your own phone." />
@@ -91,6 +107,7 @@ export default function GamesPage() {
                   <p className="mt-1 text-xs text-[color:var(--tg-ink-soft)]">
                     {game.min_players}–{game.max_players} players · a few minutes a round · everyone gets a link by
                     text or email, no sign-in needed
+                    {game.can_play_ai && ` · or play ${data.ai_name} on your own`}
                   </p>
                   <button
                     type="button"
@@ -137,7 +154,7 @@ export default function GamesPage() {
                             ` · ${game.rounds_played} ${game.rounds_played === 1 ? "round" : "rounds"} played`}
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         {game.my_play_path && (
                           <button
                             type="button"
@@ -155,6 +172,16 @@ export default function GamesPage() {
                             onClick={() => setDialog({ kind: "invite", game })}
                           >
                             <UserPlus className="h-4 w-4" /> Invite
+                          </button>
+                        )}
+                        {game.invite_url && (
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            title="Anyone who opens this link types their name and joins"
+                            onClick={() => void copyInvite(game)}
+                          >
+                            <Link2 className="h-4 w-4" /> Copy invite link
                           </button>
                         )}
                         {(game.can_manage || game.my_play_path) && (
@@ -191,6 +218,7 @@ export default function GamesPage() {
                           <div className="min-w-0 flex-1 leading-tight">
                             <div className="truncate text-sm font-medium">
                               {p.name}
+                              {p.kind === "ai" && <Bot className="ml-1 inline h-3.5 w-3.5 text-muted-foreground" />}
                               {p.wins > 0 && (
                                 <span className="ml-1.5 inline-flex items-center gap-0.5 text-xs text-amber-600">
                                   <Trophy className="h-3 w-3" /> {p.wins}
@@ -268,11 +296,20 @@ export default function GamesPage() {
                 ) : (
                   <ol className="divide-y divide-border">
                     {board.map((entry, i) => (
-                      <li key={entry.person_id} className="flex items-center gap-3 px-5 py-2.5">
+                      <li
+                        key={`${entry.kind}-${entry.person_id ?? entry.name}`}
+                        className="flex items-center gap-3 px-5 py-2.5"
+                      >
                         <span className="w-5 text-center text-sm font-semibold text-muted-foreground">
                           {i === 0 && entry.wins > 0 ? <Crown className="inline h-4 w-4 text-amber-500" /> : i + 1}
                         </span>
-                        <span className="min-w-0 flex-1 truncate font-medium">{entry.name}</span>
+                        <span className="min-w-0 flex-1 truncate font-medium">
+                          {entry.name}
+                          {entry.kind === "ai" && <Bot className="ml-1 inline h-3.5 w-3.5 text-muted-foreground" />}
+                          {entry.kind === "guest" && (
+                            <span className="ml-1.5 text-xs font-normal text-muted-foreground">guest</span>
+                          )}
+                        </span>
                         <span className="text-right leading-tight">
                           <span className="font-semibold tabular-nums">
                             {entry.wins} {entry.wins === 1 ? "win" : "wins"}
@@ -302,7 +339,7 @@ export default function GamesPage() {
             setDialog(null);
             void queryClient.invalidateQueries({ queryKey });
             if (dialog.kind === "new" && game.my_play_path) navigate(game.my_play_path);
-            else toast.success("Invite sent");
+            else toast.success(dialog.kind === "new" ? "Game started" : "Invite sent");
           }}
         />
       )}
@@ -317,7 +354,8 @@ function mySeat(game: GameSummary): GameSummaryPlayer | undefined {
 }
 
 function playerStatus(p: GameSummaryPlayer): string {
-  if (p.joined) return p.is_host ? "Started the game" : "In the game";
+  if (p.kind === "ai") return "AI player";
+  if (p.joined) return p.is_host ? "Started the game" : p.kind === "guest" ? "Guest — in the game" : "In the game";
   if (p.invite_status === "pending") return "Sending the invite…";
   if (p.invite_status === "sent") {
     const via = p.invite_channels.map((c) => (c === "sms" ? "text" : "email")).join(" and ");
@@ -355,17 +393,24 @@ function InviteDialog({ dialog, familyId, overview, onClose, onDone }: InviteDia
   const [hostId, setHostId] = useState<number | null>(overview.me_person_id);
   const [invitees, setInvitees] = useState<number[]>([]);
   const [sendInvites, setSendInvites] = useState(true);
+  const canPlayAi = isNew && dialog.game.can_play_ai;
+  const [vsAi, setVsAi] = useState(false);
+  const [aiLevel, setAiLevel] = useState<AiLevel>(overview.ai_default_level);
 
   const alreadyIn = isNew ? [] : dialog.game.players.map((p) => p.person_id);
   const choices = overview.people.filter(
     (p) => !alreadyIn.includes(p.person_id) && !(isNew && p.person_id === hostId)
   );
-  const room = isNew ? dialog.game.max_players - 1 : dialog.game.max_players - dialog.game.players.length;
+  // Seats left for family members: the host has one, and so does the AI.
+  const room = isNew
+    ? dialog.game.max_players - 1 - (vsAi ? 1 : 0)
+    : dialog.game.max_players - dialog.game.players.length;
 
-  // Changing who the host is can make them one of the ticked invitees.
+  // Changing who the host is can make them one of the ticked invitees,
+  // and giving the AI a seat can leave one too few for them.
   useEffect(() => {
-    setInvitees((ids) => ids.filter((id) => id !== hostId));
-  }, [hostId]);
+    setInvitees((ids) => ids.filter((id) => id !== hostId).slice(0, room));
+  }, [hostId, room]);
 
   const submit = useMutation({
     mutationFn: () =>
@@ -376,6 +421,8 @@ function InviteDialog({ dialog, familyId, overview, onClose, onDone }: InviteDia
             host_person_id: hostId,
             invite_person_ids: invitees,
             send_invites: sendInvites,
+            vs_ai: vsAi,
+            ai_level: aiLevel,
           })
         : api.post<GameSummary>(`/api/games/${dialog.game.game_id}/invites`, {
             person_ids: invitees,
@@ -404,7 +451,9 @@ function InviteDialog({ dialog, familyId, overview, onClose, onDone }: InviteDia
           <button
             type="button"
             className="btn-primary"
-            disabled={invitees.length === 0 || needsHost || submit.isPending}
+            // A new game needs nobody picked: the host can play the AI,
+            // or pass the invite link around once it has started.
+            disabled={(!isNew && invitees.length === 0) || needsHost || submit.isPending}
             onClick={() => submit.mutate()}
           >
             {isNew ? (submit.isPending ? "Starting…" : "Start game") : submit.isPending ? "Inviting…" : "Invite"}
@@ -434,9 +483,55 @@ function InviteDialog({ dialog, familyId, overview, onClose, onDone }: InviteDia
           </div>
         )}
 
+        {canPlayAi && (
+          <div className="rounded-md border border-border">
+            <label className="flex cursor-pointer items-center gap-3 px-3 py-2.5">
+              <input
+                type="checkbox"
+                className="h-4 w-4"
+                checked={vsAi}
+                onChange={(e) => setVsAi(e.target.checked)}
+              />
+              <Bot className="h-4 w-4 shrink-0 text-primary" />
+              <span className="min-w-0 flex-1 text-sm">
+                <span className="font-medium">Play against {overview.ai_name}</span>
+                <span className="block text-xs text-muted-foreground">
+                  Ready straight away — no waiting for anyone to join.
+                </span>
+              </span>
+            </label>
+            {vsAi && (
+              <div className="flex items-center gap-2 border-t border-border px-3 py-2.5">
+                <span className="text-xs font-medium text-muted-foreground">How good?</span>
+                <div className="flex flex-1 gap-1" role="radiogroup" aria-label={`How well ${overview.ai_name} plays`}>
+                  {overview.ai_levels.map((level) => (
+                    <button
+                      key={level}
+                      type="button"
+                      role="radio"
+                      aria-checked={aiLevel === level}
+                      onClick={() => setAiLevel(level)}
+                      className={cn(
+                        "flex-1 rounded-md border px-2 py-1.5 text-sm font-medium capitalize",
+                        aiLevel === level
+                          ? "border-primary bg-primary text-primary-foreground"
+                          : "border-border bg-white hover:bg-accent"
+                      )}
+                    >
+                      {level}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {vsAi && <p className="px-3 pb-2.5 text-xs text-muted-foreground">{AI_LEVEL_BLURB[aiLevel]}</p>}
+          </div>
+        )}
+
         <div>
           <div className="label">
-            Who do you want to play with? <span className="normal-case">(up to {room})</span>
+            {isNew ? "Invite family" : "Who do you want to play with?"}{" "}
+            <span className="normal-case">({isNew ? "optional, " : ""}up to {room})</span>
           </div>
           {choices.length === 0 ? (
             <p className="text-sm text-muted-foreground">There's nobody else in the family to invite yet.</p>
@@ -482,27 +577,39 @@ function InviteDialog({ dialog, familyId, overview, onClose, onDone }: InviteDia
           )}
         </div>
 
-        <label className="flex items-start gap-2 text-sm">
-          <input
-            type="checkbox"
-            className="mt-0.5 h-4 w-4"
-            checked={sendInvites}
-            onChange={(e) => setSendInvites(e.target.checked)}
-          />
-          <span>
-            Send each person their link by text and email
-            <span className="block text-xs text-muted-foreground">
-              Texts only go to people who have opted in to them.
+        {invitees.length > 0 && (
+          <label className="flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4"
+              checked={sendInvites}
+              onChange={(e) => setSendInvites(e.target.checked)}
+            />
+            <span>
+              Send each person their link by text and email
+              <span className="block text-xs text-muted-foreground">
+                Texts only go to people who have opted in to them.
+              </span>
             </span>
-          </span>
-        </label>
+          </label>
+        )}
 
-        {(anyUnreachable || !sendInvites) && (
+        {invitees.length > 0 && (anyUnreachable || !sendInvites) && (
           <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
             {sendInvites
               ? "Someone you picked has no phone or email we can use. "
               : "No invites will be sent. "}
             You'll get a Share link button for each person on the next screen.
+          </p>
+        )}
+
+        {isNew && (
+          <p className="flex items-start gap-2 rounded-md bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
+            <Link2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              Want someone else in? Once the game is open you can copy an invite link and send it to anyone. They
+              type their name and join — no account needed.
+            </span>
           </p>
         )}
       </div>

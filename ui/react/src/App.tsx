@@ -16,7 +16,7 @@ import FinancialAccountsPage from "./pages/FinancialAccountsPage";
 import DocumentsPage from "./pages/DocumentsPage";
 import TasksPage from "./pages/TasksPage";
 import GamesPage from "./pages/GamesPage";
-import PlayGamePage from "./pages/PlayGamePage";
+import PlayGamePage, { JoinGamePage } from "./pages/PlayGamePage";
 import StatusPage from "./pages/StatusPage";
 import AiAssistantPage from "./pages/AiAssistantPage";
 import AiSessionsListPage from "./pages/AiSessionsListPage";
@@ -34,7 +34,9 @@ export default function App() {
       <Route path="/login" element={<LoginPage />} />
       <Route path="/" element={<HomeRedirect />} />
       {/* A player's invite link to a family game. No sign-in: the token
-          in the URL is the invitation. */}
+          in the URL is the invitation. /play/join/… is the link a host
+          passes around; whoever opens it joins as a guest by name. */}
+      <Route path="/play/join/:inviteToken" element={<JoinGamePage />} />
       <Route path="/play/:token" element={<PlayGamePage />} />
 
       {/* Legacy redirects — keep old /families links working. */}

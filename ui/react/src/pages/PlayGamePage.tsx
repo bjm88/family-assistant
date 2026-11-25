@@ -1,14 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
-import { useParams } from "react-router-dom";
-import { Check, Eye, Flag, Play, RotateCcw, Share2, Trophy, WifiOff } from "lucide-react";
+import { useNavigate, useParams } from "react-router-dom";
+import { Bot, Check, Copy, Eye, Flag, Play, RotateCcw, Share2, Trophy, UserPlus, WifiOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { SHIRT_COLOR_KEYS, SHIRT_COLORS, Turkey, TURKEY_STYLES } from "@/games/Turkey";
 import { TurkeyBoard } from "@/games/TurkeyBoard";
-import { shareJoinLink } from "@/games/share";
+import { canShare, copyLink, recallGuestName, recallSeat, rememberSeat, shareJoinLink } from "@/games/share";
 import { useGameSocket } from "@/games/useGameSocket";
-import type { GameAction, GamePlayer, GameView, ShirtColor, TurkeyStyle } from "@/games/types";
+import type {
+  GameAction,
+  GamePlayer,
+  GameView,
+  GuestGameView,
+  GuestSeat,
+  ShirtColor,
+  TurkeyStyle,
+} from "@/games/types";
 import "@/games/games.css";
 
 // The page behind a player's join link, /play/<token>. It needs no
@@ -18,21 +26,42 @@ import "@/games/games.css";
 //   lobby    → the board, with a "Start game" card once two are in
 //   playing  → tap a square to pick it, tap it again to place
 //   round over → the winning line, congratulations, play again / end
+//
+// JoinGamePage, further down, is the page behind a game's shareable
+// link, /play/join/<invite token>: the same welcome, plus a box for
+// the guest's name. Joining there gives them a /play/<token> of their own.
+
+const GUEST_NAME_MAX_LENGTH = 24;
+
+/** A short message that shows at the top of the screen for a few seconds. */
+function useNotice(): [string | null, (message: string) => void] {
+  const [notice, setNotice] = useState<string | null>(null);
+  const timer = useRef<number>();
+  const flash = useCallback((message: string) => {
+    setNotice(message);
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setNotice(null), 3500);
+  }, []);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+  return [notice, flash];
+}
+
+function useGameTitle(name: string | undefined) {
+  useEffect(() => {
+    const before = document.title;
+    document.title = name ?? "Family game";
+    return () => {
+      document.title = before;
+    };
+  }, [name]);
+}
 
 export default function PlayGamePage() {
   const { token } = useParams();
   const [game, setGame] = useState<GameView | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, flash] = useNotice();
   const [picking, setPicking] = useState(false);
-  const noticeTimer = useRef<number>();
-
-  const flash = useCallback((message: string) => {
-    setNotice(message);
-    window.clearTimeout(noticeTimer.current);
-    noticeTimer.current = window.setTimeout(() => setNotice(null), 3500);
-  }, []);
-  useEffect(() => () => window.clearTimeout(noticeTimer.current), []);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -64,13 +93,7 @@ export default function PlayGamePage() {
     [send, flash]
   );
 
-  useEffect(() => {
-    const before = document.title;
-    document.title = game?.game_name ?? "Family game";
-    return () => {
-      document.title = before;
-    };
-  }, [game?.game_name]);
+  useGameTitle(game?.game_name);
 
   if (fatal) return <Sorry message={fatal} />;
   if (!game) return <Loading />;
@@ -79,7 +102,7 @@ export default function PlayGamePage() {
     return (
       <Welcome
         game={game}
-        online={link === "open"}
+        ready={link === "open"}
         notice={notice}
         onJoin={(style, color) => {
           act({ type: "join", style, color });
@@ -101,12 +124,97 @@ export default function PlayGamePage() {
   );
 }
 
+/**
+ * The page behind a game's shareable link. Whoever opens it says what
+ * to call them, picks a turkey, and is given a seat — and a link — of
+ * their own.
+ */
+export function JoinGamePage() {
+  const { inviteToken } = useParams();
+  const navigate = useNavigate();
+  const [game, setGame] = useState<GuestGameView | null>(null);
+  const [fatal, setFatal] = useState<string | null>(null);
+  const [joining, setJoining] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+
+  // This phone already joined through this link: go back to that seat.
+  const seat = inviteToken ? recallSeat(inviteToken) : null;
+  useEffect(() => {
+    if (seat) navigate(seat, { replace: true });
+  }, [seat, navigate]);
+
+  const load = useCallback(async () => {
+    if (!inviteToken || seat) return;
+    try {
+      setGame(await api.get<GuestGameView>(`/api/games/join/${encodeURIComponent(inviteToken)}`));
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 404 || err.status === 410)) {
+        setFatal(err.message);
+      }
+    }
+  }, [inviteToken, seat]);
+
+  // There is no live connection before joining, so look again every
+  // few seconds: other people are taking shirts and seats meanwhile.
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 4000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  useGameTitle(game?.game_name);
+
+  const join = async (style: TurkeyStyle, color: ShirtColor, name: string) => {
+    if (!inviteToken || joining) return;
+    setJoining(true);
+    setProblem(null);
+    try {
+      const mine = await api.post<GuestSeat>(`/api/games/join/${encodeURIComponent(inviteToken)}`, {
+        name,
+        style,
+        color,
+      });
+      rememberSeat(inviteToken, mine.play_path, mine.name);
+      navigate(mine.play_path, { replace: true });
+    } catch (err) {
+      setProblem(err instanceof Error ? err.message : "Couldn't join — try again.");
+      setJoining(false);
+      void load();
+    }
+  };
+
+  if (fatal) return <Sorry message={fatal} />;
+  if (!game || seat) return <Loading />;
+  if (game.status === "ended") return <GameOver game={game} />;
+  if (game.is_full) {
+    return (
+      <Sorry
+        message="This game is full"
+        detail={`${listNames(game.players.filter((p) => p.joined).map((p) => p.name))} are already playing. Ask ${game.invited_by} to start another game.`}
+      />
+    );
+  }
+  return <Welcome game={game} ready={!joining} notice={null} problem={problem} onJoin={join} />;
+}
+
 // ---------------------------------------------------------------------------
 // Small shared pieces
 // ---------------------------------------------------------------------------
 
-function meOf(game: GameView): GamePlayer | undefined {
-  return game.players.find((p) => p.player_id === game.you.player_id);
+function meOf(game: GameView | GuestGameView): GamePlayer | undefined {
+  const mine = game.you?.player_id;
+  return game.players.find((p) => p.player_id === mine);
+}
+
+function listNames(names: string[]): string {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/** A small robot next to the AI's name, so nobody waits for it to "join". */
+function AiTag({ player, className }: { player: GamePlayer; className?: string }) {
+  if (player.kind !== "ai") return null;
+  return <Bot aria-label="AI player" className={cn("inline h-[1em] w-[1em] shrink-0 align-[-0.125em]", className)} />;
 }
 
 function PlayerTurkey({ player, size, className }: { player: GamePlayer; size: number; className?: string }) {
@@ -196,13 +304,14 @@ function Loading() {
   );
 }
 
-function Sorry({ message }: { message: string }) {
+function Sorry({ message, detail }: { message: string; detail?: string }) {
   return (
     <div className="turkey-theme turkey-screen flex flex-col items-center justify-center gap-3 px-6 text-center">
       <Turkey style="hippie" color="green" size={130} />
       <h1 className="tg-title text-3xl">{message}</h1>
       <p className="max-w-xs text-sm">
-        Game links work for a day. Ask whoever invited you to start a new game and send you a fresh link.
+        {detail ??
+          "Game links work for a day. Ask whoever invited you to start a new game and send you a fresh link."}
       </p>
       <a href="/" className="tg-btn tg-btn-quiet mt-2">
         Open Family Assistant
@@ -216,29 +325,41 @@ function Sorry({ message }: { message: string }) {
 // ---------------------------------------------------------------------------
 
 interface WelcomeProps {
-  game: GameView;
-  online: boolean;
+  /** With `you: null` this is a guest who has yet to say who they are. */
+  game: GameView | GuestGameView;
+  /** Whether joining can go through right now (connected, not already joining). */
+  ready: boolean;
   notice: string | null;
-  onJoin: (style: TurkeyStyle, color: ShirtColor) => void;
+  /** Why the last try at joining was turned down, shown beside the Join button. */
+  problem?: string | null;
+  /** `name` is what a guest typed; empty for a player who already has one. */
+  onJoin: (style: TurkeyStyle, color: ShirtColor, name: string) => void;
   /** Set when a player who is already in is just changing turkeys. */
   onCancel?: () => void;
 }
 
-function Welcome({ game, online, notice, onJoin, onCancel }: WelcomeProps) {
+function Welcome({ game, ready, notice, problem, onJoin, onCancel }: WelcomeProps) {
   const me = meOf(game);
-  const others = game.players.filter((p) => p.player_id !== game.you.player_id);
+  const you = game.you;
+  const others = game.players.filter((p) => p.player_id !== you?.player_id);
   const takenBy = new Map<ShirtColor, string>();
   for (const p of others) {
-    if (p.joined && p.avatar_color) takenBy.set(p.avatar_color, p.name);
+    // The AI gives up its shirt to anyone who wants it.
+    if (p.joined && p.avatar_color && !(p.kind === "ai" && game.status === "lobby")) {
+      takenBy.set(p.avatar_color, p.name);
+    }
   }
   const firstFree = SHIRT_COLOR_KEYS.find((c) => !takenBy.has(c)) ?? SHIRT_COLOR_KEYS[0];
 
   const [style, setStyle] = useState<TurkeyStyle>(me?.avatar_style ?? "happy");
   const [picked, setPicked] = useState<ShirtColor | null>(me?.avatar_color ?? null);
+  const [name, setName] = useState(() => (you ? "" : recallGuestName().slice(0, GUEST_NAME_MAX_LENGTH)));
   // If someone else takes the colour while this player is choosing,
   // fall back to one that is still free.
   const color = picked && !takenBy.has(picked) ? picked : firstFree;
 
+  const guestName = name.trim();
+  const needsName = !you && !guestName;
   const underWay = game.status !== "lobby";
   return (
     <div className="turkey-theme min-h-[100dvh]">
@@ -246,16 +367,35 @@ function Welcome({ game, online, notice, onJoin, onCancel }: WelcomeProps) {
       <div className="mx-auto flex max-w-md flex-col gap-4 px-4 pb-8 pt-6">
         <header className="text-center">
           <p className="text-sm font-semibold text-[color:var(--tg-ink-soft)]">
-            {game.you.is_host ? "You're starting a game of" : `${game.invited_by} invited you to play`}
+            {you?.is_host ? "You're starting a game of" : `${game.invited_by} invited you to play`}
           </p>
           <h1 className="tg-title mt-1 text-4xl leading-none">{game.game_name}</h1>
           <p className="mx-auto mt-3 max-w-xs text-sm">
-            Hi {game.you.name}! Get four of your turkeys in a row — across, down or diagonally — before anyone
-            else does.
+            {you ? `Hi ${you.name}! ` : ""}Get four of your turkeys in a row — across, down or diagonally — before
+            anyone else does.
           </p>
         </header>
 
         <section className="tg-card p-4">
+          {!you && (
+            <div className="mb-4">
+              <label htmlFor="guest-name" className="mb-1.5 block text-sm font-extrabold">
+                What's your name?
+              </label>
+              <input
+                id="guest-name"
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                maxLength={GUEST_NAME_MAX_LENGTH}
+                placeholder="So everyone knows who's playing"
+                autoComplete="given-name"
+                autoCapitalize="words"
+                enterKeyHint="done"
+                className="w-full select-text rounded-xl border-2 border-[rgba(74,44,20,0.25)] bg-white px-3 py-2.5 text-lg font-bold text-[color:var(--tg-ink)] outline-none placeholder:text-sm placeholder:font-semibold placeholder:text-[color:var(--tg-ink-soft)] focus:border-[#e8590c]"
+              />
+            </div>
+          )}
           <div className="flex items-center gap-3">
             <span className="tg-cheer shrink-0">
               <Turkey style={style} color={color} size={104} />
@@ -267,7 +407,7 @@ function Welcome({ game, online, notice, onJoin, onCancel }: WelcomeProps) {
               <div className="text-xl font-black leading-tight">
                 {TURKEY_STYLES.find((s) => s.key === style)?.label} in {SHIRT_COLORS[color].label.toLowerCase()}
               </div>
-              {underWay && !game.you.joined && (
+              {underWay && !you?.joined && (
                 <p className="mt-1 text-xs">A round is under way. You'll watch it, then play in the next one.</p>
               )}
             </div>
@@ -325,13 +465,26 @@ function Welcome({ game, online, notice, onJoin, onCancel }: WelcomeProps) {
             </p>
           )}
 
+          {problem && (
+            <p role="alert" className="mt-4 rounded-xl bg-[#fde3e0] px-3 py-2 text-sm font-bold text-[#a32116]">
+              {problem}
+            </p>
+          )}
           <button
             type="button"
-            className="tg-btn tg-btn-primary mt-5 w-full text-lg"
-            disabled={!online}
-            onClick={() => onJoin(style, color)}
+            className={cn("tg-btn tg-btn-primary w-full text-lg", problem ? "mt-3" : "mt-5")}
+            disabled={!ready || needsName}
+            onClick={() => onJoin(style, color, guestName)}
           >
-            {!online ? "Connecting…" : game.you.joined ? "Use this turkey" : "Join game"}
+            {!ready
+              ? you
+                ? "Connecting…"
+                : "Joining…"
+              : needsName
+                ? "Type your name to join"
+                : you?.joined
+                  ? "Use this turkey"
+                  : "Join game"}
           </button>
           {onCancel && (
             <button type="button" className="mt-3 w-full text-sm font-semibold underline" onClick={onCancel}>
@@ -347,7 +500,9 @@ function Welcome({ game, online, notice, onJoin, onCancel }: WelcomeProps) {
               {others.map((p) => (
                 <li key={p.player_id} className="flex items-center gap-2 py-1.5">
                   <PlayerTurkey player={p} size={36} />
-                  <span className="min-w-0 flex-1 truncate font-semibold">{p.name}</span>
+                  <span className="min-w-0 flex-1 truncate font-semibold">
+                    {p.name} <AiTag player={p} />
+                  </span>
                   <span className="text-xs text-[color:var(--tg-ink-soft)]">
                     {p.joined ? (p.is_host ? "Started the game" : "In") : "Invited"}
                   </span>
@@ -437,9 +592,18 @@ function GameScreen({ game, online, notice, act, flash, onChangeTurkey }: GameSc
   else if (roundOver) banner = winner ? (iWon ? "You got four in a row!" : `${winner.name} got four in a row!`) : "It's a draw!";
   else if (!inRound) banner = `Watching this round — ${turnPlayer?.name ?? "someone"}'s turn`;
   else if (myTurn) banner = selected != null ? "Tap it again to place your turkey" : "Your turn — tap a square";
+  else if (turnPlayer?.kind === "ai") banner = `${turnPlayer.name} is thinking…`;
   else banner = `${turnPlayer?.name ?? "Someone"}'s turn`;
 
   const turnColor = turnPlayer?.avatar_color ? SHIRT_COLORS[turnPlayer.avatar_color].main : "#e8590c";
+
+  // The host can bring someone else in at any point; a latecomer
+  // watches the round that is going and plays in the next.
+  const inviteUrl = game.is_full ? null : game.invite_url;
+  const copyInvite = async () => {
+    if (!inviteUrl) return;
+    flash((await copyLink(inviteUrl)) ? "Invite link copied — send it to anyone you want in." : "Couldn't copy the link.");
+  };
 
   return (
     <div className="turkey-theme turkey-screen flex flex-col">
@@ -449,6 +613,16 @@ function GameScreen({ game, online, notice, act, flash, onChangeTurkey }: GameSc
         <h1 className="tg-title min-w-0 flex-1 truncate text-xl leading-tight">{game.game_name}</h1>
         {board && (
           <span className="rounded-full bg-white/60 px-2 py-0.5 text-xs font-bold">Round {board.round}</span>
+        )}
+        {inviteUrl && game.status !== "lobby" && (
+          <button
+            type="button"
+            onClick={() => void copyInvite()}
+            aria-label="Copy the invite link"
+            className="flex items-center gap-1 rounded-full bg-white/60 px-2.5 py-1 text-xs font-bold hover:bg-white"
+          >
+            <UserPlus className="h-3.5 w-3.5" /> Invite
+          </button>
         )}
         <button
           type="button"
@@ -480,7 +654,9 @@ function GameScreen({ game, online, notice, act, flash, onChangeTurkey }: GameSc
                 <PlayerTurkey player={p} size={seats.length > 3 ? 30 : 38} />
               </span>
               <div className="min-w-0 leading-tight">
-                <div className="truncate text-[13px] font-extrabold">{p.name}</div>
+                <div className="truncate text-[13px] font-extrabold">
+                  {p.name} <AiTag player={p} className="text-[color:var(--tg-ink-soft)]" />
+                </div>
                 <div className="flex items-center gap-1 text-[11px] font-semibold text-[color:var(--tg-ink-soft)]">
                   <Trophy className="h-3 w-3 shrink-0 text-[#d48806]" />
                   <span>{p.wins}</span>
@@ -658,6 +834,25 @@ function Lobby({
     if (how === "failed") flash("Couldn't copy the link.");
   };
 
+  // The game's own link: whoever opens it types their name and is in.
+  const inviteUrl = game.is_full ? null : game.invite_url;
+  const [copied, setCopied] = useState(false);
+  const copyInvite = async () => {
+    if (!inviteUrl) return;
+    if (await copyLink(inviteUrl)) {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2500);
+    } else {
+      flash("Couldn't copy the link.");
+    }
+  };
+  const shareInvite = async () => {
+    if (!inviteUrl) return;
+    const how = await shareJoinLink(inviteUrl, `Come play ${game.game_name} with me!`);
+    if (how === "copied") flash("Invite link copied — paste it in a message.");
+    if (how === "failed") flash("Couldn't share the link.");
+  };
+
   const waitingText = (p: GamePlayer): string => {
     const invite = links.get(p.player_id);
     if (p.invite_status === "pending") return "Sending the invite…";
@@ -681,11 +876,17 @@ function Lobby({
             <PlayerTurkey player={p} size={40} />
             <div className="min-w-0 flex-1 leading-tight">
               <div className="truncate font-extrabold">
-                {p.name}
+                {p.name} <AiTag player={p} />
                 {p.player_id === game.you.player_id && <span className="font-semibold"> (you)</span>}
               </div>
               <div className="truncate text-xs text-[color:var(--tg-ink-soft)]">
-                {p.joined ? (p.connected ? "Ready" : "Ready — stepped away") : waitingText(p)}
+                {p.kind === "ai"
+                  ? "Ready when you are"
+                  : p.joined
+                    ? p.connected
+                      ? "Ready"
+                      : "Ready — stepped away"
+                    : waitingText(p)}
               </div>
             </div>
             {!p.joined && links.has(p.player_id) && (
@@ -700,6 +901,34 @@ function Lobby({
           </li>
         ))}
       </ul>
+
+      {inviteUrl && (
+        <div className="mt-3 rounded-xl border-2 border-dashed border-[rgba(74,44,20,0.25)] px-3 py-2.5">
+          <div className="text-sm font-extrabold">Invite anyone with a link</div>
+          <p className="text-xs text-[color:var(--tg-ink-soft)]">
+            Whoever opens it types their name, picks a turkey and is in.
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => void copyInvite()}
+              className="flex flex-1 items-center justify-center gap-1.5 rounded-full bg-[#4a2c14] px-3 py-2 text-sm font-bold text-white"
+            >
+              {copied ? <Check className="h-4 w-4" strokeWidth={3} /> : <Copy className="h-4 w-4" />}
+              {copied ? "Copied!" : "Copy invite link"}
+            </button>
+            {canShare() && (
+              <button
+                type="button"
+                onClick={() => void shareInvite()}
+                className="flex items-center justify-center gap-1.5 rounded-full border-2 border-[#4a2c14] px-3 py-2 text-sm font-bold"
+              >
+                <Share2 className="h-4 w-4" /> Share
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {game.can_start ? (
         <button type="button" className="tg-btn tg-btn-primary mt-4 w-full text-lg" onClick={() => act({ type: "start" })}>
@@ -721,7 +950,7 @@ function Lobby({
 // Game over: final scores
 // ---------------------------------------------------------------------------
 
-function GameOver({ game }: { game: GameView }) {
+function GameOver({ game }: { game: GameView | GuestGameView }) {
   const joined = game.players.filter((p) => p.joined);
   const best = Math.max(0, ...joined.map((p) => p.wins));
   const champions = best > 0 ? joined.filter((p) => p.wins === best) : [];
@@ -736,7 +965,9 @@ function GameOver({ game }: { game: GameView }) {
               <PlayerTurkey player={champions[0]} size={140} />
             </span>
             <h1 className="tg-title text-4xl leading-none">
-              {champions[0].player_id === game.you.player_id ? "You're the champion!" : `${champions[0].name} is the champion!`}
+              {champions[0].player_id === game.you?.player_id
+                ? "You're the champion!"
+                : `${champions[0].name} is the champion!`}
             </h1>
           </>
         ) : (
