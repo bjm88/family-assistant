@@ -16,6 +16,9 @@ URL organization
                              because the AI assistant page also needs it.
 * ``/api/aiassistant/*``  — live AI assistant endpoints (face recognition,
                              chat, greet). Talks to local Ollama + InsightFace.
+* ``/api/games/*``        — family games: the Games page API plus the
+                             token-authenticated ``/api/games/play/*`` routes
+                             (HTTP + WebSocket) that invite links use.
 * ``/api/health``         — health probe.
 """
 
@@ -72,6 +75,7 @@ from .routers import (
     documents,
     families,
     financial_accounts,
+    games,
     goals,
     google,
     identity_documents,
@@ -355,6 +359,10 @@ def create_app() -> FastAPI:
     # members (not just admins) connect their own address book; each
     # route checks "admin or this person" itself.
     app.include_router(contacts.router, prefix="/api")
+    # Family games. The Games page routes need a signed-in family
+    # member; /api/games/play/{token} (and its WebSocket) are public by
+    # design — the token in a player's invite link is the credential.
+    app.include_router(games.router, prefix="/api")
     # Twilio inbound webhook — public (no admin auth) so Twilio can hit it.
     # Signature verification (X-Twilio-Signature) is enforced inside the
     # handler whenever TWILIO_AUTH_TOKEN is configured.

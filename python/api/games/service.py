@@ -1,0 +1,563 @@
+"""Starting, joining and playing a game.
+
+Everything here is synchronous and takes a SQLAlchemy session; the
+router runs it off the event loop. A player is identified by the
+``join_token`` in their link (see :mod:`api.models.game`); the family
+member who starts a game is identified by their signed-in session.
+
+A game moves through ``lobby`` → ``playing`` → ``round_over`` (→
+``playing`` again for a rematch) → ``ended``. Someone who joins while a
+round is under way watches it and is dealt in to the next one.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from .. import models
+from ..config import get_settings
+from .catalog import AVATAR_COLORS, AVATAR_STYLES, GAME_TYPES, GameType
+from .turkey_tictactoe import RuleError
+
+# A family can only have this many games going at once. Each new game
+# texts / emails its invitees, so this also bounds how many invites a
+# signed-in member can cause to be sent.
+MAX_ACTIVE_GAMES_PER_FAMILY = 10
+
+
+class GameError(Exception):
+    """A request the game can't honour. ``str(exc)`` is shown to the player."""
+
+    def __init__(self, message: str, *, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def display_name(person: Optional[models.Person]) -> str:
+    if person is None:
+        return "Someone"
+    return (person.preferred_name or person.first_name or "").strip() or "Someone"
+
+
+def game_type_of(game: models.Game) -> GameType:
+    return GAME_TYPES[game.game_type]
+
+
+def is_expired(game: models.Game, *, now: Optional[datetime] = None) -> bool:
+    return game.expires_at <= (now or utcnow())
+
+
+def current_status(game: models.Game) -> str:
+    """``games.status``, except that a game past its expiry reads as ended."""
+    return "ended" if is_expired(game) else game.status
+
+
+def play_path(token: str) -> str:
+    return f"/play/{token}"
+
+
+def play_url(token: str) -> str:
+    """The link a player opens on their phone to join."""
+    base = (get_settings().PUBLIC_BASE_URL or "http://localhost:8000").rstrip("/")
+    return base + play_path(token)
+
+
+def joined_players(game: models.Game) -> List[models.GamePlayer]:
+    """Players who are in, in the order they joined (which is turn order)."""
+    joined = [p for p in game.players if p.joined_at is not None]
+    joined.sort(key=lambda p: (p.joined_at, p.game_player_id))
+    return joined
+
+
+# ---------------------------------------------------------------------------
+# Starting a game and inviting people
+# ---------------------------------------------------------------------------
+
+
+def _family_people(
+    db: Session, family_id: int, person_ids: Iterable[int]
+) -> List[models.Person]:
+    ids = list(person_ids)
+    if not ids:
+        return []
+    return list(
+        db.execute(
+            select(models.Person)
+            .where(models.Person.person_id.in_(ids))
+            .where(models.Person.family_id == family_id)
+        ).scalars()
+    )
+
+
+def _dedupe(ids: Iterable[int], *, exclude: Collection[int] = ()) -> List[int]:
+    seen = set(exclude)
+    out: List[int] = []
+    for person_id in ids:
+        if person_id not in seen:
+            seen.add(person_id)
+            out.append(person_id)
+    return out
+
+
+def active_game_count(db: Session, family_id: int) -> int:
+    return int(
+        db.execute(
+            select(func.count())
+            .select_from(models.Game)
+            .where(models.Game.family_id == family_id)
+            .where(models.Game.status != "ended")
+            .where(models.Game.expires_at > utcnow())
+        ).scalar_one()
+    )
+
+
+def create_game(
+    db: Session,
+    *,
+    family_id: int,
+    game_type: str,
+    host_person_id: int,
+    invite_person_ids: Sequence[int],
+    send_invites: bool = True,
+) -> models.Game:
+    """Open a lobby with the host and their invitees, each with a join link.
+
+    Invitees get ``invite_status='pending'`` when ``send_invites`` is
+    set; the caller is expected to deliver them (see
+    :mod:`.invites`).
+    """
+    game_def = GAME_TYPES.get(game_type)
+    if game_def is None:
+        raise GameError("We don't have that game.", status_code=404)
+    host = db.get(models.Person, host_person_id)
+    if host is None or host.family_id != family_id:
+        raise GameError("The person starting the game isn't in this family.")
+
+    invite_ids = _dedupe(invite_person_ids, exclude=[host_person_id])
+    if not invite_ids:
+        raise GameError("Pick at least one person to play with.")
+    if len(invite_ids) > game_def.max_players - 1:
+        raise GameError(
+            f"{game_def.name} is for up to {game_def.max_players} players — "
+            f"invite at most {game_def.max_players - 1}."
+        )
+    if len(_family_people(db, family_id, invite_ids)) != len(invite_ids):
+        raise GameError("You can only invite people in your family.")
+    if active_game_count(db, family_id) >= MAX_ACTIVE_GAMES_PER_FAMILY:
+        raise GameError(
+            "There are already a lot of games going. End one before starting another."
+        )
+
+    game = models.Game(
+        family_id=family_id,
+        game_type=game_def.key,
+        status="lobby",
+        created_by_person_id=host.person_id,
+        state={},
+        expires_at=utcnow() + models.GAME_DEFAULT_TTL,
+    )
+    game.players.append(
+        models.GamePlayer(
+            person_id=host.person_id,
+            is_host=True,
+            join_token=models.generate_join_token(),
+            invite_status="not_sent",
+        )
+    )
+    for person_id in invite_ids:
+        game.players.append(_invited_player(person_id, send_invites))
+    db.add(game)
+    db.flush()
+    return game
+
+
+def _invited_player(person_id: int, send_invites: bool) -> models.GamePlayer:
+    return models.GamePlayer(
+        person_id=person_id,
+        join_token=models.generate_join_token(),
+        invite_status="pending" if send_invites else "not_sent",
+    )
+
+
+def add_invites(
+    db: Session,
+    game: models.Game,
+    person_ids: Sequence[int],
+    *,
+    send_invites: bool = True,
+) -> List[models.GamePlayer]:
+    """Invite more family members to a game that hasn't ended."""
+    if current_status(game) == "ended":
+        raise GameError("This game has ended.", status_code=410)
+    game_def = game_type_of(game)
+    new_ids = _dedupe(person_ids, exclude=[p.person_id for p in game.players])
+    if not new_ids:
+        raise GameError("Everyone you picked is already in this game.")
+    if len(game.players) + len(new_ids) > game_def.max_players:
+        raise GameError(
+            f"{game_def.name} is for up to {game_def.max_players} players."
+        )
+    if len(_family_people(db, game.family_id, new_ids)) != len(new_ids):
+        raise GameError("You can only invite people in your family.")
+    added = [_invited_player(person_id, send_invites) for person_id in new_ids]
+    game.players.extend(added)
+    db.flush()
+    return added
+
+
+# ---------------------------------------------------------------------------
+# Playing: every action a player takes arrives here with their token
+# ---------------------------------------------------------------------------
+
+
+def find_player(db: Session, token: str) -> Optional[models.GamePlayer]:
+    if not token:
+        return None
+    return db.execute(
+        select(models.GamePlayer).where(models.GamePlayer.join_token == token)
+    ).scalar_one_or_none()
+
+
+def lock_game_for_token(
+    db: Session, token: str
+) -> tuple[models.Game, models.GamePlayer]:
+    """Load the token's game with a row lock, then its players.
+
+    The lock makes actions on one game run one at a time, so two people
+    tapping at the same moment can't both take the same square or the
+    same shirt colour.
+    """
+    game_id = db.execute(
+        select(models.GamePlayer.game_id).where(
+            models.GamePlayer.join_token == token
+        )
+    ).scalar_one_or_none()
+    if game_id is None:
+        raise GameError("This link isn't valid.", status_code=404)
+    game = db.execute(
+        select(models.Game).where(models.Game.game_id == game_id).with_for_update()
+    ).scalar_one()
+    player = next(p for p in game.players if p.join_token == token)
+    return game, player
+
+
+def apply_action(db: Session, token: str, action: Dict[str, Any]) -> models.Game:
+    """Carry out one thing a player did. Raises :class:`GameError` if they can't."""
+    game, player = lock_game_for_token(db, token)
+    if current_status(game) == "ended":
+        raise GameError("This game has ended.", status_code=410)
+    kind = action.get("type")
+    try:
+        if kind == "join":
+            _join(game, player, style=action.get("style"), color=action.get("color"))
+        elif kind == "start":
+            _start(game, player)
+        elif kind == "move":
+            _move(game, player, action.get("cell"))
+        elif kind == "play_again":
+            _play_again(game, player)
+        elif kind == "end":
+            end_game(game)
+        else:
+            raise GameError("That isn't something you can do in this game.")
+    except RuleError as exc:
+        raise GameError(str(exc)) from exc
+    db.flush()
+    return game
+
+
+def _join(
+    game: models.Game, player: models.GamePlayer, *, style: Any, color: Any
+) -> None:
+    if style not in AVATAR_STYLES or color not in AVATAR_COLORS:
+        raise GameError("Pick a turkey and a shirt colour first.")
+    already_in = player.joined_at is not None
+    if already_in and game.status != "lobby":
+        raise GameError("You can't change turkeys once the game has started.")
+    for other in game.players:
+        if (
+            other is not player
+            and other.joined_at is not None
+            and other.avatar_color == color
+        ):
+            raise GameError(
+                f"{display_name(other.person)} already has that colour — pick another."
+            )
+    if not already_in:
+        if len(joined_players(game)) >= game_type_of(game).max_players:
+            raise GameError("This game is full.")
+        player.joined_at = utcnow()
+    player.avatar_style = style
+    player.avatar_color = color
+
+
+def _require_joined(player: models.GamePlayer) -> None:
+    if player.joined_at is None:
+        raise GameError("Join the game first.")
+
+
+def _deal_round(game: models.Game) -> None:
+    game_def = game_type_of(game)
+    players = joined_players(game)
+    if len(players) < game_def.min_players:
+        raise GameError(
+            f"It takes {game_def.min_players} players — waiting for someone to join."
+        )
+    game.state = game_def.rules.new_round(
+        [p.game_player_id for p in players], round_number=game.rounds_played + 1
+    )
+    game.status = "playing"
+
+
+def _start(game: models.Game, player: models.GamePlayer) -> None:
+    _require_joined(player)
+    if game.status != "lobby":
+        raise GameError("The game has already started.")
+    _deal_round(game)
+
+
+def _move(game: models.Game, player: models.GamePlayer, cell: Any) -> None:
+    _require_joined(player)
+    if game.status != "playing":
+        raise GameError("There's no round being played right now.")
+    state = game_type_of(game).rules.play(game.state, player.game_player_id, cell)
+    game.state = state
+    if state["winner_player_id"] is not None:
+        player.wins += 1
+    if state["winner_player_id"] is not None or state["is_draw"]:
+        game.status = "round_over"
+        game.rounds_played += 1
+
+
+def _play_again(game: models.Game, player: models.GamePlayer) -> None:
+    _require_joined(player)
+    if game.status != "round_over":
+        raise GameError("Finish this round first.")
+    _deal_round(game)
+
+
+def end_game(game: models.Game) -> None:
+    if game.status != "ended":
+        game.status = "ended"
+        game.ended_at = utcnow()
+
+
+# ---------------------------------------------------------------------------
+# What each player sees
+# ---------------------------------------------------------------------------
+
+
+def _player_view(
+    player: models.GamePlayer, connected: Collection[int]
+) -> Dict[str, Any]:
+    return {
+        "player_id": player.game_player_id,
+        "name": display_name(player.person),
+        "is_host": player.is_host,
+        "joined": player.joined_at is not None,
+        "avatar_style": player.avatar_style,
+        "avatar_color": player.avatar_color,
+        "wins": player.wins,
+        "connected": player.game_player_id in connected,
+        "invite_status": player.invite_status,
+    }
+
+
+def game_view(
+    game: models.Game, *, connected: Collection[int] = ()
+) -> Dict[str, Any]:
+    """The game as every player may see it. Carries no join tokens."""
+    game_def = game_type_of(game)
+    status = current_status(game)
+    board: Optional[Dict[str, Any]] = None
+    if game.state.get("cells"):
+        board = {
+            **game.state,
+            "turn_player_id": (
+                game_def.rules.current_player_id(game.state)
+                if status == "playing"
+                else None
+            ),
+        }
+    host = next((p for p in game.players if p.is_host), None)
+    return {
+        "game_id": game.game_id,
+        "game_type": game.game_type,
+        "game_name": game_def.name,
+        "status": status,
+        "invited_by": display_name(host.person if host else game.created_by),
+        "min_players": game_def.min_players,
+        "max_players": game_def.max_players,
+        "rounds_played": game.rounds_played,
+        "can_start": status == "lobby"
+        and len(joined_players(game)) >= game_def.min_players,
+        "players": [_player_view(p, connected) for p in game.players],
+        "board": board,
+    }
+
+
+def view_for_player(
+    game: models.Game,
+    player: models.GamePlayer,
+    *,
+    connected: Collection[int] = (),
+) -> Dict[str, Any]:
+    """:func:`game_view` plus who the viewer is.
+
+    The host also gets the join links of the people who haven't joined
+    yet, so they can pass one on by hand when a text or email didn't
+    get through.
+    """
+    view = game_view(game, connected=connected)
+    view["you"] = {
+        "player_id": player.game_player_id,
+        "name": display_name(player.person),
+        "is_host": player.is_host,
+        "joined": player.joined_at is not None,
+    }
+    if player.is_host:
+        view["invites"] = [
+            {
+                "player_id": p.game_player_id,
+                "name": display_name(p.person),
+                "play_url": play_url(p.join_token),
+                "invite_status": p.invite_status,
+                "invite_channels": _channels(p),
+                "invite_detail": p.invite_detail,
+            }
+            for p in game.players
+            if not p.is_host and p.joined_at is None
+        ]
+    return view
+
+
+def views_for_players(
+    db: Session, game_id: int, player_ids: Collection[int]
+) -> Dict[int, Dict[str, Any]]:
+    """The current view for each connected player, keyed by player id."""
+    game = db.get(models.Game, game_id)
+    if game is None:
+        return {}
+    return {
+        p.game_player_id: view_for_player(game, p, connected=player_ids)
+        for p in game.players
+        if p.game_player_id in player_ids
+    }
+
+
+def _channels(player: models.GamePlayer) -> List[str]:
+    return [c for c in (player.invite_channels or "").split(",") if c]
+
+
+# ---------------------------------------------------------------------------
+# The Games page (signed-in family members)
+# ---------------------------------------------------------------------------
+
+
+def game_summary(
+    game: models.Game,
+    *,
+    viewer_person_id: Optional[int],
+    viewer_is_admin: bool,
+) -> Dict[str, Any]:
+    """One row of the Games page.
+
+    A viewer sees their own join link. The host and admins see
+    everyone's, so they can hand a link to someone who didn't get it.
+    """
+    game_def = game_type_of(game)
+    is_host = (
+        viewer_person_id is not None
+        and viewer_person_id == game.created_by_person_id
+    )
+    can_manage = viewer_is_admin or is_host
+    players = []
+    my_play_path: Optional[str] = None
+    for p in game.players:
+        mine = viewer_person_id is not None and p.person_id == viewer_person_id
+        if mine:
+            my_play_path = play_path(p.join_token)
+        players.append(
+            {
+                "player_id": p.game_player_id,
+                "person_id": p.person_id,
+                "name": display_name(p.person),
+                "is_host": p.is_host,
+                "joined": p.joined_at is not None,
+                "avatar_style": p.avatar_style,
+                "avatar_color": p.avatar_color,
+                "wins": p.wins,
+                "invite_status": p.invite_status,
+                "invite_channels": _channels(p),
+                "invite_detail": p.invite_detail if can_manage else None,
+                "play_url": play_url(p.join_token) if (can_manage or mine) else None,
+            }
+        )
+    return {
+        "game_id": game.game_id,
+        "game_type": game.game_type,
+        "game_name": game_def.name,
+        "status": current_status(game),
+        "rounds_played": game.rounds_played,
+        "max_players": game_def.max_players,
+        "created_at": game.created_at.isoformat(),
+        "host_name": display_name(game.created_by),
+        "can_manage": can_manage,
+        "my_play_path": my_play_path,
+        "players": players,
+    }
+
+
+def list_games(
+    db: Session, family_id: int, *, limit: int = 20
+) -> List[models.Game]:
+    """The family's most recent games, newest first."""
+    return list(
+        db.execute(
+            select(models.Game)
+            .where(models.Game.family_id == family_id)
+            .order_by(models.Game.created_at.desc(), models.Game.game_id.desc())
+            .limit(limit)
+        ).scalars()
+    )
+
+
+def leaderboard(db: Session, family_id: int) -> Dict[str, List[Dict[str, Any]]]:
+    """All-time rounds won, per game type, by everyone who has ever joined."""
+    rows = db.execute(
+        select(
+            models.Game.game_type,
+            models.GamePlayer.person_id,
+            func.sum(models.GamePlayer.wins).label("wins"),
+            func.count().label("games"),
+        )
+        .join(models.Game, models.Game.game_id == models.GamePlayer.game_id)
+        .where(models.Game.family_id == family_id)
+        .where(models.GamePlayer.joined_at.isnot(None))
+        .group_by(models.Game.game_type, models.GamePlayer.person_id)
+    ).all()
+    people = {
+        p.person_id: p
+        for p in _family_people(db, family_id, {r.person_id for r in rows})
+    }
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        out.setdefault(row.game_type, []).append(
+            {
+                "person_id": row.person_id,
+                "name": display_name(people.get(row.person_id)),
+                "wins": int(row.wins or 0),
+                "games": int(row.games),
+            }
+        )
+    for entries in out.values():
+        entries.sort(key=lambda e: (-e["wins"], e["name"].lower()))
+    return out

@@ -22,8 +22,8 @@ Routing strategy
 * ``/assets/*``     → hashed JS/CSS bundles emitted by Vite.
 * ``/mediapipe/*``  → BlazeFace WASM + tflite weights mirrored by the
   ``copy-mediapipe-assets.mjs`` postinstall hook.
-* ``/admin/*``, ``/aiassistant/*``, ``/login``, ``/families/*`` →
-  serve ``index.html`` so React Router can take over.
+* ``/admin/*``, ``/aiassistant/*``, ``/login``, ``/play/*``,
+  ``/families/*`` → serve ``index.html`` so React Router can take over.
 * Any other GET that hits an unmatched path also gets ``index.html``
   (catch-all). Order matters — this router is registered LAST so the
   more-specific ``/api/*``, ``/legal/*``, ``/landing/*``, and ``/``
@@ -124,6 +124,14 @@ def admin_shell(path: str = "") -> HTMLResponse:
 @router.get("/aiassistant", include_in_schema=False)
 @router.get("/aiassistant/{path:path}", include_in_schema=False)
 def ai_shell(path: str = "") -> HTMLResponse:
+    return _serve_index()
+
+
+# ``/play/<token>`` — a player's invite link to a family game. Public:
+# the page it loads talks only to ``/api/games/play/<token>``.
+@router.get("/play", include_in_schema=False)
+@router.get("/play/{path:path}", include_in_schema=False)
+def play_shell(path: str = "") -> HTMLResponse:
     return _serve_index()
 
 
