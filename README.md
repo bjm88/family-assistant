@@ -262,12 +262,15 @@ saved once before files can be added to it.
 admins. It lists the games you can play together, each person on their
 own phone, and the first one is **Turkey TicTacToe**: tic-tac-toe on a
 board 5 squares wide and 10 deep, where four of your turkeys in a row
-(across, down or diagonally) wins. Two to four people can play.
+(across, down or diagonally) wins. Two to four can play, and one of
+them can be the assistant.
 
-1. **Start a game.** Press *Start a game*, tick who you want to play
-   with, and you land on your own game screen.
-2. **Everyone gets a link.** Each person invited is sent their own
-   link, `<PUBLIC_BASE_URL>/play/<token>`, by text and by email —
+1. **Start a game.** Press *Start a game* and you land on your own game
+   screen. In the dialog you can tick **Play against Avi AI** (the name
+   follows your assistant's), tick family members to invite, both, or
+   neither — the game also has a link you can hand to anyone (step 3).
+2. **Family members get a link.** Each person you ticked is sent their
+   own link, `<PUBLIC_BASE_URL>/play/<token>`, by text and by email —
    whichever of the two we can use for them. Opening it is all it takes
    to join: there is nothing to sign in to. Texts go only to people who
    have completed the SMS opt-in and haven't opted out, the same rule
@@ -275,17 +278,44 @@ board 5 squares wide and 10 deep, where four of your turkeys in a row
    connected Gmail. When neither reaches someone (or it fails), the
    lobby and the Games page say so and give the host a **Share link**
    button to pass the link on by hand.
-3. **Pick a turkey.** The welcome screen says who invited you and
+3. **Anyone else joins with the invite link.** The lobby and the Games
+   page have **Copy invite link** (and *Share* on phones that support
+   it). That link, `<PUBLIC_BASE_URL>/play/join/<token>`, is the same
+   for everyone: whoever opens it types their name, picks a turkey and
+   is in as a guest — no account, and they needn't be in the family.
+   Seats go to whoever joins first, up to four. A name already used by
+   someone in the game is turned down so players can be told apart.
+   Their phone remembers the seat, so opening the link again takes them
+   back to it. The host and admins are the only ones shown the link.
+4. **Pick a turkey.** The welcome screen says who invited you and
    offers six cartoon turkeys (Happy, Strong, Glam, Cheerleader, Hippie,
    Cheers) and eight shirt colours. A colour someone else has taken is
    crossed out.
-4. **Play.** Once two players are in, the card over the board offers
+5. **Play.** Once two players are in, the card over the board offers
    *Start game*. On your turn, tap a square to pick it and tap it again
    to place your turkey. Four in a row draws a line through the turkeys
    and announces the winner; wins are counted per player, and anyone
    can press *Play again* or *End game*. Whoever went second goes first
    next round. Someone who joins while a round is being played watches
    it and is dealt in to the next one.
+
+**Playing against Avi.** Avi takes a seat as soon as the game is
+started, so the host can press *Start game* straight away, and other
+people can still join the same game. Avi plays its turn about a second
+after the player before it. There are three levels, chosen when the
+game is started:
+
+- **Medium** (the default) plays to win: it takes a winning square,
+  nearly always blocks three in a row, and builds its own lines. It
+  slips up the way a person does — now and then it doesn't notice a
+  line, diagonals more often than rows and columns, and it is slower to
+  spot two in a row that is about to become a problem.
+- **Easy** misses a lot more and suits young players.
+- **Hard** doesn't miss anything it can see one move ahead.
+
+Whoever opens a round has a real advantage in this game. A person
+opens the first round and the opening move then passes round the
+table, so Avi opens every other round of a two-player game.
 
 How it works:
 
@@ -296,13 +326,21 @@ How it works:
   connection (locked, switched apps, bad signal) the page reconnects by
   itself and catches up. The game is stored in Postgres, so restarting
   the API doesn't lose it.
-- A link is for one person in one game. It lets its holder play that
-  game and nothing else, and it stops working when the game ends or
-  24 hours after it was started. The `games` and `game_players` tables
+- Avi's moves are chosen by rules written for this game
+  (`python/api/games/turkey_ai.py`), not by a language model, so they
+  cost nothing and need no network. The API plays them itself and
+  pushes them to the players like any other move; if the API restarts
+  while it is Avi's turn, Avi moves when the next player reconnects.
+- A personal link is for one person in one game. It lets its holder
+  play that game and nothing else. The invite link lets its holder take
+  one free seat in that game under a name they choose, which is why it
+  is worth sending only to people you want at the table. Both stop
+  working when the game ends or 24 hours after it was started. The `games` and `game_players` tables
   are deliberately left out of the tables Avi can query, because a
   token read from them would be a working link.
-- The Games page keeps a hall of fame: rounds won per person across
-  every game the family has played.
+- The Games page keeps a hall of fame: rounds won across every game
+  the family has played. Family members are counted per person, guests
+  under the name they typed, and Avi as one player.
 - The live connections are held in the memory of the one API process,
   which is how this app runs. Running several API processes would need
   a shared channel between them.
@@ -981,9 +1019,12 @@ the gate), `/api/admin/google/oauth/callback` (Avi's Gmail/Calendar
 callback — Google has to be able to reach it) and
 `/api/contacts/google/oauth/callback` (the per-person contacts
 callback; it only accepts the single-use `state` issued to a signed-in
-user), and a game invite link: the page `/play/<token>` plus
-`/api/games/play/<token>` and its WebSocket, where the token is the
-credential and opens only that one player's seat in that one game.
+user), and the two kinds of game link. A player's own link is the page
+`/play/<token>` plus `/api/games/play/<token>` and its WebSocket,
+where the token is the credential and opens only that one player's
+seat in that one game. A game's invite link is the page
+`/play/join/<token>` plus `/api/games/join/<token>`, where the token
+lets its holder see who is playing and take one free seat as a guest.
 Everything else returns
 401 unless a valid `fa_session` cookie is presented.
 
@@ -1092,8 +1133,9 @@ Tables today, grouped by domain:
   `task_followers`, `task_attachments`, `task_links` (URL citations
   added by Avi during monitoring runs).
 - **Agent audit** — `agent_tasks`, `agent_steps`.
-- **Family games** — `games`, `game_players` (one row per person in a
-  game, with their join-link token, turkey and wins).
+- **Family games** — `games`, `game_players` (one row per seat in a
+  game — a family member, a guest who joined by the invite link, or the
+  AI — with its join-link token, turkey and wins).
 - **External-service credentials** — `google_oauth_credentials`
   (Fernet-encrypted refresh tokens for Gmail + Calendar),
   `contact_provider_connections` (each person's own address-book
@@ -1152,6 +1194,8 @@ family-assistant/
 │   ├── games/
 │   │   ├── catalog.py             the games on offer + turkey styles and shirt colours
 │   │   ├── turkey_tictactoe.py    rules: 5 x 10 board, four in a row
+│   │   ├── turkey_ai.py           how the AI player picks a square (easy / medium / hard)
+│   │   ├── ai_turns.py            plays the AI's turn when it comes round
 │   │   ├── service.py             start / join / move / play again / end, and what each player sees
 │   │   ├── invites.py             text + email each invitee their join link
 │   │   └── hub.py                 live WebSocket connections per game
@@ -1185,8 +1229,9 @@ family-assistant/
 │           ├── PetsPage, ResidencesPage, VehiclesPage
 │           ├── InsurancePoliciesPage, FinancialAccountsPage, DocumentsPage
 │           ├── TasksPage, AgentTasksPage   (kanban "todo" + AI "monitoring" tabs + agent run audit)
-│           ├── GamesPage                   (start a game, invite, hall of fame)
-│           ├── PlayGamePage                (public /play/:token — pick a turkey and play)
+│           ├── GamesPage                   (start a game, invite, play the AI, hall of fame)
+│           ├── PlayGamePage                (public /play/:token — pick a turkey and play;
+│           │                                /play/join/:inviteToken — join as a guest by name)
 │           ├── AssistantPage               (admin Avi config + Google OAuth)
 │           └── AiAssistantPage             (live /aiassistant/:familyId)
 ├── docs/                          long-form docs (DATA_MODEL.md, ...)

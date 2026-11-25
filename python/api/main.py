@@ -18,7 +18,8 @@ URL organization
                              chat, greet). Talks to local Ollama + InsightFace.
 * ``/api/games/*``        — family games: the Games page API plus the
                              token-authenticated ``/api/games/play/*`` routes
-                             (HTTP + WebSocket) that invite links use.
+                             (HTTP + WebSocket) that players' links use and
+                             ``/api/games/join/*`` behind a game's invite link.
 * ``/api/health``         — health probe.
 """
 
@@ -361,7 +362,9 @@ def create_app() -> FastAPI:
     app.include_router(contacts.router, prefix="/api")
     # Family games. The Games page routes need a signed-in family
     # member; /api/games/play/{token} (and its WebSocket) are public by
-    # design — the token in a player's invite link is the credential.
+    # design — the token in a player's link is the credential. So is
+    # /api/games/join/{invite_token}: that token lets its holder take a
+    # free seat in the one game as a named guest.
     app.include_router(games.router, prefix="/api")
     # Twilio inbound webhook — public (no admin auth) so Twilio can hit it.
     # Signature verification (X-Twilio-Signature) is enforced inside the

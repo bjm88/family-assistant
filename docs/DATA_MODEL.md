@@ -25,7 +25,7 @@ document is the human-friendly companion to that catalog.
 | **Telegram onboarding** | `telegram_invites`, `telegram_contact_verifications` | Deep-link invites + the SMS-2FA challenge that confirms a contact-share before binding `Person.telegram_user_id`. |
 | **Tasks (kanban)** | `tasks`, `task_comments`, `task_followers`, `task_attachments` | User-facing household to-do board. Avi can create / update tasks via tools. |
 | **Agent audit** | `agent_tasks`, `agent_steps` | One row per agent invocation + per-step transcript (thinking, tool_call, tool_result, final). |
-| **Family games** | `games`, `game_players` | Games the family plays together on their phones (Turkey TicTacToe), who is in each one, and how many rounds each person has won. |
+| **Family games** | `games`, `game_players` | Games the family plays together on their phones (Turkey TicTacToe), who is in each one — family members, guests and the AI — and how many rounds each has won. |
 | **External-service credentials** | `google_oauth_credentials`, `contact_provider_connections` | Fernet-encrypted refresh tokens: Avi's Gmail + Calendar, and each person's own address-book grant. |
 
 Total: **~42 tables** + the `llm_schema_catalog` read-only view.
@@ -91,8 +91,8 @@ erDiagram
     families ||--o{ email_inbox_messages : "audit"
 
     families ||--o{ games : "played together"
-    games ||--o{ game_players : "one per person"
-    game_players }o--|| people : "player"
+    games ||--o{ game_players : "one per seat"
+    game_players }o--o| people : "family player"
 
     families ||--o{ tasks : "kanban board"
     tasks ||--o{ task_comments : ""
@@ -454,28 +454,47 @@ decides who goes first in the next one. A game stops accepting
 anything at `expires_at`, 24 hours after it was started, whether or not
 anyone pressed *End game*; it then reads as `ended`.
 
+`invite_token` is the secret in the game's shareable link,
+`/play/join/<invite_token>`. Unlike a player's `join_token` it is not
+tied to a person: whoever opens it can see who is playing and take one
+free seat as a guest under a name they type.
+
 ### `game_players`
 
-One row per person in a game, the host included
-(`UNIQUE (game_id, person_id)`). It holds:
+One row per seat in a game, the host included. A seat is one of three
+kinds, told apart by which columns are set:
 
-- **`join_token`** — the secret in that person's link,
+| Kind | `person_id` | `player_name` | `ai_level` |
+| --- | --- | --- | --- |
+| Family member | set | null | null |
+| Guest who joined by the invite link | null | the name they typed | null |
+| The AI | null | e.g. `Avi AI` | `easy`, `medium` or `hard` |
+
+A family member has one seat per game (`UNIQUE (game_id, person_id)`),
+and every seat has a person or a name (`ck_game_players_named`). The
+row holds:
+
+- **`join_token`** — the secret in that seat's link,
   `/play/<join_token>`. It is unique across all games and is the only
   credential the play page and its WebSocket take, so anyone holding
-  it can play as that person in that one game. These two tables are
+  it can play from that seat in that one game. These two tables are
   not in the list the assistant's SQL tool may read for that reason.
+  The AI's seat has a token like any other row, but it is never given
+  out and the play routes refuse it.
 - **`joined_at`**, **`avatar_style`**, **`avatar_color`** — set when
-  the person picks a turkey. Turn order is the order people joined in;
-  a shirt colour belongs to one player per game.
+  the person picks a turkey. Turn order is the order people joined in,
+  with the AI last; a shirt colour belongs to one player per game. The
+  AI is given a turkey when the game is started.
 - **`wins`** — rounds won in this game. The hall of fame on the Games
-  page is the sum of this per person.
+  page is the sum of this per family member, per guest name, and for
+  the AI.
 - **`invite_status`** (`not_sent` · `pending` · `sent` · `failed`),
   **`invite_channels`** (`sms`, `email` or `sms,email`) and
   **`invite_detail`** — how the invite was delivered, or why it
   couldn't be, so the host knows to share the link by hand.
 
-Both tables cascade from `families`; a `game_players` row also goes
-when its person is deleted.
+Both tables cascade from `families`; a family member's `game_players`
+rows also go when that person is deleted.
 
 ---
 

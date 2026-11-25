@@ -127,8 +127,10 @@ def ai_shell(path: str = "") -> HTMLResponse:
     return _serve_index()
 
 
-# ``/play/<token>`` — a player's invite link to a family game. Public:
-# the page it loads talks only to ``/api/games/play/<token>``.
+# ``/play/<token>`` — a player's own link to a family game — and
+# ``/play/join/<token>``, the game's invite link for guests. Public:
+# the pages they load talk only to ``/api/games/play/<token>`` and
+# ``/api/games/join/<token>``.
 @router.get("/play", include_in_schema=False)
 @router.get("/play/{path:path}", include_in_schema=False)
 def play_shell(path: str = "") -> HTMLResponse:
