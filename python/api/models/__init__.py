@@ -111,6 +111,14 @@ from .task import (
     TASK_PRIORITIES,
     TASK_STATUSES,
 )
+from .game import (
+    Game,
+    GamePlayer,
+    GAME_DEFAULT_TTL,
+    GAME_INVITE_STATUSES,
+    GAME_STATUSES,
+    generate_join_token,
+)
 
 __all__ = [
     "Family",
@@ -195,4 +203,10 @@ __all__ = [
     "TASK_OWNER_KINDS",
     "TASK_PRIORITIES",
     "TASK_STATUSES",
+    "Game",
+    "GamePlayer",
+    "GAME_DEFAULT_TTL",
+    "GAME_INVITE_STATUSES",
+    "GAME_STATUSES",
+    "generate_join_token",
 ]
