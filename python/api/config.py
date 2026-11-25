@@ -480,6 +480,13 @@ class Settings(BaseSettings):
     # Slack accepts far longer messages; this keeps replies chat-sized.
     AI_SLACK_REPLY_MAX_CHARS: int = 3000
 
+    # ---- Files sent with a reply -----------------------------------------
+    # WhatsApp and text messages can't be handed a file; Twilio fetches
+    # it from a link on PUBLIC_BASE_URL. Each link names one file, is
+    # signed with a key derived from SESSION_SECRET_KEY, and stops
+    # working after this many seconds.
+    AI_FILE_LINK_TTL_SECONDS: int = 900
+
     # ---- Monitoring tasks (Avi's standing research jobs) ---------------
     # AI-owned tasks of kind "monitoring" run on a cron schedule. The
     # scheduler is a single asyncio loop in

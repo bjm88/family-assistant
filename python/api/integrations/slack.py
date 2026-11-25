@@ -305,6 +305,70 @@ def post_message(
     return ts
 
 
+def upload_file(
+    *,
+    token: str,
+    channel: str,
+    filename: str,
+    data: bytes,
+    title: Optional[str] = None,
+    thread_ts: Optional[str] = None,
+    timeout_seconds: float = 60.0,
+) -> str:
+    """Upload a file into a conversation and return Slack's file id.
+
+    Slack's upload is three calls: ask for an upload address, send the
+    bytes there, then tell Slack which conversation (and thread) the
+    file belongs in. Needs the ``files:write`` scope.
+    """
+    if not data:
+        raise SlackSendError(f"files upload: {filename} is empty.")
+    ticket = _call(
+        token,
+        "files.getUploadURLExternal",
+        params={"filename": filename, "length": len(data)},
+        error_cls=SlackSendError,
+    )
+    upload_url = str(ticket.get("upload_url") or "")
+    file_id = str(ticket.get("file_id") or "")
+    if not upload_url or not file_id:
+        raise SlackSendError("files.getUploadURLExternal: no upload address returned.")
+    try:
+        resp = httpx.post(
+            upload_url,
+            content=data,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=timeout_seconds,
+        )
+    except httpx.HTTPError as exc:
+        raise SlackSendError(f"files upload: transport error: {exc}") from exc
+    if resp.status_code >= 400:
+        raise SlackSendError(
+            f"files upload: HTTP {resp.status_code}", code="http_error"
+        )
+    payload: dict[str, Any] = {
+        "files": [{"id": file_id, "title": title or filename}],
+        "channel_id": channel,
+    }
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    _call(
+        token,
+        "files.completeUploadExternal",
+        json_body=payload,
+        error_cls=SlackSendError,
+        timeout_seconds=timeout_seconds,
+    )
+    logger.info(
+        "Slack file upload channel=%s file_id=%s thread=%s bytes=%d",
+        channel,
+        file_id,
+        thread_ts or "-",
+        len(data),
+    )
+    return file_id
+
+
 _MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)")
 _MD_BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _MD_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULTILINE)

@@ -1048,6 +1048,149 @@ def test_web_api_error_names_the_missing_scope(monkeypatch):
     assert err.value.code == "missing_scope"
 
 
+# ---------------------------------------------------------------------------
+# Files Avi sends back ("send me a picture of the passport")
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def uploads(workspace, monkeypatch) -> list[dict[str, Any]]:
+    """Record file uploads instead of sending them to Slack."""
+    made: list[dict[str, Any]] = []
+
+    def fake_upload_file(**kwargs):
+        made.append(kwargs)
+        return f"F{uuid.uuid4().hex[:9].upper()}"
+
+    monkeypatch.setattr(slack, "upload_file", fake_upload_file)
+    return made
+
+
+def _deliver_with_files(client, payload, attach, *refs, reply="Here you go."):
+    """Deliver an event to an agent that attaches ``refs`` to its reply."""
+
+    def agent(**kwargs):
+        attach(kwargs["task_id"], *refs)
+        return reply
+
+    with patch.object(
+        slack_inbox, "_run_agent_to_completion", side_effect=agent
+    ) as agent_mock, patch.object(
+        slack_inbox.fast_action_router, "try_triage_sync", return_value=_heavy_triage()
+    ):
+        resp = _post(client, payload)
+    assert resp.status_code == 200, resp.text
+    return agent_mock
+
+
+def test_requested_file_is_uploaded_under_the_reply(
+    client, workspace, db, uploads, household_files, attach_files_to_task
+):
+    hf = household_files
+    parent = _new_ts()
+    payload = _dm(workspace, "send me a picture of the passport", via="user", thread_ts=parent)
+    ref = {"source": "identity_document", "record_id": hf.passport_id, "side": "front"}
+
+    agent = _deliver_with_files(client, payload, attach_files_to_task, ref)
+
+    assert [p["text"] for p in workspace.posts] == ["Here you go."]
+    (upload,) = uploads
+    # Same conversation, same thread, same one of Avi's identities as the reply.
+    assert upload["channel"] == payload["event"]["channel"]
+    assert upload["thread_ts"] == parent
+    assert upload["token"] == USER_TOKEN
+    assert upload["data"] == hf.passport_bytes  # Slack gets the original
+    assert upload["title"] == f"{hf.child_name}'s passport (front)"
+    assert upload["filename"].endswith("passport-front.jpg")
+    # A direct message: the agent is told nobody else is reading.
+    assert agent.call_args.kwargs["shared_conversation"] is False
+    audit = _audit(db, payload)
+    assert audit.status == "processed_replied"
+    assert "Sent file(s)" in audit.status_reason
+
+
+def test_agent_is_told_when_other_people_can_read_the_reply(
+    client, workspace, db, uploads
+):
+    """In a shared channel ``send_file`` refuses private documents."""
+    event = _message(
+        workspace, text=f"<@{workspace.bot_user_id}> send the passport", channel="C0FAMILY09"
+    )
+    event["type"] = "app_mention"
+    agent = _deliver(client, _payload(workspace, event))
+
+    assert agent.call_args.kwargs["shared_conversation"] is True
+
+
+def test_failed_upload_is_admitted_in_the_conversation(
+    client, workspace, db, monkeypatch, household_files, attach_files_to_task
+):
+    """The reply said a file was coming; if it didn't arrive, Avi says so."""
+    hf = household_files
+
+    def refuse(**_kwargs):
+        raise slack.SlackSendError("files.completeUploadExternal: missing_scope")
+
+    monkeypatch.setattr(slack, "upload_file", refuse)
+    payload = _dm(workspace, "send me a photo of the car")
+    ref = {"source": "vehicle_photo", "record_id": hf.car_id, "side": None}
+
+    _deliver_with_files(client, payload, attach_files_to_task, ref)
+
+    assert len(workspace.posts) == 2
+    assert workspace.posts[0]["text"] == "Here you go."
+    assert "couldn't attach" in workspace.posts[1]["text"]
+    assert hf.car_make in workspace.posts[1]["text"]
+    audit = _audit(db, payload)
+    assert audit.status == "processed_replied"
+    assert "File(s) not sent" in audit.status_reason
+
+
+def test_upload_asks_for_an_address_sends_the_bytes_then_shares_the_file(monkeypatch):
+    """Slack's three-step upload, against a fake Web API."""
+    calls: list[tuple[str, str, dict]] = []
+
+    class _Resp:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_get(url, **kwargs):
+        calls.append(("GET", url, kwargs))
+        return _Resp({"ok": True, "upload_url": "https://files.slack.test/up/1", "file_id": "F123"})
+
+    def fake_post(url, **kwargs):
+        calls.append(("POST", url, kwargs))
+        return _Resp({"ok": True})
+
+    monkeypatch.setattr(slack.httpx, "get", fake_get)
+    monkeypatch.setattr(slack.httpx, "post", fake_post)
+
+    file_id = slack.upload_file(
+        token="xoxb-anything", channel="D1", filename="car.png", data=b"pngbytes",
+        title="Photo of the car", thread_ts="111.222",
+    )
+
+    assert file_id == "F123"
+    (_, ask_url, ask), (_, up_url, up), (_, done_url, done) = calls
+    assert ask_url.endswith("/files.getUploadURLExternal")
+    assert ask["params"] == {"filename": "car.png", "length": 8}
+    assert up_url == "https://files.slack.test/up/1" and up["content"] == b"pngbytes"
+    # The upload address is pre-authorised; Avi's token is not sent to it.
+    assert "Authorization" not in up["headers"]
+    assert done_url.endswith("/files.completeUploadExternal")
+    assert done["json"] == {
+        "files": [{"id": "F123", "title": "Photo of the car"}],
+        "channel_id": "D1",
+        "thread_ts": "111.222",
+    }
+
+
 def test_unfaked_slack_calls_fail_instead_of_reaching_the_network():
     """The safety net in conftest: no test can talk to slack.com."""
     with pytest.raises(slack.SlackReadError, match="transport error"):

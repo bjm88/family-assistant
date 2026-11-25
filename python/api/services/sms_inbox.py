@@ -77,7 +77,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -97,7 +97,7 @@ from ..config import Settings, get_settings
 from ..db import SessionLocal
 from ..integrations import gmail, google_oauth, telegram, twilio_sms
 from ..utils.phone import normalize_phone
-from . import attachment_intake, inbound_prompts
+from . import attachment_intake, inbound_prompts, outbound_files
 
 
 logger = logging.getLogger(__name__)
@@ -662,6 +662,38 @@ def process_inbound_sms(
         max_chars=chan.reply_max_chars,
     )
 
+    # ---- Files the agent attached to this reply ---------------------
+    # Only the heavy agent can attach files (the ``send_file`` tool).
+    # Twilio fetches each one from a short-lived signed link.
+    reply_files = outbound_files.ReplyFiles()
+    media: List[Tuple[outbound_files.OutboundFile, str]] = []
+    if shortcut_used is None and not agent_failed:
+        reply_files = outbound_files.collect_for_task(
+            db,
+            task_id=task.agent_task_id,
+            family_id=person.family_id,
+            channel=chan.channel,
+        )
+        media, unlinked = outbound_files.signed_urls(
+            reply_files.files, family_id=person.family_id, channel=chan.channel
+        )
+        if unlinked or reply_files.problems:
+            final_text = (
+                f"{final_text}\n\n"
+                f"{outbound_files.failure_note(unlinked, reply_files.problems)}"
+            )
+            reply_files.problems.extend(unlinked)
+    # A text message carries every picture at once. WhatsApp takes one
+    # file per message, and only shows the words alongside a picture,
+    # so there the reply carries the first file when it is a picture
+    # and everything else follows as messages of its own.
+    if chan.channel == "sms":
+        first_media, later_media = media, []
+    elif media and media[0][0].is_image:
+        first_media, later_media = media[:1], media[1:]
+    else:
+        first_media, later_media = [], media
+
     # ---- Send the reply via Twilio ---------------------------------
     if not chan.sender_number:
         if chan.channel == "sms":
@@ -675,6 +707,7 @@ def process_inbound_sms(
                 sms_error=f"{chan.sender_env_name} not configured.",
                 shortcut_used=shortcut_used,
                 agent_failed=agent_failed,
+                files=reply_files.files,
             )
         audit.status = "failed"
         audit.status_reason = f"{chan.sender_env_name} not configured."
@@ -693,6 +726,7 @@ def process_inbound_sms(
             # WhatsApp sender helper will not double-prefix.
             to_phone=inbound.from_phone,
             body=final_text,
+            **({"media_urls": [url for _f, url in first_media]} if first_media else {}),
             **_outbound_extra(chan, settings),
         )
     except twilio_sms.TwilioSendError as exc:
@@ -712,11 +746,54 @@ def process_inbound_sms(
                 sms_error=f"twilio send: {exc}",
                 shortcut_used=shortcut_used,
                 agent_failed=agent_failed,
+                files=reply_files.files,
             )
         audit.status = "failed"
         audit.status_reason = f"twilio send: {exc}"
         db.commit()
         return audit
+
+    files_sent = [f.describe() for f, _url in first_media]
+    files_failed: List[str] = []
+    for file, url in later_media:
+        try:
+            send_func(
+                account_sid=settings.TWILIO_ACCOUNT_SID or "",
+                auth_token=settings.TWILIO_AUTH_TOKEN or "",
+                from_phone=chan.sender_number,
+                to_phone=inbound.from_phone,
+                body=file.label,
+                media_urls=[url],
+                **_outbound_extra(chan, settings),
+            )
+            files_sent.append(file.describe())
+        except twilio_sms.TwilioSendError as exc:
+            logger.warning(
+                "%s inbox: file send failed for sid=%s (%s:%s): %s",
+                chan.label,
+                inbound.message_sid,
+                file.source,
+                file.record_id,
+                exc,
+            )
+            files_failed.append(file.label)
+    if files_failed:
+        # The reply said a file was coming; say so when it isn't.
+        try:
+            send_func(
+                account_sid=settings.TWILIO_ACCOUNT_SID or "",
+                auth_token=settings.TWILIO_AUTH_TOKEN or "",
+                from_phone=chan.sender_number,
+                to_phone=inbound.from_phone,
+                body=outbound_files.failure_note(files_failed),
+                **_outbound_extra(chan, settings),
+            )
+        except twilio_sms.TwilioSendError:
+            logger.exception(
+                "%s inbox: could not report failed file send for sid=%s",
+                chan.label,
+                inbound.message_sid,
+            )
 
     # ---- Log reply + flip audit row to success ----------------------
     live_session.log_message(
@@ -737,6 +814,8 @@ def process_inbound_sms(
                 if ack_message_sid
                 else {}
             ),
+            **({"attachments_sent": files_sent} if files_sent else {}),
+            **({"attachments_failed": files_failed} if files_failed else {}),
         },
     )
     if agent_failed:
@@ -747,7 +826,17 @@ def process_inbound_sms(
         audit.status_reason = "Agent loop crashed; sent fallback apology."
     else:
         audit.status = "processed_replied"
-        audit.status_reason = None
+        file_notes: List[str] = []
+        if files_sent:
+            file_notes.append(
+                "Sent file(s): " + ", ".join(f["label"] for f in files_sent) + "."
+            )
+        if files_failed or reply_files.problems:
+            file_notes.append(
+                "File(s) not sent: "
+                + "; ".join([*files_failed, *reply_files.problems])
+            )
+        audit.status_reason = " ".join(file_notes) or None
     audit.reply_message_sid = reply_sid
     db.commit()
     return audit
@@ -1395,9 +1484,17 @@ def _format_sms_fallback_email(
 
 
 def _telegram_reply_fallback(
-    *, person: models.Person, reply_text: str, channel: str
+    *,
+    person: models.Person,
+    reply_text: str,
+    channel: str,
+    files: Sequence[outbound_files.OutboundFile] = (),
 ) -> Optional[_EmailFallbackResult]:
-    """Resend an undelivered reply on Telegram; ``None`` when not linked or it fails."""
+    """Resend an undelivered reply on Telegram; ``None`` when not linked or it fails.
+
+    ``files`` are whatever went with the original reply; they follow
+    the text.
+    """
     token = get_settings().TELEGRAM_BOT_TOKEN
     if not person.telegram_user_id or not token:
         return None
@@ -1414,6 +1511,22 @@ def _telegram_reply_fallback(
             channel, person.person_id,
         )
         return None
+    ready, _failed = outbound_files.prepare_all(files, "telegram")
+    for file, prepared in ready:
+        try:
+            telegram.send_file(
+                bot_token=token,
+                chat_id=int(person.telegram_user_id),
+                filename=prepared.filename,
+                data=prepared.data,
+                mime_type=prepared.mime_type,
+                caption=file.label,
+            )
+        except telegram.TelegramSendError:
+            logger.exception(
+                "[orch] surface=%s telegram_fallback file failed person_id=%s",
+                channel, person.person_id,
+            )
     logger.info(
         "[orch] surface=%s telegram_fallback person_id=%s", channel, person.person_id
     )
@@ -1421,7 +1534,11 @@ def _telegram_reply_fallback(
 
 
 def _sms_reply_fallback(
-    *, person: models.Person, to_phone: str, reply_text: str
+    *,
+    person: models.Person,
+    to_phone: str,
+    reply_text: str,
+    media_urls: Sequence[str] = (),
 ) -> Optional[str]:
     """Resend an undelivered WhatsApp reply by SMS; the new MessageSid, or ``None``."""
     settings = get_settings()
@@ -1450,6 +1567,7 @@ def _sms_reply_fallback(
             from_phone=settings.TWILIO_PRIMARY_PHONE,
             to_phone=to_phone,
             body=body,
+            **({"media_urls": list(media_urls)} if media_urls else {}),
             **extra,
         )
     except Exception:
@@ -1470,11 +1588,14 @@ def _email_sms_reply(
     inbound_body: Optional[str],
     reply_text: str,
     channel: str = "sms",
+    files: Sequence[outbound_files.OutboundFile] = (),
 ) -> _EmailFallbackResult:
     """Send ``reply_text`` to ``person.email_address`` via the family Gmail.
 
-    Returns a result even when we skip (no email, no Google grant) so
-    callers can put the reason on the audit row. Never raises.
+    ``files`` are whatever went (or should have gone) with the reply;
+    they are attached to the email. Returns a result even when we skip
+    (no email, no Google grant) so callers can put the reason on the
+    audit row. Never raises.
     """
     email = (person.email_address or "").strip()
     if not email:
@@ -1491,8 +1612,17 @@ def _email_sms_reply(
     subject, body = _format_sms_fallback_email(
         inbound_body=inbound_body, reply_text=reply_text, channel=channel
     )
+    ready, failed = outbound_files.prepare_all(files, "email")
+    if failed:
+        body = f"{body}\n\n{outbound_files.failure_note(failed)}"
     try:
-        gmail_id = gmail.send_email(creds, to=email, subject=subject, body=body)
+        gmail_id = gmail.send_email(
+            creds,
+            to=email,
+            subject=subject,
+            body=body,
+            **({"attachments": [prepared for _f, prepared in ready]} if ready else {}),
+        )
     except gmail.GmailSendError as exc:
         logger.exception(
             "SMS email fallback: Gmail send failed person_id=%s to=%s",
@@ -1520,6 +1650,7 @@ def _finish_with_email_fallback(
     sms_error: str,
     shortcut_used: Optional[str],
     agent_failed: bool,
+    files: Sequence[outbound_files.OutboundFile] = (),
 ) -> models.SmsInboxMessage:
     """Record a Twilio miss and, when possible, deliver the reply by email."""
     fallback = _email_sms_reply(
@@ -1527,6 +1658,7 @@ def _finish_with_email_fallback(
         person=person,
         inbound_body=inbound.body,
         reply_text=reply_text,
+        files=files,
     )
     live_session.log_message(
         db,
@@ -1545,6 +1677,11 @@ def _finish_with_email_fallback(
                 if fallback.gmail_message_id
                 else {}
             ),
+            **(
+                {"attachments_sent": [f.describe() for f in files]}
+                if files and fallback.sent
+                else {}
+            ),
         },
     )
     if fallback.sent:
@@ -1558,10 +1695,10 @@ def _finish_with_email_fallback(
     return audit
 
 
-def _reply_body_from_session(
+def _reply_row_from_session(
     db: Session, audit: models.SmsInboxMessage, twilio_sid: str
-) -> Optional[str]:
-    """Recover the outbound SMS body we logged for ``twilio_sid``."""
+) -> Optional[models.LiveSessionMessage]:
+    """The transcript row of the reply we sent as ``twilio_sid``."""
     if audit.live_session_id is None:
         return None
     rows = (
@@ -1577,8 +1714,8 @@ def _reply_body_from_session(
         .scalars()
         .all()
     )
-    sid_match: Optional[str] = None
-    kind_match: Optional[str] = None
+    sid_match: Optional[models.LiveSessionMessage] = None
+    kind_match: Optional[models.LiveSessionMessage] = None
     for row in rows:
         meta = row.meta or {}
         if meta.get("kind") in ("sms_email_fallback", "telegram_fallback"):
@@ -1586,10 +1723,10 @@ def _reply_body_from_session(
             # by seeing status_reason, but skip using this as the SMS body.
             continue
         if meta.get("twilio_message_sid") == twilio_sid:
-            sid_match = row.content
+            sid_match = row
             break
         if kind_match is None and meta.get("kind") in ("sms_reply", "whatsapp_reply"):
-            kind_match = row.content
+            kind_match = row
     return sid_match or kind_match
 
 
@@ -1639,13 +1776,25 @@ def handle_outbound_delivery_failure(
             twilio_message_sid,
         )
         return
-    reply_text = _reply_body_from_session(db, audit, twilio_message_sid)
+    reply_row = _reply_row_from_session(db, audit, twilio_message_sid)
+    reply_text = reply_row.content if reply_row is not None else None
     if not reply_text:
         logger.warning(
             "SMS delivery failure sid=%s: no reply body on the session.",
             twilio_message_sid,
         )
         return
+    # Files that went with the undelivered reply go with the resend
+    # too, to the same person, wherever the new channel can carry them.
+    sent_files = (reply_row.meta or {}).get("attachments_sent")
+
+    def _files_for(resend_channel: str) -> List[outbound_files.OutboundFile]:
+        if not sent_files:
+            return []
+        return outbound_files.for_resend(
+            db, sent_files, family_id=person.family_id, channel=resend_channel
+        ).files
+
     channel = audit.channel
     sms_tried = "SMS fallback" in (audit.status_reason or "")
     if sms_tried:
@@ -1661,10 +1810,14 @@ def handle_outbound_delivery_failure(
         else None
     )
     if channel == "whatsapp" and not sms_tried:
+        sms_media, _unlinked = outbound_files.signed_urls(
+            _files_for("sms"), family_id=person.family_id, channel="sms"
+        )
         sms_sid = _sms_reply_fallback(
             person=person,
             to_phone=twilio_sms.strip_whatsapp_prefix(audit.from_phone),
             reply_text=reply_text,
+            media_urls=[url for _f, url in sms_media],
         )
         if sms_sid:
             if session is not None:
@@ -1682,6 +1835,8 @@ def handle_outbound_delivery_failure(
                         "twilio_message_sid": sms_sid,
                         "resend": True,
                         "sms_error": err,
+                        # Kept so a failed SMS can pass them on again.
+                        **({"attachments_sent": sent_files} if sent_files else {}),
                     },
                 )
             audit.reply_message_sid = sms_sid
@@ -1690,7 +1845,10 @@ def handle_outbound_delivery_failure(
             db.commit()
             return
     fallback = _telegram_reply_fallback(
-        person=person, reply_text=reply_text, channel=channel
+        person=person,
+        reply_text=reply_text,
+        channel=channel,
+        files=_files_for("telegram"),
     )
     kind = "telegram_fallback"
     if fallback is None:
@@ -1700,6 +1858,7 @@ def handle_outbound_delivery_failure(
             inbound_body=audit.body,
             reply_text=reply_text,
             channel=channel,
+            files=_files_for("email"),
         )
         kind = "sms_email_fallback"
     if session is not None and fallback.sent:

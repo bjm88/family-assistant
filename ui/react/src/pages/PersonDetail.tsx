@@ -27,6 +27,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { Field } from "@/components/Field";
 import { Modal } from "@/components/Modal";
 import { ProfileAvatar } from "@/components/ProfileAvatar";
+import { RotateImageButton } from "@/components/RotateImageButton";
 import { useToast } from "@/components/Toast";
 import { ContactsConnectionCard } from "@/components/ContactsConnectionCard";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -199,6 +200,20 @@ export default function PersonDetail() {
               <Camera className="h-4 w-4" />
               {uploadPhoto.isPending ? "Uploading…" : "Change photo"}
             </button>
+            {person?.profile_photo_path && (
+              <RotateImageButton
+                kind="person_profile"
+                recordId={person.person_id}
+                src={`/api/media/${person.profile_photo_path}`}
+                label="profile photo"
+                onRotated={() =>
+                  Promise.all([
+                    qc.invalidateQueries({ queryKey: ["person", personId] }),
+                    qc.invalidateQueries({ queryKey: ["people", familyId] }),
+                  ])
+                }
+              />
+            )}
           </div>
         </div>
 
@@ -546,6 +561,18 @@ function PhotosSection({ personId }: { personId: number }) {
                     />
                     Use for recognition
                   </label>
+                  <RotateImageButton
+                    kind="person_photo"
+                    recordId={p.person_photo_id}
+                    src={`/api/media/${p.stored_file_path}`}
+                    label={`photo "${p.title}"`}
+                    className="self-start"
+                    onRotated={() =>
+                      qc.invalidateQueries({
+                        queryKey: ["person-photos", personId],
+                      })
+                    }
+                  />
                   <button
                     className="text-destructive hover:text-destructive/80 text-xs inline-flex items-center gap-1 self-start"
                     onClick={async () => {
@@ -1129,6 +1156,17 @@ function IdentityDocImageSlot({
     <div className="border border-border rounded-lg overflow-hidden bg-white flex flex-col">
       <div className="px-3 py-2 border-b border-border text-xs font-medium flex items-center justify-between">
         <span>{label}</span>
+        {storedPath && (
+          <RotateImageButton
+            kind="identity_document"
+            recordId={doc.identity_document_id}
+            side={side}
+            src={`/api/media/${storedPath}`}
+            label={`${side} of ${idTypeLabel(doc.document_type)}`}
+            className="ml-auto mr-3"
+            onRotated={invalidate}
+          />
+        )}
         {storedPath && (
           <button
             type="button"

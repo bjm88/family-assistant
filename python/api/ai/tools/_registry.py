@@ -98,6 +98,17 @@ class ToolContext:
     # sms_inbox, telegram_inbox); empty list otherwise. Tools that
     # want to act on "the PDF the user just sent" read this.
     inbound_attachments: List["InboundAttachmentRef"] = field(default_factory=list)
+    # Where the reply to this turn will be delivered: "email", "slack",
+    # "sms", "whatsapp", "telegram", "chat" (the web page), or None for
+    # runs that reply to nobody (monitoring jobs). ``send_file`` uses it
+    # to tell whether a file can travel with the reply.
+    reply_channel: Optional[str] = None
+    # True when other people can read the reply too (a shared Slack
+    # channel, a Telegram group). Private files are not sent there.
+    reply_is_shared: bool = False
+    # Files ``send_file`` has approved so far in this turn, so the
+    # channel's count and size limits apply to the reply as a whole.
+    reply_files: List[Any] = field(default_factory=list)
 
 
 @dataclass

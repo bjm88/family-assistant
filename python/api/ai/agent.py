@@ -198,6 +198,7 @@ async def run_agent(
     think: Optional[bool] = None,
     inbound_attachments: Optional[List[tools.InboundAttachmentRef]] = None,
     requestor_is_admin: bool = False,
+    reply_is_shared: bool = False,
 ) -> AsyncIterator[AgentEvent]:
     """Drive a single agent task to completion, yielding SSE events.
 
@@ -256,6 +257,10 @@ async def run_agent(
             person_id=person_id,
             is_admin=requestor_is_admin,
             inbound_attachments=list(inbound_attachments or []),
+            # The task's kind is the surface it came in on, which is
+            # also where the reply goes.
+            reply_channel=task.kind,
+            reply_is_shared=reply_is_shared,
         )
 
         messages: List[Dict[str, Any]] = [

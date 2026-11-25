@@ -22,6 +22,7 @@ from ...integrations import google_oauth, web_search as web_search_integration
 from ._registry import Tool, ToolRegistry
 from .handlers import calendar as _cal
 from .handlers import contacts as _contacts
+from .handlers import files as _files
 from .handlers import household as _household
 from .handlers import messaging as _msg
 from .handlers import records as _rec
@@ -129,6 +130,38 @@ def build_default_registry() -> ToolRegistry:
                 "What's the VIN on my truck?",
                 "Read me my driver's license number.",
                 "Tell me the policy number on our auto insurance.",
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            name="send_file",
+            label="Send a stored photo or document with the reply",
+            description=(
+                "Attach a file the household has stored to your reply: "
+                "the scan of a passport, driver's license or other ID; "
+                "a saved document such as an insurance card or a PDF; "
+                "or the photo kept for a person, pet, vehicle or home. "
+                "The file goes to the person you are talking to, on the "
+                "channel they wrote in on (email, Slack, WhatsApp, text "
+                "message or Telegram) — it cannot be sent to anyone "
+                "else. Use it whenever someone asks you to send, show, "
+                "share, text or email them a picture, photo, scan, copy "
+                "or document. ID scans and a person's own documents "
+                "follow the same privacy rule as their ID numbers (the "
+                "person, their spouse, or their parent); photos and "
+                "household documents can go to any family member. Only "
+                "say a file is attached after this tool returns "
+                "successfully; if it returns an error, tell the person "
+                "what the error says instead."
+            ),
+            parameters=_files.SEND_FILE_SCHEMA,
+            handler=_files.handle_send_file,
+            timeout_seconds=10.0,
+            examples=(
+                "Send me a picture of Jackson's passport.",
+                "Text me a photo of the BMW.",
+                "Can you email me our dental insurance card?",
             ),
         )
     )

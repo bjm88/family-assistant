@@ -158,6 +158,74 @@ flowchart TB
 | **Email** | Gmail unread poll, 60 s | `From:` matches `people.email_address` | `users.messages.send` reply, threaded | `live_sessions(source='email', external_thread_id=<thread_id>)` |
 | **Doorbird gate** | scaffold only (planned) | LAN device, no auth surface yet | open / ring | n/a |
 
+### Sending files back
+
+Ask Avi for a stored picture or document — "send me a picture of
+Jackson's passport", "text me a photo of the BMW", "email me the dental
+insurance card" — and it arrives with his reply, on the channel you
+asked on. He can send the scan of an ID document, a saved document
+(image or PDF), and the photo kept for a person, pet, vehicle or home.
+
+| Channel | How the file travels | Limits |
+|---|---|---|
+| **Email** | attached to the reply | 20 MB per reply |
+| **Slack** | uploaded into the same conversation or thread (needs the `files:write` scope) | 50 MB per file |
+| **Telegram** | sent after the reply, pictures inline and everything else as a document | 45 MB per file |
+| **WhatsApp** | Twilio fetches it from a signed link; one file per message | pictures and PDFs / Office files; pictures over 4 MB are shrunk |
+| **SMS (MMS)** | Twilio fetches it from a signed link | pictures only; shrunk to under 1 MB so carriers deliver them |
+| **Live page** | not supported — Avi suggests one of the channels above | |
+
+**Who can be sent what.** The file only ever goes to the person who
+asked, on the channel they asked on; Avi cannot send a household file
+to anyone else. ID scans and documents filed under one person follow
+the same rule as that person's ID numbers: the person, their spouse, or
+their parent. Household documents and photos go to any identified
+member of the household. Private files are not posted in a shared Slack
+channel or Telegram group.
+
+**How it works.** The agent calls the `send_file` tool
+(`ai/tools/handlers/files.py`), which finds the record, applies the
+rules above and the channel's limits, and returns an error the model
+relays ("there's no picture saved for that license") instead of
+approving. When the agent finishes, the channel's inbox service reads
+the approved files for that turn (`services/outbound_files.py`) and
+delivers them; if delivery fails, Avi says so in the conversation. The
+transcript records which files went out (`attachments_sent` on the
+reply's metadata).
+
+**The signed link.** Twilio can't be handed a file, so for WhatsApp and
+SMS the reply carries a URL under `/api/outbound-files/` on
+`PUBLIC_BASE_URL`. That route needs no login. Each link is signed with a
+key derived from `SESSION_SECRET_KEY`, names one file for one channel,
+and stops working after `AI_FILE_LINK_TTL_SECONDS` (default 900).
+Without a public https `PUBLIC_BASE_URL`, Avi declines to send files on
+those two channels. Twilio keeps its own copy of any media it delivers,
+in the account's message log.
+
+### Rotating a stored image
+
+A scan or phone photo that was saved sideways can be turned in the
+admin console. Every stored picture has a **Rotate** control: the front
+and back of an identity document, a document that is an image, a
+person's profile picture and extra photos, pet and residence photos,
+and a vehicle's picture. It opens a dialog with *Rotate left* and
+*Rotate right*, a quarter turn each; nothing is stored until **Save**.
+
+Save calls `POST /api/admin/images/rotate` (admins only) with what the
+picture belongs to and the net clockwise turn (90, 180 or 270). The
+server (`services/image_rotation.py`) writes the turned picture as a
+new file, points the record at it, and deletes the old file. The new
+path means no browser keeps showing the old picture.
+
+- The picture is turned from how it is displayed. A phone photo's
+  "held sideways" orientation note is applied first and then removed.
+- The format is kept. PNGs keep their exact pixels. A JPEG is
+  re-encoded once per save, at quality 95.
+- PDFs, animated images and formats the server can't open (HEIC)
+  are refused with a message, and left untouched.
+- A person photo used for face recognition has its face data
+  recomputed from the turned picture.
+
 ### Request flow — "Avi, say hi to whoever walks in"
 
 The face pipeline is **two-stage** to keep the backend free for chat
@@ -200,7 +268,7 @@ Mac fires **zero** times instead of every 2.5 s.
 | Heavy chat model | **`gemma4:26b`** via Ollama | Tool-using agent, multi-turn reasoning. Default for every surface. |
 | Fast model | **`gemma4:e2b`** via Ollama (`/api/chat`, `think: false`) | 1-sentence contextual acknowledgments inside the 3-second race window so push surfaces never sit silent. |
 | Agent loop | `ai/agent.py` | Plan/execute/observe loop, async generator that yields `task_started · step · delta · task_completed · task_failed` events to the SSE channel and writes one `agent_steps` row per emission. |
-| Tool registry | `ai/tools.py` | 19 callable tools: `sql_query`, `lookup_person`, `reveal_sensitive_identifier`, `reveal_secret`, `gmail_send`, `calendar_list_upcoming`, `calendar_check_availability`, `calendar_find_free_slots`, `calendar_list_for_person`, `task_create / list / get / update / add_comment / add_follower / set_schedule / attach_link`, `web_search`, `telegram_invite`, plus `contacts_search` / `contacts_save` for the speaker's own address book, and the household-record writers: `household_records_list`, `goal_save`, `medication_save`, `identity_document_save`, `document_save_from_message`, `person_photo_save_from_message` and `household_record_save` (people, relationships, pets, vehicles, residences, insurance, financial accounts, medical conditions, physicians, jobs, websites, sensitive identifiers, document details, family settings — add / update only, no delete; email, phone and parent-role changes need a signed-in admin). Each is a `Tool(name, description, parameters, handler, timeout, requires)`. |
+| Tool registry | `ai/tools.py` | Callable tools: `sql_query`, `lookup_person`, `reveal_sensitive_identifier`, `reveal_secret`, `send_file` (attach a stored photo or document to the reply), `gmail_send`, `calendar_list_upcoming`, `calendar_check_availability`, `calendar_find_free_slots`, `calendar_list_for_person`, `task_create / list / get / update / add_comment / add_follower / set_schedule / attach_link`, `web_search`, `telegram_invite`, plus `contacts_search` / `contacts_save` for the speaker's own address book, and the household-record writers: `household_records_list`, `goal_save`, `medication_save`, `identity_document_save`, `document_save_from_message`, `person_photo_save_from_message` and `household_record_save` (people, relationships, pets, vehicles, residences, insurance, financial accounts, medical conditions, physicians, jobs, websites, sensitive identifiers, document details, family settings — add / update only, no delete; email, phone and parent-role changes need a signed-in admin). Each is a `Tool(name, description, parameters, handler, timeout, requires)`. |
 | Monitoring scheduler | `services/monitoring_scheduler.py` | Single-process `asyncio` loop launched in the FastAPI lifespan. Every `AI_MONITORING_TICK_SECONDS` it scans for `owner_kind='ai'` + `task_kind='monitoring'` rows whose `next_run_at` has elapsed, claims them under a row lock, advances `next_run_at` from the cron schedule (interpreted in `families.timezone`), and dispatches the run through the shared agent background pool. Monitoring runs use `AI_OLLAMA_THINKING_MODEL` with Ollama's `think:true` reasoning flag and have `web_search` available (Brave or Tavily, gated by `FA_SEARCH_PROVIDER`). |
 | SQL sandbox | `ai/sql_tool.py` | Read-only Postgres role + statement-level guard; the model can write SELECTs against `llm_schema_catalog` without touching ciphertext. |
 | Authz scope | `ai/authz.py` | Per-speaker access policy (self / spouse / parent / child / unauthorized) injected into every system prompt and re-checked inside sensitive tools. |
@@ -697,9 +765,9 @@ apps' posts.
      channels) and `message.mpim` (group DMs).
 3. **OAuth & Permissions**
    - *Bot token scopes*: `chat:write`, `im:history`, `app_mentions:read`,
-     `users:read`, `users:read.email`, `files:read`.
+     `users:read`, `users:read.email`, `files:read`, `files:write`.
    - *User token scopes* (authorise while signed in to Slack **as Avi**):
-     `chat:write`, `im:history`, `files:read` — plus `groups:history`,
+     `chat:write`, `im:history`, `files:read`, `files:write` — plus `groups:history`,
      `channels:history` and `mpim:history` if you added the channel
      events above (Slack adds them for you when you subscribe).
    - Reinstall the app to the workspace after changing scopes, and copy
@@ -715,7 +783,9 @@ those channels to this server, and anything that doesn't mention Avi is
 dropped without being stored.
 
 `files:read` is what lets Avi open photos and documents. Without it he
-still answers, and says he couldn't open the file.
+still answers, and says he couldn't open the file. `files:write` is what
+lets him send one back (see [Sending files back](#sending-files-back));
+without it he says the file couldn't be attached.
 
 **`.env`:**
 

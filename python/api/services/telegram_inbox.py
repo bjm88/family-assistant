@@ -75,7 +75,13 @@ from ..integrations import telegram, twilio_sms
 from ..integrations.contacts import sync as contact_sync
 from ..integrations.contacts import vcard as contact_vcard
 from ..utils.phone import normalize_phone
-from . import attachment_intake, inbound_lock, inbound_prompts, telegram_persistence
+from . import (
+    attachment_intake,
+    inbound_lock,
+    inbound_prompts,
+    outbound_files,
+    telegram_persistence,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -703,6 +709,7 @@ def process_inbound_update(
                 history=history,
                 user_message=user_message,
                 inbound_attachments=inbound_attachment_refs,
+                shared_conversation=not inbound.is_private_chat,
             )
             agent_failed = False
         except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
@@ -722,6 +729,21 @@ def process_inbound_update(
         max_chars=settings.AI_TELEGRAM_REPLY_MAX_CHARS,
     )
 
+    # ---- Files the agent attached to this reply ---------------------
+    # Only the heavy agent can attach files (the ``send_file`` tool).
+    reply_files = outbound_files.ReplyFiles()
+    if shortcut_used is None and not agent_failed:
+        reply_files = outbound_files.collect_for_task(
+            db,
+            task_id=task.agent_task_id,
+            family_id=person.family_id,
+            channel="telegram",
+        )
+        if reply_files.problems:
+            final_text = (
+                f"{final_text}\n\n{outbound_files.failure_note([], reply_files.problems)}"
+            )
+
     # ---- Send the (final) reply via the Bot API ---------------------
     try:
         reply_message_id = telegram.send_message(
@@ -739,6 +761,44 @@ def process_inbound_update(
         audit.status_reason = f"send_message: {exc}"
         db.commit()
         return audit
+
+    files_sent: List[dict] = []
+    ready, files_failed = outbound_files.prepare_all(reply_files.files, "telegram")
+    for file, prepared in ready:
+        try:
+            file_message_id = telegram.send_file(
+                bot_token=settings.TELEGRAM_BOT_TOKEN or "",
+                chat_id=inbound.chat_id,
+                filename=prepared.filename,
+                data=prepared.data,
+                mime_type=prepared.mime_type,
+                caption=file.label,
+            )
+            files_sent.append(
+                {**file.describe(), "telegram_message_id": file_message_id}
+            )
+        except telegram.TelegramSendError as exc:
+            logger.warning(
+                "Telegram inbox: file send failed for update_id=%s (%s:%s): %s",
+                inbound.update_id,
+                file.source,
+                file.record_id,
+                exc,
+            )
+            files_failed.append(file.label)
+    if files_failed:
+        # The reply said a file was coming; say so when it isn't.
+        try:
+            telegram.send_message(
+                bot_token=settings.TELEGRAM_BOT_TOKEN or "",
+                chat_id=inbound.chat_id,
+                text=outbound_files.failure_note(files_failed),
+            )
+        except telegram.TelegramSendError:
+            logger.exception(
+                "Telegram inbox: could not report failed file send for update_id=%s",
+                inbound.update_id,
+            )
 
     # ---- Log reply + flip audit row to success ----------------------
     live_session.log_message(
@@ -758,6 +818,8 @@ def process_inbound_update(
             # exchange in the right order.
             "ack_telegram_message_id": ack_sent_message_id,
             **({"shortcut": shortcut_used} if shortcut_used else {}),
+            **({"attachments_sent": files_sent} if files_sent else {}),
+            **({"attachments_failed": files_failed} if files_failed else {}),
         },
     )
     audit.status = "processed_replied"
@@ -774,6 +836,19 @@ def process_inbound_update(
         )
     else:
         audit.status_reason = None
+    file_notes: List[str] = []
+    if files_sent:
+        file_notes.append(
+            "Sent file(s): " + ", ".join(f["label"] for f in files_sent) + "."
+        )
+    if files_failed or reply_files.problems:
+        file_notes.append(
+            "File(s) not sent: " + "; ".join([*files_failed, *reply_files.problems])
+        )
+    if file_notes:
+        audit.status_reason = " ".join(
+            x for x in (audit.status_reason, *file_notes) if x
+        )
     audit.reply_telegram_message_id = reply_message_id
     db.commit()
     return audit
@@ -2438,11 +2513,14 @@ def _run_agent_to_completion(
     history: List[dict],
     user_message: str,
     inbound_attachments: Optional[List[agent_tools.InboundAttachmentRef]] = None,
+    shared_conversation: bool = False,
 ) -> str:
     """Drain the async agent generator and return the final reply text.
 
     Thin wrapper over :func:`api.ai.agent_drain.drain_agent_sync`
     that adds the Telegram-flavoured fallback copy.
+    ``shared_conversation`` is true for a group chat, where private
+    files must not be posted.
     """
     registry = agent_tools.build_default_registry()
     with SessionLocal() as db_for_caps:
@@ -2466,6 +2544,7 @@ def _run_agent_to_completion(
         capabilities=capabilities,
         extra_run_kwargs={
             "inbound_attachments": list(inbound_attachments or []),
+            "reply_is_shared": shared_conversation,
         },
     )
 

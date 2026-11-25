@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
-from typing import List, Optional
+from typing import Any, List, Optional, Sequence
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -43,6 +43,21 @@ def _service(creds: Credentials):
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
+def _attach(msg: EmailMessage, attachments: Optional[Sequence[Any]]) -> None:
+    """Add files to ``msg``.
+
+    Each attachment is anything with ``filename``, ``mime_type`` and
+    ``data`` (bytes) — see ``services.outbound_files.PreparedFile``.
+    """
+    for item in attachments or ():
+        maintype, _, subtype = (item.mime_type or "").partition("/")
+        if not maintype or not subtype:
+            maintype, subtype = "application", "octet-stream"
+        msg.add_attachment(
+            item.data, maintype=maintype, subtype=subtype, filename=item.filename
+        )
+
+
 def send_email(
     creds: Credentials,
     *,
@@ -50,8 +65,9 @@ def send_email(
     subject: str,
     body: str,
     sender: Optional[str] = None,
+    attachments: Optional[Sequence[Any]] = None,
 ) -> str:
-    """Send a plain-text email and return Gmail's message id.
+    """Send a plain-text email, with optional files, and return Gmail's message id.
 
     Parameters
     ----------
@@ -71,6 +87,7 @@ def send_email(
     msg["To"] = to
     msg["From"] = sender or "me"
     msg["Subject"] = subject
+    _attach(msg, attachments)
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
 
@@ -96,8 +113,9 @@ def send_reply(
     references: Optional[str],
     thread_id: str,
     sender: Optional[str] = None,
+    attachments: Optional[Sequence[Any]] = None,
 ) -> str:
-    """Send a plain-text reply that threads on an existing Gmail thread.
+    """Send a plain-text reply, with optional files, on an existing Gmail thread.
 
     Setting ``In-Reply-To`` + ``References`` is what makes Gmail (and
     every other RFC-compliant client) collapse the new message under
@@ -118,6 +136,7 @@ def send_reply(
     msg["References"] = (
         f"{references} {in_reply_to}".strip() if references else in_reply_to
     )
+    _attach(msg, attachments)
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     try:

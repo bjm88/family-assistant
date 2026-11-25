@@ -75,6 +75,7 @@ from .routers import (
     goals,
     google,
     identity_documents,
+    images,
     insurance_policies,
     jobs,
     landing,
@@ -94,6 +95,7 @@ from .routers import (
     residences,
     sensitive_identifiers,
     slack_webhook,
+    outbound_files as outbound_files_router,
     sms_webhook,
     spa,
     status,
@@ -328,6 +330,7 @@ def create_app() -> FastAPI:
         residences.router,
         residence_photos.router,
         identity_documents.router,
+        images.router,
         sensitive_identifiers.router,
         vehicles.router,
         insurance_policies.router,
@@ -353,6 +356,10 @@ def create_app() -> FastAPI:
     # Signature verification (X-Twilio-Signature) is enforced inside the
     # handler whenever TWILIO_AUTH_TOKEN is configured.
     app.include_router(sms_webhook.router, prefix="/api")
+    # Files Avi sends by WhatsApp / text: Twilio fetches them from here.
+    # Public by necessity; each URL is a signed link to one file that
+    # expires after AI_FILE_LINK_TTL_SECONDS.
+    app.include_router(outbound_files_router.router, prefix="/api")
     # Slack Events API webhook — public for the same reason. Every
     # request must carry a valid X-Slack-Signature; without
     # SLACK_APP_SIGNING_SECRET the handler refuses everything.

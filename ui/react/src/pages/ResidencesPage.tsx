@@ -16,6 +16,7 @@ import type { Residence, ResidencePhoto } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
+import { RotateImageButton } from "@/components/RotateImageButton";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -499,24 +500,41 @@ function ResidencePhotosSection({ residence }: { residence: Residence }) {
                     {p.description}
                   </div>
                 )}
-                <button
-                  type="button"
-                  className="text-destructive hover:text-destructive/80 text-xs inline-flex items-center gap-1 self-start mt-auto"
-                  onClick={async () => {
-                    if (
-                      await confirm({
-                        title: `Delete "${p.title}"?`,
-                        message: "The photo will be permanently removed.",
-                        destructive: true,
-                        confirmLabel: "Delete photo",
-                      })
-                    ) {
-                      del.mutate(p.residence_photo_id);
+                <div className="mt-auto flex items-center justify-between gap-2">
+                  <RotateImageButton
+                    kind="residence_photo"
+                    recordId={p.residence_photo_id}
+                    src={`/api/media/${p.stored_file_path}`}
+                    label={`photo "${p.title}"`}
+                    onRotated={() =>
+                      Promise.all([
+                        qc.invalidateQueries({
+                          queryKey: ["residence-photos", residence.residence_id],
+                        }),
+                        // The cover picture shown in the list may be this one.
+                        qc.invalidateQueries({ queryKey: ["residences"] }),
+                      ])
                     }
-                  }}
-                >
-                  <Trash2 className="h-3.5 w-3.5" /> Remove
-                </button>
+                  />
+                  <button
+                    type="button"
+                    className="text-destructive hover:text-destructive/80 text-xs inline-flex items-center gap-1"
+                    onClick={async () => {
+                      if (
+                        await confirm({
+                          title: `Delete "${p.title}"?`,
+                          message: "The photo will be permanently removed.",
+                          destructive: true,
+                          confirmLabel: "Delete photo",
+                        })
+                      ) {
+                        del.mutate(p.residence_photo_id);
+                      }
+                    }}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" /> Remove
+                  </button>
+                </div>
               </div>
             </div>
           ))}

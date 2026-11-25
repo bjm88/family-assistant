@@ -8,6 +8,7 @@ import type { Person, Residence, Vehicle } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
+import { RotateImageButton } from "@/components/RotateImageButton";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -655,6 +656,16 @@ function VehiclePhotoSection({ vehicle }: { vehicle: Vehicle }) {
                 ? "Replace photo"
                 : "Upload photo"}
           </button>
+          {vehicle.profile_image_path && (
+            <RotateImageButton
+              kind="vehicle_photo"
+              recordId={vehicle.vehicle_id}
+              src={`/api/media/${vehicle.profile_image_path}`}
+              label="vehicle photo"
+              className="self-start"
+              onRotated={invalidate}
+            />
+          )}
           {vehicle.profile_image_path && (
             <button
               type="button"

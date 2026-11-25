@@ -3,11 +3,12 @@ import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { Download, FileText, Trash2, Upload } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, resolveApiPath } from "@/lib/api";
 import type { DocumentRecord, Person } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
+import { RotateImageButton } from "@/components/RotateImageButton";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -36,6 +37,11 @@ interface UploadForm {
   document_category?: DocumentCategory | "";
   person_id?: string;
   notes?: string;
+}
+
+// Where a document's file is served from (an admin-only address).
+function downloadUrl(d: DocumentRecord): string {
+  return resolveApiPath(`/api/documents/${d.document_id}/download`);
 }
 
 export default function DocumentsPage() {
@@ -176,10 +182,29 @@ export default function DocumentsPage() {
                     </td>
                     <td className="text-muted-foreground">{d.original_file_name}</td>
                     <td>{new Date(d.created_at).toLocaleDateString()}</td>
-                    <td className="text-right">
+                    <td className="text-right whitespace-nowrap">
+                      {d.mime_type?.startsWith("image/") && (
+                        <RotateImageButton
+                          kind="document"
+                          recordId={d.document_id}
+                          // The download address stays the same when the
+                          // file changes, so tag it with the last-changed
+                          // time to get the current picture.
+                          src={`${downloadUrl(d)}?v=${encodeURIComponent(d.updated_at)}`}
+                          label={`"${d.title}"`}
+                          variant="icon"
+                          className="mr-3"
+                          onRotated={() =>
+                            qc.invalidateQueries({
+                              queryKey: ["documents", familyId],
+                            })
+                          }
+                        />
+                      )}
                       <a
                         className="text-primary hover:text-primary/80 mr-3 inline-flex"
-                        href={`/api/documents/${d.document_id}/download`}
+                        href={downloadUrl(d)}
+                        title={`Download "${d.title}"`}
                       >
                         <Download className="h-4 w-4" />
                       </a>

@@ -407,3 +407,200 @@ def test_family():
         }
     finally:
         s.close()
+
+
+# ---------------------------------------------------------------------------
+# Stored household files, for tests of Avi sending them back
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def household_files(test_family):
+    """A child, an uncle, and stored files for the integration family.
+
+    The integration-test person is the child's parent, and has no
+    relationship to the uncle. On disk (under the scratch storage
+    root) and in the database there are:
+
+    * the child's passport — a large photo of the front, no back;
+    * the child's driver's license — on record, no picture saved;
+    * the uncle's passport — with a picture;
+    * a car the child drives — with a PNG photo;
+    * a household PDF (dental insurance) filed under nobody;
+    * a PDF filed under the uncle.
+
+    Names carry a random tag so "the child" or "the car" can be asked
+    for by name without colliding with rows other tests left behind.
+    Everything is removed afterwards.
+    """
+    import io
+    import uuid
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    from api import storage
+
+    tag = uuid.uuid4().hex[:6]
+    family_id = test_family["family_id"]
+    folder = f"family_{family_id}/outbound_test_{tag}"
+    written: list[str] = []
+
+    def write(name: str, data: bytes) -> str:
+        rel = f"{folder}/{name}"
+        path = storage.absolute_path(rel)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        written.append(rel)
+        return rel
+
+    # A few megabytes, like a phone photo of a document.
+    detail = Image.frombytes("RGB", (600, 450), os.urandom(600 * 450 * 3))
+    buf = io.BytesIO()
+    detail.resize((3000, 2250), Image.BICUBIC).save(buf, format="JPEG", quality=95)
+    big_jpeg = buf.getvalue()
+    buf = io.BytesIO()
+    Image.new("RGBA", (320, 200), (30, 90, 200, 128)).save(buf, format="PNG")
+    png = buf.getvalue()
+    pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+
+    s = SessionLocal()
+    rows: list = []
+    owners: list = []
+    try:
+        child = models.Person(
+            family_id=family_id, first_name=f"Jaxon{tag}", last_name="Filetest"
+        )
+        uncle = models.Person(
+            family_id=family_id, first_name=f"Uncle{tag}", last_name="Filetest"
+        )
+        other_family = models.Family(family_name=f"Other household {tag}")
+        s.add_all([child, uncle, other_family])
+        s.flush()
+        stranger = models.Person(
+            family_id=other_family.family_id,
+            first_name=f"Stranger{tag}",
+            last_name="Filetest",
+        )
+        s.add(stranger)
+        s.flush()
+        owners = [stranger, child, uncle, other_family]
+        edge = models.PersonRelationship(
+            from_person_id=test_family["person_id"],
+            to_person_id=child.person_id,
+            relationship_type="parent_of",
+        )
+        passport = models.IdentityDocument(
+            person_id=child.person_id,
+            document_type="passport",
+            front_image_path=write("passport-front.jpg", big_jpeg),
+        )
+        license_ = models.IdentityDocument(
+            person_id=child.person_id, document_type="drivers_license"
+        )
+        uncle_passport = models.IdentityDocument(
+            person_id=uncle.person_id,
+            document_type="passport",
+            front_image_path=write("uncle-passport.png", png),
+        )
+        stranger_passport = models.IdentityDocument(
+            person_id=stranger.person_id,
+            document_type="passport",
+            front_image_path=write("stranger-passport.png", png),
+        )
+        car = models.Vehicle(
+            family_id=family_id,
+            vehicle_type="car",
+            make=f"Bimmer{tag}",
+            model="430",
+            year=2021,
+            primary_driver_person_id=child.person_id,
+            profile_image_path=write("car.png", png),
+        )
+        dental = models.Document(
+            family_id=family_id,
+            title=f"Dental insurance {tag}",
+            document_category="insurance",
+            stored_file_path=write("dental.pdf", pdf),
+            original_file_name="dental.pdf",
+            mime_type="application/pdf",
+            file_size_bytes=len(pdf),
+        )
+        uncle_doc = models.Document(
+            family_id=family_id,
+            person_id=uncle.person_id,
+            title=f"Tax return {tag}",
+            stored_file_path=write("tax.pdf", pdf),
+            original_file_name="tax.pdf",
+            mime_type="application/pdf",
+            file_size_bytes=len(pdf),
+        )
+        rows = [
+            edge, passport, license_, uncle_passport, stranger_passport,
+            car, dental, uncle_doc,
+        ]
+        s.add_all(rows)
+        s.commit()
+        yield SimpleNamespace(
+            tag=tag,
+            family_id=family_id,
+            parent_id=test_family["person_id"],
+            child_id=child.person_id,
+            child_name=child.first_name,
+            uncle_id=uncle.person_id,
+            uncle_name=uncle.first_name,
+            stranger_id=stranger.person_id,
+            passport_id=passport.identity_document_id,
+            license_id=license_.identity_document_id,
+            uncle_passport_id=uncle_passport.identity_document_id,
+            stranger_passport_id=stranger_passport.identity_document_id,
+            car_id=car.vehicle_id,
+            car_make=car.make,
+            dental_id=dental.document_id,
+            uncle_doc_id=uncle_doc.document_id,
+            passport_bytes=big_jpeg,
+            png_bytes=png,
+            pdf_bytes=pdf,
+        )
+    finally:
+        s.rollback()
+        for row in [*rows, *owners]:
+            try:
+                s.delete(s.merge(row))
+                s.commit()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                s.rollback()
+        s.close()
+        for rel in written:
+            storage.delete_if_exists(rel)
+        try:
+            storage.absolute_path(folder).rmdir()
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def attach_files_to_task():
+    """Record a successful ``send_file`` result on an agent task.
+
+    Stands in for the agent having called the tool, for tests that mock
+    the agent itself: ``attach(task_id, {"source": ..., "record_id":
+    ..., "side": ...}, ...)``.
+    """
+    from datetime import datetime, timezone
+
+    def attach(task_id: int, *refs: dict) -> None:
+        with SessionLocal() as s:
+            s.add(
+                models.AgentStep(
+                    agent_task_id=task_id,
+                    step_index=1,
+                    step_type="tool_result",
+                    tool_name="send_file",
+                    tool_output={"attachments": list(refs)},
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+            s.commit()
+
+    return attach

@@ -74,7 +74,7 @@ from ..ai import vision
 from ..config import Settings, get_settings
 from ..db import SessionLocal
 from ..integrations import slack
-from . import attachment_intake, inbound_prompts
+from . import attachment_intake, inbound_prompts, outbound_files
 
 
 logger = logging.getLogger(__name__)
@@ -495,6 +495,7 @@ def process_inbound_message(
                 history=history,
                 user_message=user_message,
                 inbound_attachments=inbound_attachment_refs,
+                shared_conversation=not inbound.is_direct,
             )
         except Exception:  # noqa: BLE001 - last-ditch catch so we always reply
             logger.exception(
@@ -514,6 +515,21 @@ def process_inbound_message(
         max_chars=settings.AI_SLACK_REPLY_MAX_CHARS,
     )
 
+    # ---- Files the agent attached to this reply ---------------------
+    # Only the heavy agent can attach files (the ``send_file`` tool).
+    reply_files = outbound_files.ReplyFiles()
+    if shortcut_used is None and not agent_failed:
+        reply_files = outbound_files.collect_for_task(
+            db,
+            task_id=task.agent_task_id,
+            family_id=person.family_id,
+            channel="slack",
+        )
+        if reply_files.problems:
+            final_text = (
+                f"{final_text}\n\n{outbound_files.failure_note([], reply_files.problems)}"
+            )
+
     # ---- Send the (final) reply ------------------------------------
     try:
         reply_ts = _send(settings, inbound, final_text)
@@ -525,6 +541,18 @@ def process_inbound_message(
         audit.status_reason = f"chat.postMessage: {exc}"
         db.commit()
         return audit
+
+    files_sent, files_failed = _send_files(settings, inbound, reply_files.files)
+    if files_failed:
+        # The reply said a file was coming; say so when it isn't.
+        try:
+            _send(settings, inbound, outbound_files.failure_note(files_failed))
+        except slack.SlackSendError:
+            logger.exception(
+                "Slack inbox: could not report failed file upload for %s/%s",
+                inbound.channel_id,
+                inbound.ts,
+            )
 
     # ---- Log reply + flip audit row to success ----------------------
     live_session.log_message(
@@ -542,11 +570,22 @@ def process_inbound_message(
             "via": inbound.via,
             "ack_slack_message_ts": ack_ts,
             **({"shortcut": shortcut_used} if shortcut_used else {}),
+            **({"attachments_sent": files_sent} if files_sent else {}),
+            **({"attachments_failed": files_failed} if files_failed else {}),
         },
     )
     notes: List[str] = []
     if agent_failed:
         notes.append("Agent loop crashed; sent fallback apology.")
+    if files_sent:
+        notes.append(
+            "Sent file(s): " + ", ".join(f["label"] for f in files_sent) + "."
+        )
+    if files_failed or reply_files.problems:
+        notes.append(
+            "File(s) not sent: "
+            + "; ".join([*files_failed, *reply_files.problems])
+        )
     if file_problems:
         notes.append(
             f"{len(file_problems)} shared file(s) could not be retrieved: "
@@ -579,6 +618,50 @@ def _send(
         text=slack.format_outbound(text, max_chars=settings.AI_SLACK_REPLY_MAX_CHARS),
         thread_ts=inbound.reply_thread_ts,
     )
+
+
+def _send_files(
+    settings: Settings,
+    inbound: slack.InboundSlackMessage,
+    files: List[outbound_files.OutboundFile],
+) -> Tuple[List[dict], List[str]]:
+    """Upload ``files`` into the conversation, under the reply.
+
+    Returns what was sent (for the transcript) and the labels of
+    anything that failed. One failed upload doesn't stop the others.
+    """
+    sent: List[dict] = []
+    failed: List[str] = []
+    if not files:
+        return sent, failed
+    token = _token_for(inbound.via, settings)
+    for file in files:
+        try:
+            if not token:
+                raise slack.SlackSendError(
+                    f"No Slack {inbound.via} token configured to reply with."
+                )
+            prepared = outbound_files.prepare(file, "slack")
+            file_id = slack.upload_file(
+                token=token,
+                channel=inbound.channel_id,
+                filename=prepared.filename,
+                data=prepared.data,
+                title=file.label,
+                thread_ts=inbound.reply_thread_ts,
+            )
+            sent.append({**file.describe(), "slack_file_id": file_id})
+        except (slack.SlackSendError, outbound_files.FileUnavailable) as exc:
+            logger.warning(
+                "Slack inbox: file upload failed for %s/%s (%s:%s): %s",
+                inbound.channel_id,
+                inbound.ts,
+                file.source,
+                file.record_id,
+                exc,
+            )
+            failed.append(file.label)
+    return sent, failed
 
 
 def _existing(
@@ -887,11 +970,14 @@ def _run_agent_to_completion(
     history: List[dict],
     user_message: str,
     inbound_attachments: Optional[List[agent_tools.InboundAttachmentRef]] = None,
+    shared_conversation: bool = False,
 ) -> str:
     """Drain the async agent generator and return the final reply text.
 
     Thin wrapper over :func:`api.ai.agent_drain.drain_agent_sync`, the
-    same one the SMS and Telegram inboxes use.
+    same one the SMS and Telegram inboxes use. ``shared_conversation``
+    is true for a channel other people can read, where private files
+    must not be posted.
     """
     registry = agent_tools.build_default_registry()
     with SessionLocal() as db_for_caps:
@@ -914,6 +1000,7 @@ def _run_agent_to_completion(
         capabilities=capabilities,
         extra_run_kwargs={
             "inbound_attachments": list(inbound_attachments or []),
+            "reply_is_shared": shared_conversation,
         },
     )
 

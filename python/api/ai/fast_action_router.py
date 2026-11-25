@@ -268,6 +268,8 @@ _CLASSIFIER_SYSTEM_PROMPT = (
     "looking up, adding or updating someone in the user's own "
     "contacts / address book (a forwarded email, a shared contact, "
     "a business card, pasted contact details), "
+    "being sent a stored picture, scan, photo or document ('send me "
+    "a picture of the passport', 'text me the insurance card'), "
     "anything that needs a tool not listed "
     "above, anything ambiguous.\n"
     "\n"
@@ -427,6 +429,31 @@ def is_contacts_request(message: str) -> bool:
     return bool(_CONTACTS_REQUEST_RE.search(message or ""))
 
 
+# "Send me a picture of Jackson's passport", "text me a photo of the
+# BMW", "I need a copy of my license". Only the heavy agent has the
+# `send_file` tool, and the family-QA shortcut would answer these in
+# words ("I can't send images"). Recognised by wording, like contacts
+# requests; a false match only costs latency.
+_FILE_NOUN = (
+    r"(?:pic|pics|picture|pictures|photo|photos|photograph|image|images|"
+    r"scan|scans|screenshot|copy|copies|pdf|pdfs|file|files|attachment|"
+    r"attachments|document|documents|doc|docs|card)"
+)
+_FILE_REQUEST_RE = re.compile(
+    r"\b(?:send|resend|text|email|e-mail|share|show|forward|attach|give)\b"
+    r"[^.!?\n]{0,80}\b" + _FILE_NOUN + r"\b"
+    r"|\b(?:need|want|get|have|got|find)\b[^.!?\n]{0,40}"
+    r"\b(?:pic|pics|picture|pictures|photo|photos|image|images|scan|scans|"
+    r"copy|copies|pdf|pdfs)\b",
+    re.IGNORECASE,
+)
+
+
+def is_file_request(message: str) -> bool:
+    """True when the message asks to be sent a picture, scan or document."""
+    return bool(_FILE_REQUEST_RE.search(message or ""))
+
+
 async def classify_triage(message: str) -> str:
     """Run the combined classifier; return one of :data:`ALL_LABELS`.
 
@@ -439,6 +466,9 @@ async def classify_triage(message: str) -> str:
         return LABEL_HEAVY
     if is_contacts_request(text):
         logger.info("[triage] contacts request — routing to HEAVY for %r", text[:80])
+        return LABEL_HEAVY
+    if is_file_request(text):
+        logger.info("[triage] file request — routing to HEAVY for %r", text[:80])
         return LABEL_HEAVY
     settings = get_settings()
     if not settings.AI_FAST_ACTION_SHORTCUT_ENABLED:

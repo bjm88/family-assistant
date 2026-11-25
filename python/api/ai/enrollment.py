@@ -112,6 +112,18 @@ def enroll_photo(photo_id: int) -> None:
         db.close()
 
 
+def reenroll_photo(photo_id: int) -> None:
+    """Recompute a photo's face data after its image changed.
+
+    The stored embedding and face position describe the old pixels (a
+    rotated photo has the face somewhere else, turned), so they are
+    dropped first. :func:`enroll_photo` then computes fresh ones when
+    the photo is used for recognition, and does nothing when it isn't.
+    """
+    remove_photo_enrollment(photo_id)
+    enroll_photo(photo_id)
+
+
 def remove_photo_enrollment(photo_id: int) -> None:
     """Drop any embedding previously computed for this photo."""
     db = SessionLocal()

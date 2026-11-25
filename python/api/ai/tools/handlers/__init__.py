@@ -10,6 +10,7 @@ Modules
 
 * :mod:`api.ai.tools.handlers.sql`       — ``sql_query`` + ``lookup_person``
 * :mod:`api.ai.tools.handlers.secrets`   — ``reveal_sensitive_identifier`` + ``reveal_secret``
+* :mod:`api.ai.tools.handlers.files`     — ``send_file`` (attach a stored photo / document to the reply)
 * :mod:`api.ai.tools.handlers.calendar`  — every ``calendar_*`` tool
 * :mod:`api.ai.tools.handlers.tasks`     — every ``task_*`` tool
 * :mod:`api.ai.tools.handlers.messaging` — ``gmail_send`` + ``telegram_invite``

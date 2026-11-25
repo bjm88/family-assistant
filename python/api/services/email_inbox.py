@@ -66,7 +66,7 @@ from ..db import SessionLocal
 from ..integrations import gmail
 from ..integrations import google_oauth
 from . import inbound_lock
-from . import attachment_intake, inbound_prompts
+from . import attachment_intake, inbound_prompts, outbound_files
 
 
 logger = logging.getLogger(__name__)
@@ -701,6 +701,29 @@ def _handle_one_message(
                 "into it and follow up as soon as I can."
             )
 
+    # ---- Files the agent attached to this reply -------------------------
+    # Only the heavy agent can attach files (the ``send_file`` tool).
+    reply_files = outbound_files.ReplyFiles()
+    attachments: list = []
+    files_failed: List[str] = []
+    if shortcut_used is None and not agent_failed:
+        reply_files = outbound_files.collect_for_task(
+            db,
+            task_id=task.agent_task_id,
+            family_id=person.family_id,
+            channel="email",
+        )
+        attachments, files_failed = outbound_files.prepare_all(
+            reply_files.files, "email"
+        )
+        if files_failed or reply_files.problems:
+            # The reply says a file is attached; say so when it isn't.
+            final_text = (
+                f"{final_text}\n\n"
+                f"{outbound_files.failure_note(files_failed, reply_files.problems)}"
+            )
+    files_sent = [file.describe() for file, _prepared in attachments]
+
     # ---- Send the reply -----------------------------------------------
     reply_subject = msg.subject or "(no subject)"
     in_reply_to = msg.in_reply_to_header or msg.message_id
@@ -713,6 +736,11 @@ def _handle_one_message(
             in_reply_to=in_reply_to,
             references=msg.references_header,
             thread_id=msg.thread_id,
+            **(
+                {"attachments": [prepared for _file, prepared in attachments]}
+                if attachments
+                else {}
+            ),
         )
     except gmail.GmailSendError as exc:
         logger.exception(
@@ -742,6 +770,8 @@ def _handle_one_message(
             "agent_task_id": task.agent_task_id,
             "gmail_message_id": reply_id,
             "in_reply_to": msg.message_id,
+            **({"attachments_sent": files_sent} if files_sent else {}),
+            **({"attachments_failed": files_failed} if files_failed else {}),
         },
     )
     if agent_failed:
@@ -749,7 +779,17 @@ def _handle_one_message(
     elif shortcut_used == "web_search":
         status_reason = "Web-search shortcut handled (skipped heavy agent)."
     else:
-        status_reason = None
+        file_notes: List[str] = []
+        if files_sent:
+            file_notes.append(
+                "Sent file(s): " + ", ".join(f["label"] for f in files_sent) + "."
+            )
+        if files_failed or reply_files.problems:
+            file_notes.append(
+                "File(s) not sent: "
+                + "; ".join([*files_failed, *reply_files.problems])
+            )
+        status_reason = " ".join(file_notes) or None
     audit_row = _save_audit(
         db,
         **common_audit,

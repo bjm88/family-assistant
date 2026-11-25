@@ -273,6 +273,72 @@ def get_me(bot_token: str, *, timeout_seconds: float = 10.0) -> BotIdentity:
 # ---------------------------------------------------------------------------
 
 
+# Telegram re-compresses anything sent as a photo and refuses large
+# ones, so only modest pictures go that way; the rest are documents,
+# which arrive untouched.
+_PHOTO_MAX_BYTES = 8 * 1024 * 1024
+
+
+def send_file(
+    *,
+    bot_token: str,
+    chat_id: int,
+    filename: str,
+    data: bytes,
+    mime_type: str,
+    caption: Optional[str] = None,
+    timeout_seconds: float = 60.0,
+) -> int:
+    """Send a picture or document and return Telegram's message_id.
+
+    Pictures are shown inline; if Telegram won't take one as a photo
+    (too large, odd proportions) it is sent as a document instead.
+    """
+    if not bot_token:
+        raise TelegramSendError("TELEGRAM_BOT_TOKEN missing.")
+    as_photo = (
+        mime_type in ("image/jpeg", "image/png") and len(data) <= _PHOTO_MAX_BYTES
+    )
+    attempts = (
+        [("sendPhoto", "photo"), ("sendDocument", "document")]
+        if as_photo
+        else [("sendDocument", "document")]
+    )
+    form: dict[str, Any] = {"chat_id": str(int(chat_id))}
+    if caption:
+        form["caption"] = caption[:1000]
+    last_error = "no attempt made"
+    for method, field_name in attempts:
+        try:
+            resp = httpx.post(
+                _bot_endpoint(bot_token, method),
+                data=form,
+                files={field_name: (filename, data, mime_type)},
+                timeout=timeout_seconds,
+            )
+        except httpx.HTTPError as exc:
+            raise TelegramSendError(f"transport error: {exc}") from exc
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        if resp.status_code < 400 and body.get("ok"):
+            message_id = int((body.get("result") or {}).get("message_id") or 0)
+            logger.info(
+                "Telegram %s chat=%s message_id=%s bytes=%d",
+                method,
+                chat_id,
+                message_id,
+                len(data),
+            )
+            return message_id
+        last_error = (
+            f"{method} HTTP {resp.status_code}: "
+            f"{body.get('description') or resp.text[:300]}"
+        )
+    raise TelegramSendError(last_error)
+
+
 def send_message(
     *,
     bot_token: str,
