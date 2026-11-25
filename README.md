@@ -256,6 +256,60 @@ saved once before files can be added to it.
 - Avi can see in the database that these files exist (kind, label,
   file name) but can't yet open them or send them in a message.
 
+### Family games
+
+**Games** in the sidebar is for everyone in the family, not just
+admins. It lists the games you can play together, each person on their
+own phone, and the first one is **Turkey TicTacToe**: tic-tac-toe on a
+board 5 squares wide and 10 deep, where four of your turkeys in a row
+(across, down or diagonally) wins. Two to four people can play.
+
+1. **Start a game.** Press *Start a game*, tick who you want to play
+   with, and you land on your own game screen.
+2. **Everyone gets a link.** Each person invited is sent their own
+   link, `<PUBLIC_BASE_URL>/play/<token>`, by text and by email —
+   whichever of the two we can use for them. Opening it is all it takes
+   to join: there is nothing to sign in to. Texts go only to people who
+   have completed the SMS opt-in and haven't opted out, the same rule
+   as every other text Avi starts; email comes from the assistant's
+   connected Gmail. When neither reaches someone (or it fails), the
+   lobby and the Games page say so and give the host a **Share link**
+   button to pass the link on by hand.
+3. **Pick a turkey.** The welcome screen says who invited you and
+   offers six cartoon turkeys (Happy, Strong, Glam, Cheerleader, Hippie,
+   Cheers) and eight shirt colours. A colour someone else has taken is
+   crossed out.
+4. **Play.** Once two players are in, the card over the board offers
+   *Start game*. On your turn, tap a square to pick it and tap it again
+   to place your turkey. Four in a row draws a line through the turkeys
+   and announces the winner; wins are counted per player, and anyone
+   can press *Play again* or *End game*. Whoever went second goes first
+   next round. Someone who joins while a round is being played watches
+   it and is dealt in to the next one.
+
+How it works:
+
+- Every player holds a WebSocket open to
+  `/api/games/play/<token>/ws`; each change is pushed to all of them at
+  once, so a move shows on the other phones immediately. ngrok passes
+  WebSockets through without any extra setting. If a phone loses the
+  connection (locked, switched apps, bad signal) the page reconnects by
+  itself and catches up. The game is stored in Postgres, so restarting
+  the API doesn't lose it.
+- A link is for one person in one game. It lets its holder play that
+  game and nothing else, and it stops working when the game ends or
+  24 hours after it was started. The `games` and `game_players` tables
+  are deliberately left out of the tables Avi can query, because a
+  token read from them would be a working link.
+- The Games page keeps a hall of fame: rounds won per person across
+  every game the family has played.
+- The live connections are held in the memory of the one API process,
+  which is how this app runs. Running several API processes would need
+  a shared channel between them.
+- Phones reach the app through FastAPI, which serves the built bundle,
+  so after pulling this change run `scripts/restart.sh`: it applies
+  the new migration, rebuilds the bundle and restarts the API.
+
 ### Request flow — "Avi, say hi to whoever walks in"
 
 The face pipeline is **two-stage** to keep the backend free for chat
@@ -927,7 +981,10 @@ the gate), `/api/admin/google/oauth/callback` (Avi's Gmail/Calendar
 callback — Google has to be able to reach it) and
 `/api/contacts/google/oauth/callback` (the per-person contacts
 callback; it only accepts the single-use `state` issued to a signed-in
-user). Everything else returns
+user), and a game invite link: the page `/play/<token>` plus
+`/api/games/play/<token>` and its WebSocket, where the token is the
+credential and opens only that one player's seat in that one game.
+Everything else returns
 401 unless a valid `fa_session` cookie is presented.
 
 ### 7. Run database migrations
@@ -1035,6 +1092,8 @@ Tables today, grouped by domain:
   `task_followers`, `task_attachments`, `task_links` (URL citations
   added by Avi during monitoring runs).
 - **Agent audit** — `agent_tasks`, `agent_steps`.
+- **Family games** — `games`, `game_players` (one row per person in a
+  game, with their join-link token, turkey and wins).
 - **External-service credentials** — `google_oauth_credentials`
   (Fernet-encrypted refresh tokens for Gmail + Calendar),
   `contact_provider_connections` (each person's own address-book
@@ -1076,6 +1135,7 @@ family-assistant/
 │   │   ├── identity_documents · sensitive_identifiers · assistants
 │   │   ├── tasks · google · contacts · status · legal · media
 │   │   ├── ai_chat · ai_face · ai_tts · live_sessions · agent_tasks
+│   │   ├── games                  (Games page API + token-authenticated play routes and WebSocket)
 │   │   ├── sms_webhook            (public Twilio inbound)
 │   │   └── slack_webhook          (public Slack Events API inbound)
 │   ├── ai/
@@ -1089,6 +1149,12 @@ family-assistant/
 │   │   ├── session.py             find_or_create per-surface LiveSession
 │   │   ├── face.py · enrollment.py InsightFace wrapper, embedding cache, cosine match
 │   │   └── tts.py                 Kokoro-82M ONNX, voice by gender, disk cache
+│   ├── games/
+│   │   ├── catalog.py             the games on offer + turkey styles and shirt colours
+│   │   ├── turkey_tictactoe.py    rules: 5 x 10 board, four in a row
+│   │   ├── service.py             start / join / move / play again / end, and what each player sees
+│   │   ├── invites.py             text + email each invitee their join link
+│   │   └── hub.py                 live WebSocket connections per game
 │   ├── services/
 │   │   ├── email_inbox.py         Gmail long-poll loop (lifespan task)
 │   │   ├── telegram_inbox.py      Telegram getUpdates loop + per-update agent dispatch
@@ -1108,9 +1174,10 @@ family-assistant/
 │   └── migrations/                Alembic revisions
 ├── ui/react/                      Vite + React + TS admin console + AI page
 │   └── src/
-│       ├── App.tsx                route tree (/admin/..., /aiassistant/:id)
+│       ├── App.tsx                route tree (/admin/..., /aiassistant/:id, /play/:token)
 │       ├── lib/api.ts             fetch wrapper + resolveApiPath rewriting
 │       ├── components/            Layout, Modal, PageHeader, Toast, etc.
+│       ├── games/                 turkey avatars (SVG), the board, the live-connection hook
 │       └── pages/
 │           ├── FamiliesList, FamilyDashboard, FamilySettings
 │           ├── PeoplePage, PersonDetail, RelationshipsPage
@@ -1118,6 +1185,8 @@ family-assistant/
 │           ├── PetsPage, ResidencesPage, VehiclesPage
 │           ├── InsurancePoliciesPage, FinancialAccountsPage, DocumentsPage
 │           ├── TasksPage, AgentTasksPage   (kanban "todo" + AI "monitoring" tabs + agent run audit)
+│           ├── GamesPage                   (start a game, invite, hall of fame)
+│           ├── PlayGamePage                (public /play/:token — pick a turkey and play)
 │           ├── AssistantPage               (admin Avi config + Google OAuth)
 │           └── AiAssistantPage             (live /aiassistant/:familyId)
 ├── docs/                          long-form docs (DATA_MODEL.md, ...)

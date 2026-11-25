@@ -25,9 +25,10 @@ document is the human-friendly companion to that catalog.
 | **Telegram onboarding** | `telegram_invites`, `telegram_contact_verifications` | Deep-link invites + the SMS-2FA challenge that confirms a contact-share before binding `Person.telegram_user_id`. |
 | **Tasks (kanban)** | `tasks`, `task_comments`, `task_followers`, `task_attachments` | User-facing household to-do board. Avi can create / update tasks via tools. |
 | **Agent audit** | `agent_tasks`, `agent_steps` | One row per agent invocation + per-step transcript (thinking, tool_call, tool_result, final). |
+| **Family games** | `games`, `game_players` | Games the family plays together on their phones (Turkey TicTacToe), who is in each one, and how many rounds each person has won. |
 | **External-service credentials** | `google_oauth_credentials`, `contact_provider_connections` | Fernet-encrypted refresh tokens: Avi's Gmail + Calendar, and each person's own address-book grant. |
 
-Total: **~40 tables** + the `llm_schema_catalog` read-only view.
+Total: **~42 tables** + the `llm_schema_catalog` read-only view.
 
 ---
 
@@ -88,6 +89,10 @@ erDiagram
     families ||--o{ sms_inbox_messages : "audit"
     sms_inbox_messages ||--o{ sms_inbox_attachments : ""
     families ||--o{ email_inbox_messages : "audit"
+
+    families ||--o{ games : "played together"
+    games ||--o{ game_players : "one per person"
+    game_players }o--|| people : "player"
 
     families ||--o{ tasks : "kanban board"
     tasks ||--o{ task_comments : ""
@@ -429,6 +434,48 @@ Append-only per-step transcript. `step_type` is one of:
 
 Replaying the rows in `step_index` order reproduces the run. The
 admin "agent runs" page hangs off this table.
+
+---
+
+## Family games
+
+### `games`
+
+One row per game started from the Games page. `game_type` names the
+game (`turkey_tictactoe` is the only one so far) and `status` moves
+through `lobby` → `playing` → `round_over` (back to `playing` for a
+rematch) → `ended`. `state` is a JSONB document owned by the game's
+rules module; for Turkey TicTacToe it is the current round: the 50
+squares row by row (`cells`, each the `game_player_id` standing there
+or null), `turn_order` and `turn_index`, the `round` number, and, once
+the round is over, `winner_player_id` with the `winning_cells` in line
+order, or `is_draw`. `rounds_played` counts finished rounds and also
+decides who goes first in the next one. A game stops accepting
+anything at `expires_at`, 24 hours after it was started, whether or not
+anyone pressed *End game*; it then reads as `ended`.
+
+### `game_players`
+
+One row per person in a game, the host included
+(`UNIQUE (game_id, person_id)`). It holds:
+
+- **`join_token`** — the secret in that person's link,
+  `/play/<join_token>`. It is unique across all games and is the only
+  credential the play page and its WebSocket take, so anyone holding
+  it can play as that person in that one game. These two tables are
+  not in the list the assistant's SQL tool may read for that reason.
+- **`joined_at`**, **`avatar_style`**, **`avatar_color`** — set when
+  the person picks a turkey. Turn order is the order people joined in;
+  a shirt colour belongs to one player per game.
+- **`wins`** — rounds won in this game. The hall of fame on the Games
+  page is the sum of this per person.
+- **`invite_status`** (`not_sent` · `pending` · `sent` · `failed`),
+  **`invite_channels`** (`sms`, `email` or `sms,email`) and
+  **`invite_detail`** — how the invite was delivered, or why it
+  couldn't be, so the host knows to share the link by hand.
+
+Both tables cascade from `families`; a `game_players` row also goes
+when its person is deleted.
 
 ---
 
