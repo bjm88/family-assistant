@@ -8,6 +8,7 @@ import type { Person, Residence, Vehicle } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
+import { RecordAttachments } from "@/components/RecordAttachments";
 import { RotateImageButton } from "@/components/RotateImageButton";
 import { Field } from "@/components/Field";
 import { useToast } from "@/components/Toast";
@@ -30,6 +31,12 @@ const BODY_STYLES = [
   "other",
 ];
 const FUEL_TYPES = ["gasoline", "diesel", "hybrid", "plug_in_hybrid", "electric"];
+// What a file attached to a vehicle can be filed as.
+const VEHICLE_ATTACHMENT_KINDS = [
+  { value: "title", label: "Title" },
+  { value: "registration", label: "Registration" },
+  { value: "other", label: "Other" },
+];
 
 const NUMERIC_FIELDS = [
   "year",
@@ -216,7 +223,15 @@ export default function VehiclesPage() {
                               {v.make} {v.model}
                             </div>
                             <div className="text-xs text-muted-foreground">
-                              {v.nickname ?? v.color ?? ""}
+                              {[
+                                v.nickname ?? v.color,
+                                v.attachment_count > 0 &&
+                                  `${v.attachment_count} ${
+                                    v.attachment_count === 1 ? "file" : "files"
+                                  }`,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ")}
                             </div>
                           </div>
                         </div>
@@ -575,6 +590,21 @@ function VehicleModal({
 
       {mode === "edit" && vehicle && (
         <VehiclePhotoSection vehicle={vehicle} />
+      )}
+      {mode === "edit" && vehicle ? (
+        <RecordAttachments
+          basePath={`/api/vehicles/${vehicle.vehicle_id}/attachments`}
+          heading="Title and paperwork"
+          hint="Photos or PDFs of the title, the registration and similar paperwork."
+          kinds={VEHICLE_ATTACHMENT_KINDS}
+          rotateKind="vehicle_attachment"
+          onChanged={invalidate}
+        />
+      ) : (
+        <div className="mt-6 border-t border-border pt-4 text-xs text-muted-foreground">
+          Save the vehicle first, then open it again to add its photo, title
+          and other paperwork.
+        </div>
       )}
     </Modal>
   );

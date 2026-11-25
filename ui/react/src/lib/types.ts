@@ -231,6 +231,24 @@ export interface Vehicle {
   current_mileage: number | null;
   profile_image_path: string | null;
   notes: string | null;
+  // Files attached to the vehicle (title, registration, …).
+  attachment_count: number;
+}
+
+// A photo or PDF attached to an insurance policy or a vehicle.
+export interface RecordAttachment {
+  attachment_id: number;
+  // The insurance policy or vehicle the file belongs to.
+  owner_id: number;
+  attachment_kind: string;
+  label: string | null;
+  original_file_name: string;
+  mime_type: string;
+  file_size_bytes: number | null;
+  // False for a PDF.
+  is_image: boolean;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface InsurancePolicy {
@@ -252,6 +270,8 @@ export interface InsurancePolicy {
   notes: string | null;
   covered_person_ids: number[];
   covered_vehicle_ids: number[];
+  // Files attached to the policy (insurance card, policy document, …).
+  attachment_count: number;
 }
 
 export interface FinancialAccount {

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Optional
+from typing import List, Optional
 
 from sqlalchemy import Date, ForeignKey, Integer, LargeBinary, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -136,3 +136,14 @@ class Vehicle(Base, TimestampMixin):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     family: Mapped["Family"] = relationship(back_populates="vehicles")  # noqa: F821
+    attachments: Mapped[List["VehicleAttachment"]] = relationship(  # noqa: F821
+        back_populates="vehicle",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="VehicleAttachment.vehicle_attachment_id",
+    )
+
+    @property
+    def attachment_count(self) -> int:
+        """How many files (title, registration, …) are attached."""
+        return len(self.attachments)

@@ -18,7 +18,7 @@ document is the human-friendly companion to that catalog.
 |---|---|---|
 | **Family core** | `families`, `assistants`, `people`, `person_relationships`, `person_photos`, `face_embeddings`, `goals` | Who lives in the household, how they relate, what they care about, and the face gallery used to recognise them on camera. |
 | **Health** | `medical_conditions`, `medications`, `physicians` | Per-person medical context Avi can fetch when relevant. |
-| **Household assets** | `pets`, `pet_photos`, `residences`, `residence_photos`, `addresses`, `vehicles`, `insurance_policies`, `insurance_policy_people`, `insurance_policy_vehicles`, `financial_accounts`, `documents` | Things the family owns or insures. |
+| **Household assets** | `pets`, `pet_photos`, `residences`, `residence_photos`, `addresses`, `vehicles`, `vehicle_attachments`, `insurance_policies`, `insurance_policy_people`, `insurance_policy_vehicles`, `insurance_policy_attachments`, `financial_accounts`, `documents` | Things the family owns or insures. |
 | **Identity (encrypted)** | `identity_documents`, `sensitive_identifiers` | Passports, SSNs, ITINs, etc. Stored as Fernet ciphertext + a plaintext last-four. |
 | **AI conversation surfaces** | `live_sessions`, `live_session_participants`, `live_session_messages` | One row per continuous interaction (live, sms, whatsapp, telegram, slack, email) and its transcript. |
 | **Inbox audit** | `email_inbox_messages`, `sms_inbox_messages` (incl. WhatsApp via the `channel` column), `sms_inbox_attachments`, `telegram_inbox_messages`, `telegram_inbox_attachments`, `slack_inbox_messages`, `slack_inbox_attachments` | One row per inbound message Avi inspected, with an explicit security verdict (`processed_replied`, `ignored_unknown_sender`, etc.). |
@@ -196,9 +196,11 @@ similar live in `sensitive_identifiers`.
 | `residences` (+ `residence_photos`) | Owned / rented / vacation / inherited. Linked to `addresses`. |
 | `addresses` | Generic postal address, referenced by residences and policies. |
 | `vehicles` | VIN + license plate are encrypted (`*_encrypted` + `*_last_four`). Includes registration expiration date Avi proactively surfaces. |
+| `vehicle_attachments` | Photos and PDFs filed on a vehicle. `attachment_kind` ∈ `title`, `registration`, `other`; optional `label`. The file is on disk at `stored_file_path`. |
 | `insurance_policies` | Carrier, plan, dates, premiums. `policy_number_encrypted` + `policy_number_last_four`. |
 | `insurance_policy_people` | M:N — which household members are covered by which policy. |
 | `insurance_policy_vehicles` | M:N — which vehicles are covered (auto / classic-auto policies). |
+| `insurance_policy_attachments` | Photos and PDFs filed on a policy. `attachment_kind` ∈ `insurance_card`, `policy_document`, `other`; optional `label`. |
 | `financial_accounts` | Bank / brokerage / retirement. `account_number_encrypted`, `routing_number_encrypted`, plus `*_last_four` for safe display. |
 | `documents` | Generic document store (PDFs, scans). Optional `person_id` link. |
 

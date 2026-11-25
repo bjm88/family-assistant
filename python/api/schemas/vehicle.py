@@ -80,3 +80,5 @@ class VehicleRead(OrmModel):
     current_mileage: Optional[int]
     profile_image_path: Optional[str]
     notes: Optional[str]
+    # Files attached to the vehicle (title, registration, …).
+    attachment_count: int = 0

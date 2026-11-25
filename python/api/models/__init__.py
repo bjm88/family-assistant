@@ -39,6 +39,12 @@ from .insurance_policy import (
     InsurancePolicyPerson,
     InsurancePolicyVehicle,
 )
+from .record_attachment import (
+    INSURANCE_POLICY_ATTACHMENT_KINDS,
+    VEHICLE_ATTACHMENT_KINDS,
+    InsurancePolicyAttachment,
+    VehicleAttachment,
+)
 from .financial_account import FinancialAccount
 from .document import Document
 from .pending_attachment import PendingAttachment
@@ -137,6 +143,10 @@ __all__ = [
     "InsurancePolicy",
     "InsurancePolicyPerson",
     "InsurancePolicyVehicle",
+    "InsurancePolicyAttachment",
+    "VehicleAttachment",
+    "INSURANCE_POLICY_ATTACHMENT_KINDS",
+    "VEHICLE_ATTACHMENT_KINDS",
     "FinancialAccount",
     "Document",
     "PendingAttachment",

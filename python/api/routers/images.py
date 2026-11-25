@@ -2,8 +2,8 @@
 
 One endpoint for every picture the admin UI shows: the scans on an
 identity document, an image saved as a document, a person's profile
-picture and extra photos, pet and residence photos, and a vehicle's
-picture.
+picture and extra photos, pet and residence photos, a vehicle's
+picture, and a photo attached to an insurance policy or a vehicle.
 
 ``POST /api/admin/images/rotate`` takes what the picture belongs to
 and how far to turn it clockwise (90, 180 or 270 degrees). The rotated
@@ -43,14 +43,16 @@ ImageKind = Literal[
     "pet_photo",
     "residence_photo",
     "vehicle_photo",
+    "insurance_policy_attachment",
+    "vehicle_attachment",
 ]
 
 
 class RotateImageRequest(BaseModel):
     kind: ImageKind
     # The id of the record the image belongs to: the identity document,
-    # document, person, person photo, pet photo, residence photo or
-    # vehicle.
+    # document, person, person photo, pet photo, residence photo,
+    # vehicle, or insurance-policy / vehicle attachment.
     record_id: int
     # Identity documents only: which scan.
     side: Optional[Literal["front", "back"]] = None
@@ -100,6 +102,19 @@ def _find(
     if req.kind == "residence_photo":
         row = db.get(models.ResidencePhoto, req.record_id)
         return _required(row, "Photo"), "stored_file_path", "file_size_bytes"
+    if req.kind in ("insurance_policy_attachment", "vehicle_attachment"):
+        model = (
+            models.InsurancePolicyAttachment
+            if req.kind == "insurance_policy_attachment"
+            else models.VehicleAttachment
+        )
+        row = _required(db.get(model, req.record_id), "Attachment")
+        if not row.is_image:
+            raise HTTPException(
+                status_code=400,
+                detail="Only attachments that are images can be rotated.",
+            )
+        return row, "stored_file_path", "file_size_bytes"
     row = db.get(models.Vehicle, req.record_id)
     return _required(row, "Vehicle"), "profile_image_path", None
 

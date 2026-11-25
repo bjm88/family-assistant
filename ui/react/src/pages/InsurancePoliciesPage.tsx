@@ -8,6 +8,7 @@ import type { InsurancePolicy, Person, Vehicle } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Modal } from "@/components/Modal";
+import { RecordAttachments } from "@/components/RecordAttachments";
 import { Field } from "@/components/Field";
 import { EncryptedField } from "@/components/EncryptedField";
 import { useToast } from "@/components/Toast";
@@ -31,6 +32,12 @@ const POLICY_TYPES = [
   "other",
 ];
 const BILLING = ["monthly", "quarterly", "semi_annual", "annual"];
+// What a file attached to a policy can be filed as.
+const POLICY_ATTACHMENT_KINDS = [
+  { value: "insurance_card", label: "Insurance card" },
+  { value: "policy_document", label: "Policy document" },
+  { value: "other", label: "Other" },
+];
 
 // Exhaustive named field list — see VehicleForm in VehiclesPage.tsx for
 // why every field has to be explicitly defaulted (so reset() truly
@@ -186,6 +193,10 @@ export default function InsurancePoliciesPage() {
                       <div className="text-xs text-muted-foreground">
                         Covers {p.covered_person_ids.length} people,{" "}
                         {p.covered_vehicle_ids.length} vehicles
+                        {p.attachment_count > 0 &&
+                          ` · ${p.attachment_count} ${
+                            p.attachment_count === 1 ? "file" : "files"
+                          }`}
                       </div>
                     </td>
                     <td>{p.carrier_name}</td>
@@ -557,6 +568,22 @@ function PolicyModal({
           </Field>
         </div>
       </form>
+
+      {mode === "edit" && policy ? (
+        <RecordAttachments
+          basePath={`/api/insurance-policies/${policy.insurance_policy_id}/attachments`}
+          heading="Photos and documents"
+          hint="Photos of the insurance card, and PDFs or photos of the policy."
+          kinds={POLICY_ATTACHMENT_KINDS}
+          rotateKind="insurance_policy_attachment"
+          onChanged={invalidate}
+        />
+      ) : (
+        <div className="mt-6 border-t border-border pt-4 text-xs text-muted-foreground">
+          Save the policy first, then open it again to add photos of the
+          insurance card and policy documents.
+        </div>
+      )}
     </Modal>
   );
 }

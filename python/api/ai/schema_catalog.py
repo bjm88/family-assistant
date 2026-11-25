@@ -63,6 +63,8 @@ ALLOWED_TABLES: frozenset[str] = frozenset(
         "insurance_policies",
         "insurance_policy_people",
         "insurance_policy_vehicles",
+        "insurance_policy_attachments",
+        "vehicle_attachments",
         "financial_accounts",
         "identity_documents",
         "sensitive_identifiers",

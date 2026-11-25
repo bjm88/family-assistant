@@ -131,6 +131,56 @@ def save_vehicle_profile_photo(
     return str(dest_path.relative_to(root)), size
 
 
+def _save_record_attachment(
+    dest_dir: Path, upload_file: BinaryIO, original_filename: str
+) -> Tuple[str, int]:
+    root = get_settings().storage_root
+    _ensure_dir(dest_dir)
+    filename = f"{uuid.uuid4().hex}{_ext_from_filename(original_filename)}"
+    dest_path = dest_dir / filename
+    with open(dest_path, "wb") as out:
+        shutil.copyfileobj(upload_file, out)
+    return str(dest_path.relative_to(root)), dest_path.stat().st_size
+
+
+def save_vehicle_attachment(
+    family_id: int,
+    vehicle_id: int,
+    upload_file: BinaryIO,
+    original_filename: str,
+) -> Tuple[str, int]:
+    """Persist a vehicle's paperwork (title, registration, …).
+
+    Files land in ``family_<id>/vehicles/vehicle_<id>/documents/``.
+    Returns ``(relative_path, size)``.
+    """
+    root = get_settings().storage_root
+    return _save_record_attachment(
+        root / f"family_{family_id}" / "vehicles" / f"vehicle_{vehicle_id}" / "documents",
+        upload_file,
+        original_filename,
+    )
+
+
+def save_insurance_policy_attachment(
+    family_id: int,
+    insurance_policy_id: int,
+    upload_file: BinaryIO,
+    original_filename: str,
+) -> Tuple[str, int]:
+    """Persist a file attached to an insurance policy (card, policy document, …).
+
+    Files land in ``family_<id>/insurance/policy_<id>/``. Returns
+    ``(relative_path, size)``.
+    """
+    root = get_settings().storage_root
+    return _save_record_attachment(
+        root / f"family_{family_id}" / "insurance" / f"policy_{insurance_policy_id}",
+        upload_file,
+        original_filename,
+    )
+
+
 def save_residence_photo(
     family_id: int,
     residence_id: int,

@@ -104,6 +104,8 @@ def delete_vehicle(vehicle_id: int, db: Session = Depends(get_db)) -> None:
     if v is None:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     storage.delete_if_exists(v.profile_image_path)
+    for attachment in v.attachments:
+        storage.delete_if_exists(attachment.stored_file_path)
     db.delete(v)
 
 

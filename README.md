@@ -208,7 +208,8 @@ A scan or phone photo that was saved sideways can be turned in the
 admin console. Every stored picture has a **Rotate** control: the front
 and back of an identity document, a document that is an image, a
 person's profile picture and extra photos, pet and residence photos,
-and a vehicle's picture. It opens a dialog with *Rotate left* and
+a vehicle's picture, and any photo attached to a vehicle or an
+insurance policy. It opens a dialog with *Rotate left* and
 *Rotate right*, a quarter turn each; nothing is stored until **Save**.
 
 Save calls `POST /api/admin/images/rotate` (admins only) with what the
@@ -225,6 +226,35 @@ path means no browser keeps showing the old picture.
   are refused with a message, and left untouched.
 - A person photo used for face recognition has its face data
   recomputed from the turned picture.
+
+### Photos and PDFs on vehicles and insurance policies
+
+A vehicle and an insurance policy can each carry any number of files:
+photos or PDFs. Open the record for editing in the admin console.
+
+- **Vehicles → edit a vehicle → Title and paperwork.** Each file is
+  filed as *Title*, *Registration* or *Other*.
+- **Insurance → edit a policy → Photos and documents.** Each file is
+  filed as *Insurance card*, *Policy document* or *Other*.
+
+Pick the kind, type an optional label ("Front", "2026 renewal"), and
+choose one or more files. Each file shows as a card: click it to open
+it in a new tab, change its kind from the menu on the card, turn a
+sideways photo with **Rotate**, or **Remove** it. Files are saved
+straight away; they don't wait for *Save changes*. A record has to be
+saved once before files can be added to it.
+
+- Admins only (`/api/admin/vehicles/{id}/attachments` and
+  `/api/admin/insurance-policies/{id}/attachments`). A title or an
+  insurance card shows the numbers the database otherwise encrypts.
+- Photos (JPEG, PNG, HEIC, WebP, GIF, TIFF) and PDFs are accepted. The
+  server decides by the file's contents, not its name. HEIC photos are
+  stored but only preview in Safari and can't be rotated.
+- Files live under `resources/family_<id>/vehicles/vehicle_<id>/documents/`
+  and `resources/family_<id>/insurance/policy_<id>/`. Removing a file,
+  or deleting the vehicle or policy, deletes them from disk.
+- Avi can see in the database that these files exist (kind, label,
+  file name) but can't yet open them or send them in a message.
 
 ### Request flow — "Avi, say hi to whoever walks in"
 
@@ -984,8 +1014,9 @@ Tables today, grouped by domain:
   `person_relationships`, `person_photos`, `face_embeddings`, `goals`.
 - **Health** — `medical_conditions`, `medications`, `physicians`.
 - **Household assets** — `pets`, `pet_photos`, `residences`,
-  `residence_photos`, `addresses`, `vehicles`, `insurance_policies`,
-  `insurance_policy_people`, `insurance_policy_vehicles`,
+  `residence_photos`, `addresses`, `vehicles`, `vehicle_attachments`,
+  `insurance_policies`, `insurance_policy_people`,
+  `insurance_policy_vehicles`, `insurance_policy_attachments`,
   `financial_accounts`, `documents`.
 - **Identity (encrypted)** — `identity_documents`,
   `sensitive_identifiers`.
@@ -1041,6 +1072,7 @@ family-assistant/
 │   │   ├── goals · medical_conditions · medications · physicians
 │   │   ├── pets · pet_photos · residences · residence_photos · addresses
 │   │   ├── vehicles · insurance_policies · financial_accounts · documents
+│   │   ├── record_attachments     (photos + PDFs on vehicles and policies)
 │   │   ├── identity_documents · sensitive_identifiers · assistants
 │   │   ├── tasks · google · contacts · status · legal · media
 │   │   ├── ai_chat · ai_face · ai_tts · live_sessions · agent_tasks

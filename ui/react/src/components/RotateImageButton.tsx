@@ -13,12 +13,15 @@ export type RotatableImageKind =
   | "person_photo"
   | "pet_photo"
   | "residence_photo"
-  | "vehicle_photo";
+  | "vehicle_photo"
+  | "insurance_policy_attachment"
+  | "vehicle_attachment";
 
 interface RotateImageButtonProps {
   kind: RotatableImageKind;
   // The record the image belongs to: the identity document, document,
-  // person, person photo, pet photo, residence photo or vehicle.
+  // person, person photo, pet photo, residence photo, vehicle, or
+  // insurance-policy / vehicle attachment.
   recordId: number;
   // Identity documents only: which scan.
   side?: "front" | "back";

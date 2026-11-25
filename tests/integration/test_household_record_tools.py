@@ -120,6 +120,7 @@ _DELIBERATELY_NOT_EDITABLE = {
     "AssistantUpdate",  # Avi's own persona / voice — an admin setting
     "PetPhotoUpdate",  # photo files, managed in the console
     "ResidencePhotoUpdate",
+    "RecordAttachmentUpdate",  # files on a vehicle / policy, managed in the console
     "AddressUpdate",  # legacy table with no API; residences carry the address
 }
 

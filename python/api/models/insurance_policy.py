@@ -89,6 +89,12 @@ class InsurancePolicy(Base, TimestampMixin):
     covered_vehicles: Mapped[List["InsurancePolicyVehicle"]] = relationship(
         back_populates="insurance_policy", cascade="all, delete-orphan"
     )
+    attachments: Mapped[List["InsurancePolicyAttachment"]] = relationship(  # noqa: F821
+        back_populates="insurance_policy",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="InsurancePolicyAttachment.insurance_policy_attachment_id",
+    )
 
 
 class InsurancePolicyPerson(Base):

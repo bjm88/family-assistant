@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import crypto, models, schemas
+from .. import crypto, models, schemas, storage
 from ..auth import require_admin
 from ..db import get_db
 
@@ -37,6 +37,7 @@ def _to_read(policy: models.InsurancePolicy) -> schemas.InsurancePolicyRead:
         notes=policy.notes,
         covered_person_ids=[cp.person_id for cp in policy.covered_people],
         covered_vehicle_ids=[cv.vehicle_id for cv in policy.covered_vehicles],
+        attachment_count=len(policy.attachments),
     )
 
 
@@ -137,4 +138,6 @@ def delete_insurance_policy(insurance_policy_id: int, db: Session = Depends(get_
     policy = db.get(models.InsurancePolicy, insurance_policy_id)
     if policy is None:
         raise HTTPException(status_code=404, detail="Insurance policy not found")
+    for attachment in policy.attachments:
+        storage.delete_if_exists(attachment.stored_file_path)
     db.delete(policy)

@@ -70,3 +70,5 @@ class InsurancePolicyRead(OrmModel):
     notes: Optional[str]
     covered_person_ids: List[int] = Field(default_factory=list)
     covered_vehicle_ids: List[int] = Field(default_factory=list)
+    # Files attached to the policy (insurance card, policy document, …).
+    attachment_count: int = 0

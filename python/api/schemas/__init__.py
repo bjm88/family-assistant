@@ -55,6 +55,7 @@ from .sensitive_identifier import (
     SensitiveIdentifierRead,
 )
 from .vehicle import VehicleCreate, VehicleUpdate, VehicleRead
+from .record_attachment import RecordAttachmentRead, RecordAttachmentUpdate
 from .insurance_policy import (
     InsurancePolicyCreate,
     InsurancePolicyUpdate,
@@ -162,6 +163,8 @@ __all__ = [
     "VehicleCreate",
     "VehicleUpdate",
     "VehicleRead",
+    "RecordAttachmentRead",
+    "RecordAttachmentUpdate",
     "InsurancePolicyCreate",
     "InsurancePolicyUpdate",
     "InsurancePolicyRead",
