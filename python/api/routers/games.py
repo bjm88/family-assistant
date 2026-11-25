@@ -21,6 +21,16 @@ Two kinds of caller, two kinds of auth:
   The socket carries everything a player does (``join``, ``start``,
   ``move``, ``play_again``, ``end``; ``ping`` to keep the line open)
   and pushes the whole game back to every player after each change.
+
+* **Guests** hold the game's shareable link, ``/play/join/<token>``,
+  which the host copies and passes on. It isn't tied to a person: the
+  guest types their name, and joining gives them a seat and a join
+  link of their own, after which they are a player like any other.
+
+  - ``GET  /api/games/join/{invite_token}``  who is playing, before joining
+  - ``POST /api/games/join/{invite_token}``  join with a name and a turkey
+
+When the AI has a seat, :mod:`api.games.ai_turns` plays its turns.
 """
 
 from __future__ import annotations
@@ -50,7 +60,7 @@ from starlette.concurrency import run_in_threadpool
 from .. import models, schemas
 from ..auth import CurrentUser, require_family_member, require_user
 from ..db import get_db, session_scope
-from ..games import invites, service
+from ..games import ai_turns, invites, service
 from ..games.catalog import GAME_TYPES
 from ..games.hub import hub
 
@@ -126,6 +136,7 @@ def games_overview(
                 "tagline": g.tagline,
                 "min_players": g.min_players,
                 "max_players": g.max_players,
+                "can_play_ai": g.ai is not None,
             }
             for g in GAME_TYPES.values()
         ],
@@ -145,6 +156,9 @@ def games_overview(
             for g in service.list_games(db, family_id)
         ],
         "leaderboard": service.leaderboard(db, family_id),
+        "ai_name": service.ai_name(db.get(models.Family, family_id)),
+        "ai_levels": list(models.GAME_AI_LEVELS),
+        "ai_default_level": models.GAME_AI_DEFAULT_LEVEL,
     }
 
 
@@ -196,6 +210,8 @@ async def start_game(
                 host_person_id=host_id,
                 invite_person_ids=payload.invite_person_ids,
                 send_invites=payload.send_invites,
+                vs_ai=payload.vs_ai,
+                ai_level=payload.ai_level,
             )
             summary = service.game_summary(
                 game, viewer_person_id=host_id, viewer_is_admin=user.is_admin
@@ -303,6 +319,60 @@ def play_view(
     )
 
 
+@router.get("/join/{invite_token}")
+def guest_view(
+    invite_token: str, response: Response, db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """The game behind a shareable link, for someone who hasn't joined yet."""
+    game = service.find_game_by_invite(db, invite_token)
+    if game is None:
+        raise HTTPException(status_code=404, detail="This link isn't valid.")
+    if service.is_expired(game):
+        raise HTTPException(status_code=410, detail="This game has ended.")
+    response.headers["Cache-Control"] = "no-store"
+    return service.view_for_guest(
+        game, connected=hub.connected_player_ids(game.game_id)
+    )
+
+
+@router.post("/join/{invite_token}", status_code=status.HTTP_201_CREATED)
+async def guest_join(
+    invite_token: str, payload: schemas.GameGuestJoin, response: Response
+) -> Dict[str, Any]:
+    """Join through the shareable link. Returns the guest's own play link."""
+
+    def game_id_of() -> int:
+        with session_scope() as db:
+            game = service.find_game_by_invite(db, invite_token)
+            if game is None:
+                raise service.GameError("This link isn't valid.", status_code=404)
+            return game.game_id
+
+    def work() -> Dict[str, Any]:
+        with session_scope() as db:
+            player = service.join_as_guest(
+                db,
+                invite_token,
+                name=payload.name,
+                style=payload.style,
+                color=payload.color,
+            )
+            return {
+                "play_path": service.play_path(player.join_token),
+                "player_id": player.game_player_id,
+                "name": service.seat_name(player),
+            }
+
+    game_id = await _in_thread(game_id_of)
+    try:
+        # Through the hub, so the people already in the lobby see them arrive.
+        seat = await hub.run(game_id, work)
+    except service.GameError as exc:
+        raise _http_error(exc) from exc
+    response.headers["Cache-Control"] = "no-store"
+    return seat
+
+
 def _seat(token: str) -> Optional[Tuple[int, int]]:
     """``(game_id, player_id)`` for a usable token, else ``None``."""
     with session_scope() as db:
@@ -312,9 +382,11 @@ def _seat(token: str) -> Optional[Tuple[int, int]]:
         return player.game_id, player.game_player_id
 
 
-def _apply(token: str, action: Dict[str, Any]) -> None:
+def _apply(token: str, action: Dict[str, Any]) -> bool:
+    """Carry out a player's action. Returns whether the AI is now up."""
     with session_scope() as db:
-        service.apply_action(db, token, action)
+        game = service.apply_action(db, token, action)
+        return service.ai_to_move(game) is not None
 
 
 async def _receive_action(websocket: WebSocket) -> Optional[Dict[str, Any]]:
@@ -346,6 +418,9 @@ async def play_socket(websocket: WebSocket, token: str) -> None:
     try:
         # Sends this player the game, and shows the others they're here.
         await hub.run(game_id)
+        # If the server restarted while the AI was thinking, this is
+        # what gets it going again.
+        ai_turns.nudge(game_id)
         while True:
             action = await _receive_action(websocket)
             if action is None:
@@ -372,7 +447,8 @@ async def _act(
     websocket: WebSocket, game_id: int, token: str, action: Dict[str, Any]
 ) -> None:
     try:
-        await hub.run(game_id, partial(_apply, token, action))
+        if await hub.run(game_id, partial(_apply, token, action)):
+            ai_turns.nudge(game_id)
     except service.GameError as exc:
         await websocket.send_json({"type": "error", "message": str(exc)})
     except Exception:  # noqa: BLE001 - one bad action must not drop the player

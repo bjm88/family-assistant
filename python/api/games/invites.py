@@ -104,6 +104,8 @@ def _prepare(player_id: int) -> Optional[_Invite]:
             player is None
             or player.invite_status != "pending"
             or player.joined_at is not None
+            # Guests and the AI have no phone number or email on file.
+            or player.person is None
         ):
             return None
         game = player.game

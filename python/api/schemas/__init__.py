@@ -105,7 +105,7 @@ from .live_session import (
     LiveSessionParticipantRead,
     LiveSessionRead,
 )
-from .game import GameCreate, GameInvite
+from .game import GameCreate, GameGuestJoin, GameInvite
 
 __all__ = [
     "FamilyCreate",
@@ -207,5 +207,6 @@ __all__ = [
     "EnsureActiveSessionRequest",
     "EndSessionRequest",
     "GameCreate",
+    "GameGuestJoin",
     "GameInvite",
 ]

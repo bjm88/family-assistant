@@ -8,6 +8,7 @@ integration family.
 
 from __future__ import annotations
 
+import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -23,7 +24,7 @@ from api.ai.schema_catalog import ALLOWED_TABLES
 from api.auth import ROLE_ADMIN, ROLE_MEMBER, sign_session, verify_session
 from api.config import get_settings
 from api.db import SessionLocal
-from api.games import invites, service
+from api.games import ai_turns, invites, service, turkey_ai
 from api.games import turkey_tictactoe as ttt
 from api.games.hub import hub
 from api.routers import games as games_router
@@ -166,7 +167,7 @@ def players():
         yield tc
 
 
-def _start(client, hh, invite, *, host=None, send_invites=True) -> Dict[str, Any]:
+def _start(client, hh, invite, *, host=None, send_invites=True, **more) -> Dict[str, Any]:
     resp = client.post(
         "/api/games",
         json={
@@ -175,6 +176,7 @@ def _start(client, hh, invite, *, host=None, send_invites=True) -> Dict[str, Any
             "host_person_id": (host or hh.ben).person_id,
             "invite_person_ids": [p.person_id for p in invite],
             "send_invites": send_invites,
+            **more,
         },
     )
     assert resp.status_code == 201, resp.text
@@ -506,9 +508,13 @@ def test_starting_a_game_validates_who_is_invited(client, household):
     # Someone from another household.
     resp = start(invite_person_ids=[hh.stranger.person_id])
     assert resp.status_code == 400 and "your family" in resp.json()["detail"]
-    # Inviting only yourself.
-    resp = start(invite_person_ids=[hh.ben.person_id])
-    assert resp.status_code == 400 and "at least one" in resp.json()["detail"]
+    # Too many once the AI's seat is counted.
+    resp = start(
+        invite_person_ids=[p.person_id for p in (hh.katie, hh.max, hh.lily)],
+        vs_ai=True,
+    )
+    assert resp.status_code == 400 and "up to 4 players" in resp.json()["detail"]
+    assert start(vs_ai=True, ai_level="grandmaster").status_code == 422
     # Five players in a four-player game.
     resp = start(
         invite_person_ids=[p.person_id for p in (hh.katie, hh.max, hh.lily, hh.omar)]
@@ -516,7 +522,16 @@ def test_starting_a_game_validates_who_is_invited(client, household):
     assert resp.status_code == 400 and "up to 4 players" in resp.json()["detail"]
     assert start(game_type="chess").status_code == 404
     assert start(host_person_id=hh.stranger.person_id).status_code == 400
-    assert start(invite_person_ids=[]).status_code == 422
+
+
+def test_a_game_can_be_started_without_inviting_anyone(client, household, outbox):
+    # The host passes the shareable link around instead (or plays the AI).
+    hh = household
+    for nobody in ([], [hh.ben.person_id]):  # inviting yourself invites no one
+        game = _start(client, hh, [], invite_person_ids=nobody)
+        assert [p["name"] for p in game["players"]] == ["Ben"]
+        assert game["invite_url"].startswith("https://family.example/play/join/")
+    assert outbox.email == [] and outbox.sms == []
 
 
 def test_host_can_invite_more_until_the_game_is_full(app, client, household, outbox):
@@ -743,8 +758,8 @@ def test_two_players_join_play_win_rematch_and_end(client, household, players, d
     overview = client.get(f"/api/games?family_id={hh.family_id}").json()
     assert overview["leaderboard"] == {
         "turkey_tictactoe": [
-            {"person_id": hh.ben.person_id, "name": "Ben", "wins": 1, "games": 1},
-            {"person_id": hh.katie.person_id, "name": "Katie", "wins": 0, "games": 1},
+            {"person_id": hh.ben.person_id, "kind": "family", "name": "Ben", "wins": 1, "games": 1},
+            {"person_id": hh.katie.person_id, "kind": "family", "name": "Katie", "wins": 0, "games": 1},
         ]
     }
     listed = overview["games"][0]
@@ -853,3 +868,394 @@ def test_ending_a_game_from_the_games_page_reaches_connected_players(
         )
         assert resp.status_code == 200, resp.text
         assert _state(katie)["status"] == "ended"
+
+
+# ---------------------------------------------------------------------------
+# The shareable invite link: anyone who has it joins as a guest, by name
+# ---------------------------------------------------------------------------
+
+
+def _invite_token(game: Dict[str, Any]) -> str:
+    return game["invite_url"].rsplit("/", 1)[1]
+
+
+def _guest_join(tc, invite: str, name: str, style: str = "girl", color: str = "pink"):
+    return tc.post(
+        f"/api/games/join/{invite}",
+        json={"name": name, "style": style, "color": color},
+    )
+
+
+def test_the_shareable_link_shows_the_game_without_signing_in_or_leaking_links(
+    app, client, household
+):
+    hh = household
+    game = _start(client, hh, [hh.katie], send_invites=False)
+    invite = _invite_token(game)
+    assert game["invite_url"] == f"https://family.example/play/join/{invite}"
+    assert len(invite) >= 32 and invite not in {_token(game, hh.ben), _token(game, hh.katie)}
+
+    anonymous = TestClient(app)
+    resp = anonymous.get(f"/api/games/join/{invite}")
+    assert resp.status_code == 200, resp.text
+    view = resp.json()
+    assert view["you"] is None
+    assert view["invited_by"] == "Ben" and view["game_name"] == "Turkey TicTacToe"
+    assert view["is_full"] is False
+    assert [(p["name"], p["joined"]) for p in view["players"]] == [
+        ("Ben", False),
+        ("Katie", False),
+    ]
+    for secret in (invite, _token(game, hh.ben), _token(game, hh.katie)):
+        assert secret not in resp.text
+
+    assert anonymous.get("/api/games/join/not-a-real-link").status_code == 404
+    assert _guest_join(anonymous, "not-a-real-link", "Rose").status_code == 404
+    # A player's own link is not a shareable link, and the other way round.
+    assert anonymous.get(f"/api/games/join/{_token(game, hh.katie)}").status_code == 404
+    assert anonymous.get(f"/api/games/play/{invite}").status_code == 404
+
+    # Only the host (and admins) are shown the link to pass on.
+    host_view = anonymous.get(f"/api/games/play/{_token(game, hh.ben)}").json()
+    assert host_view["invite_url"] == game["invite_url"]
+    assert "invite_url" not in anonymous.get(f"/api/games/play/{_token(game, hh.katie)}").json()
+    katie = _member_client(app, hh.katie)
+    listed = katie.get(f"/api/games?family_id={hh.family_id}").json()["games"][0]
+    assert listed["invite_url"] is None
+
+
+def test_a_guest_types_their_name_joins_and_plays(client, household, players):
+    hh = household
+    game = _start(client, hh, [hh.katie], send_invites=False)
+    invite = _invite_token(game)
+    url = "/api/games/play/{}/ws".format
+    with players.websocket_connect(url(_token(game, hh.ben))) as ben:
+        _state(ben)
+        _act(ben, {"type": "join", "style": "strong", "color": "red"}, [ben])
+
+        # Things a guest can get wrong. None of them reaches the lobby.
+        for name, style, color, problem in [
+            ("   ", "girl", "pink", "Tell us your name"),
+            ("x" * 25, "girl", "pink", "a bit long"),
+            ("BEN", "girl", "pink", "already a Ben in this game"),
+            ("Rose", "girl", "red", "Ben already has that colour"),
+            ("Rose", "dragon", "pink", "Pick a turkey"),
+        ]:
+            resp = _guest_join(players, invite, name, style, color)
+            assert resp.status_code == 400, resp.text
+            assert problem in resp.json()["detail"]
+
+        resp = _guest_join(players, invite, "  Grandma   Rose ")
+        assert resp.status_code == 201, resp.text
+        seat = resp.json()
+        assert seat["name"] == "Grandma Rose"
+        token = seat["play_path"].rsplit("/", 1)[1]
+        assert seat["play_path"] == f"/play/{token}" and token != invite
+
+        # Ben's lobby shows her arrive, already holding her turkey.
+        state = _state(ben)
+        assert [(p["name"], p["kind"], p["joined"]) for p in state["players"]] == [
+            ("Ben", "family", True),
+            ("Katie", "family", False),
+            ("Grandma Rose", "guest", True),
+        ]
+        assert state["players"][2]["avatar_color"] == "pink"
+        assert state["can_start"] is True
+        # She is in, so she is not someone the host still has to chase.
+        assert [i["name"] for i in state["invites"]] == ["Katie"]
+
+        # Her own link works like any player's from here on.
+        with players.websocket_connect(url(token)) as rose:
+            both = [ben, rose]
+            mine = _state(rose)
+            _state(ben)
+            assert mine["you"] == {
+                "player_id": seat["player_id"],
+                "name": "Grandma Rose",
+                "is_host": False,
+                "joined": True,
+            }
+            assert "invite_url" not in mine and "invites" not in mine
+
+            state = _act(rose, {"type": "start"}, both)
+            ben_id, rose_id = state["board"]["turn_order"]
+            assert rose_id == seat["player_id"]
+            # Rose wins down the right-hand edge.
+            for row in range(3):
+                _act(ben, {"type": "move", "cell": _cell(row, 0)}, both)
+                _act(rose, {"type": "move", "cell": _cell(row, 4)}, both)
+            _act(ben, {"type": "move", "cell": _cell(9, 2)}, both)
+            state = _act(rose, {"type": "move", "cell": _cell(3, 4)}, both)
+            assert state["board"]["winner_player_id"] == rose_id
+            assert [p["wins"] for p in state["players"]] == [0, 0, 1]
+
+    # Guests are in the hall of fame under the name they played as.
+    board = client.get(f"/api/games?family_id={hh.family_id}").json()["leaderboard"]
+    assert board["turkey_tictactoe"] == [
+        {"person_id": None, "kind": "guest", "name": "Grandma Rose", "wins": 1, "games": 1},
+        {"person_id": hh.ben.person_id, "kind": "family", "name": "Ben", "wins": 0, "games": 1},
+    ]
+
+
+def test_the_shareable_link_stops_working_when_the_game_is_full_or_over(
+    client, household, players
+):
+    hh = household
+    game = _start(client, hh, [hh.katie], send_invites=False)
+    invite = _invite_token(game)
+    for name, color in [("Ann", "red"), ("Bob", "blue"), ("Cy", "green"), ("Di", "gold")]:
+        assert _guest_join(players, invite, name, color=color).status_code == 201
+    assert players.get(f"/api/games/join/{invite}").json()["is_full"] is True
+    resp = _guest_join(players, invite, "Ed", color="teal")
+    assert resp.status_code == 400 and "full" in resp.json()["detail"]
+    # Seats go to whoever joins first, so Katie's own link is too late as well.
+    with players.websocket_connect(
+        f"/api/games/play/{_token(game, hh.katie)}/ws"
+    ) as katie:
+        _state(katie)
+        assert "full" in _error(katie, {"type": "join", "style": "girl", "color": "teal"})
+
+    resp = players.post(f"/api/games/{game['game_id']}/end", headers=_admin_cookie())
+    assert resp.status_code == 200 and resp.json()["invite_url"] is None
+    assert players.get(f"/api/games/join/{invite}").json()["status"] == "ended"
+    resp = _guest_join(players, invite, "Flo", color="teal")
+    assert resp.status_code == 410 and resp.json()["detail"] == "This game has ended."
+
+
+# ---------------------------------------------------------------------------
+# How the AI chooses its square
+# ---------------------------------------------------------------------------
+
+
+def _board(mine=(), theirs=()) -> Dict[str, Any]:
+    """A two-player board where the AI is player 1 and it is its turn."""
+    state = ttt.new_round([1, 2], round_number=1)
+    cells = list(state["cells"])
+    for cell in mine:
+        cells[cell] = 1
+    for cell in theirs:
+        cells[cell] = 2
+    return {**state, "cells": cells}
+
+
+def _choices(state, level: str, tries: int = 300) -> List[int]:
+    return [
+        turkey_ai.choose_move(state, 1, level=level, rng=random.Random(seed))
+        for seed in range(tries)
+    ]
+
+
+@pytest.mark.parametrize("level", ["easy", "medium", "hard", None, "no-such-level"])
+def test_the_ai_only_ever_plays_an_empty_square(level):
+    rng = random.Random(11)
+    state = ttt.new_round([1, 2, 3], round_number=1)
+    while not ttt.is_over(state):
+        mover = ttt.current_player_id(state)
+        cell = turkey_ai.choose_move(state, mover, level=level, rng=rng)
+        assert state["cells"][cell] is None
+        state = ttt.play(state, mover, cell)
+    with pytest.raises(ttt.RuleError):
+        turkey_ai.choose_move({**state, "cells": [1] * 50}, 1)
+
+
+@pytest.mark.parametrize("level", ["medium", "hard"])
+def test_the_ai_takes_its_own_win_rather_than_blocking(level):
+    state = _board(
+        mine=[_cell(r, 1) for r in (2, 3, 4)],
+        theirs=[_cell(8, c) for c in (0, 1, 2)],
+    )
+    assert set(_choices(state, level)) == {_cell(1, 1), _cell(5, 1)}
+
+
+def _share(state, level: str, squares) -> float:
+    """How often the AI at ``level`` plays one of ``squares`` on this board."""
+    picks = _choices(state, level)
+    return sum(pick in squares for pick in picks) / len(picks)
+
+
+def test_the_ai_blocks_three_in_a_row_and_medium_sometimes_misses_it():
+    across = _board(theirs=[_cell(3, c) for c in (0, 1, 2)])
+    slanted = _board(theirs=[_cell(2 + i, i) for i in range(3)])
+    assert _share(across, "hard", {_cell(3, 3)}) == 1
+    assert _share(slanted, "hard", {_cell(5, 3)}) == 1
+    # Three with both ends open can't be stopped, but it still tries.
+    open_ended = _board(theirs=[_cell(2, 1), _cell(3, 2), _cell(4, 3)])
+    assert _share(open_ended, "hard", {_cell(1, 0), _cell(5, 4)}) == 1
+
+    # Medium: nearly always, not always — and diagonals slip past more often.
+    straight = _share(across, "medium", {_cell(3, 3)})
+    diagonal = _share(slanted, "medium", {_cell(5, 3)})
+    assert 0.86 <= straight <= 0.98
+    assert 0.65 <= diagonal < straight
+    assert _share(across, "easy", {_cell(3, 3)}) < straight
+
+
+def test_the_ai_sets_up_two_ways_to_win_and_stops_an_opponent_doing_the_same():
+    # Two in a column with room at both ends: a third makes two ways to win.
+    pair = [_cell(4, 2), _cell(5, 2)]
+    either_end = {_cell(3, 2), _cell(6, 2)}
+    assert _share(_board(mine=pair), "hard", either_end) == 1
+    assert _share(_board(theirs=pair), "hard", either_end) == 1
+    # Medium lets a pair grow now and then; that is how you beat it.
+    assert 0.6 <= _share(_board(theirs=pair), "medium", either_end) <= 0.92
+    assert _share(_board(theirs=pair), "easy", either_end) < 0.5
+
+
+def _ai_match(first: str, second: str, games: int = 200) -> float:
+    """Share of ``games`` the ``first`` level wins; who opens alternates."""
+    rng = random.Random(2026)
+    wins = 0
+    for number in range(games):
+        state = ttt.new_round([1, 2], round_number=number + 1)
+        while not ttt.is_over(state):
+            mover = ttt.current_player_id(state)
+            level = first if mover == 1 else second
+            state = ttt.play(
+                state, mover, turkey_ai.choose_move(state, mover, level=level, rng=rng)
+            )
+        wins += state["winner_player_id"] == 1
+    return wins / games
+
+
+def test_each_level_plays_better_than_the_one_below():
+    assert _ai_match("medium", "easy") > 0.55
+    assert _ai_match("hard", "medium") > 0.55
+    assert _ai_match("hard", "easy") > 0.6
+
+
+# ---------------------------------------------------------------------------
+# Playing against the AI
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def quick_ai(monkeypatch):
+    """The AI answers at once and, being seeded, the same way every run."""
+    monkeypatch.setattr(ai_turns, "THINK_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr(turkey_ai, "random", random.Random(5))
+
+
+def test_the_ai_takes_a_seat_plays_its_turns_and_its_wins_count(
+    client, household, players, db, quick_ai
+):
+    hh = household
+    game = _start(client, hh, [], vs_ai=True, ai_level="hard")
+    assert [(p["name"], p["kind"], p["joined"]) for p in game["players"]] == [
+        ("Ben", "family", False),
+        ("Avi AI", "ai", True),
+    ]
+    seat = game["players"][1]
+    assert seat["avatar_style"] and seat["avatar_color"]
+    # Nobody is given a link to play as the AI, and its token opens nothing.
+    assert seat["play_url"] is None and seat["person_id"] is None
+    row = db.query(models.GamePlayer).filter_by(game_id=game["game_id"], person_id=None).one()
+    assert row.ai_level == "hard"
+    assert players.get(f"/api/games/play/{row.join_token}").status_code == 404
+    with pytest.raises(WebSocketDisconnect):
+        with players.websocket_connect(f"/api/games/play/{row.join_token}/ws"):
+            pass
+
+    with players.websocket_connect(
+        f"/api/games/play/{_token(game, hh.ben)}/ws"
+    ) as ben:
+        me = [ben]
+        state = _state(ben)
+        avi = state["players"][1]
+        assert avi["connected"] is True and state["can_start"] is False
+
+        # Ben wants the shirt the AI is wearing; the AI changes.
+        state = _act(ben, {"type": "join", "style": "happy", "color": avi["avatar_color"]}, me)
+        assert state["players"][0]["avatar_color"] == avi["avatar_color"]
+        assert state["players"][1]["avatar_color"] not in (None, avi["avatar_color"])
+        assert state["can_start"] is True  # no need to wait for anyone
+
+        state = _act(ben, {"type": "start"}, me)
+        ben_id, avi_id = state["board"]["turn_order"]
+        assert avi_id == avi["player_id"]
+        assert state["board"]["turn_player_id"] == ben_id  # a person opens
+
+        # Ben plays; the AI answers by itself.
+        state = _act(ben, {"type": "move", "cell": _cell(9, 4)}, me)
+        assert state["board"]["turn_player_id"] == avi_id
+        state = _state(ben)
+        assert state["board"]["cells"].count(avi_id) == 1
+        assert state["board"]["turn_player_id"] == ben_id
+
+        # Ben wanders around the edges; the AI gets four in a row.
+        edges = [_cell(0, 0), _cell(0, 4), _cell(9, 0), _cell(9, 2), _cell(0, 2),
+                 _cell(5, 0), _cell(5, 4), _cell(4, 0), _cell(4, 4), _cell(1, 4)]
+        while state["status"] == "playing":
+            cell = next(c for c in edges if state["board"]["cells"][c] is None)
+            state = _act(ben, {"type": "move", "cell": cell}, me)
+            if state["status"] == "playing":
+                state = _state(ben)
+        board = state["board"]
+        assert state["status"] == "round_over"
+        assert board["winner_player_id"] == avi_id
+        assert len(board["winning_cells"]) >= 4
+        assert all(board["cells"][c] == avi_id for c in board["winning_cells"])
+        assert [p["wins"] for p in state["players"]] == [0, 1]
+
+        # Rematch: it's the AI's turn to open, and it does.
+        state = _act(ben, {"type": "play_again"}, me)
+        assert state["board"]["turn_player_id"] == avi_id
+        state = _state(ben)
+        assert state["board"]["cells"].count(avi_id) == 1
+        assert state["board"]["turn_player_id"] == ben_id
+        _act(ben, {"type": "end"}, me)
+
+    board = client.get(f"/api/games?family_id={hh.family_id}").json()["leaderboard"]
+    assert board["turkey_tictactoe"] == [
+        {"person_id": None, "kind": "ai", "name": "Avi AI", "wins": 1, "games": 1},
+        {"person_id": hh.ben.person_id, "kind": "family", "name": "Ben", "wins": 0, "games": 1},
+    ]
+
+
+def test_the_ai_picks_its_turn_back_up_when_a_player_reconnects(
+    client, household, players, quick_ai
+):
+    # As after a restart: the game was left on the AI's turn with nothing
+    # running to play it.
+    hh = household
+    game = _start(client, hh, [], vs_ai=True)
+    token = _token(game, hh.ben)
+    with SessionLocal() as s:
+        for action in (
+            {"type": "join", "style": "beer", "color": "teal"},
+            {"type": "start"},
+            {"type": "move", "cell": _cell(4, 2)},
+        ):
+            service.apply_action(s, token, action)
+        s.commit()
+
+    with players.websocket_connect(f"/api/games/play/{token}/ws") as ben:
+        state = _state(ben)
+        ben_id, avi_id = state["board"]["turn_order"]
+        assert state["board"]["turn_player_id"] == avi_id
+        state = _state(ben)
+        assert state["board"]["cells"].count(avi_id) == 1
+        assert state["board"]["turn_player_id"] == ben_id
+
+
+def test_the_ai_plays_alongside_people_and_guests(client, household, players, quick_ai):
+    hh = household
+    game = _start(client, hh, [hh.katie], send_invites=False, vs_ai=True)
+    url = "/api/games/play/{}/ws".format
+    with players.websocket_connect(url(_token(game, hh.ben))) as ben, players.websocket_connect(
+        url(_token(game, hh.katie))
+    ) as katie:
+        both = [ben, katie]
+        _state(ben), _state(ben), _state(katie)
+        _act(ben, {"type": "join", "style": "happy", "color": "blue"}, both)
+        _act(katie, {"type": "join", "style": "girl", "color": "purple"}, both)
+        state = _act(ben, {"type": "start"}, both)
+        # People first, in the order they joined; the AI goes last.
+        ben_id, katie_id, avi_id = state["board"]["turn_order"]
+        assert [p["kind"] for p in state["players"]] == ["family", "family", "ai"]
+        state = _act(ben, {"type": "move", "cell": _cell(0, 0)}, both)
+        assert state["board"]["turn_player_id"] == katie_id
+        state = _act(katie, {"type": "move", "cell": _cell(9, 4)}, both)
+        assert state["board"]["turn_player_id"] == avi_id
+        states = [_state(ws) for ws in both]
+        assert all(s["board"]["turn_player_id"] == ben_id for s in states)
+        assert states[0]["board"]["cells"].count(avi_id) == 1

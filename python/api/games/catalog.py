@@ -3,16 +3,17 @@
 Adding a game means adding a :class:`GameType` here with a rules module
 that exposes ``new_round`` / ``play`` / ``current_player_id`` (see
 :mod:`.turkey_tictactoe`), plus its screen in the React app
-(``ui/react/src/games/``).
+(``ui/react/src/games/``). A game the AI can play also names a module
+with ``choose_move`` (see :mod:`.turkey_ai`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
-from . import turkey_tictactoe
+from . import turkey_ai, turkey_tictactoe
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,9 @@ class GameType:
     min_players: int
     max_players: int
     rules: ModuleType
+    # Module with ``choose_move(state, player_id, level=...)`` when the
+    # game can be played against the AI; ``None`` when it can't.
+    ai: Optional[ModuleType] = None
 
 
 GAME_TYPES: Dict[str, GameType] = {
@@ -33,6 +37,7 @@ GAME_TYPES: Dict[str, GameType] = {
         min_players=2,
         max_players=4,
         rules=turkey_tictactoe,
+        ai=turkey_ai,
     ),
 }
 
