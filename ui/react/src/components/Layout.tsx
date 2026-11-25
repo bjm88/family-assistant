@@ -13,6 +13,7 @@ import {
   Building2,
   Car,
   FileText,
+  Gamepad2,
   GitFork,
   History,
   Home,
@@ -36,7 +37,8 @@ import { UserPill } from "@/components/UserPill";
 // Admin/CRUD nav. Tasks intentionally lives in the top assistant
 // cluster (alongside Live AI + Session history) because it's the
 // daily-driver surface for the agent's TODOs and Automated Monitoring,
-// not a static admin record like People or Vehicles.
+// not a static admin record like People or Vehicles. Games sits there
+// too: it's something the whole family opens, not a record to manage.
 const NAV = [
   { to: "", label: "Overview", icon: Home, end: true, adminOnly: false },
   { to: "tree", label: "Family tree", icon: GitFork, adminOnly: false },
@@ -132,6 +134,20 @@ export default function Layout() {
         >
           <ListTodo className="h-4 w-4" />
           Tasks
+        </NavLink>
+        <NavLink
+          to={`/admin/families/${familyId}/games`}
+          className={({ isActive }) =>
+            cn(
+              "flex items-center gap-2 rounded-md px-3 py-2 text-xs transition-colors",
+              isActive
+                ? "bg-primary/10 text-primary font-medium"
+                : "text-foreground/70 hover:bg-muted hover:text-foreground"
+            )
+          }
+        >
+          <Gamepad2 className="h-4 w-4" />
+          Games
         </NavLink>
       </div>
       <nav className="flex-1 p-3 space-y-1 overflow-y-auto">

@@ -15,6 +15,8 @@ export default defineConfig({
       "/api": {
         target: "http://localhost:8000",
         changeOrigin: true,
+        // The family games talk to the backend over a WebSocket.
+        ws: true,
       },
     },
   },

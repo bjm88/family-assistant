@@ -5,6 +5,7 @@ import {
   Bot,
   Building2,
   Car,
+  Gamepad2,
   History,
   Home,
   ListTodo,
@@ -411,7 +412,7 @@ export default function FamilyDashboard() {
 // use, not just theirs to look at.
 function MemberHero({ familyId }: { familyId: string }) {
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
       <Link
         to={`/aiassistant/${familyId}`}
         className="card hover:shadow-md transition-shadow bg-primary text-primary-foreground border-primary"
@@ -456,6 +457,22 @@ function MemberHero({ familyId }: { familyId: string }) {
             <div className="font-semibold">My tasks</div>
             <div className="text-xs text-muted-foreground mt-0.5">
               Things you own, were assigned, or follow.
+            </div>
+          </div>
+        </div>
+      </Link>
+      <Link
+        to={`/admin/families/${familyId}/games`}
+        className="card hover:shadow-md transition-shadow"
+      >
+        <div className="card-body flex items-start gap-3">
+          <div className="rounded-lg bg-primary/10 p-2 text-primary shrink-0">
+            <Gamepad2 className="h-5 w-5" />
+          </div>
+          <div className="min-w-0">
+            <div className="font-semibold">Games</div>
+            <div className="text-xs text-muted-foreground mt-0.5">
+              Play Turkey TicTacToe with the family.
             </div>
           </div>
         </div>

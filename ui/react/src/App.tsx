@@ -15,6 +15,8 @@ import InsurancePoliciesPage from "./pages/InsurancePoliciesPage";
 import FinancialAccountsPage from "./pages/FinancialAccountsPage";
 import DocumentsPage from "./pages/DocumentsPage";
 import TasksPage from "./pages/TasksPage";
+import GamesPage from "./pages/GamesPage";
+import PlayGamePage from "./pages/PlayGamePage";
 import StatusPage from "./pages/StatusPage";
 import AiAssistantPage from "./pages/AiAssistantPage";
 import AiSessionsListPage from "./pages/AiSessionsListPage";
@@ -31,6 +33,9 @@ export default function App() {
           users get redirected to their per-role home. */}
       <Route path="/login" element={<LoginPage />} />
       <Route path="/" element={<HomeRedirect />} />
+      {/* A player's invite link to a family game. No sign-in: the token
+          in the URL is the invitation. */}
+      <Route path="/play/:token" element={<PlayGamePage />} />
 
       {/* Legacy redirects — keep old /families links working. */}
       <Route path="/families" element={<Navigate to="/admin/families" replace />} />
@@ -150,6 +155,8 @@ export default function App() {
         {/* Tasks page is shared — backend filters to created/assigned/follower
             for members, and admins see the full board. */}
         <Route path="/admin/families/:familyId/tasks" element={<TasksPage />} />
+        {/* Games are for everyone in the family. */}
+        <Route path="/admin/families/:familyId/games" element={<GamesPage />} />
         <Route
           path="/admin/families/:familyId/status"
           element={

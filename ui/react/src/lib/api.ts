@@ -15,6 +15,8 @@ const PASSTHROUGH_ROOTS = [
   "/api/auth/",
   // Contacts connections are per person, not admin-only.
   "/api/contacts/",
+  // Family games: open to every family member, and to invitees by link.
+  "/api/games",
 ];
 
 export function resolveApiPath(path: string): string {
