@@ -8,6 +8,15 @@ carrying a ``join_token``. The token is the whole credential: the link
 person in that one game without signing in, and gives access to nothing
 else.
 
+A seat is one of three kinds (:attr:`GamePlayer.kind`):
+
+* ``family`` — a family member: the host, or someone they invited.
+* ``guest``  — someone who opened the game's shareable invite link
+  (``/play/join/<games.invite_token>``) and typed their name. They get
+  a seat and a ``join_token`` of their own.
+* ``ai``     — the assistant playing as an opponent. It joins when the
+  game is created and moves by itself.
+
 The board lives in ``games.state`` as JSON so each game type can keep
 its own shape; see ``api.games.turkey_tictactoe`` for the only one so
 far.
@@ -42,11 +51,23 @@ from ._mixins import TimestampMixin
 # ``migrations/versions/0015_family_games.py``.
 GAME_STATUSES: tuple[str, ...] = ("lobby", "playing", "round_over", "ended")
 GAME_INVITE_STATUSES: tuple[str, ...] = ("not_sent", "pending", "sent", "failed")
+# Keep in lock-step with ``ck_game_players_ai_level`` in
+# ``migrations/versions/0016_game_guests_ai.py``.
+GAME_AI_LEVELS: tuple[str, ...] = ("easy", "medium", "hard")
+GAME_AI_DEFAULT_LEVEL = "medium"
 
 # How long a game's links keep working after it is started. Long enough
 # for an evening of rematches, short enough that an old text message
 # doesn't stay a working link for weeks.
 GAME_DEFAULT_TTL = timedelta(hours=24)
+
+
+GAME_PLAYERS_COMMENT = (
+    "One player in one game: a family member (the host or someone they "
+    "invited), a guest who joined through the game's shareable link, or "
+    "the AI opponent. Holds the secret link they join with, the turkey "
+    "they picked, and how many rounds they have won in this game."
+)
 
 
 def generate_join_token(*, n_bytes: int = 24) -> str:
@@ -61,6 +82,7 @@ class Game(Base, TimestampMixin):
             "status IN ('lobby', 'playing', 'round_over', 'ended')",
             name="ck_games_status",
         ),
+        UniqueConstraint("invite_token", name="uq_games_invite_token"),
         Index("ix_games_family_created", "family_id", "created_at"),
         {
             "comment": (
@@ -127,6 +149,15 @@ class Game(Base, TimestampMixin):
         nullable=True,
         comment="When a player ended the game. NULL while it can still be played.",
     )
+    invite_token: Mapped[Optional[str]] = mapped_column(
+        String(80),
+        nullable=True,
+        comment=(
+            "Secret in the game's shareable invite link, /play/join/<token>. "
+            "Anyone who opens it types their name and joins as a guest "
+            "while there is room. NULL = the game has no shareable link."
+        ),
+    )
 
     players: Mapped[List["GamePlayer"]] = relationship(
         back_populates="game",
@@ -147,14 +178,16 @@ class GamePlayer(Base, TimestampMixin):
             "invite_status IN ('not_sent', 'pending', 'sent', 'failed')",
             name="ck_game_players_invite_status",
         ),
+        CheckConstraint(
+            "ai_level IS NULL OR ai_level IN ('easy', 'medium', 'hard')",
+            name="ck_game_players_ai_level",
+        ),
+        CheckConstraint(
+            "person_id IS NOT NULL OR player_name IS NOT NULL",
+            name="ck_game_players_named",
+        ),
         Index("ix_game_players_person", "person_id"),
-        {
-            "comment": (
-                "One family member in one game: the host or someone they "
-                "invited. Holds the secret link they join with, the turkey "
-                "they picked, and how many rounds they have won in this game."
-            )
-        },
+        {"comment": GAME_PLAYERS_COMMENT},
     )
 
     game_player_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -163,10 +196,30 @@ class GamePlayer(Base, TimestampMixin):
         nullable=False,
         comment="Game this seat belongs to.",
     )
-    person_id: Mapped[int] = mapped_column(
+    person_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("people.person_id", ondelete="CASCADE"),
-        nullable=False,
-        comment="Family member who plays in this seat.",
+        nullable=True,
+        comment=(
+            "Family member who plays in this seat. NULL for a guest and "
+            "for the AI, who are named by player_name instead."
+        ),
+    )
+    player_name: Mapped[Optional[str]] = mapped_column(
+        String(40),
+        nullable=True,
+        comment=(
+            "Name shown for a seat that isn't a family member: what a "
+            "guest typed when they joined, or the AI's name (e.g. "
+            "'Avi AI'). NULL for family members."
+        ),
+    )
+    ai_level: Mapped[Optional[str]] = mapped_column(
+        String(12),
+        nullable=True,
+        comment=(
+            "Set only for the AI's seat: how well it plays — 'easy', "
+            "'medium' or 'hard'. NULL for people."
+        ),
     )
     is_host: Mapped[bool] = mapped_column(
         Boolean,
@@ -228,4 +281,15 @@ class GamePlayer(Base, TimestampMixin):
     )
 
     game: Mapped["Game"] = relationship(back_populates="players")
-    person: Mapped["Person"] = relationship()  # noqa: F821
+    person: Mapped[Optional["Person"]] = relationship()  # noqa: F821
+
+    @property
+    def is_ai(self) -> bool:
+        return self.ai_level is not None
+
+    @property
+    def kind(self) -> str:
+        """``'ai'``, ``'guest'`` or ``'family'``."""
+        if self.ai_level is not None:
+            return "ai"
+        return "guest" if self.person_id is None else "family"

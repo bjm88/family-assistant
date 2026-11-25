@@ -114,6 +114,8 @@ from .task import (
 from .game import (
     Game,
     GamePlayer,
+    GAME_AI_DEFAULT_LEVEL,
+    GAME_AI_LEVELS,
     GAME_DEFAULT_TTL,
     GAME_INVITE_STATUSES,
     GAME_STATUSES,
@@ -205,6 +207,8 @@ __all__ = [
     "TASK_STATUSES",
     "Game",
     "GamePlayer",
+    "GAME_AI_DEFAULT_LEVEL",
+    "GAME_AI_LEVELS",
     "GAME_DEFAULT_TTL",
     "GAME_INVITE_STATUSES",
     "GAME_STATUSES",
