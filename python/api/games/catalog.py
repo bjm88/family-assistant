@@ -7,7 +7,7 @@ There are two kinds of game:
   :mod:`.turkey_tictactoe` and :mod:`.chinese_checkers`). The whole
   game is in ``games.state`` and is sent to every player after each
   move. A game the AI can play also names a module with
-  ``choose_move`` (see :mod:`.turkey_ai`).
+  ``choose_move`` (see :mod:`.turkey_ai` and :mod:`.checkers_ai`).
 * **Real-time** (Zombie Apocalypse, ``realtime=True``): a rules module
   with a ``Round`` that is run in memory while a level is being played
   (see :mod:`.zombie_apocalypse` and :mod:`.zombie_live`).
@@ -23,7 +23,13 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Dict, Optional, Tuple
 
-from . import chinese_checkers, turkey_ai, turkey_tictactoe, zombie_apocalypse
+from . import (
+    checkers_ai,
+    chinese_checkers,
+    turkey_ai,
+    turkey_tictactoe,
+    zombie_apocalypse,
+)
 
 # The React app draws these; the keys are what is stored in
 # ``game_players.avatar_style`` / ``avatar_color``.
@@ -111,6 +117,7 @@ GAME_TYPES: Dict[str, GameType] = {
         min_players=chinese_checkers.MIN_PLAYERS,
         max_players=chinese_checkers.MAX_PLAYERS,
         rules=chinese_checkers,
+        ai=checkers_ai,
         styles=MARBLE_STYLES,
         pick="your color",
         move_key="path",

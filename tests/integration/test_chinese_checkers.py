@@ -1,4 +1,5 @@
-"""Chinese Checkers: the board, the rules, and a game played over sockets.
+"""Chinese Checkers: the board, the rules, the AI player, and a game
+played over sockets.
 
 The fixtures (a household of its own per test, an app whose sockets
 share one event loop, texts and emails recorded instead of sent) are
@@ -9,11 +10,14 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from contextlib import ExitStack
 from typing import Any, Dict, List, Optional, Sequence
 
 import pytest
 
+from api.db import SessionLocal
+from api.games import ai_turns, checkers_ai, service
 from api.games import chinese_checkers as cc
 from api.games.turkey_tictactoe import RuleError
 
@@ -387,15 +391,8 @@ def test_the_games_page_offers_chinese_checkers_for_two_to_six(client, household
     game = catalog[CHECKERS]
     assert game["name"] == "Chinese Checkers"
     assert (game["min_players"], game["max_players"]) == (2, 6)
-    assert game["realtime"] is False and game["can_play_ai"] is False
-
-    resp = client.post(
-        "/api/games",
-        json={"family_id": household.family_id, "game_type": CHECKERS,
-              "host_person_id": household.ben.person_id, "invite_person_ids": [],
-              "vs_ai": True},
-    )
-    assert resp.status_code == 400 and "against the AI" in resp.json()["detail"]
+    assert game["realtime"] is False and game["can_play_ai"] is True
+    assert body["ai_default_level"] == "medium"
 
 
 def test_invites_ask_people_to_pick_a_color(client, household, outbox):
@@ -567,3 +564,267 @@ def test_six_can_play_and_a_seventh_is_turned_away(client, household, players):
                    (table["marbles"][hole] for hole in point))
         assert sum(1 for owner in table["marbles"] if owner is None) == 61
         assert table["turn_player_id"] == state["you"]["player_id"]
+
+
+# ---------------------------------------------------------------------------
+# The AI player
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "level,count",
+    [("easy", 2), ("medium", 2), ("hard", 2), (None, 2), ("no-such-level", 2),
+     ("easy", 6), ("medium", 3), ("medium", 6), ("hard", 4)],
+)
+def test_the_ai_only_makes_legal_moves_and_always_finishes_the_round(level, count):
+    rng = random.Random(count * 7 + len(level or ""))
+    ids = list(range(1, count + 1))
+    for number in range(2):
+        state = cc.new_round(ids, round_number=number + 1)
+        while not cc.is_over(state):
+            assert state["moves"] < 1500, "the round never ended"
+            mover = cc.current_player_id(state)
+            path = checkers_ai.choose_move(state, mover, level=level, rng=rng)
+            # ``play`` turns down anything the rules don't allow.
+            state = cc.play(state, mover, path)
+        assert state["winner_player_id"] in ids
+    with pytest.raises(RuleError):
+        checkers_ai.choose_move(state, 1)  # the round is over
+    with pytest.raises(RuleError):
+        checkers_ai.choose_move(cc.new_round([1, 2], round_number=1), 9)
+
+
+def _ai_choices(state, level: str, tries: int = 300) -> List[List[int]]:
+    return [
+        checkers_ai.choose_move(state, 1, level=level, rng=random.Random(seed))
+        for seed in range(tries)
+    ]
+
+
+@pytest.mark.parametrize("level", ["medium", "hard"])
+def test_the_ai_plays_the_move_that_wins_the_round(level):
+    point = list(cc.POINTS[3])
+    last, outside = _hole(-1, 5), _hole(-1, 4)
+    # A marble at the back has a long hop on offer; winning comes first.
+    back, stone = _hole(1, -3), _hole(1, -2)
+    state = _table(
+        {1: [h for h in point if h != last] + [outside, back], 2: [stone, _hole(4, -8)]}
+    )
+    assert {tuple(path) for path in _ai_choices(state, level, 100)} == {(outside, last)}
+
+
+def test_the_ai_strings_hops_together_and_medium_sometimes_stops_short():
+    # Four stepping stones lead one marble from near home into the far point.
+    chain = [_hole(1, -3), _hole(1, -1), _hole(-1, 1), _hole(-1, 3), _hole(-3, 5)]
+    stones = [_hole(1, -2), _hole(0, 0), _hole(-1, 2), _hole(-2, 4)]
+    state = _table({1: [chain[0], _hole(4, -8), _hole(3, -7)], 2: stones + [_hole(-4, 8)]})
+    assert cc.reachable(state["marbles"], chain[0], 3)[chain[-1]] == chain
+
+    def share(level: str) -> float:
+        picks = _ai_choices(state, level)
+        return sum(path == chain for path in picks) / len(picks)
+
+    assert share("hard") == 1
+    # Medium: more often than not, but it loses track of some, and then
+    # mostly plays the part of the chain it did follow (the rest of the
+    # time it wasn't looking at that marble at all).
+    medium = share("medium")
+    assert 0.5 <= medium <= 0.8
+    part_way = [path for path in _ai_choices(state, "medium") if path != chain]
+    assert sum(path == chain[: len(path)] for path in part_way) / len(part_way) > 0.55
+    assert share("easy") < medium - 0.2
+
+
+def _checkers_ai_match(first: str, second: str, games: int = 30) -> float:
+    """Share of ``games`` the ``first`` level wins; who opens alternates."""
+    rng = random.Random(2026)
+    wins = 0
+    for number in range(games):
+        state = cc.new_round([1, 2], round_number=number + 1)
+        while not cc.is_over(state):
+            mover = cc.current_player_id(state)
+            level = first if mover == 1 else second
+            state = cc.play(
+                state, mover, checkers_ai.choose_move(state, mover, level=level, rng=rng)
+            )
+        wins += state["winner_player_id"] == 1
+    return wins / games
+
+
+def test_each_checkers_level_plays_better_than_the_one_below():
+    assert _checkers_ai_match("medium", "easy") > 0.75
+    assert _checkers_ai_match("hard", "medium") > 0.75
+
+
+def test_medium_beats_a_player_who_only_ever_takes_the_longest_move_but_not_always():
+    rng = random.Random(31)
+    wins = 0
+    games = 40
+    for number in range(games):
+        state = cc.new_round([1, 2], round_number=number + 1)
+        while not cc.is_over(state):
+            mover = cc.current_player_id(state)
+            path = (
+                checkers_ai.choose_move(state, 1, level="medium", rng=rng)
+                if mover == 1
+                else _best_move(state, 2, rng)
+            )
+            state = cc.play(state, mover, path)
+        wins += state["winner_player_id"] == 1
+    assert 0.5 < wins / games < 1
+
+
+def test_how_long_a_move_takes_to_watch():
+    state = cc.new_round([1, 2], round_number=1)
+    assert cc.playback_seconds(state) == 0
+    step = cc.play(state, 1, [_hole(3, -5), _hole(3, -4)])
+    assert cc.playback_seconds(step) == pytest.approx(0.62)
+    hop = cc.play(state, 1, [_hole(3, -6), _hole(3, -4)])
+    assert cc.playback_seconds(hop) == pytest.approx(0.73)
+    three = {**hop, "last_move": {"player_id": 1, "path": [1, 2, 3, 4], "seq": 1}}
+    assert cc.playback_seconds(three) == pytest.approx(0.14 + 3 * 0.43 + 2 * 0.08 + 0.16)
+
+
+# ---------------------------------------------------------------------------
+# Playing against the AI
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def quick_ai(monkeypatch):
+    """The AI answers at once and, being seeded, the same way every run."""
+    monkeypatch.setattr(ai_turns, "THINK_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr(cc, "playback_seconds", lambda state: 0.0)
+    monkeypatch.setattr(checkers_ai, "random", random.Random(5))
+
+
+def test_the_ai_takes_a_seat_at_chinese_checkers_and_plays_to_the_end(
+    client, household, players, quick_ai
+):
+    hh = household
+    game = _checkers_game(client, hh, [], vs_ai=True, ai_level="hard")
+    assert [(p["name"], p["kind"], p["joined"]) for p in game["players"]] == [
+        ("Ben", "family", False),
+        ("Avi AI", "ai", True),
+    ]
+    seat = game["players"][1]
+    assert seat["avatar_style"] == "marble" and seat["avatar_color"]
+    assert seat["play_url"] is None
+
+    with _socket(players, _token(game, hh.ben)) as ben:
+        me = [ben]
+        state = _state(ben)
+        avi = state["players"][1]
+        assert avi["connected"] is True and state["can_start"] is False
+
+        # Ben wants the color the AI has; the AI takes another.
+        state = _act(ben, {"type": "join", "style": "marble", "color": avi["avatar_color"]}, me)
+        assert state["players"][0]["avatar_color"] == avi["avatar_color"]
+        assert state["players"][1]["avatar_color"] not in (None, avi["avatar_color"])
+        assert state["can_start"] is True  # no need to wait for anyone
+
+        state = _act(ben, {"type": "start"}, me)
+        table = state["checkers"]["state"]
+        ben_id, avi_id = table["turn_order"]
+        assert avi_id == avi["player_id"] and table["homes"] == [0, 3]
+        assert table["turn_player_id"] == ben_id  # a person opens
+
+        # Ben plays; the AI answers by itself, with a move of its own marble.
+        state = _act(ben, {"type": "move", "path": [_hole(3, -6), _hole(3, -4)]}, me)
+        assert state["checkers"]["state"]["turn_player_id"] == avi_id
+        state = _state(ben)
+        table = state["checkers"]["state"]
+        answer = table["last_move"]
+        assert answer["player_id"] == avi_id and answer["seq"] == 2
+        assert table["marbles"][answer["path"][-1]] == avi_id
+        assert table["marbles"][answer["path"][0]] is None
+        assert table["turn_player_id"] == ben_id
+
+        # Ben only ever takes the longest move on offer; the AI on hard
+        # gets its marbles across first.
+        rng = random.Random(3)
+        while state["status"] == "playing":
+            table = state["checkers"]["state"]
+            assert table["moves"] < 400 and table["turn_player_id"] == ben_id
+            state = _act(ben, {"type": "move", "path": _best_move(table, ben_id, rng)}, me)
+            if state["status"] == "playing":
+                state = _state(ben)
+        table = state["checkers"]["state"]
+        assert state["status"] == "round_over"
+        assert table["winner_player_id"] == avi_id and table["last_move"]["player_id"] == avi_id
+        assert all(table["marbles"][hole] is not None for hole in cc.POINTS[0])
+        assert [p["wins"] for p in state["players"]] == [0, 1]
+
+        # Again: it's the AI's turn to open, and it does.
+        state = _act(ben, {"type": "play_again"}, me)
+        assert state["checkers"]["state"]["turn_player_id"] == avi_id
+        state = _state(ben)
+        table = state["checkers"]["state"]
+        assert table["round"] == 2 and table["moves"] == 1
+        assert table["last_move"]["player_id"] == avi_id
+        assert table["turn_player_id"] == ben_id
+        _act(ben, {"type": "end"}, me)
+
+    board = client.get(f"/api/games?family_id={hh.family_id}").json()["leaderboard"]
+    assert board[CHECKERS] == [
+        {"person_id": None, "kind": "ai", "name": "Avi AI", "wins": 1, "games": 1},
+        {"person_id": hh.ben.person_id, "kind": "family", "name": "Ben", "wins": 0, "games": 1},
+    ]
+
+
+def test_the_ai_lets_a_move_be_watched_before_it_makes_its_own(
+    client, household, players, monkeypatch
+):
+    monkeypatch.setattr(ai_turns, "THINK_SECONDS", (0.0, 0.0))
+    hh = household
+    game = _checkers_game(client, hh, [], vs_ai=True)
+    token = _token(game, hh.ben)
+    hop = [_hole(3, -6), _hole(3, -4)]
+    with SessionLocal() as s:
+        service.apply_action(s, token, {"type": "join", "style": "marble", "color": "teal"})
+        service.apply_action(s, token, {"type": "start"})
+        s.commit()
+        # Ben's turn: nothing for the AI to wait for.
+        assert service.ai_turn_wait(s, game["game_id"]) is None
+
+    with _socket(players, token) as ben:
+        _state(ben)
+        sent = time.monotonic()
+        state = _act(ben, {"type": "move", "path": hop}, [ben])
+        watching = cc.playback_seconds(state["checkers"]["state"])
+        assert watching == pytest.approx(0.73)
+        with SessionLocal() as s:
+            assert service.ai_turn_wait(s, game["game_id"]) == pytest.approx(watching)
+        state = _state(ben)
+        assert state["checkers"]["state"]["last_move"]["seq"] == 2
+        # The hop was still being shown on Ben's phone until then.
+        assert time.monotonic() - sent >= watching - 0.05
+
+
+def test_the_ai_plays_chinese_checkers_alongside_people(client, household, players, quick_ai):
+    hh = household
+    game = _checkers_game(client, hh, [hh.katie], send_invites=False, vs_ai=True)
+    with _socket(players, _token(game, hh.ben)) as ben, _socket(
+        players, _token(game, hh.katie)
+    ) as katie:
+        both = [ben, katie]
+        _state(ben), _state(ben), _state(katie)
+        _act(ben, {"type": "join", "style": "marble", "color": "blue"}, both)
+        _act(katie, {"type": "join", "style": "marble", "color": "purple"}, both)
+        state = _act(ben, {"type": "start"}, both)
+        table = state["checkers"]["state"]
+        # People first, in the order they joined; the AI goes last. Three
+        # players take every other point.
+        ben_id, katie_id, avi_id = table["turn_order"]
+        assert [p["kind"] for p in state["players"]] == ["family", "family", "ai"]
+        assert table["homes"] == [0, 2, 4]
+        rng = random.Random(8)
+        state = _act(ben, {"type": "move", "path": _best_move(table, ben_id, rng)}, both)
+        table = state["checkers"]["state"]
+        assert table["turn_player_id"] == katie_id
+        state = _act(katie, {"type": "move", "path": _best_move(table, katie_id, rng)}, both)
+        assert state["checkers"]["state"]["turn_player_id"] == avi_id
+        tables = [_state(ws)["checkers"]["state"] for ws in both]
+        assert all(t["turn_player_id"] == ben_id for t in tables)
+        assert tables[0]["last_move"]["player_id"] == avi_id
+        assert tables[0]["last_move"] == tables[1]["last_move"]

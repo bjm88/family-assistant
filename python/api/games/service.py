@@ -518,9 +518,15 @@ def ai_to_move(game: models.Game) -> Optional[models.GamePlayer]:
     return player if player is not None and player.is_ai else None
 
 
-def is_ai_turn(db: Session, game_id: int) -> bool:
+def ai_turn_wait(db: Session, game_id: int) -> Optional[float]:
+    """``None`` unless it is the AI's turn; then how many seconds the
+    players need to watch the move before it (0 in a game whose moves
+    simply appear)."""
     game = db.get(models.Game, game_id)
-    return game is not None and ai_to_move(game) is not None
+    if game is None or ai_to_move(game) is None:
+        return None
+    watch = getattr(game_type_of(game).rules, "playback_seconds", None)
+    return float(watch(game.state)) if watch is not None else 0.0
 
 
 def play_ai_turn(db: Session, game_id: int) -> bool:
@@ -533,10 +539,10 @@ def play_ai_turn(db: Session, game_id: int) -> bool:
     chooser = game_type_of(game).ai
     if player is None or chooser is None:
         return False
-    cell = chooser.choose_move(
+    move = chooser.choose_move(
         game.state, player.game_player_id, level=player.ai_level
     )
-    _move(game, player, cell)
+    _move(game, player, move)
     db.flush()
     return True
 

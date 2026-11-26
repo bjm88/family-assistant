@@ -6,6 +6,8 @@ being dealt, a player (re)connecting after a restart — the router calls
 :func:`nudge`. If the AI is up it "thinks" for a moment, so its turkey
 doesn't land in the same instant as the player's, then plays through
 the hub like anyone else, which pushes the new board to every phone.
+In a game where the phones play each move back (a marble hopping across
+the Chinese Checkers board), it first waits for that to finish.
 
 At most one task runs per game. A nudge that arrives while one is
 running makes it look again before it stops, so a move made in that
@@ -18,7 +20,7 @@ import asyncio
 import logging
 import random
 from functools import partial
-from typing import Set, Tuple
+from typing import Optional, Set, Tuple
 
 from starlette.concurrency import run_in_threadpool
 
@@ -47,9 +49,9 @@ def nudge(game_id: int) -> None:
     task.add_done_callback(_tasks.discard)
 
 
-def _is_ai_turn(game_id: int) -> bool:
+def _ai_turn_wait(game_id: int) -> Optional[float]:
     with session_scope() as db:
-        return service.is_ai_turn(db, game_id)
+        return service.ai_turn_wait(db, game_id)
 
 
 def _play(game_id: int) -> bool:
@@ -61,8 +63,10 @@ async def _take_turns(game_id: int) -> None:
     try:
         while True:
             _look_again.discard(game_id)
-            while await run_in_threadpool(_is_ai_turn, game_id):
-                await asyncio.sleep(random.uniform(*THINK_SECONDS))
+            while (
+                watching := await run_in_threadpool(_ai_turn_wait, game_id)
+            ) is not None:
+                await asyncio.sleep(watching + random.uniform(*THINK_SECONDS))
                 if not await hub.run(game_id, partial(_play, game_id)):
                     break  # the round ended while it was thinking
             if game_id not in _look_again:

@@ -44,6 +44,8 @@ top one; point ``p`` is opposite point ``(p + 3) % 6``.
     phones play it back hop by hop.
 ``winner_player_id`` / ``is_draw``
     Set when the round is over.
+
+Playing against the AI: :mod:`.checkers_ai` picks its moves.
 """
 
 from __future__ import annotations
@@ -152,6 +154,34 @@ def new_round(player_ids: Sequence[int], *, round_number: int) -> Dict[str, Any]
         "last_move": None,
         "moves": 0,
     }
+
+
+# How long the phones take to play a move back, in seconds: a pause
+# before the marble lifts, each hop (or the one step), the rest between
+# hops, and a moment after it lands. Keep in step with CheckersBoard.tsx.
+_PLAYBACK_LEAD = 0.14
+_PLAYBACK_HOP = 0.43
+_PLAYBACK_STEP = 0.32
+_PLAYBACK_REST = 0.08
+_PLAYBACK_TAIL = 0.16
+
+
+def playback_seconds(state: Dict[str, Any]) -> float:
+    """How long everyone spends watching the move just made.
+
+    The AI waits this long before it moves, so a player's own marble
+    has landed on their screen before the AI's sets off.
+    """
+    last = state.get("last_move")
+    if not last:
+        return 0.0
+    path = last["path"]
+    hops = len(path) - 1
+    if hops == 1 and path[1] in NEIGHBOURS[path[0]]:
+        travel = _PLAYBACK_STEP
+    else:
+        travel = hops * _PLAYBACK_HOP + (hops - 1) * _PLAYBACK_REST
+    return _PLAYBACK_LEAD + travel + _PLAYBACK_TAIL
 
 
 def is_over(state: Dict[str, Any]) -> bool:
