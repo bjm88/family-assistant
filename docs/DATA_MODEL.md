@@ -457,9 +457,12 @@ anyone pressed *End game*; it then reads as `ended`.
 For Zombie Apocalypse `state` holds what lasts between levels, not the
 level being played: `level` (the next one to play), `duration` in
 seconds, `loadouts` (the two weapons each player picked, by
-`game_player_id`), `kills` per player across the game, `best_level`
-and each player's own `best`, and `last`, the result of the level just
-finished (`level`, `won`, the house's strength, kills per player).
+`game_player_id`), `dogs` (the guard dog each player picked: `juno`,
+`wynnie`, `wolf` or `missy`; a player with none has Juno), `kills` per
+player across the game, `best_level` and each player's own `best`, and
+`last`, the result of the level just finished (`level`, `won`, the
+house's strength, kills per player and, in `dog_kills`, how many of
+those each player's dog made).
 While a level is on, `round` records its `level`, `duration`, random
 `seed` and who is fighting; the zombies, shots and the house's strength
 exist only in the API's memory until the level ends. `rounds_played`

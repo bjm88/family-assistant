@@ -287,7 +287,8 @@ Two to four can play, and one of them can be the assistant.
    it). That link, `<PUBLIC_BASE_URL>/play/join/<token>`, is the same
    for everyone: whoever opens it types their name, picks a turkey and
    is in as a guest — no account, and they needn't be in the family.
-   Seats go to whoever joins first, up to four. A name already used by
+   Seats go to whoever joins first, up to four (two at Zombie
+   Apocalypse). A name already used by
    someone in the game is turned down so players can be told apart.
    Their phone remembers the seat, so opening the link again takes them
    back to it. The host and admins are the only ones shown the link.
@@ -323,28 +324,35 @@ table, so Avi opens every other round of a two-player game.
 
 #### Zombie Apocalypse
 
-One to four players defend the family house together. The map is seen
-from above with the house in the middle; zombies come in from the top
-and bottom edges, find their way round the trees and pile up against
-the walls, and every second they spend there takes points off the
-house's 1000. Keep it standing until the clock runs out (2 minutes
+One or two players defend the family house together: the host alone,
+or with one other person (a family member, or whoever opens the invite
+link). The map is seen from above at a slant, so everyone on it stands
+up and what is nearer is drawn in front. The house is in the middle
+with its roof off; zombies come in from the top and bottom edges, find
+their way round the trees and pile up against the walls, and every
+second they spend there takes points off the house's 1000. Keep it standing until the clock runs out (2 minutes
 unless the host picks 1, 3 or 5) and the level is survived; the next
 one is harder. If the house falls, the same level is offered again.
 
 - **Characters.** The welcome screen offers eight: Army guy, Army girl,
   Dad, Mom, Girl, Boy, Crazy uncle and Crazy grandma, each in any of
   the eight shirt colours.
-- **Moving.** Each player stands on the house and slides along its top
-  or bottom wall, always facing outward. Put a thumb on the map and the
-  character goes to where the thumb is; touch above the house for the
-  top wall, below it for the bottom.
-- **Shooting.** The weapons are four buttons under the map. Tapping
-  one fires it straight out from where the character stands; there is
-  nothing to aim. Tapping a different weapon switches to it and fires
-  in the same tap, and a weapon just switched to is always ready. The
-  machine gun, flamethrower and crossbow keep firing while the button
-  is held. A button fills back up while its weapon reloads and shows
-  the shots left. One thumb moves, the other fires.
+- **Controls.** All of them are in a strip under the map, so no hand
+  covers it. Each player stands in the house and slides along its top
+  or bottom wall, always facing outward.
+  - *Bottom left, left thumb:* the four weapons, two rows of two.
+  - *Middle:* the slide. The bar is the wall from end to end; put a
+    thumb on it and the character goes to that place, and the knob
+    shows where they are.
+  - *Bottom right corner:* the wall button, with an arrow up and an
+    arrow down. Tapping it turns the character round to defend the
+    other wall; the lit arrow is the wall they face.
+- **Shooting.** Tapping a weapon fires it straight out from where the
+  character stands; there is nothing to aim. Tapping a different weapon
+  switches to it and fires in the same tap, and a weapon just switched
+  to is always ready. The machine gun, flamethrower and crossbow keep
+  firing while the button is held. A button fills back up while its
+  weapon reloads and shows the shots left.
 - **Weapons.** Everyone carries the crossbow, which never runs out, and
   two boulders a level. Before each level every player picks two more:
 
@@ -360,17 +368,36 @@ one is harder. If the house falls, the same level is offered again.
   | Boulder | Rolls straight out from where you stand to the edge of the map and flattens everything it touches. Two a level, no more. |
 
   A longer level comes with more ammunition (except boulders).
-- **Zombies.** Ordinary zombies from level 1, fast zombie dogs from
-  level 2, bats (which fly over the trees) from level 3 and ogres, slow
-  and very hard to kill, from level 4. A level starts with a handful
-  and the waves get bigger and closer together as the clock runs down;
-  later levels and bigger teams bring more, tougher and faster ones.
-  Every level is generated afresh from those settings.
+- **Guard dogs.** Before a level each player also picks a dog. It
+  waits in the house, at its own end, and runs out at any zombie on
+  the ground that comes close to the walls (bats are out of its
+  reach). It comes home after three kills, or sooner if the zombies
+  around it have hurt it enough, and rests 10 seconds (longer the more
+  hurt it is, up to 20) before it will go out again. A dog is never
+  lost. Its kills count for its owner.
+
+  | Dog | Strength | Bite | Speed |
+  | --- | --- | --- | --- |
+  | Juno, a Bernese mountain dog (the default) | Medium | Medium | Medium |
+  | Wynnie, a big black Newfoundland | High | Strong | Slow |
+  | Wolf, a small white husky and spaniel mix | Low | Lighter | Very fast |
+  | Missy, an English bulldog | Medium | Strongest | Slow |
+- **Zombies.** Ordinary zombies from level 1, fast black zombie dogs
+  from level 2 and bats (which fly over the trees) from level 3. Every
+  level ends with an ogre, slow and very hard to kill, which walks on
+  in time to reach the house in the last quarter of a minute. Every
+  three levels another one joins it at the end (two from level 4,
+  three from level 7, and so on up to five), and from level 4 ogres
+  turn up in the ordinary waves as well. A level
+  starts with a handful and the waves get bigger and closer together
+  as the clock runs down; later levels, and a second player, bring
+  more, tougher and faster ones. Every level is generated afresh from
+  those settings.
 - Someone who joins while a level is being played watches it and fights
   from the next one. Anyone in the game can start the next level.
-- On a computer: drag with the mouse, or A/D and the arrow keys to
-  slide, W/S to change walls, 1 to 4 to fire, space for the weapon in
-  hand.
+- On a computer: drag the slide with the mouse, or A/D and the arrow
+  keys to slide, W/S to change walls, 1 to 4 to fire, space for the
+  weapon in hand.
 
 How it works:
 
@@ -398,10 +425,11 @@ How it works:
   and only its result is written to Postgres. When a level starts the
   server sends every zombie's route and timing once; after that it
   sends, ten times a second, only what changed: who was hit, who froze,
-  who moved or fired, and the house's strength. Each phone draws the
+  who moved or fired, where the guard dogs are, and the house's
+  strength. Each phone draws the
   zombies from that schedule on its own clock, so the picture stays
-  smooth on a poor connection. The server decides hits, ammunition, the
-  clock and whether the house stands. The clock stops while no player
+  smooth on a poor connection. The server decides hits, ammunition,
+  what the dogs do, the clock and whether the house stands. The clock stops while no player
   is connected, and a phone that reconnects is sent the level as it
   stands. Restarting the API in the middle of a level calls that level
   off; the game goes back to the screen between levels.
