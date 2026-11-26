@@ -260,10 +260,14 @@ saved once before files can be added to it.
 
 **Games** in the sidebar is for everyone in the family, not just
 admins. It lists the games you can play together, each person on their
-own phone, and the first one is **Turkey TicTacToe**: tic-tac-toe on a
-board 5 squares wide and 10 deep, where four of your turkeys in a row
-(across, down or diagonally) wins. Two to four can play, and one of
-them can be the assistant.
+own phone. There are two: **Turkey TicTacToe**, played in turns, and
+**Zombie Apocalypse**, played live as one team (described
+[further down](#zombie-apocalypse)). Starting a game, inviting people
+and joining work the same way for both.
+
+Turkey TicTacToe is tic-tac-toe on a board 5 squares wide and 10 deep,
+where four of your turkeys in a row (across, down or diagonally) wins.
+Two to four can play, and one of them can be the assistant.
 
 1. **Start a game.** Press *Start a game* and you land on your own game
    screen. In the dialog you can tick **Play against Avi AI** (the name
@@ -317,6 +321,57 @@ Whoever opens a round has a real advantage in this game. A person
 opens the first round and the opening move then passes round the
 table, so Avi opens every other round of a two-player game.
 
+#### Zombie Apocalypse
+
+One to four players defend the family house together. The map is seen
+from above with the house in the middle; zombies come in from the top
+and bottom edges, find their way round the trees and pile up against
+the walls, and every second they spend there takes points off the
+house's 1000. Keep it standing until the clock runs out (2 minutes
+unless the host picks 1, 3 or 5) and the level is survived; the next
+one is harder. If the house falls, the same level is offered again.
+
+- **Characters.** The welcome screen offers eight: Army guy, Army girl,
+  Dad, Mom, Girl, Boy, Crazy uncle and Crazy grandma, each in any of
+  the eight shirt colours.
+- **Moving.** Each player stands on the house and slides along its top
+  or bottom wall, always facing outward. Put a thumb on the map and the
+  character goes to where the thumb is; touch above the house for the
+  top wall, below it for the bottom.
+- **Shooting.** The weapons are four buttons under the map. Tapping
+  one fires it straight out from where the character stands; there is
+  nothing to aim. Tapping a different weapon switches to it and fires
+  in the same tap, and a weapon just switched to is always ready. The
+  machine gun, flamethrower and crossbow keep firing while the button
+  is held. A button fills back up while its weapon reloads and shows
+  the shots left. One thumb moves, the other fires.
+- **Weapons.** Everyone carries the crossbow, which never runs out, and
+  two boulders a level. Before each level every player picks two more:
+
+  | Weapon | What it does |
+  | --- | --- |
+  | Crossbow | One zombie a shot. Unlimited. |
+  | Machine gun | One zombie a shot, ten shots a second. |
+  | Sniper rifle | One zombie a shot, reaches the edge of the map, hits very hard, slow to reload. |
+  | Shotgun | Hits everything in a wedge in front of you, up close. |
+  | Flamethrower | Burns everything in a short wedge for as long as you hold it. |
+  | Grenade | Thrown at the first zombie in front of you; a big blast. |
+  | Snowball | Thrown the same way; freezes the group it lands on for 6 seconds and doesn't hurt them. |
+  | Boulder | Rolls straight out from where you stand to the edge of the map and flattens everything it touches. Two a level, no more. |
+
+  A longer level comes with more ammunition (except boulders).
+- **Zombies.** Ordinary zombies from level 1, fast zombie dogs from
+  level 2, bats (which fly over the trees) from level 3 and ogres, slow
+  and very hard to kill, from level 4. A level starts with a handful
+  and the waves get bigger and closer together as the clock runs down;
+  later levels and bigger teams bring more, tougher and faster ones.
+  Every level is generated afresh from those settings.
+- Someone who joins while a level is being played watches it and fights
+  from the next one. Anyone in the game can start the next level.
+- On a computer: drag with the mouse, or A/D and the arrow keys to
+  slide, W/S to change walls, 1 to 4 to fire, space for the weapon in
+  hand.
+
 How it works:
 
 - Every player holds a WebSocket open to
@@ -338,9 +393,22 @@ How it works:
   working when the game ends or 24 hours after it was started. The `games` and `game_players` tables
   are deliberately left out of the tables Avi can query, because a
   token read from them would be a working link.
-- The Games page keeps a hall of fame: rounds won across every game
-  the family has played. Family members are counted per person, guests
-  under the name they typed, and Avi as one player.
+- Zombie Apocalypse runs on the same WebSocket, but a level is played
+  in the memory of the API process (`python/api/games/zombie_live.py`)
+  and only its result is written to Postgres. When a level starts the
+  server sends every zombie's route and timing once; after that it
+  sends, ten times a second, only what changed: who was hit, who froze,
+  who moved or fired, and the house's strength. Each phone draws the
+  zombies from that schedule on its own clock, so the picture stays
+  smooth on a poor connection. The server decides hits, ammunition, the
+  clock and whether the house stands. The clock stops while no player
+  is connected, and a phone that reconnects is sent the level as it
+  stands. Restarting the API in the middle of a level calls that level
+  off; the game goes back to the screen between levels.
+- The Games page keeps a hall of fame for each game: rounds won at
+  Turkey TicTacToe, and levels survived (with the highest level
+  reached) at Zombie Apocalypse. Family members are counted per person,
+  guests under the name they typed, and Avi as one player.
 - The live connections are held in the memory of the one API process,
   which is how this app runs. Running several API processes would need
   a shared channel between them.

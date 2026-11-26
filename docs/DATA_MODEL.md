@@ -25,7 +25,7 @@ document is the human-friendly companion to that catalog.
 | **Telegram onboarding** | `telegram_invites`, `telegram_contact_verifications` | Deep-link invites + the SMS-2FA challenge that confirms a contact-share before binding `Person.telegram_user_id`. |
 | **Tasks (kanban)** | `tasks`, `task_comments`, `task_followers`, `task_attachments` | User-facing household to-do board. Avi can create / update tasks via tools. |
 | **Agent audit** | `agent_tasks`, `agent_steps` | One row per agent invocation + per-step transcript (thinking, tool_call, tool_result, final). |
-| **Family games** | `games`, `game_players` | Games the family plays together on their phones (Turkey TicTacToe), who is in each one — family members, guests and the AI — and how many rounds each has won. |
+| **Family games** | `games`, `game_players` | Games the family plays together on their phones (Turkey TicTacToe, Zombie Apocalypse), who is in each one — family members, guests and the AI — and how many rounds each has won. |
 | **External-service credentials** | `google_oauth_credentials`, `contact_provider_connections` | Fernet-encrypted refresh tokens: Avi's Gmail + Calendar, and each person's own address-book grant. |
 
 Total: **~42 tables** + the `llm_schema_catalog` read-only view.
@@ -442,9 +442,9 @@ admin "agent runs" page hangs off this table.
 ### `games`
 
 One row per game started from the Games page. `game_type` names the
-game (`turkey_tictactoe` is the only one so far) and `status` moves
+game (`turkey_tictactoe` or `zombie_apocalypse`) and `status` moves
 through `lobby` → `playing` → `round_over` (back to `playing` for a
-rematch) → `ended`. `state` is a JSONB document owned by the game's
+rematch or the next level) → `ended`. `state` is a JSONB document owned by the game's
 rules module; for Turkey TicTacToe it is the current round: the 50
 squares row by row (`cells`, each the `game_player_id` standing there
 or null), `turn_order` and `turn_index`, the `round` number, and, once
@@ -453,6 +453,17 @@ order, or `is_draw`. `rounds_played` counts finished rounds and also
 decides who goes first in the next one. A game stops accepting
 anything at `expires_at`, 24 hours after it was started, whether or not
 anyone pressed *End game*; it then reads as `ended`.
+
+For Zombie Apocalypse `state` holds what lasts between levels, not the
+level being played: `level` (the next one to play), `duration` in
+seconds, `loadouts` (the two weapons each player picked, by
+`game_player_id`), `kills` per player across the game, `best_level`
+and each player's own `best`, and `last`, the result of the level just
+finished (`level`, `won`, the house's strength, kills per player).
+While a level is on, `round` records its `level`, `duration`, random
+`seed` and who is fighting; the zombies, shots and the house's strength
+exist only in the API's memory until the level ends. `rounds_played`
+counts finished levels.
 
 `invite_token` is the secret in the game's shareable link,
 `/play/join/<invite_token>`. Unlike a player's `join_token` it is not
@@ -482,12 +493,14 @@ row holds:
   The AI's seat has a token like any other row, but it is never given
   out and the play routes refuse it.
 - **`joined_at`**, **`avatar_style`**, **`avatar_color`** — set when
-  the person picks a turkey. Turn order is the order people joined in,
+  the person picks a turkey (or, in Zombie Apocalypse, a character such
+  as `army_guy` or `grandma`). Turn order is the order people joined in,
   with the AI last; a shirt colour belongs to one player per game. The
   AI is given a turkey when the game is started.
-- **`wins`** — rounds won in this game. The hall of fame on the Games
-  page is the sum of this per family member, per guest name, and for
-  the AI.
+- **`wins`** — rounds won in this game; in Zombie Apocalypse, levels
+  the player fought in and survived. The hall of fame on the Games
+  page is the sum of this per game type and per family member, guest
+  name, or the AI.
 - **`invite_status`** (`not_sent` · `pending` · `sent` · `failed`),
   **`invite_channels`** (`sms`, `email` or `sms,email`) and
   **`invite_detail`** — how the invite was delivered, or why it
