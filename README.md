@@ -383,17 +383,28 @@ one is harder. If the house falls, the same level is offered again.
   | Wynnie, a big black Newfoundland | High | Strong | Slow |
   | Wolf, a small white husky and spaniel mix | Low | Lighter | Very fast |
   | Missy, an English bulldog | Medium | Strongest | Slow |
-- **Zombies.** Ordinary zombies from level 1, fast black zombie dogs
-  from level 2 and bats (which fly over the trees) from level 3. Every
-  level ends with an ogre, slow and very hard to kill, which walks on
-  in time to reach the house in the last quarter of a minute. Every
-  three levels another one joins it at the end (two from level 4,
-  three from level 7, and so on up to five), and from level 4 ogres
-  turn up in the ordinary waves as well. A level
+- **Zombies.** Ordinary zombies and fast black zombie dogs from
+  level 1, and bats (which fly over the trees) from level 2. A level
   starts with a handful and the waves get bigger and closer together
   as the clock runs down; later levels, and a second player, bring
   more, tougher and faster ones. Every level is generated afresh from
   those settings.
+- **Ogres.** Slow, and very hard to kill. They start coming when the
+  clock is half-way: two for each player, at one wall and then the
+  other, spread over what is left of the level so that the last
+  reaches the house with a quarter of a minute to go. Every four
+  levels there is one more for each player (three each from level 5,
+  four from level 9, up to six), and from level 4 ogres turn up in
+  the ordinary waves as well. The ogres of the first three levels are
+  young ones, a little over half as strong on level 1 and full-grown
+  by level 4.
+- **The vampire.** Taller than a zombie and about twice as quick to
+  the house, though it never runs straight: it darts from side to
+  side all the way in, differently every time. At the wall it does
+  nearly three times a zombie's damage, and it takes four times as
+  much killing. It can come on any level from the first, several
+  times a level, but there is only ever one on the map: the next
+  waits until the last is dead, and a few seconds more.
 - Someone who joins while a level is being played watches it and fights
   from the next one. Anyone in the game can start the next level.
 - On a computer: drag the slide with the mouse, or A/D and the arrow
