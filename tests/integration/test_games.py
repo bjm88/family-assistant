@@ -694,7 +694,7 @@ def test_two_players_join_play_win_rematch_and_end(client, household, players, d
         assert "It takes 2 players" in _error(ben, {"type": "start"})
 
         # Shirt colours are one per player.
-        assert "Ben already has that colour" in _error(
+        assert "Ben already has that color" in _error(
             katie, {"type": "join", "style": "cheerleader", "color": "red"}
         )
         state = _act(katie, {"type": "join", "style": "cheerleader", "color": "pink"}, both)
@@ -942,7 +942,7 @@ def test_a_guest_types_their_name_joins_and_plays(client, household, players):
             ("   ", "girl", "pink", "Tell us your name"),
             ("x" * 25, "girl", "pink", "a bit long"),
             ("BEN", "girl", "pink", "already a Ben in this game"),
-            ("Rose", "girl", "red", "Ben already has that colour"),
+            ("Rose", "girl", "red", "Ben already has that color"),
             ("Rose", "dragon", "pink", "Pick a turkey"),
         ]:
             resp = _guest_join(players, invite, name, style, color)

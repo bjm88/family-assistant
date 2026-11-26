@@ -398,19 +398,19 @@ def test_the_games_page_offers_chinese_checkers_for_two_to_six(client, household
     assert resp.status_code == 400 and "against the AI" in resp.json()["detail"]
 
 
-def test_invites_ask_people_to_pick_a_colour(client, household, outbox):
+def test_invites_ask_people_to_pick_a_color(client, household, outbox):
     hh = household
     game = _checkers_game(client, hh, [hh.katie])
     assert game["game_type"] == CHECKERS and game["status"] == "lobby"
     mail = outbox.email[0]
     assert mail["to"] == hh.katie.email_address
     assert mail["subject"] == "Ben invited you to play Chinese Checkers"
-    assert "pick your colour and join" in mail["body"]
+    assert "pick your color and join" in mail["body"]
     assert "turkey" not in mail["body"]
     assert f"/play/{_token(game, hh.katie)}" in mail["body"]
 
 
-def test_two_players_pick_colours_hop_race_to_the_far_point_and_play_again(
+def test_two_players_pick_colors_hop_race_to_the_far_point_and_play_again(
     client, household, players
 ):
     hh = household
@@ -429,16 +429,16 @@ def test_two_players_pick_colours_hop_race_to_the_far_point_and_play_again(
         assert board["holes"] == [list(hole) for hole in cc.HOLES]
         assert board["points"] == [list(point) for point in cc.POINTS]
 
-        # Nothing to pick but a colour, one per player.
-        assert "Pick a colour first" in _error(
+        # Nothing to pick but a color, one per player.
+        assert "Pick a color first" in _error(
             ben, {"type": "join", "style": "strong", "color": "red"}
         )
-        assert "Pick a colour first" in _error(
+        assert "Pick a color first" in _error(
             ben, {"type": "join", "style": "marble", "color": "beige"}
         )
         state = _act(ben, {"type": "join", "style": "marble", "color": "red"}, both)
         assert state["you"]["joined"] is True and state["can_start"] is False
-        assert "Ben already has that colour" in _error(
+        assert "Ben already has that color" in _error(
             katie, {"type": "join", "style": "marble", "color": "red"}
         )
         state = _act(katie, {"type": "join", "style": "marble", "color": "blue"}, both)
@@ -455,7 +455,7 @@ def test_two_players_pick_colours_hop_race_to_the_far_point_and_play_again(
         assert table["turn_player_id"] == ben_id and table["last_move"] is None
         assert all(table["marbles"][hole] == ben_id for hole in cc.POINTS[0])
         assert all(table["marbles"][hole] == katie_id for hole in cc.POINTS[3])
-        assert "can't change colours" in _error(
+        assert "can't change colors" in _error(
             ben, {"type": "join", "style": "marble", "color": "gold"}
         )
 
@@ -522,31 +522,31 @@ def test_two_players_pick_colours_hop_race_to_the_far_point_and_play_again(
 def test_six_can_play_and_a_seventh_is_turned_away(client, household, players):
     hh = household
     family = [hh.ben, hh.katie, hh.max, hh.lily, hh.omar]
-    colours = ["red", "orange", "gold", "green", "teal"]
+    colors = ["red", "orange", "gold", "green", "teal"]
     game = _checkers_game(client, hh, family[1:], send_invites=False)
     invite = _invite_token(game)
     assert players.get(f"/api/games/join/{invite}").json()["game_type"] == CHECKERS
 
-    # A guest's marble needs a colour nobody has, and nothing else.
+    # A guest's marble needs a color nobody has, and nothing else.
     with _socket(players, _token(game, hh.ben)) as ben:
         _state(ben)
         _act(ben, {"type": "join", "style": "marble", "color": "red"}, [ben])
         resp = _guest_join(players, invite, "Rose", style="marble", color="red")
-        assert resp.status_code == 400 and "already has that colour" in resp.json()["detail"]
+        assert resp.status_code == 400 and "already has that color" in resp.json()["detail"]
         resp = _guest_join(players, invite, "Rose", style="girl", color="pink")
-        assert resp.status_code == 400 and "Pick a colour first" in resp.json()["detail"]
+        assert resp.status_code == 400 and "Pick a color first" in resp.json()["detail"]
         resp = _guest_join(players, invite, "Rose", style="marble", color="pink")
         assert resp.status_code == 201, resp.text
         _state(ben)
 
         with ExitStack() as rest:
             table_of = [ben]
-            for person, colour in list(zip(family, colours))[1:]:
+            for person, color in list(zip(family, colors))[1:]:
                 ws = rest.enter_context(_socket(players, _token(game, person)))
                 table_of.append(ws)
                 for seat in table_of:
                     _state(seat)
-                _act(ws, {"type": "join", "style": "marble", "color": colour}, table_of)
+                _act(ws, {"type": "join", "style": "marble", "color": color}, table_of)
 
             # Six at the table: full.
             assert players.get(f"/api/games/join/{invite}").json()["is_full"] is True

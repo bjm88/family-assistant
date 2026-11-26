@@ -46,7 +46,7 @@ SURVIVOR_STYLES: Tuple[str, ...] = (
     "uncle",
     "grandma",
 )
-# Chinese Checkers has nothing to pick but a colour: everyone is a marble.
+# Chinese Checkers has nothing to pick but a color: everyone is a marble.
 MARBLE_STYLES: Tuple[str, ...] = ("marble",)
 AVATAR_COLORS: Tuple[str, ...] = (
     "red",
@@ -112,7 +112,7 @@ GAME_TYPES: Dict[str, GameType] = {
         max_players=chinese_checkers.MAX_PLAYERS,
         rules=chinese_checkers,
         styles=MARBLE_STYLES,
-        pick="your colour",
+        pick="your color",
         move_key="path",
     ),
 }

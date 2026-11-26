@@ -416,13 +416,13 @@ def _join(
     game: models.Game, player: models.GamePlayer, *, style: Any, color: Any
 ) -> None:
     game_def = game_type_of(game)
-    # "your turkey" -> "turkey"; a marble has only its colour to pick.
+    # "your turkey" -> "turkey"; a marble has only its color to pick.
     what = game_def.pick.split()[-1]
     if style not in game_def.styles or color not in AVATAR_COLORS:
         raise GameError(
-            "Pick a colour first."
-            if what == "colour"
-            else f"Pick a {what} and a shirt colour first."
+            "Pick a color first."
+            if what == "color"
+            else f"Pick a {what} and a shirt color first."
         )
     already_in = player.joined_at is not None
     if already_in and game.status != "lobby":
@@ -441,7 +441,7 @@ def _join(
                 )
                 continue
             raise GameError(
-                f"{seat_name(other)} already has that colour — pick another."
+                f"{seat_name(other)} already has that color — pick another."
             )
     if not already_in:
         if len(joined_players(game)) >= game_def.max_players:
