@@ -1,4 +1,5 @@
 import { Turkey, turkeyStyle } from "./Turkey";
+import { Marble } from "./checkers/Marble";
 import type { AvatarStyle, ShirtColor } from "./types";
 import { Survivor } from "./zombies/Survivor";
 import { isSurvivorStyle } from "./zombies/survivors";
@@ -14,13 +15,16 @@ interface AvatarProps {
 
 /**
  * A player as they appear in their game: a turkey in Turkey TicTacToe,
- * a character in Zombie Apocalypse. Renders nothing for someone who
- * hasn't picked one yet.
+ * a character in Zombie Apocalypse, a marble in Chinese Checkers.
+ * Renders nothing for someone who hasn't picked one yet.
  */
 export function Avatar({ gameType, style, color, size, className }: AvatarProps) {
   if (!style || !color) return null;
   if (gameType === "zombie_apocalypse") {
     return isSurvivorStyle(style) ? <Survivor style={style} color={color} size={size} className={className} /> : null;
+  }
+  if (gameType === "chinese_checkers") {
+    return <Marble color={color} size={size} className={className} />;
   }
   const turkey = turkeyStyle(style);
   return turkey ? <Turkey style={turkey} color={color} size={size} className={className} /> : null;

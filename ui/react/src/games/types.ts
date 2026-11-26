@@ -26,8 +26,11 @@ export type SurvivorStyle =
   | "uncle"
   | "grandma";
 
-/** A turkey in Turkey TicTacToe, a character in Zombie Apocalypse. */
-export type AvatarStyle = TurkeyStyle | SurvivorStyle;
+/** Chinese Checkers has nothing to pick but a colour: everyone is a marble. */
+export type MarbleStyle = "marble";
+
+/** A turkey in Turkey TicTacToe, a character in Zombie Apocalypse, a marble in Chinese Checkers. */
+export type AvatarStyle = TurkeyStyle | SurvivorStyle | MarbleStyle;
 
 export type ShirtColor =
   | "red"
@@ -192,6 +195,42 @@ export interface ZombieView {
   rules: ZombieRules;
 }
 
+// ---- Chinese Checkers (see python/api/games/chinese_checkers.py) -------
+
+/** The move just made: every hole the marble touched, in order. */
+export interface CheckersMove {
+  player_id: number;
+  path: number[];
+  /** The number of the move in this round, from 1. */
+  seq: number;
+}
+
+export interface CheckersState {
+  /** One entry per hole: the player_id of the marble in it, or null. */
+  marbles: (number | null)[];
+  turn_order: number[];
+  /** The point each player started in, in the order of turn_order. */
+  homes: number[];
+  round: number;
+  winner_player_id: number | null;
+  is_draw: boolean;
+  last_move: CheckersMove | null;
+  moves: number;
+  /** Whose turn it is; null when no round is being played. */
+  turn_player_id: number | null;
+}
+
+export interface CheckersView {
+  /** Where each hole is: [x, z], drawn at (x + z / 2, z * sqrt(3) / 2). */
+  holes: [number, number][];
+  /** The holes of the six points, clockwise from the top one. */
+  points: number[][];
+  /** Marbles a player has. */
+  pieces: number;
+  /** The round on the board; null before the first one. */
+  state: CheckersState | null;
+}
+
 /** The game as anyone may see it. */
 export interface GameBase {
   game_id: number;
@@ -209,6 +248,8 @@ export interface GameBase {
   board: GameBoard | null;
   /** Only for Zombie Apocalypse. */
   zombie?: ZombieView;
+  /** Only for Chinese Checkers. */
+  checkers?: CheckersView;
 }
 
 /** What a player sees on /play/<token>. */
@@ -239,6 +280,8 @@ export type GameAction =
   | { type: "guard_dog"; dog: string }
   | { type: "settings"; duration: number }
   | { type: "move"; cell: number }
+  /** Chinese Checkers: where the marble starts, then every hole it lands in. */
+  | { type: "move"; path: number[] }
   | { type: "play_again" }
   | { type: "end" };
 

@@ -8,6 +8,7 @@ import { SHIRT_COLOR_KEYS, SHIRT_COLORS, Turkey, TURKEY_STYLES, turkeyStyle } fr
 import { TurkeyBoard } from "@/games/TurkeyBoard";
 import { canShare, copyLink, recallGuestName, recallSeat, rememberSeat, shareJoinLink } from "@/games/share";
 import { useGameSocket } from "@/games/useGameSocket";
+import { CHECKERS_GAME, CheckersGame, CheckersGameOver, CheckersWelcome } from "@/games/checkers/CheckersGame";
 import { LiveFeed, ZOMBIE_GAME, ZombieGame, ZombieGameOver, ZombieWelcome } from "@/games/zombies/ZombieGame";
 import type {
   AvatarStyle,
@@ -33,9 +34,10 @@ import "@/games/games.css";
 // link, /play/join/<invite token>: the same welcome, plus a box for
 // the guest's name. Joining there gives them a /play/<token> of their own.
 //
-// That is Turkey TicTacToe. Zombie Apocalypse has the same pages with
-// its own screens (games/zombies/ZombieGame.tsx); this file only picks
-// which game's screens to show.
+// That is Turkey TicTacToe. Zombie Apocalypse and Chinese Checkers
+// have the same pages with their own screens
+// (games/zombies/ZombieGame.tsx, games/checkers/CheckersGame.tsx); this
+// file only picks which game's screens to show.
 
 const GUEST_NAME_MAX_LENGTH = 24;
 
@@ -141,6 +143,33 @@ export default function PlayGamePage() {
       />
     );
   }
+  if (game.game_type === CHECKERS_GAME) {
+    if (game.status === "ended") return <CheckersGameOver game={game} />;
+    if (!game.you.joined || picking) {
+      return (
+        <CheckersWelcome
+          game={game}
+          ready={link === "open"}
+          notice={notice}
+          onJoin={(style, color) => {
+            act({ type: "join", style, color });
+            setPicking(false);
+          }}
+          onCancel={picking ? () => setPicking(false) : undefined}
+        />
+      );
+    }
+    return (
+      <CheckersGame
+        game={game}
+        online={link === "open"}
+        notice={notice}
+        act={act}
+        flash={flash}
+        onChangeColor={() => setPicking(true)}
+      />
+    );
+  }
   if (game.status === "ended") return <GameOver game={game} />;
   if (!game.you.joined || picking) {
     return (
@@ -230,7 +259,11 @@ export function JoinGamePage() {
   if (fatal) return <Sorry message={fatal} />;
   if (!game || seat) return <Loading />;
   const zombies = game.game_type === ZOMBIE_GAME;
-  if (game.status === "ended") return zombies ? <ZombieGameOver game={game} /> : <GameOver game={game} />;
+  const checkers = game.game_type === CHECKERS_GAME;
+  if (game.status === "ended") {
+    if (zombies) return <ZombieGameOver game={game} />;
+    return checkers ? <CheckersGameOver game={game} /> : <GameOver game={game} />;
+  }
   if (game.is_full) {
     return (
       <Sorry
@@ -241,6 +274,9 @@ export function JoinGamePage() {
   }
   if (zombies) {
     return <ZombieWelcome game={game} ready={!joining} notice={null} problem={problem} onJoin={join} />;
+  }
+  if (checkers) {
+    return <CheckersWelcome game={game} ready={!joining} notice={null} problem={problem} onJoin={join} />;
   }
   return <Welcome game={game} ready={!joining} notice={null} problem={problem} onJoin={join} />;
 }

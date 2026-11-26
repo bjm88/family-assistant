@@ -10,6 +10,7 @@ import { useConfirm } from "@/components/ConfirmDialog";
 import { useToast } from "@/components/Toast";
 import { Avatar } from "@/games/Avatar";
 import { Turkey } from "@/games/Turkey";
+import { Marble } from "@/games/checkers/Marble";
 import { Survivor } from "@/games/zombies/Survivor";
 import { copyLink, shareJoinLink } from "@/games/share";
 import type {
@@ -22,6 +23,7 @@ import type {
 } from "@/games/types";
 import "@/games/games.css";
 import "@/games/zombies/zombies.css";
+import "@/games/checkers/checkers.css";
 
 // The family's Games page: start a game and invite people, hop back
 // into one that's going, and see who has won the most.
@@ -117,6 +119,31 @@ export default function GamesPage() {
                     <button
                       type="button"
                       className="za-btn za-btn-primary mt-4"
+                      onClick={() => setDialog({ kind: "new", game })}
+                    >
+                      <Play className="h-5 w-5 fill-current" /> Start a game
+                    </button>
+                  </div>
+                </div>
+              </section>
+            ) : game.key === "chinese_checkers" ? (
+              <section key={game.key} className="checkers-theme overflow-hidden rounded-xl border border-[#1d5a51] shadow-sm">
+                <div className="flex flex-col items-center gap-4 p-5 sm:flex-row sm:p-6">
+                  <div className="flex shrink-0 items-end -space-x-3">
+                    <Marble color="blue" size={64} />
+                    <Marble color="red" size={88} className="relative z-10" />
+                    <Marble color="gold" size={64} />
+                  </div>
+                  <div className="min-w-0 flex-1 text-center sm:text-left">
+                    <h2 className="cc-title text-3xl leading-none">{game.name}</h2>
+                    <p className="mt-2 text-sm font-semibold">{game.tagline}</p>
+                    <p className="cc-soft mt-1 text-xs">
+                      {playerCount(game)}, each with a color · chain hops for big moves, and everyone watches them
+                      play out · invite anyone with a link, no sign-in needed
+                    </p>
+                    <button
+                      type="button"
+                      className="cc-btn cc-btn-primary mt-4"
                       onClick={() => setDialog({ kind: "new", game })}
                     >
                       <Play className="h-5 w-5 fill-current" /> Start a game
