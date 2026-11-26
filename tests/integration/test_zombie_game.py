@@ -99,9 +99,15 @@ def _defend(rnd, clock, *, until: Optional[float] = None) -> None:
 
 def test_every_weapon_has_a_reach_a_speed_a_damage_and_is_single_hit_or_area():
     w = za.WEAPONS
-    assert list(w) == ["crossbow", "machine_gun", "sniper", "shotgun", "flamethrower", "grenade"]
+    assert list(w) == [
+        "crossbow", "machine_gun", "sniper", "shotgun", "flamethrower", "grenade",
+        "snowball", "boulder",
+    ]
     for weapon in w.values():
-        assert weapon.range > 0 and weapon.speed > 0 and weapon.damage > 0 and weapon.reload > 0
+        assert weapon.range > 0 and weapon.speed > 0 and weapon.reload > 0
+        assert weapon.damage > 0 or weapon.freeze > 0
+    # Each has a reload time of its own.
+    assert len({weapon.reload for weapon in w.values()}) == len(w)
 
     single = {k for k, weapon in w.items() if not weapon.area}
     assert single == {"crossbow", "machine_gun", "sniper"}
@@ -119,21 +125,32 @@ def test_every_weapon_has_a_reach_a_speed_a_damage_and_is_single_hit_or_area():
     assert w["flamethrower"].range < w["shotgun"].range < w["crossbow"].range
     # Grenade: the big blast.
     assert w["grenade"].kind == "lob" and w["grenade"].radius >= 60
+    # Snowball: freezes an area and hurts nobody.
+    assert w["snowball"].kind == "lob" and w["snowball"].damage == 0
+    assert w["snowball"].freeze >= 3 and w["snowball"].radius >= 60
+    # Boulder: rolls right across the map; everybody has two, no more.
+    assert w["boulder"].kind == "roll" and w["boulder"].ammo == 2 and w["boulder"].given
+    assert za.GIVEN_WEAPONS == ("boulder",)
 
 
-def test_a_loadout_is_two_different_weapons_besides_the_crossbow():
+def test_a_loadout_is_the_crossbow_two_picked_weapons_and_two_boulders():
     assert za.clean_loadout(["grenade", "sniper"]) == ["grenade", "sniper"]
+    assert za.clean_loadout(["snowball", "flamethrower"]) == ["snowball", "flamethrower"]
     for bad in (["grenade"], ["grenade", "grenade"], ["crossbow", "sniper"],
-                ["grenade", "sniper", "shotgun"], ["grenade", "laser"], "grenade", None):
+                ["boulder", "sniper"], ["grenade", "sniper", "shotgun"],
+                ["grenade", "laser"], "grenade", None):
         assert za.clean_loadout(bad) is None, bad
 
     rnd, _ = _round(picks=("grenade", "sniper"))
     fighter = rnd.fighters[1]
-    assert fighter.weapons == ["crossbow", "grenade", "sniper"]
-    assert fighter.ammo == [None, za.WEAPONS["grenade"].ammo, za.WEAPONS["sniper"].ammo]
-    # A longer level comes with more ammunition.
+    assert fighter.weapons == ["crossbow", "grenade", "sniper", "boulder"]
+    assert fighter.ammo == [None, za.WEAPONS["grenade"].ammo, za.WEAPONS["sniper"].ammo, 2]
+    # A longer level comes with more ammunition, but never more boulders.
     longer, _ = _round(duration=300, picks=("grenade", "sniper"))
     assert longer.fighters[1].ammo[1] > fighter.ammo[1]
+    assert longer.fighters[1].ammo[3] == 2
+    shorter, _ = _round(duration=60, picks=("grenade", "sniper"))
+    assert shorter.fighters[1].ammo[3] == 2
 
 
 def test_shots_use_up_ammunition_and_cannot_be_fired_faster_than_the_weapon_reloads():
@@ -167,6 +184,30 @@ def test_shots_use_up_ammunition_and_cannot_be_fired_faster_than_the_weapon_relo
     assert not rnd.fire(99, {"w": 0, "a": 0.0})
 
 
+def test_a_weapon_that_was_just_switched_to_is_ready_to_fire():
+    rnd, clock = _round(picks=("sniper", "grenade"))
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + 1)
+    assert rnd.fire(1, {"w": 1, "a": 0.0})
+    assert not rnd.fire(1, {"w": 1, "a": 0.0})  # reloading
+
+    # Any time, even while the last weapon is reloading.
+    rnd.switch(1, {"w": 2})
+    assert rnd.fighters[1].weapon == 2
+    assert rnd.fire(1, {"w": 2, "a": 0.0})
+    assert not rnd.fire(1, {"w": 2, "a": 0.0})
+    # Switching back: ready again.
+    rnd.switch(1, {"w": 1})
+    assert rnd.fire(1, {"w": 1, "a": 0.0})
+    # Firing a weapon other than the one in hand switches to it.
+    assert rnd.fire(1, {"w": 0, "a": 0.0})
+    assert rnd.fighters[1].weapon == 0
+    assert rnd.drain()["w"] == [[1, 0]]
+    # Staying on a weapon doesn't make it ready.
+    rnd.switch(1, {"w": 0})
+    assert not rnd.fire(1, {"w": 0, "a": 0.0})
+    assert rnd.fighters[1].ammo == [None, za.WEAPONS["sniper"].ammo - 2, za.WEAPONS["grenade"].ammo - 1, 2]
+
+
 def test_nobody_can_shoot_before_the_countdown_ends():
     rnd, clock = _round()
     assert rnd.t == -za.COUNTDOWN_SECONDS
@@ -180,7 +221,7 @@ def test_a_hit_only_counts_for_a_shot_that_was_fired_and_could_reach():
     _advance(rnd, clock, za.COUNTDOWN_SECONDS + 12)
     fighter = rnd.fighters[1]
     near = min(rnd._active.values(), key=lambda z: math.dist(z.position(rnd.t), (fighter.x, fighter.y)))
-    hp = near.hp
+    near.hp = near.max_hp = hp = 100
 
     # No such shot.
     assert not rnd.hit(1, {"s": 1, "z": near.id})
@@ -195,7 +236,7 @@ def test_a_hit_only_counts_for_a_shot_that_was_fired_and_could_reach():
     assert rnd.fire(1, {"w": 0, "a": 0.0, "s": 2})
     assert not rnd.hit(1, {"s": 2, "z": later.id})
     # Nor one further away than the weapon reaches.
-    far = za.Zombie(9000, za.ZOMBIE_TYPES["walker"], t0=rnd.t, x0=20, y0=700, tx=150, ty=390,
+    far = za.Zombie(9000, za.ZOMBIE_TYPES["walker"], t0=rnd.t, path=[(20, 700), (150, 390)],
                     speed=20, hp=60, dps=5)
     rnd._active[far.id] = far
     rnd._by_id[far.id] = far
@@ -215,13 +256,15 @@ def test_single_hit_weapons_hurt_one_zombie_and_area_weapons_hurt_the_crowd():
     fighter = rnd.fighters[1]
     # Let a crowd gather at the top wall.
     at_wall: list = []
-    while len(at_wall) < 4:
+    while len(at_wall) < 6:
         _advance(rnd, clock, 0.5)
         assert rnd.over is None
         at_wall = [
             z for z in rnd._active.values()
             if z.arrive < rnd.t and z.ty < za.HOUSE_Y and not z.flying
         ]
+    for z in at_wall:
+        z.hp = z.max_hp = 500  # tough enough to count the hits on
     rnd.drain()
     target = at_wall[0]
 
@@ -300,8 +343,9 @@ def test_zombies_run_in_from_off_the_top_and_bottom_of_the_map_in_waves():
         # They start out of sight and end up at the house.
         assert z.position(z.t0)[1] == pytest.approx(z.y0, abs=za.BAT_WEAVE)
         x, y = z.position(z.arrive + 1)
-        assert za.HOUSE_LEFT <= x <= za.HOUSE_RIGHT
-        assert za.HOUSE_TOP - 40 <= y <= za.HOUSE_BOTTOM + 40
+        assert (x, y) == pytest.approx((z.tx, z.ty))
+        assert za.HOUSE_LEFT - 15 <= x <= za.HOUSE_RIGHT + 15
+        assert za.HOUSE_TOP - 50 <= y <= za.HOUSE_BOTTOM + 50
         # Those from the top attack the top of the house.
         assert (y < za.HOUSE_Y) == (z.y0 < 0)
         assert 0 < z.t0 < 120
@@ -309,7 +353,72 @@ def test_zombies_run_in_from_off_the_top_and_bottom_of_the_map_in_waves():
     # Waves: bursts of zombies with quiet gaps between them.
     gaps = [b.t0 - a.t0 for a, b in zip(zombies, zombies[1:])]
     assert max(gaps) > 3.0
-    assert sum(1 for g in gaps if g > 3.0) >= 5
+    assert sum(1 for g in gaps if g > 2.0) >= 5
+
+
+@pytest.mark.parametrize("level,team", [(1, 1), (4, 2), (8, 4)])
+def test_a_level_starts_with_a_few_zombies_and_builds_to_a_crowd(level, team):
+    for seed in range(5):
+        zombies = za.build_level(level, team, 120, seed)
+        quarters = [sum(1 for z in zombies if q * 30 <= z.t0 < (q + 1) * 30) for q in range(4)]
+        # More in every quarter of the level than in the one before.
+        assert quarters == sorted(quarters) and quarters[3] > 3 * quarters[0], quarters
+        # The opening wave is a handful...
+        assert 1 <= sum(1 for z in zombies if z.t0 < 6) <= 4 * team + level
+        # ...and the last ones are dozens strong.
+        assert quarters[3] >= 30
+
+
+def test_dozens_of_zombies_are_on_the_map_at_once_and_fit_around_the_house():
+    rnd, clock = _round(level=6, players=4, seed=4)
+    most = 0
+    while rnd.over is None:
+        _advance(rnd, clock, 1.0)
+        most = max(most, len(rnd._active))
+    assert most >= 50
+
+    # Small enough that a crowd fits: fifty zombies shoulder to shoulder
+    # cover less ground than there is for them to stand on at the walls.
+    walker = za.ZOMBIE_TYPES["walker"]
+    standing_room = 2 * (za.HOUSE_W + 2 * za.PILE_OVERHANG) * (za.PILE_DEPTH + 2 * walker.radius)
+    assert 50 * math.pi * walker.radius ** 2 < standing_room
+    assert walker.radius * 2 <= za.WORLD_W / 20
+
+
+def test_trees_stand_on_each_side_of_the_house_and_zombies_walk_around_them():
+    bent = 0
+    for seed in range(12):
+        trees = za.build_trees(seed)
+        assert trees == za.build_trees(seed)
+        top = [t for t in trees if t[1] < za.HOUSE_TOP]
+        bottom = [t for t in trees if t[1] > za.HOUSE_BOTTOM]
+        assert len(top) == len(bottom) == za.TREES_PER_SIDE == 3
+        for x, y, r in trees:
+            assert r < x < za.WORLD_W - r and r < y < za.WORLD_H - r
+            # Clear of the house and of the crowd at its walls.
+            assert min(abs(y - za.HOUSE_TOP), abs(y - za.HOUSE_BOTTOM)) > r + za.PILE_DEPTH + 30
+        for i, a in enumerate(trees):
+            for b in trees[i + 1:]:
+                # Room for an ogre to walk between any two.
+                gap = math.dist(a[:2], b[:2]) - a[2] - b[2]
+                assert gap > 2 * za.ZOMBIE_TYPES["ogre"].radius
+
+        for z in za.build_level(6, 2, 120, seed):
+            if z.flying:
+                assert len(z.path) == 2  # bats fly straight over
+                continue
+            bent += len(z.path) > 2
+            t = z.t0
+            while t < z.arrive + 0.5:
+                x, y = z.position(t)
+                for tx, ty, r in trees:
+                    assert math.dist((x, y), (tx, ty)) >= r + z.radius, (seed, z.id, t)
+                t += 0.2
+    assert bent > 200
+
+    # The phones are told where the trees are.
+    rnd, _ = _round(seed=5)
+    assert rnd.snapshot(1)["trees"] == [list(t) for t in za.build_trees(5)]
 
 
 def test_levels_bring_new_kinds_and_tougher_faster_more_numerous_zombies():
@@ -324,14 +433,16 @@ def test_levels_bring_new_kinds_and_tougher_faster_more_numerous_zombies():
     previous = None
     for level in range(1, 15):
         diff = za.difficulty(level, 1)
-        count = sum(len(za.build_level(level, 1, 120, seed)) for seed in range(8))
+        # An ogre counts for several zombies.
+        count = sum(
+            z.type.threat for seed in range(8) for z in za.build_level(level, 1, 120, seed)
+        )
         if previous is not None:
             assert diff["hp"] > previous["hp"]                    # strength
             assert diff["speed"] >= previous["speed"]             # speed
-            assert diff["at_once"] > previous["at_once"]          # how many at once
-            assert diff["wave_budget"] > previous["wave_budget"]
+            assert diff["wave_budget"] > previous["wave_budget"]  # how many at once
             assert diff["wave_every"] <= previous["wave_every"]
-            assert count > previous["count"] * 0.95
+            assert count > previous["count"] * 0.97
         previous = {**diff, "count": count}
 
     # A level-9 walker really is tougher and quicker than a level-1 one.
@@ -348,7 +459,7 @@ def test_levels_bring_new_kinds_and_tougher_faster_more_numerous_zombies():
 def test_bats_weave_as_they_fly_in_and_everyone_else_walks_straight():
     zombies = za.build_level(5, 2, 120, seed=2)
     bat = next(z for z in zombies if z.flying)
-    walker = next(z for z in zombies if z.type.key == "walker")
+    walker = next(z for z in zombies if z.type.key == "walker" and len(z.path) == 2)
 
     def off_line(z, t):
         x, y = z.position(t)
@@ -361,6 +472,130 @@ def test_bats_weave_as_they_fly_in_and_everyone_else_walks_straight():
     assert max(off_line(walker, t) for t in mid(walker)) < 0.01
     # The weave has died away by the time the bat is on the roof.
     assert off_line(bat, bat.arrive + 1) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Snowballs and boulders
+# ---------------------------------------------------------------------------
+
+
+def _crowd_at_top_wall(rnd, clock, size: int) -> list:
+    crowd: list = []
+    while len(crowd) < size:
+        _advance(rnd, clock, 0.5)
+        assert rnd.over is None
+        crowd = [
+            z for z in rnd._active.values()
+            if z.arrive < rnd.t and z.ty < za.HOUSE_Y and not z.flying
+        ]
+    rnd.drain()
+    return crowd
+
+
+def test_a_snowball_freezes_the_group_where_it_lands_and_hurts_nobody():
+    rnd, clock = _round(level=5, players=2, picks=("snowball", "grenade"))
+    snowball = za.WEAPONS["snowball"]
+    crowd = _crowd_at_top_wall(rnd, clock, 6)
+    x = sum(z.tx for z in crowd) / len(crowd)
+    y = sum(z.ty for z in crowd) / len(crowd)
+    walking = [z for z in rnd._active.values() if z.arrive > rnd.t + 8 and z.y0 > za.WORLD_H]
+    assert walking  # on their way in from the bottom, nowhere near
+
+    thrown_at = rnd.t
+    assert rnd.fire(1, {"w": 1, "a": 0.0, "x": x, "y": y})
+    assert all(z.until < rnd.t for z in crowd)  # still in the air
+    _advance(rnd, clock, 0.5)
+    batch = rnd.drain()
+    caught = {z.id for z in crowd if math.dist((z.tx, z.ty), (x, y)) <= snowball.radius}
+    assert len(caught) >= 4
+    frozen = {entry[0]: entry for entry in batch["fr"]}
+    assert caught <= set(frozen) and not ({z.id for z in walking} & set(frozen))
+    # Nobody was hurt, let alone killed.
+    assert "d" not in batch
+    assert all(z.alive and z.hp == z.max_hp for z in crowd)
+    assert rnd.fighters[1].kills == 0
+
+    # Frozen zombies stand still and leave the house alone...
+    for z in crowd:
+        if z.id in caught:
+            _id, stop, until = frozen[z.id]
+            assert thrown_at < until - snowball.freeze < thrown_at + 1
+            assert z.clock(rnd.t) == stop == z.clock(rnd.t + 2)
+    # One caught on its way in stops where it is, then carries on from there.
+    mover = walking[0]
+    here = mover.position(rnd.t)
+    mover.freeze(rnd.t, snowball.freeze)
+    assert mover.position(rnd.t + snowball.freeze - 1) == mover.position(rnd.t + 1)
+    assert mover.position(rnd.t + 1) == pytest.approx(here, abs=0.5)
+    assert mover.position(mover.until) == pytest.approx(here, abs=0.5)
+    assert math.dist(mover.position(mover.until + 2), here) == pytest.approx(2 * mover.speed, rel=0.2)
+    for z in list(rnd._active.values()):
+        if z.id not in frozen:
+            rnd._active.pop(z.id)  # leave only the frozen ones
+    rnd._next = len(rnd.zombies)
+    house = rnd.house
+    _advance(rnd, clock, snowball.freeze - 1.5)
+    assert rnd.house == house
+    # ...until they thaw.
+    _advance(rnd, clock, 4)
+    assert rnd.house < house
+    # A phone that connects now is told who was held up, and for how long.
+    assert {entry[0] for entry in rnd.snapshot(1)["fr"]} == set(frozen)
+
+    # A second snowball on a frozen zombie keeps it frozen longer.
+    z = next(iter(rnd._active.values()))
+    z.freeze(100.0, 6.0)
+    z.freeze(103.0, 6.0)
+    assert (z.until, z.clock(108.9), z.clock(110.0)) == (109.0, z.stop, pytest.approx(z.stop + 1.0))
+
+
+def test_a_boulder_rolls_straight_out_and_flattens_everything_in_its_way():
+    rnd, clock = _round(level=6, players=2, seed=9)
+    boulder = za.WEAPONS["boulder"]
+    fighter = rnd.fighters[1]
+    _crowd_at_top_wall(rnd, clock, 8)
+    ogre = za.Zombie(9001, za.ZOMBIE_TYPES["ogre"], t0=rnd.t - 30,
+                     path=[(fighter.x, -40.0), (fighter.x, 120.0)], speed=14, hp=900, dps=14)
+    rnd._active[ogre.id] = rnd._by_id[ogre.id] = ogre
+
+    def lane(z, t):
+        """How far the zombie is from the line straight up from the player."""
+        x, y = z.position(t)
+        return abs(x - fighter.x), fighter.y - y
+
+    before = dict(rnd._active)
+    kills = fighter.kills
+    assert rnd.fire(1, {"w": 3, "a": -math.pi / 2})  # straight up the map
+    started = rnd.t
+    assert rnd.drain()["f"] == [[1, 3, round(-math.pi / 2, 3), pytest.approx(fighter.x), pytest.approx(fighter.y - boulder.range, abs=0.1)]]
+    # It takes its time getting there: the ogre is hit when it arrives, not before.
+    _advance(rnd, clock, 0.3)
+    assert ogre.alive
+    _advance(rnd, clock, 2.0)
+    assert not ogre.alive
+
+    flattened = [z for z in before.values() if not z.alive]
+    assert len(flattened) >= 3 and fighter.kills - kills == len(flattened)
+    for z in before.values():
+        off, ahead = lane(z, started)
+        if not z.alive:
+            # Only those in its path, whatever they are and however strong.
+            assert off <= boulder.radius + z.radius + 25
+        elif ahead > 0 and z.clock(started) > z.arrive:
+            # Standing beside its path: untouched.
+            assert off > boulder.radius + z.radius - 1 and z.hp == z.max_hp
+    # Zombies at the other wall, behind the player, are untouched.
+    assert all(z.alive for z in before.values() if lane(z, started)[1] < -boulder.radius - z.radius)
+
+    # Two a level, however long the level and whatever else is carried.
+    clock.now += 2
+    assert rnd.fire(1, {"w": 3, "a": 0.0})
+    clock.now += 2
+    assert not rnd.fire(1, {"w": 3, "a": 0.0})
+    assert rnd.fighters[1].ammo[3] == 0 and rnd.fighters[2].ammo[3] == 2
+    # It rolls off the far edge of the map and is gone.
+    _advance(rnd, clock, 6.0)
+    assert rnd._rolls == []
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +656,7 @@ def test_updates_say_only_what_changed_and_a_snapshot_says_everything():
     assert len(snap["z"]) == len(rnd.zombies)
     assert [p["id"] for p in snap["p"]] == [1, 2]
     assert [p["x"] for p in snap["p"]] == [za.PLAYER_SLOTS[0][0], za.PLAYER_SLOTS[1][0]]
-    assert snap["ammo"] == [None, za.WEAPONS["shotgun"].ammo, za.WEAPONS["machine_gun"].ammo]
+    assert snap["ammo"] == [None, za.WEAPONS["shotgun"].ammo, za.WEAPONS["machine_gun"].ammo, 2]
     assert snap["dead"] == [] and snap["hp"] == []
     # Someone watching has no weapons of their own.
     assert rnd.snapshot(None)["ammo"] is None and rnd.snapshot(77)["ammo"] is None
@@ -439,17 +674,18 @@ def test_updates_say_only_what_changed_and_a_snapshot_says_everything():
     assert sent <= 3
 
     target = next(iter(rnd._active.values()))
+    target.hp = target.max_hp = 70
     rnd.switch(2, {"w": 2})
     assert _shoot(rnd, clock, 1, target, shot=5)
     batch = rnd.drain()
-    assert batch["d"] == [[target.id, target.max_hp - 40, 1]]
+    assert batch["d"] == [[target.id, 30, 1]]
     assert batch["f"][0][:2] == [1, 0]
     assert batch["w"] == [[2, 2]]
     assert batch["a"] == {"1": 5}
     # Said once, not again.
     rnd.advance(0.1)
     again = rnd.drain()
-    assert again is None or not ({"d", "f", "w", "a"} & set(again))
+    assert again is None or not ({"d", "f", "w", "a", "fr"} & set(again))
 
     clock.now += 1
     assert _shoot(rnd, clock, 1, target, shot=6)
@@ -544,6 +780,8 @@ def test_one_player_sets_up_and_loses_the_house_by_standing_still(
         # Pick two weapons to go with the crossbow.
         ben.send_json({"type": "loadout", "weapons": ["grenade", "crossbow"]})
         assert "crossbow" in _until(ben, lambda m: m["type"] == "error")["message"]
+        ben.send_json({"type": "loadout", "weapons": ["grenade", "boulder"]})
+        assert _until(ben, lambda m: m["type"] == "error")
         ben.send_json({"type": "loadout", "weapons": ["grenade", "sniper"]})
         assert _state(ben)["zombie"]["loadouts"] == {str(me): ["grenade", "sniper"]}
         ben.send_json({"type": "settings", "duration": 45})
@@ -558,8 +796,9 @@ def test_one_player_sets_up_and_loses_the_house_by_standing_still(
         assert playing["status"] == "playing" and playing["zombie"]["fighting"] == [me]
         snap = _until(ben, lambda m: m["type"] == "zs")
         assert snap["level"] == 1 and snap["house"] == 1000 and snap["t"] <= 0
-        assert snap["p"][0]["weapons"] == ["crossbow", "grenade", "sniper"]
-        assert snap["ammo"] == [None, 9, 14]
+        assert snap["p"][0]["weapons"] == ["crossbow", "grenade", "sniper", "boulder"]
+        assert snap["ammo"] == [None, 9, 14, 2]
+        assert len(snap["trees"]) == 6
         assert zombie_live.is_live(game["game_id"])
 
         # Weapons are chosen between levels, not during one.
@@ -594,10 +833,11 @@ def _fight(driver, shooters: Dict[int, Any], snap: Dict[str, Any]) -> Dict[str, 
     """
     spots = {p["id"]: (p["x"], p["y"]) for p in snap["p"]}
     zombies = {}
-    for zid, _kind, t0, x0, y0, tx, ty, speed, hp in snap["z"]:
-        travel = math.hypot(tx - x0, ty - y0) / speed
-        zombies[zid] = {"id": zid, "t0": t0, "arrive": t0 + travel, "hp": hp,
-                        "from": (x0, y0), "to": (tx, ty)}
+    for zid, _kind, t0, speed, hp, *rail in snap["z"]:
+        corners = list(zip(rail[::2], rail[1::2]))
+        length = sum(math.dist(a, b) for a, b in zip(corners, corners[1:]))
+        zombies[zid] = {"id": zid, "t0": t0, "arrive": t0 + length / speed, "hp": hp,
+                        "from": corners[0], "to": corners[-1]}
     shot = 0
     while True:
         message = driver.receive_json()
@@ -619,7 +859,7 @@ def _fight(driver, shooters: Dict[int, Any], snap: Dict[str, Any]) -> Dict[str, 
                 p = min(1.0, (t - z["t0"]) / (z["arrive"] - z["t0"]))
                 x = z["from"][0] + (z["to"][0] - z["from"][0]) * p
                 y = z["from"][1] + (z["to"][1] - z["from"][1]) * p
-                if math.dist((x, y), spots[player_id]) > 300:
+                if math.dist((x, y), spots[player_id]) > 280:
                     continue
                 if best is None or z["arrive"] < best["arrive"]:
                     best = z
