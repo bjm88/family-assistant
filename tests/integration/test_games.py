@@ -331,7 +331,7 @@ def test_overview_lists_the_game_the_family_and_how_each_person_is_reached(
     resp = client.get(f"/api/games?family_id={household.family_id}")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert [g["key"] for g in body["catalog"]] == ["turkey_tictactoe"]
+    assert [g["key"] for g in body["catalog"]] == ["turkey_tictactoe", "zombie_apocalypse"]
     assert body["catalog"][0]["min_players"] == 2
     notify = {p["name"]: p["notify"] for p in body["people"]}
     assert notify == {
