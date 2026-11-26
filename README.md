@@ -260,10 +260,11 @@ saved once before files can be added to it.
 
 **Games** in the sidebar is for everyone in the family, not just
 admins. It lists the games you can play together, each person on their
-own phone. There are two: **Turkey TicTacToe**, played in turns, and
-**Zombie Apocalypse**, played live as one team (described
+own phone. There are three: **Turkey TicTacToe**, played in turns,
+**Zombie Apocalypse**, played live as one team, and **Chinese
+Checkers** for up to six (the last two are described
 [further down](#zombie-apocalypse)). Starting a game, inviting people
-and joining work the same way for both.
+and joining work the same way for all of them.
 
 Turkey TicTacToe is tic-tac-toe on a board 5 squares wide and 10 deep,
 where four of your turkeys in a row (across, down or diagonally) wins.
@@ -288,13 +289,13 @@ Two to four can play, and one of them can be the assistant.
    for everyone: whoever opens it types their name, picks a turkey and
    is in as a guest — no account, and they needn't be in the family.
    Seats go to whoever joins first, up to four (two at Zombie
-   Apocalypse). A name already used by
+   Apocalypse, six at Chinese Checkers). A name already used by
    someone in the game is turned down so players can be told apart.
    Their phone remembers the seat, so opening the link again takes them
    back to it. The host and admins are the only ones shown the link.
 4. **Pick a turkey.** The welcome screen says who invited you and
    offers six cartoon turkeys (Happy, Strong, Glam, Cheerleader, Hippie,
-   Cheers) and eight shirt colours. A colour someone else has taken is
+   Cheers) and eight shirt colors. A color someone else has taken is
    crossed out.
 5. **Play.** Once two players are in, the card over the board offers
    *Start game*. On your turn, tap a square to pick it and tap it again
@@ -336,7 +337,7 @@ one is harder. If the house falls, the same level is offered again.
 
 - **Characters.** The welcome screen offers eight: Army guy, Army girl,
   Dad, Mom, Girl, Boy, Crazy uncle and Crazy grandma, each in any of
-  the eight shirt colours.
+  the eight shirt colors.
 - **Controls.** All of them are in a strip under the map, so no hand
   covers it. Each player stands in the house and slides along its top
   or bottom wall, always facing outward.
@@ -399,6 +400,49 @@ one is harder. If the house falls, the same level is offered again.
   keys to slide, W/S to change walls, 1 to 4 to fire, space for the
   weapon in hand.
 
+#### Chinese Checkers
+
+The traditional game on the 121-hole star, for two to six players.
+Everyone starts with ten marbles filling one point of the star and
+races them to the point opposite; the first to fill it wins the round.
+
+- **Colors.** There is nothing to pick but a color: red, orange, gold,
+  green, teal, blue, purple or pink, one player each.
+- **Seats.** Two players sit opposite each other; three take every
+  other point; four are two pairs of opposites; five and six go round
+  the star. Each phone turns the board so that its player's own marbles
+  start at the bottom and travel up, and the holes they have to fill
+  are ringed in their color. The whole board is always on screen; it
+  never scrolls or zooms.
+- **Moving.** A marble goes one step to an empty hole next to it, or
+  hops over a single marble next to it (anyone's) into the empty hole
+  straight beyond, and may keep hopping from where it lands. Nothing is
+  captured. On your turn:
+  1. Tap one of your marbles (the ones that can move have a ring). The
+     holes it can go to light up.
+  2. Tap one. The marble goes there. If it hopped and can hop again,
+     the next holes light up: keep tapping to chain hops, and the bar
+     under the board counts them. After a single step, the other holes
+     stay lit so you can pick a different one.
+  3. **Undo** (or a tap on a hole the marble has already been in)
+     takes hops back; tapping another marble starts over with that one.
+  4. **Confirm** plays the move. Nothing is sent until then.
+- **Everyone sees it.** When a move is confirmed, every phone shows the
+  marble lifting and hopping along its path, hole by hole (about half a
+  second a hop), and leaves a dotted trail on the board until the next
+  move. The next player can move once it has landed.
+- **Rules worth knowing.** A marble may pass through any point, but
+  once it is in the point it is heading for it stays there. A marble
+  can't land in the same hole twice in one move. If someone else's
+  marble is sitting in your far point, the round is yours once the
+  point is full and at least one marble in it is yours, so a marble
+  left at home can't block the player opposite. A player with no legal
+  move is passed over.
+- The scoreboard above the board shows how many marbles each player has
+  home. Who opens rotates each round, wins are counted per player, and
+  someone who joins during a round watches it and plays in the next.
+- There is no AI opponent for this game.
+
 How it works:
 
 - Every player holds a WebSocket open to
@@ -433,9 +477,15 @@ How it works:
   is connected, and a phone that reconnects is sent the level as it
   stands. Restarting the API in the middle of a level calls that level
   off; the game goes back to the screen between levels.
+- A Chinese Checkers move is sent as the path the marble takes: the
+  hole it starts in, then every hole it lands in. The server
+  (`python/api/games/chinese_checkers.py`) checks each hop and keeps
+  the path as the round's last move, which is what the phones play
+  back. The phone works out which holes to light up with the same
+  rules, but only the server's answer counts.
 - The Games page keeps a hall of fame for each game: rounds won at
-  Turkey TicTacToe, and levels survived (with the highest level
-  reached) at Zombie Apocalypse. Family members are counted per person,
+  Turkey TicTacToe and Chinese Checkers, and levels survived (with the
+  highest level reached) at Zombie Apocalypse. Family members are counted per person,
   guests under the name they typed, and Avi as one player.
 - The live connections are held in the memory of the one API process,
   which is how this app runs. Running several API processes would need
@@ -1288,10 +1338,12 @@ family-assistant/
 │   │   ├── face.py · enrollment.py InsightFace wrapper, embedding cache, cosine match
 │   │   └── tts.py                 Kokoro-82M ONNX, voice by gender, disk cache
 │   ├── games/
-│   │   ├── catalog.py             the games on offer + turkey styles and shirt colours
+│   │   ├── catalog.py             the games on offer + turkey styles and shirt colors
 │   │   ├── turkey_tictactoe.py    rules: 5 x 10 board, four in a row
 │   │   ├── turkey_ai.py           how the AI player picks a square (easy / medium / hard)
 │   │   ├── ai_turns.py            plays the AI's turn when it comes round
+│   │   ├── zombie_apocalypse.py · zombie_live.py   rules and the live level of Zombie Apocalypse
+│   │   ├── chinese_checkers.py    rules: the 121-hole star, steps and chains of hops
 │   │   ├── service.py             start / join / move / play again / end, and what each player sees
 │   │   ├── invites.py             text + email each invitee their join link
 │   │   └── hub.py                 live WebSocket connections per game
@@ -1317,7 +1369,8 @@ family-assistant/
 │       ├── App.tsx                route tree (/admin/..., /aiassistant/:id, /play/:token)
 │       ├── lib/api.ts             fetch wrapper + resolveApiPath rewriting
 │       ├── components/            Layout, Modal, PageHeader, Toast, etc.
-│       ├── games/                 turkey avatars (SVG), the board, the live-connection hook
+│       ├── games/                 turkey avatars (SVG), the board, the live-connection hook;
+│       │                          zombies/ and checkers/ hold the other two games' screens
 │       └── pages/
 │           ├── FamiliesList, FamilyDashboard, FamilySettings
 │           ├── PeoplePage, PersonDetail, RelationshipsPage

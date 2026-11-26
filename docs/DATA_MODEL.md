@@ -25,7 +25,7 @@ document is the human-friendly companion to that catalog.
 | **Telegram onboarding** | `telegram_invites`, `telegram_contact_verifications` | Deep-link invites + the SMS-2FA challenge that confirms a contact-share before binding `Person.telegram_user_id`. |
 | **Tasks (kanban)** | `tasks`, `task_comments`, `task_followers`, `task_attachments` | User-facing household to-do board. Avi can create / update tasks via tools. |
 | **Agent audit** | `agent_tasks`, `agent_steps` | One row per agent invocation + per-step transcript (thinking, tool_call, tool_result, final). |
-| **Family games** | `games`, `game_players` | Games the family plays together on their phones (Turkey TicTacToe, Zombie Apocalypse), who is in each one — family members, guests and the AI — and how many rounds each has won. |
+| **Family games** | `games`, `game_players` | Games the family plays together on their phones (Turkey TicTacToe, Zombie Apocalypse, Chinese Checkers), who is in each one — family members, guests and the AI — and how many rounds each has won. |
 | **External-service credentials** | `google_oauth_credentials`, `contact_provider_connections` | Fernet-encrypted refresh tokens: Avi's Gmail + Calendar, and each person's own address-book grant. |
 
 Total: **~42 tables** + the `llm_schema_catalog` read-only view.
@@ -442,7 +442,7 @@ admin "agent runs" page hangs off this table.
 ### `games`
 
 One row per game started from the Games page. `game_type` names the
-game (`turkey_tictactoe` or `zombie_apocalypse`) and `status` moves
+game (`turkey_tictactoe`, `zombie_apocalypse` or `chinese_checkers`) and `status` moves
 through `lobby` → `playing` → `round_over` (back to `playing` for a
 rematch or the next level) → `ended`. `state` is a JSONB document owned by the game's
 rules module; for Turkey TicTacToe it is the current round: the 50
@@ -467,6 +467,16 @@ While a level is on, `round` records its `level`, `duration`, random
 `seed` and who is fighting; the zombies, shots and the house's strength
 exist only in the API's memory until the level ends. `rounds_played`
 counts finished levels.
+
+For Chinese Checkers `state` is the current round: `marbles`, one entry
+per hole of the 121-hole star (numbered row by row from the top, left
+to right) holding the `game_player_id` of the marble in it or null;
+`turn_order` and `turn_index`; `homes`, the point (0 to 5, clockwise
+from the top) each player started in, in turn order; the `round`
+number; `moves`, the number of moves made; `last_move`, the move just
+made as `{player_id, path, seq}` where `path` is every hole the marble
+touched in order; and, once the round is over, `winner_player_id` or
+`is_draw`.
 
 `invite_token` is the secret in the game's shareable link,
 `/play/join/<invite_token>`. Unlike a player's `join_token` it is not
@@ -497,8 +507,10 @@ row holds:
   out and the play routes refuse it.
 - **`joined_at`**, **`avatar_style`**, **`avatar_color`** — set when
   the person picks a turkey (or, in Zombie Apocalypse, a character such
-  as `army_guy` or `grandma`). Turn order is the order people joined in,
-  with the AI last; a shirt colour belongs to one player per game. The
+  as `army_guy` or `grandma`; in Chinese Checkers the style is always
+  `marble` and only the color is a choice). Turn order is the order
+  people joined in, with the AI last; a color belongs to one player per
+  game. The
   AI is given a turkey when the game is started.
 - **`wins`** — rounds won in this game; in Zombie Apocalypse, levels
   the player fought in and survived. The hall of fame on the Games
