@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
-import { Check, Copy, Eye, Flag, Play, RotateCcw, Share2, Trophy, Undo2, UserPlus, WifiOff } from "lucide-react";
+import { Bot, Check, Copy, Eye, Flag, Play, RotateCcw, Share2, Trophy, Undo2, UserPlus, WifiOff } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { SHIRT_COLOR_KEYS, SHIRT_COLORS } from "../Turkey";
 import { canShare, copyLink, recallGuestName, shareJoinLink } from "../share";
@@ -42,6 +42,12 @@ function PlayerMarble({ player, size, className }: { player: GamePlayer; size: n
   return <Marble color={player.avatar_color} size={size} className={className} title={player.name} />;
 }
 
+/** A small robot next to the AI's name, so nobody waits for it to "join". */
+function AiTag({ player }: { player: GamePlayer }) {
+  if (player.kind !== "ai") return null;
+  return <Bot aria-label="AI player" className="inline h-[1em] w-[1em] shrink-0 align-[-0.125em]" />;
+}
+
 function Notice({ message }: { message: string | null }) {
   if (!message) return null;
   return (
@@ -78,7 +84,10 @@ export function CheckersWelcome({ game, ready, notice, problem, onJoin, onCancel
   const others = game.players.filter((p) => p.player_id !== you?.player_id);
   const takenBy = new Map<ShirtColor, string>();
   for (const p of others) {
-    if (p.joined && p.avatar_color) takenBy.set(p.avatar_color, p.name);
+    // The AI gives up its color to anyone who wants it.
+    if (p.joined && p.avatar_color && !(p.kind === "ai" && game.status === "lobby")) {
+      takenBy.set(p.avatar_color, p.name);
+    }
   }
   const firstFree = SHIRT_COLOR_KEYS.find((c) => !takenBy.has(c)) ?? SHIRT_COLOR_KEYS[0];
 
@@ -202,8 +211,12 @@ export function CheckersWelcome({ game, ready, notice, problem, onJoin, onCancel
               {others.map((p) => (
                 <li key={p.player_id} className="flex items-center gap-2 py-1.5">
                   <PlayerMarble player={p} size={30} />
-                  <span className="min-w-0 flex-1 truncate font-semibold">{p.name}</span>
-                  <span className="cc-soft text-xs">{p.joined ? (p.is_host ? "Started the game" : "In") : "Invited"}</span>
+                  <span className="min-w-0 flex-1 truncate font-semibold">
+                    {p.name} <AiTag player={p} />
+                  </span>
+                  <span className="cc-soft text-xs">
+                    {p.kind === "ai" ? "AI player" : p.joined ? (p.is_host ? "Started the game" : "In") : "Invited"}
+                  </span>
                 </li>
               ))}
             </ul>
@@ -400,7 +413,8 @@ export function CheckersGame({ game, online, notice, act, flash, onChangeColor }
     hint = `${turnPlayer?.name ?? "Someone"}'s turn. You'll play in the next one.`;
   } else if (!myTurn) {
     title = `${turnPlayer?.name ?? "Someone"}'s turn`;
-    hint = turnPlayer && !turnPlayer.connected ? "They've stepped away" : busy ? null : "Waiting for their move";
+    if (turnPlayer?.kind === "ai") hint = "Thinking…";
+    else hint = turnPlayer && !turnPlayer.connected ? "They've stepped away" : busy ? null : "Waiting for their move";
   } else if (sending) {
     title = "Sending your move…";
   } else if (busy) {
@@ -479,7 +493,7 @@ export function CheckersGame({ game, online, notice, act, flash, onChangeColor }
               >
                 <PlayerMarble player={p} size={22} className="shrink-0" />
                 <span className="min-w-0 flex-1 truncate text-[13px] font-extrabold">
-                  {p.player_id === myId ? "You" : p.name}
+                  {p.player_id === myId ? "You" : p.name} <AiTag player={p} />
                 </span>
                 {home !== null ? (
                   <span className="shrink-0 text-xs font-bold tabular-nums" title="Marbles in the far point">
@@ -696,11 +710,17 @@ function Lobby({
             <PlayerMarble player={p} size={32} />
             <div className="min-w-0 flex-1 leading-tight">
               <div className="truncate font-extrabold">
-                {p.name}
+                {p.name} <AiTag player={p} />
                 {p.player_id === game.you.player_id && <span className="font-semibold"> (you)</span>}
               </div>
               <div className="cc-soft truncate text-xs">
-                {p.joined ? (p.connected ? "Ready" : "Ready — stepped away") : waitingText(p)}
+                {p.kind === "ai"
+                  ? "Ready when you are"
+                  : p.joined
+                    ? p.connected
+                      ? "Ready"
+                      : "Ready — stepped away"
+                    : waitingText(p)}
               </div>
             </div>
             {!p.joined && links.has(p.player_id) && (

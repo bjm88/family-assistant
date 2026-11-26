@@ -40,6 +40,11 @@ const AI_LEVEL_BLURB: Record<AiLevel, string> = {
   medium: "Plays to win and blocks most of the time, but slips up now and then.",
   hard: "Doesn't miss a thing.",
 };
+const CHECKERS_AI_LEVEL_BLURB: Record<AiLevel, string> = {
+  easy: "Mostly just moves forward. Good for young players.",
+  medium: "Plays a sound game and finds most chains, but misses the best move now and then.",
+  hard: "Follows every chain to the end and thinks about the move after.",
+};
 
 type Dialog =
   | { kind: "new"; game: GameCatalogEntry }
@@ -140,6 +145,7 @@ export default function GamesPage() {
                     <p className="cc-soft mt-1 text-xs">
                       {playerCount(game)}, each with a color · chain hops for big moves, and everyone watches them
                       play out · invite anyone with a link, no sign-in needed
+                      {game.can_play_ai && ` · or play ${data.ai_name} on your own`}
                     </p>
                     <button
                       type="button"
@@ -596,7 +602,11 @@ function InviteDialog({ dialog, familyId, overview, onClose, onDone }: InviteDia
                 </div>
               </div>
             )}
-            {vsAi && <p className="px-3 pb-2.5 text-xs text-muted-foreground">{AI_LEVEL_BLURB[aiLevel]}</p>}
+            {vsAi && (
+              <p className="px-3 pb-2.5 text-xs text-muted-foreground">
+                {(isNew && dialog.game.key === "chinese_checkers" ? CHECKERS_AI_LEVEL_BLURB : AI_LEVEL_BLURB)[aiLevel]}
+              </p>
+            )}
           </div>
         )}
 
