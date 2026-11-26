@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Check, Copy, Flag, Play, Share2, Skull, Trophy, WifiOff } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, ChevronsLeftRight, Copy, Flag, Play, Share2, Skull, Trophy, WifiOff } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { SHIRT_COLOR_KEYS, SHIRT_COLORS } from "../Turkey";
 import { canShare, copyLink, recallGuestName, shareJoinLink } from "../share";
@@ -26,11 +26,12 @@ import "./zombies.css";
 //
 //   welcome  → who invited you, pick a character and a shirt, join
 //   setup    → the team, your weapons, how long to hold out, "Start level N"
-//   level    → the map (engine.ts) with the clock above it and a button
-//              for each weapon below; then back to setup for the next one
+//   level    → the map (engine.ts) with the clock above it and the
+//              controls below; then back to setup for the next one
 //
-// One thumb slides the player along the house; the other taps a weapon
-// to fire it straight out.
+// Everything the thumbs do is under the map, so nothing covers it: the
+// left thumb taps a weapon to fire it straight out; the right one
+// slides the player along the wall and flips them to the other wall.
 
 export const ZOMBIE_GAME = "zombie_apocalypse";
 const GUEST_NAME_MAX_LENGTH = 24;
@@ -417,6 +418,8 @@ interface BattleProps {
 function Battle({ game, zombie, online, send, feed, onPhase, onEnd }: BattleProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const backdropRef = useRef<HTMLCanvasElement>(null);
+  const slideRef = useRef<HTMLDivElement>(null);
+  const sliding = useRef<number | null>(null);
   const engineRef = useRef<ZombieEngine | null>(null);
   // The weapon whose reload is showing, and the shot that started it.
   const [view, setView] = useState<{ hud: Hud | null; reload: { index: number; shot: number } | null }>({
@@ -437,15 +440,24 @@ function Battle({ game, zombie, online, send, feed, onPhase, onEnd }: BattleProp
     const canvas = canvasRef.current;
     const backdrop = backdropRef.current;
     if (!canvas || !backdrop) return;
-    const engine = new ZombieEngine(canvas, backdrop, rules, meId, send, (hud) => {
-      report.current(hud.phase);
-      setView((before) => {
-        const last = before.hud;
-        let reload = before.reload;
-        if (last && hud.shot !== last.shot) reload = { index: hud.weapon, shot: hud.shot };
-        else if (last && hud.weapon !== last.weapon) reload = null;
-        return { hud, reload };
-      });
+    const engine = new ZombieEngine({
+      canvas,
+      backdrop,
+      rules,
+      me: meId,
+      send,
+      onHud: (hud) => {
+        report.current(hud.phase);
+        setView((before) => {
+          const last = before.hud;
+          let reload = before.reload;
+          if (last && hud.shot !== last.shot) reload = { index: hud.weapon, shot: hud.shot };
+          else if (last && hud.weapon !== last.weapon) reload = null;
+          return { hud, reload };
+        });
+      },
+      // The knob follows the player sixty times a second: not through React.
+      onWhere: (fraction) => slideRef.current?.style.setProperty("--za-at", fraction.toFixed(4)),
     });
     engine.setPlayers(players.current);
     engineRef.current = engine;
@@ -467,6 +479,15 @@ function Battle({ game, zombie, online, send, feed, onPhase, onEnd }: BattleProp
   const teamKills = hud ? Object.values(hud.kills).reduce((sum, n) => sum + n, 0) : 0;
   const over = hud?.phase === "won" || hud?.phase === "lost";
   const hurry = !!hud && hud.phase === "playing" && hud.left <= 10;
+  const facingTop = (hud?.side ?? -1) < 0;
+
+  /** The thumb on the slide: where it is along the bar is where the player goes along the wall. */
+  const slideTo = (event: React.PointerEvent<HTMLDivElement>) => {
+    const box = event.currentTarget.getBoundingClientRect();
+    // Half the knob (zombies.css), so the knob comes to rest under the thumb.
+    const margin = Math.min(26, box.width * 0.18);
+    engineRef.current?.steer((event.clientX - box.left - margin) / (box.width - margin * 2));
+  };
 
   return (
     <div className="zombie-theme zombie-screen flex flex-col">
@@ -503,13 +524,10 @@ function Battle({ game, zombie, online, send, feed, onPhase, onEnd }: BattleProp
               title={p.name}
             >
               <Portrait player={p} size={24} />
-              {/* Four across leaves no room for names; the faces and shirts tell them apart. */}
-              <span className={cn("min-w-0 flex-1 truncate text-xs font-bold", fighters.length > 3 && "sr-only")}>
+              <span className="min-w-0 flex-1 truncate text-xs font-bold">
                 {p.player_id === meId ? "You" : p.name}
               </span>
-              <span className={cn("text-xs font-black tabular-nums", fighters.length > 3 && "flex-1 text-right")}>
-                {hud?.kills[p.player_id] ?? 0}
-              </span>
+              <span className="text-xs font-black tabular-nums">{hud?.kills[p.player_id] ?? 0}</span>
             </div>
           ))}
         </div>
@@ -539,53 +557,116 @@ function Battle({ game, zombie, online, send, feed, onPhase, onEnd }: BattleProp
         <div className="px-4 py-5 text-center text-sm font-semibold">
           You're watching this level. You'll be in the next one.
         </div>
+      ) : !hud?.weapons.length ? (
+        <div className="za-controls">
+          <div className="za-soft za-dots col-span-3 flex items-center justify-center text-sm font-semibold">
+            Loading the level
+          </div>
+        </div>
       ) : (
-        <div className="za-weapons" role="group" aria-label="Weapons: tap one to fire it">
-          {(hud?.weapons.length ? hud.weapons : []).map((key, index) => {
-            const weapon = weapons.get(key);
-            const left = hud?.ammo[index] ?? null;
-            const inHand = hud?.weapon === index;
-            const empty = left !== null && left <= 0;
-            return (
-              <button
-                key={key}
-                type="button"
-                className={cn("za-weapon", inHand && "za-weapon-held", empty && "za-weapon-empty")}
-                aria-pressed={inHand}
-                aria-label={`${weapon?.name ?? key}, ${left === null ? "never runs out" : `${left} left`}`}
-                onPointerDown={(event) => {
-                  event.preventDefault();
-                  try {
-                    event.currentTarget.setPointerCapture(event.pointerId);
-                  } catch {
-                    /* the pointer is already gone */
-                  }
-                  engineRef.current?.press(index);
-                }}
-                onPointerUp={() => engineRef.current?.release(index)}
-                onPointerCancel={() => engineRef.current?.release(index)}
-                onContextMenu={(event) => event.preventDefault()}
-              >
-                {inHand && reload?.index === index && weapon && weapon.reload >= 0.25 && !empty && (
-                  <span key={reload.shot} className="za-reload" style={{ animationDuration: `${weapon.reload}s` }} />
-                )}
-                <span className="za-weapon-key">{index + 1}</span>
-                <span className="za-weapon-ammo">{left === null ? "∞" : left}</span>
-                <WeaponIcon weapon={key} />
-                <span className="za-weapon-name">{weapon?.name ?? key}</span>
-              </button>
-            );
-          })}
-          {!hud?.weapons.length && (
-            <div className="za-soft za-dots col-span-4 flex h-[76px] items-center justify-center text-sm font-semibold">
-              Loading the level
-            </div>
-          )}
+        <div className="za-controls">
+          <div className="za-weapons" role="group" aria-label="Weapons: tap one to fire it">
+            {hud.weapons.map((key, index) => {
+              const weapon = weapons.get(key);
+              const left = hud.ammo[index] ?? null;
+              const inHand = hud.weapon === index;
+              const empty = left !== null && left <= 0;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  className={cn("za-weapon", inHand && "za-weapon-held", empty && "za-weapon-empty")}
+                  aria-pressed={inHand}
+                  aria-label={`${weapon?.name ?? key}, ${left === null ? "never runs out" : `${left} left`}`}
+                  onPointerDown={(event) => {
+                    event.preventDefault();
+                    try {
+                      event.currentTarget.setPointerCapture(event.pointerId);
+                    } catch {
+                      /* the pointer is already gone */
+                    }
+                    engineRef.current?.press(index);
+                  }}
+                  onPointerUp={() => engineRef.current?.release(index)}
+                  onPointerCancel={() => engineRef.current?.release(index)}
+                  onContextMenu={(event) => event.preventDefault()}
+                >
+                  {inHand && reload?.index === index && weapon && weapon.reload >= 0.25 && !empty && (
+                    <span key={reload.shot} className="za-reload" style={{ animationDuration: `${weapon.reload}s` }} />
+                  )}
+                  <span className="za-weapon-key">{index + 1}</span>
+                  <span className="za-weapon-ammo">{left === null ? "∞" : left}</span>
+                  <WeaponIcon weapon={key} />
+                  <span className="za-weapon-name">{BUTTON_NAMES[key] ?? weapon?.name ?? key}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div
+            ref={slideRef}
+            className="za-slide"
+            role="slider"
+            aria-label="Slide to move along the wall"
+            aria-orientation="horizontal"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={50}
+            onPointerDown={(event) => {
+              event.preventDefault();
+              if (sliding.current !== null) return;
+              sliding.current = event.pointerId;
+              try {
+                event.currentTarget.setPointerCapture(event.pointerId);
+              } catch {
+                /* the pointer is already gone */
+              }
+              slideTo(event);
+            }}
+            onPointerMove={(event) => {
+              if (event.pointerId === sliding.current) slideTo(event);
+            }}
+            onPointerUp={(event) => {
+              if (event.pointerId === sliding.current) sliding.current = null;
+            }}
+            onPointerCancel={(event) => {
+              if (event.pointerId === sliding.current) sliding.current = null;
+            }}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <span className="za-slide-rail" />
+            <span className="za-slide-knob">
+              <ChevronsLeftRight className="h-6 w-6" strokeWidth={3} />
+            </span>
+            <span className="za-slide-hint">Slide to move</span>
+          </div>
+
+          <button
+            type="button"
+            className="za-flip"
+            aria-label={facingTop ? "Facing the top wall. Tap to face the bottom." : "Facing the bottom wall. Tap to face the top."}
+            onPointerDown={(event) => {
+              event.preventDefault();
+              engineRef.current?.flip();
+            }}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <span className={cn("za-flip-way", facingTop && "za-flip-on")}>
+              <ChevronUp className="h-7 w-7" strokeWidth={3.5} />
+            </span>
+            <span className="za-flip-label">{facingTop ? "Top" : "Bottom"}</span>
+            <span className={cn("za-flip-way", !facingTop && "za-flip-on")}>
+              <ChevronDown className="h-7 w-7" strokeWidth={3.5} />
+            </span>
+          </button>
         </div>
       )}
     </div>
   );
 }
+
+/** Names too long for one line of a weapon's button, with the place to break them. */
+const BUTTON_NAMES: Record<string, string> = { flamethrower: "Flame\u00adthrower" };
 
 // ---------------------------------------------------------------------------
 // Between levels: the team, weapons, how long, start

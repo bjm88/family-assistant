@@ -1,9 +1,10 @@
 import { useEffect, useRef } from "react";
 import type { ReactNode } from "react";
-import { ZOMBIE_ART } from "./draw";
+import { ZOMBIE_LOOK, drawGuardDog } from "./draw";
+import type { DogPose } from "./draw";
 
-// Small pictures of the weapons (seen from the side, pointing right)
-// and of the zombies (as they look on the map).
+// Small pictures of the weapons (seen from the side, pointing right),
+// and of the zombies and the guard dogs as they look on the map.
 
 const INK = "#10151c";
 const line = { stroke: INK, strokeWidth: 1.2, strokeLinejoin: "round" as const };
@@ -97,11 +98,8 @@ export function WeaponIcon({ weapon, className }: { weapon: string; className?: 
   );
 }
 
-// How much of the picture each zombie needs, in map units.
-const ZOMBIE_SPAN: Record<string, number> = { walker: 25, dog: 22, ogre: 40, bat: 23 };
-
-/** One zombie, drawn exactly as it is on the map, facing up. */
-export function ZombieIcon({ kind, size = 44 }: { kind: string; size?: number }) {
+/** A canvas `size` across, sharp on any screen, drawn by `paint` in a box 1 unit square. */
+function useSketch(size: number, paint: (ctx: CanvasRenderingContext2D) => void, deps: unknown[]) {
   const ref = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     const canvas = ref.current;
@@ -110,10 +108,49 @@ export function ZombieIcon({ kind, size = 44 }: { kind: string; size?: number })
     const dpr = Math.min(3, window.devicePixelRatio || 1);
     canvas.width = Math.round(size * dpr);
     canvas.height = Math.round(size * dpr);
-    const scale = (size * dpr) / (ZOMBIE_SPAN[kind] ?? 25);
-    ctx.setTransform(scale, 0, 0, scale, canvas.width / 2, canvas.height / 2);
-    ctx.rotate(-Math.PI / 2);
-    (ZOMBIE_ART[kind] ?? ZOMBIE_ART.walker)(ctx, 0.35, false, 0.4);
-  }, [kind, size]);
+    ctx.setTransform(canvas.width, 0, 0, canvas.height, 0, 0);
+    paint(ctx);
+    // `paint` is new every time; `deps` says when the picture really changes.
+  }, [size, ...deps]);
+  return ref;
+}
+
+/** One zombie, drawn exactly as it is on the map, coming this way. */
+export function ZombieIcon({ kind, size = 44 }: { kind: string; size?: number }) {
+  const ref = useSketch(
+    size,
+    (ctx) => {
+      const look = ZOMBIE_LOOK[kind] ?? ZOMBIE_LOOK.walker;
+      const span = Math.max(look.w, look.h);
+      ctx.scale(1 / span, 1 / span);
+      ctx.translate(span / 2, (span + look.h) / 2 - (look.h - look.ay));
+      look.draw(ctx, 0.3, false, false, 0);
+    },
+    [kind]
+  );
+  return <canvas ref={ref} style={{ width: size, height: size }} aria-hidden />;
+}
+
+/** A guard dog, as it is on the map; its collar is its owner's colour. */
+export function DogIcon({
+  dog,
+  size = 56,
+  collar = "#e03131",
+  pose = "sit",
+}: {
+  dog: string;
+  size?: number;
+  collar?: string;
+  pose?: DogPose;
+}) {
+  const ref = useSketch(
+    size,
+    (ctx) => {
+      ctx.scale(1 / 30, 1 / 30);
+      ctx.translate(pose === "sit" ? 13 : 12, 27);
+      drawGuardDog(ctx, dog, pose, 0.3, collar);
+    },
+    [dog, collar, pose]
+  );
   return <canvas ref={ref} style={{ width: size, height: size }} aria-hidden />;
 }

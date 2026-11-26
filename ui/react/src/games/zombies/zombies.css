@@ -119,6 +119,7 @@
 }
 .za-pick:disabled { opacity: 0.5; }
 
+
 .za-bar {
   height: 4px;
   border-radius: 2px;
@@ -148,20 +149,33 @@
   touch-action: none;
 }
 
-.za-weapons {
+/* Everything the thumbs do, in a strip under the map: weapons on the
+   left, the slide in the middle, the wall to face on the right. */
+.za-controls {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: clamp(120px, 35%, 172px) minmax(0, 1fr) clamp(50px, 13.5%, 72px);
   gap: 6px;
-  /* Thumb-sized on a phone; on a wide screen they stay together in the middle. */
+  flex: none;
+  height: clamp(138px, 21vh, 176px);
+  height: clamp(138px, 21dvh, 176px);
+  /* On a wide screen they stay together in the middle. */
   padding: 6px max(6px, calc((100% - 560px) / 2)) 8px;
   background: #0b120d;
+}
+
+.za-weapons {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  min-height: 0;
 }
 
 /* A weapon's button: tap it and it fires. */
 .za-weapon {
   position: relative;
   display: flex;
-  height: 76px;
+  min-height: 0;
   flex-direction: column;
   align-items: center;
   justify-content: center;
@@ -178,18 +192,19 @@
   background: linear-gradient(180deg, #34502f 0%, #1f3320 100%);
 }
 .za-weapon-empty { opacity: 0.35; }
-.za-weapon svg { position: relative; width: 52px; height: 34px; }
+.za-weapon svg { position: relative; flex: 0 1 30px; width: min(46px, 74%); min-height: 0; }
+/* Long names take two lines: the buttons are narrow, two to a row. */
 .za-weapon-name {
   position: relative;
   max-width: 100%;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   padding: 0 2px;
+  text-align: center;
+  hyphens: manual;
   font-size: 9.5px;
   font-weight: 800;
   letter-spacing: -0.01em;
-  line-height: 1.1;
+  line-height: 1.05;
   color: var(--za-ink-soft);
 }
 .za-weapon-ammo {
@@ -200,6 +215,9 @@
   font-weight: 900;
   font-variant-numeric: tabular-nums;
   color: var(--za-amber);
+  /* On a narrow button the picture reaches under the number. */
+  z-index: 1;
+  text-shadow: 0 0 3px #0b120d, 0 0 3px #0b120d, 0 1px 2px #0b120d;
 }
 .za-weapon-key {
   position: absolute;
@@ -222,6 +240,93 @@
 @keyframes za-reload {
   from { transform: scaleY(1); }
   to { transform: scaleY(0); }
+}
+
+/* The slide: the knob is where the player is along the wall, and a
+   thumb anywhere on the bar sends them there. */
+.za-slide {
+  --za-at: 0.5;
+  --za-knob: min(52px, 36%);
+  position: relative;
+  min-width: 0;
+  border-radius: 18px;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(180deg, #18221c 0%, #101812 100%);
+  box-shadow: inset 0 3px 8px rgba(0, 0, 0, 0.55);
+  touch-action: none;
+  cursor: ew-resize;
+}
+.za-slide-rail {
+  position: absolute;
+  left: calc(var(--za-knob) / 2);
+  right: calc(var(--za-knob) / 2);
+  top: 50%;
+  height: 6px;
+  margin-top: -3px;
+  border-radius: 3px;
+  background: rgba(154, 230, 110, 0.22);
+}
+.za-slide-knob {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--za-knob) / 2 + var(--za-at) * (100% - var(--za-knob)));
+  display: flex;
+  width: var(--za-knob);
+  height: min(64px, 62%);
+  align-items: center;
+  justify-content: center;
+  border-radius: 16px;
+  color: #0d1a10;
+  background: linear-gradient(180deg, #b6f08d 0%, #74c948 100%);
+  box-shadow: 0 4px 0 #3d7a22, 0 6px 14px rgba(0, 0, 0, 0.45);
+  transform: translate(-50%, -54%);
+  pointer-events: none;
+}
+.za-slide-hint {
+  position: absolute;
+  inset: auto 0 5px;
+  text-align: center;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: var(--za-ink-soft);
+  pointer-events: none;
+}
+
+/* Which wall to face: the lit arrow is the way the player is looking. */
+.za-flip {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  border-radius: 18px;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(180deg, #26342b 0%, #18221c 100%);
+  box-shadow: 0 3px 0 #070b08;
+  padding: 4px;
+  touch-action: none;
+}
+.za-flip:active { transform: translateY(2px); box-shadow: 0 1px 0 #070b08; }
+.za-flip-way {
+  display: flex;
+  width: 100%;
+  flex: 1 1 0%;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  color: rgba(255, 255, 255, 0.22);
+}
+.za-flip-on {
+  color: #0d1a10;
+  background: linear-gradient(180deg, #b6f08d 0%, #74c948 100%);
+}
+.za-flip-label {
+  padding: 2px 0;
+  font-size: 9.5px;
+  font-weight: 800;
+  line-height: 1;
+  color: var(--za-ink-soft);
 }
 
 .za-outcome {

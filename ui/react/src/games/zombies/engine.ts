@@ -1,11 +1,29 @@
 import { SHIRT_COLORS } from "../Turkey";
 import type { GamePlayer, ShirtColor, SurvivorStyle, ZombieKind, ZombieRules, ZombieWeapon } from "../types";
 import type { LiveMessage } from "../useGameSocket";
-import { ZOMBIE_ART, drawBoulder, drawCanopies, drawGround, drawIce, drawSurvivor } from "./draw";
+import {
+  TILT,
+  WALL_H,
+  WALL_T,
+  ZOMBIE_LOOK,
+  drawBoulder,
+  drawGround,
+  drawGuardDog,
+  drawIce,
+  drawSurvivor,
+  drawTree,
+  drawWall,
+} from "./draw";
+import type { DogPose, ZombieLook } from "./draw";
 import { isSurvivorStyle } from "./survivors";
 
 // A level of Zombie Apocalypse on the phone: the map, drawn on a canvas
 // sixty times a second, and everything the player does in it.
+//
+// The map is seen at a slant (draw.ts): the level itself is flat, in
+// the server's units, and only the drawing squashes the ground and
+// stands everyone up on it. What is nearer the bottom of the screen is
+// drawn over what is behind it.
 //
 // The server (python/api/games/zombie_apocalypse.py) sends the whole
 // level once — every zombie's rail and when it sets off — and after
@@ -35,6 +53,19 @@ const STALL_AFTER = 1.5;
 const MAX_DPR = 2;
 /** How far apart two players on a wall must be for both names to fit. */
 const NAME_ROOM = 26;
+/** Pictures of a zombie over one stride. */
+const FRAMES = 8;
+/** How high off the ground bolts and bullets fly, on the screen. */
+const SHOT_HEIGHT = 10;
+const DOG_HOME = 0;
+const DOG_OUT = 1;
+// What is drawn in order of depth.
+const ZED = 0;
+const TREE = 1;
+const WALL = 2;
+const FIGHTER = 3;
+const HOUND = 4;
+const ROLL = 5;
 
 const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
 const round1 = (v: number) => Math.round(v * 10) / 10;
@@ -59,13 +90,35 @@ export interface Hud {
   shot: number;
   /** By player id, this level. */
   kills: Record<number, number>;
+  /** The wall this player is defending, or on the way to: -1 top, 1 bottom. */
+  side: number;
   /** Nothing has been heard from the server for a moment. */
   stalled: boolean;
+}
+
+export interface EngineOptions {
+  canvas: HTMLCanvasElement;
+  /** Sits under `canvas`: the grass and the floor of the house, painted once. */
+  backdrop: HTMLCanvasElement;
+  rules: ZombieRules;
+  /** This player's id. */
+  me: number;
+  send: (message: LiveMessage) => boolean;
+  onHud: (hud: Hud) => void;
+  /** How far along the wall this player is, 0 (left) to 1, whenever it changes. */
+  onWhere?: (fraction: number) => void;
 }
 
 interface Zed {
   id: number;
   kind: ZombieKind;
+  look: ZombieLook;
+  /** Which of its kind's sets of clothes it wears. */
+  art: number;
+  /** Walking up the screen, so seen from behind. */
+  back: boolean;
+  /** Its kind, clothes and direction as one number, for looking up its pictures. */
+  code: number;
   t0: number;
   speed: number;
   maxHp: number;
@@ -87,7 +140,6 @@ interface Zed {
   gone: boolean;
   x: number;
   y: number;
-  angle: number;
   /** Its own clock, which stops while it is frozen. */
   te: number;
   atHouse: boolean;
@@ -145,6 +197,8 @@ interface Effect {
   kind: "splat" | "spark" | "boom" | "frost" | "flash" | "pellet" | "flame" | "dust";
   x: number;
   y: number;
+  /** How far off the ground it is, on the screen. */
+  up: number;
   age: number;
   life: number;
   r: number;
@@ -156,6 +210,47 @@ interface Pending {
   q: number;
   z: Zed;
   amount: number;
+}
+
+/** A player's guard dog. */
+interface Hound {
+  owner: number;
+  key: string;
+  speed: number;
+  hx: number;
+  hy: number;
+  x: number;
+  y: number;
+  /** Where the server last said it was. */
+  tx: number;
+  ty: number;
+  /** 0 at home, 1 out, 2 on its way back. */
+  state: number;
+  /** Per cent. */
+  health: number;
+  /** When its rest is over, on the level's clock. */
+  readyAt: number;
+  /** 1 facing right, -1 left. */
+  face: number;
+  moving: boolean;
+  cycle: number;
+}
+
+/** Something drawn in its turn, from the back of the map to the front. */
+interface Item {
+  depth: number;
+  what: number;
+  ref: unknown;
+}
+
+/** A tree or a wall, drawn once and stamped from then on. */
+interface Picture {
+  picture: HTMLCanvasElement;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  depth: number;
 }
 
 interface Snapshot {
@@ -171,6 +266,7 @@ interface Snapshot {
   dead: number[];
   fr: number[][];
   p: { id: number; x: number; side: number; weapons: string[]; weapon: number; kills: number }[];
+  dogs?: { dog: string; home: number[]; at: number[] }[];
   ammo: (number | null)[] | null;
   ack: number;
 }
@@ -183,6 +279,8 @@ interface Batch {
   f?: number[][];
   m?: number[][];
   w?: number[][];
+  /** Guard dogs: player, x, y, state, health %, when its rest ends. */
+  g?: number[][];
   a?: Record<string, number>;
   o?: string;
 }
@@ -246,12 +344,12 @@ function coneShare(
 export class ZombieEngine {
   private readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D | null;
-  /** Sits under `canvas`: the grass and the house, painted once. */
   private readonly backdrop: HTMLCanvasElement;
   private readonly rules: ZombieRules;
   private readonly meId: number;
   private readonly send: (message: LiveMessage) => boolean;
   private readonly onHud: (hud: Hud) => void;
+  private readonly onWhere: ((fraction: number) => void) | undefined;
   private readonly weapons = new Map<string, ZombieWeapon>();
   private readonly observer: ResizeObserver | null = null;
 
@@ -259,8 +357,13 @@ export class ZombieEngine {
   private scale = 1;
   private offX = 0;
   private offY = 0;
-  /** The leaves of each tree, ready to stamp over whatever walks under them. */
-  private canopies: { picture: HTMLCanvasElement; x: number; y: number; size: number }[] = [];
+  /** Canvas pixels to a map unit. */
+  private px = 1;
+  private treePictures: Picture[] = [];
+  private wallPictures: Picture[] = [];
+  private sprites = new Map<number, HTMLCanvasElement>();
+  private items: Item[] = [];
+  private itemCount = 0;
   private painted = false;
 
   // The level.
@@ -277,6 +380,7 @@ export class ZombieEngine {
   private next = 0;
   private active: Zed[] = [];
   private fighters = new Map<number, Fighter>();
+  private dogs = new Map<number, Hound>();
   private people = new Map<number, { name: string; style: SurvivorStyle | null; color: ShirtColor | null }>();
 
   // The clock: the level's time is this phone's time plus `offset`.
@@ -293,7 +397,7 @@ export class ZombieEngine {
   private wish = -1;
   private wishUntil = 0;
   private keyDir = 0;
-  private pointer: number | null = null;
+  private toldWhere = -1;
   private shotSeq = 0;
   private msgSeq = 0;
   private shots = 0;
@@ -313,28 +417,19 @@ export class ZombieEngine {
   private hudAt = 0;
   private hudKey = "";
 
-  constructor(
-    canvas: HTMLCanvasElement,
-    backdrop: HTMLCanvasElement,
-    rules: ZombieRules,
-    me: number,
-    send: (message: LiveMessage) => boolean,
-    onHud: (hud: Hud) => void
-  ) {
+  constructor(options: EngineOptions) {
+    const { canvas, rules } = options;
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
-    this.backdrop = backdrop;
+    this.backdrop = options.backdrop;
     this.rules = rules;
-    this.meId = me;
-    this.send = send;
-    this.onHud = onHud;
+    this.meId = options.me;
+    this.send = options.send;
+    this.onHud = options.onHud;
+    this.onWhere = options.onWhere;
     this.house = this.houseMax = rules.house.hp;
     for (const weapon of rules.weapons) this.weapons.set(weapon.key, weapon);
 
-    canvas.addEventListener("pointerdown", this.onPointerDown);
-    canvas.addEventListener("pointermove", this.onPointerMove);
-    canvas.addEventListener("pointerup", this.onPointerUp);
-    canvas.addEventListener("pointercancel", this.onPointerUp);
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
     window.addEventListener("blur", this.onBlur);
@@ -350,14 +445,11 @@ export class ZombieEngine {
   destroy() {
     cancelAnimationFrame(this.raf);
     this.observer?.disconnect();
-    const canvas = this.canvas;
-    canvas.removeEventListener("pointerdown", this.onPointerDown);
-    canvas.removeEventListener("pointermove", this.onPointerMove);
-    canvas.removeEventListener("pointerup", this.onPointerUp);
-    canvas.removeEventListener("pointercancel", this.onPointerUp);
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);
     window.removeEventListener("blur", this.onBlur);
+    this.sprites.clear();
+    this.items.length = 0;
   }
 
   /** Who is who: names, characters and shirt colours come with the game, not the level. */
@@ -405,9 +497,18 @@ export class ZombieEngine {
         cum.push(cum[cum.length - 1] + Math.hypot(path[i] - path[i - 2], path[i + 1] - path[i - 1]));
       }
       const dist = cum[cum.length - 1] || 1;
+      const kind = kinds[row[1]] ?? kinds[0];
+      const look = ZOMBIE_LOOK[kind.key] ?? ZOMBIE_LOOK.walker;
+      const art = row[0] % look.variants;
+      // Those from the bottom of the map walk up the screen.
+      const back = path[1] > rules.house.y;
       const z: Zed = {
         id: row[0],
-        kind: kinds[row[1]] ?? kinds[0],
+        kind,
+        look,
+        art,
+        back,
+        code: (kinds.indexOf(kind) * 4 + art) * 2 + (back ? 1 : 0),
         t0: row[2],
         speed: row[3],
         maxHp: row[4],
@@ -425,7 +526,6 @@ export class ZombieEngine {
         gone: false,
         x: path[0],
         y: path[1],
-        angle: path[1] < rules.house.y ? Math.PI / 2 : -Math.PI / 2,
         te: 0,
         atHouse: false,
         hurtAt: -10,
@@ -467,6 +567,30 @@ export class ZombieEngine {
         firedAt: old?.firedAt ?? -10,
       });
     }
+    this.dogs.clear();
+    for (const dog of snap.dogs ?? []) {
+      const owner = dog.at[0];
+      const [hx, hy] = dog.home;
+      this.dogs.set(owner, {
+        owner,
+        key: dog.dog,
+        speed: rules.guard_dogs.find((d) => d.key === dog.dog)?.speed ?? 120,
+        hx,
+        hy,
+        x: dog.at[1],
+        y: dog.at[2],
+        tx: dog.at[1],
+        ty: dog.at[2],
+        state: dog.at[3],
+        health: dog.at[4],
+        readyAt: dog.at[5],
+        // At home they face the middle of the house.
+        face: hx < rules.house.x ? 1 : -1,
+        moving: false,
+        cycle: owner * 0.37,
+      });
+    }
+    this.items.length = 0;
     const me = this.fighters.get(this.meId);
     this.ammo = snap.ammo ? [...snap.ammo] : [];
     this.readyAt = me ? me.weapons.map(() => 0) : [];
@@ -485,6 +609,8 @@ export class ZombieEngine {
       this.trees = snap.trees;
       this.paintGround();
     }
+    this.toldWhere = -1;
+    this.tellWhere();
     this.emitHud();
   }
 
@@ -504,7 +630,8 @@ export class ZombieEngine {
           if (!z.gone) this.splat(z);
           const fighter = this.fighters.get(by);
           if (fighter) fighter.kills += 1;
-        } else if (by !== this.meId) {
+        } else if (by !== this.meId || z.pend <= 0) {
+          // This player's own shots have flashed already; their dog's bites haven't.
           z.hurtAt = now;
         }
       }
@@ -523,6 +650,17 @@ export class ZombieEngine {
       for (const [id, index] of batch.w) {
         const fighter = this.fighters.get(id);
         if (fighter && id !== this.meId) fighter.weapon = index;
+      }
+    }
+    if (batch.g) {
+      for (const [id, x, y, state, health, readyAt] of batch.g) {
+        const dog = this.dogs.get(id);
+        if (!dog) continue;
+        dog.tx = x;
+        dog.ty = y;
+        dog.state = state;
+        dog.health = health;
+        dog.readyAt = readyAt;
       }
     }
     if (batch.f) {
@@ -679,7 +817,7 @@ export class ZombieEngine {
     const y0 = this.trackY(side);
     if (weapon.kind === "shot") {
       this.bolts.push({ w: weapon, x, y0, side, gone: 8, mine, shot });
-      this.effect("flash", x, y0 + side * 14, 0.06, 3);
+      this.effect("flash", x, y0 + side * 14, 0.06, 3, SHOT_HEIGHT);
     } else if (weapon.kind === "cone") {
       const flames = weapon.key === "flamethrower";
       const count = flames ? 3 : 9;
@@ -693,11 +831,12 @@ export class ZombieEngine {
           y0 + Math.sin(angle) * 12,
           life,
           flames ? 3 + Math.random() * 2.5 : 1,
+          SHOT_HEIGHT - 1,
           Math.cos(angle) * speed,
           Math.sin(angle) * speed
         );
       }
-      if (!flames) this.effect("flash", x, y0 + side * 14, 0.08, 5);
+      if (!flames) this.effect("flash", x, y0 + side * 14, 0.08, 5, SHOT_HEIGHT);
     } else if (weapon.kind === "lob") {
       const out = clamp(reach || weapon.range * 0.6, 30, weapon.range);
       this.lobs.push({ w: weapon, x, y0, side, reach: out, age: 0, life: out / weapon.speed });
@@ -714,38 +853,34 @@ export class ZombieEngine {
     return side < 0 ? this.rules.track.top : this.rules.track.bottom;
   }
 
-  private onPointerDown = (event: PointerEvent) => {
-    if (this.pointer !== null) return;
-    this.pointer = event.pointerId;
-    try {
-      this.canvas.setPointerCapture(event.pointerId);
-    } catch {
-      /* the pointer is already gone */
-    }
-    event.preventDefault();
-    this.steer(event);
-  };
-
-  private onPointerMove = (event: PointerEvent) => {
-    if (event.pointerId === this.pointer) this.steer(event);
-  };
-
-  private onPointerUp = (event: PointerEvent) => {
-    if (event.pointerId === this.pointer) this.pointer = null;
-  };
-
-  /** Head for where the finger is: along the wall, and to the wall on its side of the house. */
-  private steer(event: PointerEvent) {
+  /** The slide control: 0 is the left end of the wall, 1 the right. */
+  steer(fraction: number) {
     const me = this.fighters.get(this.meId);
-    if (!me) return;
-    const box = this.canvas.getBoundingClientRect();
-    const x = (event.clientX - box.left - this.offX) / this.scale;
-    const y = (event.clientY - box.top - this.offY) / this.scale;
-    const { track, house } = this.rules;
-    me.tx = clamp(x, track.left, track.right);
-    // A finger resting on the roof doesn't flip the player back and forth.
-    if (y < house.y - 8) me.tside = TOP;
-    else if (y > house.y + 8) me.tside = BOTTOM;
+    if (!me || !Number.isFinite(fraction)) return;
+    const { left, right } = this.rules.track;
+    me.tx = left + clamp(fraction, 0, 1) * (right - left);
+  }
+
+  /** Turn round and defend the other wall. */
+  flip() {
+    const me = this.fighters.get(this.meId);
+    if (me && !this.over) this.face(me, -me.tside);
+  }
+
+  private face(me: Fighter, side: number) {
+    if (me.tside === side) return;
+    me.tside = side;
+    this.emitHud();
+  }
+
+  private tellWhere() {
+    const me = this.fighters.get(this.meId);
+    if (!me || !this.onWhere) return;
+    const { left, right } = this.rules.track;
+    const fraction = (me.x - left) / (right - left);
+    if (Math.abs(fraction - this.toldWhere) < 0.002) return;
+    this.toldWhere = fraction;
+    this.onWhere(fraction);
   }
 
   private onKeyDown = (event: KeyboardEvent) => {
@@ -757,8 +892,8 @@ export class ZombieEngine {
     const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
     if (key === "ArrowLeft" || key === "a") this.keyDir = -1;
     else if (key === "ArrowRight" || key === "d") this.keyDir = 1;
-    else if (key === "ArrowUp" || key === "w") me.tside = TOP;
-    else if (key === "ArrowDown" || key === "s") me.tside = BOTTOM;
+    else if (key === "ArrowUp" || key === "w") this.face(me, TOP);
+    else if (key === "ArrowDown" || key === "s") this.face(me, BOTTOM);
     else if (key === " ") {
       if (!event.repeat) this.press(me.weapon);
     } else if (key >= "1" && key <= "9") {
@@ -779,7 +914,6 @@ export class ZombieEngine {
   private onBlur = () => {
     this.stopSliding(this.fighters.get(this.meId));
     this.held = -1;
-    this.pointer = null;
   };
 
   private stopSliding(me: Fighter | undefined) {
@@ -811,7 +945,6 @@ export class ZombieEngine {
       if (z.alive) this.active.push(z);
     }
     let dead = false;
-    const turn = Math.min(1, dt * 7);
     for (const z of this.active) {
       if (!z.alive) {
         dead = true;
@@ -822,18 +955,6 @@ export class ZombieEngine {
       z.y = spot.y;
       z.te = spot.te;
       z.atHouse = spot.te >= z.arrive;
-      let heading: number;
-      if (z.atHouse) {
-        heading = z.y < rules.house.y ? Math.PI / 2 : -Math.PI / 2;
-      } else {
-        const leg = spot.leg * 2;
-        heading = Math.atan2(z.path[leg + 1] - z.path[leg - 1], z.path[leg] - z.path[leg - 2]);
-        if (z.kind.flying) heading += 0.35 * Math.cos(rules.bat_weave_rate * (z.te - z.t0) + z.phase);
-      }
-      let off = heading - z.angle;
-      if (off > Math.PI) off -= TAU;
-      else if (off < -Math.PI) off += TAU;
-      z.angle += off * turn;
     }
     if (dead) this.active = this.active.filter((z) => z.alive);
 
@@ -851,6 +972,26 @@ export class ZombieEngine {
       const gap = f.tx - f.x;
       const most = rules.move_speed * dt;
       f.x += clamp(gap, -most, most);
+    }
+    this.tellWhere();
+
+    // Dogs go to where the server last saw them, a little faster than they run.
+    for (const dog of this.dogs.values()) {
+      const dx = dog.tx - dog.x;
+      const dy = dog.ty - dog.y;
+      const gap = Math.hypot(dx, dy);
+      const most = dog.speed * 1.3 * dt;
+      if (gap > 90 || gap <= most) {
+        dog.x = dog.tx;
+        dog.y = dog.ty;
+      } else {
+        dog.x += (dx / gap) * most;
+        dog.y += (dy / gap) * most;
+      }
+      dog.moving = gap > 1.2;
+      if (dog.moving && Math.abs(dx) > 1.5) dog.face = dx > 0 ? 1 : -1;
+      else if (dog.state === DOG_HOME && !dog.moving) dog.face = dog.hx < rules.house.x ? 1 : -1;
+      dog.cycle += dt * (dog.moving ? 2.8 : dog.state === DOG_OUT ? 2.4 : 0.8);
     }
     if (me && !this.over) {
       const x = round1(me.x);
@@ -895,7 +1036,7 @@ export class ZombieEngine {
           hit = z;
         }
         if (hit) {
-          this.effect("spark", hit.x, hit.y - b.side * hit.kind.radius * 0.5, 0.14, 3);
+          this.effect("spark", hit.x, hit.y, 0.14, 3, hit.look.alt + Math.min(SHOT_HEIGHT, hit.look.tall * 0.6));
           if (b.mine) {
             const q = ++this.msgSeq;
             this.send({ type: "zh", s: b.shot, z: hit.id, q });
@@ -924,7 +1065,8 @@ export class ZombieEngine {
             lob.x,
             lob.y0 + lob.side * lob.reach,
             lob.w.freeze ? 0.7 : 0.45,
-            lob.w.radius
+            lob.w.radius,
+            0
           );
         }
       }
@@ -939,7 +1081,8 @@ export class ZombieEngine {
             roll.x + (Math.random() * 2 - 1) * roll.w.radius * 0.7,
             roll.y0 + roll.side * (roll.gone - roll.w.radius),
             0.5,
-            3 + Math.random() * 3
+            3 + Math.random() * 3,
+            0
           );
         }
       }
@@ -957,12 +1100,12 @@ export class ZombieEngine {
     }
   }
 
-  private effect(kind: Effect["kind"], x: number, y: number, life: number, r: number, vx = 0, vy = 0) {
-    if (this.effects.length < 400) this.effects.push({ kind, x, y, age: 0, life, r, vx, vy });
+  private effect(kind: Effect["kind"], x: number, y: number, life: number, r: number, up: number, vx = 0, vy = 0) {
+    if (this.effects.length < 400) this.effects.push({ kind, x, y, up, age: 0, life, r, vx, vy });
   }
 
   private splat(z: Zed) {
-    this.effect("splat", z.x, z.y, z.kind.flying ? 0.5 : 1.4, z.kind.radius);
+    this.effect("splat", z.x, z.y, z.kind.flying ? 0.5 : 1.4, z.kind.radius, 0);
   }
 
   // ---- the picture ----------------------------------------------------------
@@ -974,30 +1117,34 @@ export class ZombieEngine {
     if (!width || !height) return;
     const dpr = Math.min(MAX_DPR, window.devicePixelRatio || 1);
     const { w, h } = this.rules.world;
-    const fit = Math.min(width / w, height / h);
+    const fit = Math.min(width / w, height / (h * TILT));
     for (const layer of [canvas, this.backdrop]) {
       layer.width = Math.round(width * dpr);
       layer.height = Math.round(height * dpr);
     }
     this.scale = fit;
     this.offX = (width - w * fit) / 2;
-    this.offY = (height - h * fit) / 2;
+    this.offY = (height - h * TILT * fit) / 2;
     this.paintGround();
   }
 
   /**
-   * The grass, the house and the trees don't move. The ground is
-   * painted once on a canvas of its own underneath, so a frame only
-   * has to draw what moves; each tree's leaves are kept as a small
-   * picture to stamp over the zombies passing below.
+   * The grass and the floor of the house don't move: they are painted
+   * once on a canvas of their own underneath, so a frame only has to
+   * draw what moves. The trees and the two long walls of the house are
+   * kept as small pictures, stamped in their turn so that whoever is
+   * behind them is hidden and whoever is in front is not.
    */
   private paintGround() {
     const canvas = this.canvas;
     if (!canvas.clientWidth) return;
     const { w, h } = this.rules.world;
+    const house = this.rules.house;
     const dpr = canvas.width / canvas.clientWidth;
     const px = this.scale * dpr;
     if (!px || !Number.isFinite(px)) return;
+    if (px !== this.px) this.sprites.clear();
+    this.px = px;
     const ctx = this.backdrop.getContext("2d");
     if (ctx) {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1005,26 +1152,103 @@ export class ZombieEngine {
       ctx.setTransform(px, 0, 0, px, Math.round(this.offX * dpr), Math.round(this.offY * dpr));
       ctx.save();
       ctx.beginPath();
-      ctx.rect(0, 0, w, h);
+      ctx.rect(0, 0, w, h * TILT);
       ctx.clip();
       const seed = this.trees.reduce((sum, tree) => sum + tree[0] * 7 + tree[1] * 13, 1);
       drawGround(ctx, this.rules, this.trees, Math.round(seed));
       ctx.restore();
     }
-    this.canopies = this.trees.map((tree) => {
-      const [x, y, r] = tree;
-      const size = r * 2 + 4;
-      const picture = document.createElement("canvas");
-      picture.width = picture.height = Math.max(1, Math.ceil(size * px));
-      const leaves = picture.getContext("2d");
-      if (leaves) {
-        leaves.scale(picture.width / size, picture.height / size);
-        leaves.translate(size / 2 - x, size / 2 - y);
-        drawCanopies(leaves, [tree]);
-      }
-      return { picture, x: x - size / 2, y: y - size / 2, size };
+    this.treePictures = this.trees.map(([x, y, r]) => {
+      const wide = r * 2 + 6;
+      const tall = r * 2.3 + 5;
+      return this.picture(wide, tall, x - wide / 2, y * TILT - tall + 2, y, (pen) => {
+        pen.translate(wide / 2, tall - 2);
+        drawTree(pen, r, Math.round(x * 31 + y * 17));
+      });
     });
+    const wide = house.w + 13;
+    const tall = WALL_H + WALL_T + 8;
+    this.wallPictures = [house.y - house.h / 2, house.y + house.h / 2].map((y) =>
+      this.picture(wide, tall, house.x - wide / 2, y * TILT - tall + 1, y, (pen) => {
+        pen.translate(4, tall - 1);
+        drawWall(pen, house.w + 5);
+      })
+    );
     this.painted = true;
+  }
+
+  /** A small canvas `wide` by `tall` map units, drawn once by `paint`. */
+  private picture(
+    wide: number,
+    tall: number,
+    x: number,
+    y: number,
+    depth: number,
+    paint: (pen: CanvasRenderingContext2D) => void
+  ): Picture {
+    const px = this.px;
+    const picture = document.createElement("canvas");
+    picture.width = Math.max(1, Math.ceil(wide * px));
+    picture.height = Math.max(1, Math.ceil(tall * px));
+    const pen = picture.getContext("2d");
+    if (pen) {
+      pen.scale(px, px);
+      paint(pen);
+    }
+    return { picture, x, y, w: picture.width / px, h: picture.height / px, depth };
+  }
+
+  /**
+   * A zombie's picture for one step of its stride. Dozens of them are
+   * on the map at once, so each picture is drawn once and stamped from
+   * then on.
+   */
+  private sprite(z: Zed, frame: number, flash: boolean): HTMLCanvasElement {
+    const key = ((z.code * 2 + (z.atHouse ? 1 : 0)) * FRAMES + frame) * 2 + (flash ? 1 : 0);
+    let sprite = this.sprites.get(key);
+    if (sprite) return sprite;
+    const look = z.look;
+    const px = this.px;
+    sprite = document.createElement("canvas");
+    sprite.width = Math.max(1, Math.ceil(look.w * px));
+    sprite.height = Math.max(1, Math.ceil(look.h * px));
+    const pen = sprite.getContext("2d");
+    if (pen) {
+      pen.scale(px, px);
+      pen.translate(look.ax, look.ay);
+      look.draw(pen, frame / FRAMES, z.atHouse, z.back, z.art);
+      if (flash) {
+        // Lit up white for a moment when it is hit.
+        pen.save();
+        pen.setTransform(1, 0, 0, 1, 0, 0);
+        pen.globalCompositeOperation = "source-atop";
+        pen.fillStyle = "rgba(255,255,255,0.6)";
+        pen.fillRect(0, 0, sprite.width, sprite.height);
+        pen.restore();
+      }
+      if (!look.alt) {
+        // Its shadow, slipped in underneath.
+        pen.globalCompositeOperation = "destination-over";
+        pen.fillStyle = "rgba(0,0,0,0.28)";
+        pen.beginPath();
+        pen.ellipse(0.5, 0, z.kind.radius * 0.95, z.kind.radius * 0.38, 0, 0, TAU);
+        pen.fill();
+      }
+    }
+    this.sprites.set(key, sprite);
+    return sprite;
+  }
+
+  private put(depth: number, what: number, ref: unknown) {
+    const item = this.items[this.itemCount];
+    if (item) {
+      item.depth = depth;
+      item.what = what;
+      item.ref = ref;
+    } else {
+      this.items.push({ depth, what, ref });
+    }
+    this.itemCount++;
   }
 
   private draw(now: number) {
@@ -1034,110 +1258,131 @@ export class ZombieEngine {
     const rules = this.rules;
     const { w, h } = rules.world;
     const dpr = canvas.width / canvas.clientWidth;
-    const px = this.scale * dpr;
-    const left = Math.round(this.offX * dpr);
-    const top = Math.round(this.offY * dpr);
+    const px = this.px;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.save();
-    ctx.setTransform(px, 0, 0, px, left, top);
+    ctx.setTransform(px, 0, 0, px, Math.round(this.offX * dpr), Math.round(this.offY * dpr));
     ctx.beginPath();
-    ctx.rect(0, 0, w, h);
+    ctx.rect(0, 0, w, h * TILT);
     ctx.clip();
 
     const t = this.t;
     const me = this.fighters.get(this.meId);
 
-    this.drawEffects(ctx, false);
+    // Flat on the ground, under everyone's feet.
+    ctx.save();
+    ctx.scale(1, TILT);
+    this.drawEffects(ctx, 0);
     if (me && this.started && !this.over) this.drawReach(ctx, me);
+    ctx.restore();
+    this.drawFloor(ctx, now);
 
-    // On the ground: walkers, dogs and ogres.
-    for (const z of this.active) if (!z.kind.flying && z.alive && !z.gone) this.drawZed(ctx, z, t, now);
-    for (const roll of this.rolls) {
-      ctx.save();
-      ctx.translate(roll.x, roll.y0 + roll.side * roll.gone);
-      drawBoulder(ctx, roll.w.radius, (roll.side * roll.gone) / roll.w.radius);
-      ctx.restore();
+    // Everything that stands up, from the back of the map to the front.
+    this.itemCount = 0;
+    for (const z of this.active) if (!z.kind.flying && z.alive && !z.gone) this.put(z.y, ZED, z);
+    for (const tree of this.treePictures) this.put(tree.depth, TREE, tree);
+    for (const wall of this.wallPictures) this.put(wall.depth, WALL, wall);
+    for (const f of this.fighters.values()) this.put(this.fighterY(f), FIGHTER, f);
+    for (const dog of this.dogs.values()) this.put(dog.y, HOUND, dog);
+    for (const roll of this.rolls) this.put(roll.y0 + roll.side * roll.gone, ROLL, roll);
+    const items = this.items;
+    for (let i = 1; i < this.itemCount; i++) {
+      const item = items[i];
+      let j = i - 1;
+      while (j >= 0 && items[j].depth > item.depth) {
+        items[j + 1] = items[j];
+        j--;
+      }
+      items[j + 1] = item;
     }
-    this.drawHouse(ctx, now);
-    // Teammates standing together would have their names in a heap, so
-    // one of a huddle is named: you, if you're in it.
-    const named = this.named;
-    named.length = 0;
-    if (me) named.push(me);
-    for (const f of this.fighters.values()) {
-      if (f === me) continue;
-      const clear = named.every((o) => o.side !== f.side || Math.abs(o.x - f.x) > NAME_ROOM);
-      if (clear) named.push(f);
-      this.drawFighter(ctx, f, now, false, clear);
+    for (let i = 0; i < this.itemCount; i++) {
+      const item = items[i];
+      switch (item.what) {
+        case ZED:
+          this.drawZed(ctx, item.ref as Zed, t, now);
+          break;
+        case TREE:
+        case WALL: {
+          const stamp = item.ref as Picture;
+          // Leaves let a little of what is behind them show.
+          if (item.what === TREE) ctx.globalAlpha = 0.88;
+          ctx.drawImage(stamp.picture, stamp.x, stamp.y, stamp.w, stamp.h);
+          ctx.globalAlpha = 1;
+          break;
+        }
+        case FIGHTER:
+          this.drawFighter(ctx, item.ref as Fighter, now, item.ref === me);
+          break;
+        case HOUND:
+          this.drawHound(ctx, item.ref as Hound, t);
+          break;
+        default:
+          this.drawRoll(ctx, item.ref as Roll);
+      }
     }
-    if (me) this.drawFighter(ctx, me, now, true, true);
     this.drawBolts(ctx);
-
-    ctx.globalAlpha = 0.86;
-    for (const tree of this.canopies) ctx.drawImage(tree.picture, tree.x, tree.y, tree.size, tree.size);
-    ctx.globalAlpha = 1;
+    this.drawEffects(ctx, 1);
+    // Blasts lie on the ground but show over the crowd they land in.
+    ctx.save();
+    ctx.scale(1, TILT);
+    this.drawEffects(ctx, 2);
+    ctx.restore();
 
     // In the air: bats, and whatever has been thrown.
     for (const z of this.active) {
       if (!z.kind.flying || !z.alive || z.gone) continue;
       ctx.fillStyle = "rgba(0,0,0,0.25)";
       ctx.beginPath();
-      ctx.ellipse(z.x + 4, z.y + 7, 5, 2.4, 0, 0, TAU);
+      ctx.ellipse(z.x, z.y * TILT, 5, 2, 0, 0, TAU);
       ctx.fill();
       this.drawZed(ctx, z, t, now);
     }
     for (const lob of this.lobs) {
       const f = lob.age / lob.life;
-      const lift = Math.sin(Math.PI * f);
-      const y = lob.y0 + lob.side * lob.reach * f;
+      const ground = (lob.y0 + lob.side * lob.reach * f) * TILT;
+      const up = SHOT_HEIGHT * (1 - f) + Math.sin(Math.PI * f) * (16 + lob.reach * 0.14);
       ctx.fillStyle = "rgba(0,0,0,0.25)";
       ctx.beginPath();
-      ctx.ellipse(lob.x + 3 * lift + 1, y + 5 * lift + 1, 3, 2, 0, 0, TAU);
+      ctx.ellipse(lob.x, ground, 3.2, 1.5, 0, 0, TAU);
       ctx.fill();
-      const r = 3 + 2.4 * lift;
       ctx.beginPath();
-      ctx.arc(lob.x, y, r, 0, TAU);
+      ctx.arc(lob.x, ground - up, 3.4, 0, TAU);
       ctx.fillStyle = lob.w.freeze ? "#ffffff" : "#3f5527";
       ctx.fill();
       ctx.lineWidth = 0.8;
       ctx.strokeStyle = lob.w.freeze ? "#a5d8ff" : "#141a12";
       ctx.stroke();
     }
-    this.drawEffects(ctx, true);
     this.drawBars(ctx);
+    this.drawNames(ctx, me);
     this.drawWords(ctx, now);
     ctx.restore();
   }
 
   private drawZed(ctx: CanvasRenderingContext2D, z: Zed, t: number, now: number) {
-    ctx.save();
-    ctx.translate(z.x, z.y);
-    ctx.save();
-    ctx.rotate(z.angle);
-    (ZOMBIE_ART[z.kind.key] ?? ZOMBIE_ART.walker)(ctx, z.te, z.atHouse, z.phase);
-    ctx.restore();
-    if (t < z.until) drawIce(ctx, z.kind.radius, z.until - t);
-    if (now - z.hurtAt < 0.09) {
-      ctx.globalAlpha = 0.55;
-      ctx.beginPath();
-      ctx.arc(0, 0, z.kind.radius, 0, TAU);
-      ctx.fillStyle = "#fff";
-      ctx.fill();
-      ctx.globalAlpha = 1;
+    const look = z.look;
+    const turn = z.te * (z.atHouse ? look.rate * 1.5 : look.rate) + z.phase;
+    const frame = Math.floor((turn - Math.floor(turn)) * FRAMES) % FRAMES;
+    const sprite = this.sprite(z, frame, now - z.hurtAt < 0.09);
+    const y = z.y * TILT - look.alt;
+    ctx.drawImage(sprite, z.x - look.ax, y - look.ay, sprite.width / this.px, sprite.height / this.px);
+    if (t < z.until) {
+      ctx.save();
+      ctx.translate(z.x, look.alt ? y + look.tall : y);
+      drawIce(ctx, look.w * 0.6, look.alt ? look.tall * 2 : look.tall, z.until - t);
+      ctx.restore();
     }
-    ctx.restore();
   }
 
-  /** How hurt each wounded zombie is. */
+  /** How hurt each wounded zombie is, over its head. */
   private drawBars(ctx: CanvasRenderingContext2D) {
     for (const z of this.active) {
       if (!z.alive || z.gone) continue;
       const hp = z.hp - z.pend;
       if (hp >= z.maxHp) continue;
-      const r = z.kind.radius;
-      const width = Math.max(10, r * 2);
-      const y = z.y - r - 4.5;
+      const width = Math.max(10, z.kind.radius * 2);
+      const y = z.y * TILT - z.look.alt - z.look.tall - 4;
       ctx.fillStyle = "rgba(0,0,0,0.6)";
       ctx.fillRect(z.x - width / 2 - 0.5, y - 0.5, width + 1, 2.8);
       ctx.fillStyle = "#ff6b6b";
@@ -1151,51 +1396,122 @@ export class ZombieEngine {
     return y + (this.trackY(f.from) - y) * (f.cross / this.rules.cross_seconds);
   }
 
-  private drawFighter(ctx: CanvasRenderingContext2D, f: Fighter, now: number, mine: boolean, named: boolean) {
-    const y = this.fighterY(f);
+  private shirtOf(player: number) {
+    const color = this.fighters.get(player)?.color ?? this.people.get(player)?.color ?? "blue";
+    return SHIRT_COLORS[color] ?? SHIRT_COLORS.blue;
+  }
+
+  private drawFighter(ctx: CanvasRenderingContext2D, f: Fighter, now: number, mine: boolean) {
+    const y = this.fighterY(f) * TILT;
     const facing = f.cross > this.rules.cross_seconds / 2 ? f.from : f.side;
-    const shirt = SHIRT_COLORS[f.color ?? "blue"] ?? SHIRT_COLORS.blue;
     ctx.fillStyle = "rgba(0,0,0,0.28)";
     ctx.beginPath();
-    ctx.ellipse(f.x + 1.5, y + 2, 9, 8, 0, 0, TAU);
+    ctx.ellipse(f.x, y, 8, 3.2, 0, 0, TAU);
     ctx.fill();
     if (mine) {
-      // A ring marks which one is you; it empties and refills as the
-      // weapon in hand reloads.
-      ctx.lineWidth = 1.6;
-      ctx.strokeStyle = "rgba(255,255,255,0.28)";
+      // A ring on the floor marks which one is you; it empties and
+      // refills as the weapon in hand reloads.
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(255,255,255,0.3)";
       ctx.beginPath();
-      ctx.arc(f.x, y, 12.5, 0, TAU);
+      ctx.ellipse(f.x, y, 11.5, 5, 0, 0, TAU);
       ctx.stroke();
       const weapon = this.weapons.get(f.weapons[f.weapon]);
       const wait = (this.readyAt[f.weapon] ?? 0) - now;
       const ready = weapon && weapon.reload >= 0.3 && wait > 0 ? 1 - wait / weapon.reload : 1;
-      ctx.strokeStyle = ready >= 1 ? shirt.light : "#ffd43b";
+      ctx.strokeStyle = ready >= 1 ? this.shirtOf(f.id).light : "#ffd43b";
       ctx.beginPath();
-      ctx.arc(f.x, y, 12.5, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(ready, 0, 1));
+      ctx.ellipse(f.x, y, 11.5, 5, 0, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(ready, 0, 1));
       ctx.stroke();
     }
     ctx.save();
     ctx.translate(f.x, y);
-    ctx.rotate((facing * Math.PI) / 2);
     const recoil = clamp(1 - (now - f.firedAt) / 0.12, 0, 1) * 2;
-    drawSurvivor(ctx, f.style, f.color, f.weapons[f.weapon] ?? this.rules.default_weapon, recoil);
+    const weapon = f.weapons[f.weapon] ?? this.rules.default_weapon;
+    drawSurvivor(ctx, f.style, f.color, weapon, recoil, facing === TOP, f.x * 0.3);
     ctx.restore();
-    if (!named) return;
+  }
 
-    const name = mine ? "You" : f.name.length > 9 ? `${f.name.slice(0, 8)}…` : f.name;
+  /**
+   * Teammates standing together would have their names in a heap, so
+   * one of a huddle is named: you, if you're in it.
+   */
+  private drawNames(ctx: CanvasRenderingContext2D, me: Fighter | undefined) {
+    const named = this.named;
+    named.length = 0;
+    if (me) named.push(me);
+    for (const f of this.fighters.values()) {
+      if (f !== me && named.every((o) => o.side !== f.side || Math.abs(o.x - f.x) > NAME_ROOM)) named.push(f);
+    }
     ctx.font = "700 6.5px system-ui, sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    const ny = y - facing * 15.5;
     ctx.lineWidth = 2;
     ctx.strokeStyle = "rgba(0,0,0,0.75)";
-    ctx.strokeText(name, f.x, ny);
-    ctx.fillStyle = mine ? "#ffe066" : "#fff";
-    ctx.fillText(name, f.x, ny);
+    for (const f of named) {
+      const mine = f === me;
+      const name = mine ? "You" : f.name.length > 9 ? `${f.name.slice(0, 8)}…` : f.name;
+      const y = this.fighterY(f) * TILT - 35;
+      ctx.strokeText(name, f.x, y);
+      ctx.fillStyle = mine ? "#ffe066" : "#fff";
+      ctx.fillText(name, f.x, y);
+    }
   }
 
-  /** Where the weapon in hand reaches, straight out from the player. */
+  private drawHound(ctx: CanvasRenderingContext2D, dog: Hound, t: number) {
+    const house = this.rules.house;
+    const resting = dog.state === DOG_HOME && dog.readyAt > 0 && t < dog.readyAt;
+    const pose: DogPose =
+      dog.moving || dog.state > DOG_OUT ? "run" : dog.state === DOG_OUT ? "bite" : resting ? "lie" : "sit";
+    // Over the wall in a bound.
+    const wall = Math.min(Math.abs(dog.y - (house.y - house.h / 2)), Math.abs(dog.y - (house.y + house.h / 2)));
+    const hop = clamp(1 - wall / 10, 0, 1) * (WALL_H + 4);
+    const y = dog.y * TILT;
+    ctx.fillStyle = "rgba(0,0,0,0.25)";
+    ctx.beginPath();
+    ctx.ellipse(dog.x, y, 8, 2.8, 0, 0, TAU);
+    ctx.fill();
+    ctx.save();
+    ctx.translate(dog.x, y - hop);
+    ctx.scale(dog.face, 1);
+    drawGuardDog(ctx, dog.key, pose, dog.cycle, this.shirtOf(dog.owner).main);
+    ctx.restore();
+    if (resting && !dog.moving) {
+      // Asleep, and for how much longer.
+      ctx.font = "800 6px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.lineWidth = 1.8;
+      ctx.strokeStyle = "rgba(0,0,0,0.7)";
+      const label = `z${Math.sin(dog.cycle * 3) > 0 ? "Z" : "z"} ${Math.max(1, Math.ceil(dog.readyAt - t))}`;
+      ctx.strokeText(label, dog.x, y - 15);
+      ctx.fillStyle = "#d0ebff";
+      ctx.fillText(label, dog.x, y - 15);
+    } else if (dog.state !== DOG_HOME && dog.health < 100) {
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(dog.x - 7.5, y - hop - 22.5, 15, 2.8);
+      ctx.fillStyle = dog.health > 35 ? "#69db7c" : "#ffd43b";
+      ctx.fillRect(dog.x - 7, y - hop - 22, 14 * clamp(dog.health / 100, 0, 1), 1.8);
+    }
+  }
+
+  private drawRoll(ctx: CanvasRenderingContext2D, roll: Roll) {
+    const r = roll.w.radius;
+    const y = (roll.y0 + roll.side * roll.gone) * TILT;
+    ctx.fillStyle = "rgba(0,0,0,0.3)";
+    ctx.beginPath();
+    ctx.ellipse(roll.x, y, r, r * 0.42, 0, 0, TAU);
+    ctx.fill();
+    ctx.save();
+    ctx.translate(roll.x, y - r * 0.85);
+    drawBoulder(ctx, r * 0.95, (roll.side * roll.gone) / r);
+    ctx.restore();
+  }
+
+  /**
+   * Where the weapon in hand reaches, straight out from the player.
+   * Drawn flat on the ground, in the level's own units.
+   */
   private drawReach(ctx: CanvasRenderingContext2D, me: Fighter) {
     if (me.cross > 0) return;
     const weapon = this.weapons.get(me.weapons[me.weapon]);
@@ -1242,10 +1558,10 @@ export class ZombieEngine {
   private drawBolts(ctx: CanvasRenderingContext2D) {
     ctx.lineCap = "round";
     for (const b of this.bolts) {
-      const y = b.y0 + b.side * b.gone;
+      const y = (b.y0 + b.side * b.gone) * TILT - SHOT_HEIGHT;
       const key = b.w.key;
       const tail = key === "sniper" ? 46 : key === "machine_gun" ? 8 : 10;
-      const back = y - b.side * Math.min(tail, b.gone);
+      const back = y - b.side * Math.min(tail, b.gone) * TILT;
       ctx.beginPath();
       ctx.moveTo(b.x, back);
       ctx.lineTo(b.x, y);
@@ -1269,13 +1585,19 @@ export class ZombieEngine {
     }
   }
 
-  private drawEffects(ctx: CanvasRenderingContext2D, above: boolean) {
+  /**
+   * What shots leave behind, in three passes: 0 is flat on the ground
+   * under everyone, 1 is in the air, 2 is the blasts over the crowd.
+   * Passes 0 and 2 are drawn in the level's own units, with the canvas
+   * squashed; pass 1 is drawn upright.
+   */
+  private drawEffects(ctx: CanvasRenderingContext2D, pass: number) {
     for (const e of this.effects) {
-      const ground = e.kind === "splat" || e.kind === "dust";
-      if (ground === above) continue;
       const f = e.age / e.life;
+      const y = e.y * TILT - e.up;
       switch (e.kind) {
         case "splat": {
+          if (pass !== 0) break;
           ctx.globalAlpha = 0.7 * (1 - f);
           ctx.fillStyle = "#5c8a2f";
           const grow = e.r * (0.7 + 0.6 * Math.min(1, f * 6));
@@ -1290,6 +1612,7 @@ export class ZombieEngine {
           break;
         }
         case "dust":
+          if (pass !== 0) break;
           ctx.globalAlpha = 0.4 * (1 - f);
           ctx.fillStyle = "#b9a98a";
           ctx.beginPath();
@@ -1297,39 +1620,53 @@ export class ZombieEngine {
           ctx.fill();
           break;
         case "spark":
+          if (pass !== 1) break;
           ctx.globalAlpha = 1 - f;
           ctx.fillStyle = "#fff3bf";
           ctx.beginPath();
-          ctx.arc(e.x, e.y, e.r * (0.5 + f), 0, TAU);
+          ctx.arc(e.x, y, e.r * (0.5 + f), 0, TAU);
           ctx.fill();
           break;
         case "flash":
+          if (pass !== 1) break;
           ctx.globalAlpha = 1 - f;
           ctx.fillStyle = "#ffe066";
           ctx.beginPath();
-          ctx.arc(e.x, e.y, e.r, 0, TAU);
+          ctx.arc(e.x, y, e.r, 0, TAU);
           ctx.fill();
           break;
         case "pellet":
+          if (pass !== 1) break;
           ctx.globalAlpha = 1 - f * 0.6;
           ctx.strokeStyle = "#ffe8a3";
           ctx.lineWidth = 1;
           ctx.beginPath();
-          ctx.moveTo(e.x, e.y);
-          ctx.lineTo(e.x - e.vx * 0.012, e.y - e.vy * 0.012);
+          ctx.moveTo(e.x, y);
+          ctx.lineTo(e.x - e.vx * 0.012, y - e.vy * TILT * 0.012);
           ctx.stroke();
           break;
         case "flame": {
+          if (pass !== 1) break;
           ctx.globalAlpha = 0.75 * (1 - f);
           ctx.fillStyle = f < 0.35 ? "#fff3bf" : f < 0.7 ? "#ffa94d" : "#e8590c";
           ctx.beginPath();
-          ctx.arc(e.x, e.y, e.r * (0.7 + 1.6 * f), 0, TAU);
+          ctx.arc(e.x, y - f * 5, e.r * (0.7 + 1.6 * f), 0, TAU);
           ctx.fill();
           break;
         }
         case "boom": {
           const grow = e.r * Math.min(1, 0.25 + f * 2.2);
-          ctx.globalAlpha = 0.75 * (1 - f);
+          if (pass === 1) {
+            // The fireball going up from it.
+            ctx.globalAlpha = 0.6 * (1 - f);
+            ctx.fillStyle = f < 0.3 ? "#fff3bf" : "#ff922b";
+            ctx.beginPath();
+            ctx.arc(e.x, y - grow * (0.25 + f * 0.5), grow * 0.5, 0, TAU);
+            ctx.fill();
+            break;
+          }
+          if (pass !== 2) break;
+          ctx.globalAlpha = 0.7 * (1 - f);
           ctx.fillStyle = f < 0.3 ? "#fff3bf" : "#ff922b";
           ctx.beginPath();
           ctx.arc(e.x, e.y, grow * 0.8, 0, TAU);
@@ -1342,6 +1679,7 @@ export class ZombieEngine {
           break;
         }
         case "frost": {
+          if (pass !== 2) break;
           const grow = e.r * Math.min(1, 0.3 + f * 2.5);
           ctx.globalAlpha = 0.5 * (1 - f);
           ctx.fillStyle = "#d0ebff";
@@ -1365,31 +1703,42 @@ export class ZombieEngine {
     ctx.globalAlpha = 1;
   }
 
-  /** The house's strength, on its roof. */
-  private drawHouse(ctx: CanvasRenderingContext2D, now: number) {
+  /** On the floor of the house: the dogs' beds, and the house's strength on the rug. */
+  private drawFloor(ctx: CanvasRenderingContext2D, now: number) {
     const house = this.rules.house;
+    const middle = house.y * TILT;
     const bitten = clamp(1 - (now - this.houseHurtAt) / 0.5, 0, 1);
     if (bitten > 0 || this.over === "lost") {
       ctx.fillStyle = `rgba(224,49,49,${this.over === "lost" ? 0.4 : 0.22 * bitten})`;
-      ctx.fillRect(house.x - house.w / 2, house.y - house.h / 2, house.w, house.h);
+      ctx.fillRect(house.x - house.w / 2, middle - (house.h / 2) * TILT, house.w, house.h * TILT);
+    }
+    ctx.lineWidth = 1;
+    for (const dog of this.dogs.values()) {
+      const shirt = this.shirtOf(dog.owner);
+      ctx.beginPath();
+      ctx.ellipse(dog.hx, dog.hy * TILT + 0.5, 13, 5.2, 0, 0, TAU);
+      ctx.fillStyle = shirt.dark;
+      ctx.fill();
+      ctx.strokeStyle = shirt.light;
+      ctx.stroke();
     }
     const share = clamp(this.house / this.houseMax, 0, 1);
     const color = share > 0.5 ? "#69db7c" : share > 0.25 ? "#ffd43b" : "#ff6b6b";
-    const width = 132;
+    const width = 128;
     const x = house.x - width / 2;
     ctx.fillStyle = "rgba(0,0,0,0.55)";
-    ctx.fillRect(x - 1.5, house.y + 3.5, width + 3, 7);
+    ctx.fillRect(x - 1.5, middle - 10, width + 3, 6.4);
     ctx.fillStyle = color;
-    ctx.fillRect(x, house.y + 5, width * share, 4);
+    ctx.fillRect(x, middle - 8.8, width * share, 4);
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.font = "800 16px system-ui, sans-serif";
+    ctx.font = "800 14px system-ui, sans-serif";
     ctx.lineWidth = 3;
     ctx.strokeStyle = "rgba(0,0,0,0.7)";
     const label = String(Math.max(0, Math.round(this.house)));
-    ctx.strokeText(label, house.x, house.y - 6);
+    ctx.strokeText(label, house.x, middle - 17.5);
     ctx.fillStyle = bitten > 0.5 ? "#ffc9c9" : "#fff";
-    ctx.fillText(label, house.x, house.y - 6);
+    ctx.fillText(label, house.x, middle - 17.5);
   }
 
   private drawWords(ctx: CanvasRenderingContext2D, now: number) {
@@ -1418,7 +1767,7 @@ export class ZombieEngine {
     ctx.textBaseline = "middle";
     ctx.lineWidth = size / 9;
     ctx.strokeStyle = "rgba(0,0,0,0.7)";
-    const y = house.y - world.h * 0.24;
+    const y = (house.y - world.h * 0.24) * TILT;
     ctx.strokeText(text, world.w / 2, y);
     ctx.fillStyle = "#fff";
     ctx.fillText(text, world.w / 2, y);
@@ -1446,6 +1795,7 @@ export class ZombieEngine {
       ammo: this.ammo,
       shot: this.shots,
       kills,
+      side: me ? me.tside : TOP,
       stalled: this.stalled(now),
     };
     const key = JSON.stringify(hud);

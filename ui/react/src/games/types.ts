@@ -119,6 +119,20 @@ export interface ZombieKind {
   from_level: number;
 }
 
+/** A dog a player can pick to help guard the house. */
+export interface GuardDog {
+  key: string;
+  name: string;
+  breed: string;
+  /** How much of a mauling it takes before it runs home. */
+  hp: number;
+  /** The damage one bite does. */
+  bite: number;
+  /** Map units a second. */
+  speed: number;
+  blurb: string;
+}
+
 export interface ZombieRules {
   world: { w: number; h: number };
   house: { x: number; y: number; w: number; h: number; hp: number };
@@ -136,6 +150,12 @@ export interface ZombieRules {
   zombies: ZombieKind[];
   bat_weave: number;
   bat_weave_rate: number;
+  guard_dogs: GuardDog[];
+  default_guard_dog: string;
+  /** A dog comes home after this many kills... */
+  guard_max_kills: number;
+  /** ...and rests between this many seconds and this many. */
+  guard_rest: [number, number];
 }
 
 export interface ZombieLevelResult {
@@ -148,6 +168,8 @@ export interface ZombieLevelResult {
   /** By player id. */
   kills: Record<string, number>;
   shots: Record<string, number>;
+  /** Of each player's kills, the ones their dog made. */
+  dog_kills?: Record<string, number>;
 }
 
 export interface ZombieView {
@@ -158,6 +180,8 @@ export interface ZombieView {
   durations: number[];
   /** By player id: the two weapons each player picked. */
   loadouts: Record<string, string[]>;
+  /** By player id: the guard dog each player picked. */
+  guard_dogs: Record<string, string>;
   /** Who is in the level being played. */
   fighting: number[];
   last: ZombieLevelResult | null;
@@ -212,6 +236,7 @@ export type GameAction =
   | { type: "join"; style: AvatarStyle; color: ShirtColor }
   | { type: "start" }
   | { type: "loadout"; weapons: string[] }
+  | { type: "guard_dog"; dog: string }
   | { type: "settings"; duration: number }
   | { type: "move"; cell: number }
   | { type: "play_again" }
