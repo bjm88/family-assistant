@@ -1,11 +1,16 @@
 """Rules of Zombie Apocalypse.
 
 A co-operative tower defence for one to four players, seen from above.
-The family's house stands in the middle of the map with the players
-inside it. Zombies come in waves from off the top and bottom of the
-screen, walk to the house and attack it. The house starts with
-``HOUSE_HP`` points; if any are left when the clock runs out the
-players have survived the level, and the next one is harder.
+The family's house stands across the middle of the map. Zombies come in
+waves from off the top and bottom of the screen, walk to the house and
+attack it. The house starts with ``HOUSE_HP`` points; if any are left
+when the clock runs out the players have survived the level, and the
+next one is harder.
+
+Each player slides left and right along the top or the bottom wall of
+the house, and can change walls. They always face out, and every weapon
+fires straight out from where they stand: there is no aiming, only
+being in the right place.
 
 Unlike Turkey TicTacToe this is played in real time, so it is built to
 say as little as possible over the network:
@@ -22,10 +27,12 @@ say as little as possible over the network:
 * **A player's own phone decides what their bolts and bullets hit**
   and reports it (``zh``), so a shot that looked like a hit on a slow
   connection is a hit. The server checks the report is plausible — the
-  shot was really fired, with ammunition, by a weapon that reaches that
-  far — and applies the damage. Sprays (shotgun, flamethrower) and
-  grenades are worked out here, from where the zombies are when the
-  message arrives.
+  shot was really fired, with ammunition, the zombie is in front of
+  where it was fired from and the weapon reaches that far — and applies
+  the damage. Sprays (shotgun, flamethrower), grenades, snowballs and
+  boulders are worked out here, from where the zombies are at the time.
+* **Players say where they are** (``zm``, and with every shot); the
+  server keeps them on the walls and passes it on.
 
 :class:`Round` is one level being played. It knows nothing about
 sockets or the database; :mod:`.zombie_live` drives it.
@@ -49,28 +56,44 @@ GAME_KEY = "zombie_apocalypse"
 WORLD_W = 360.0
 WORLD_H = 640.0
 
-# The house: centre and size. Players stand inside it.
+# The house: centre and size. It is nearly as wide as the map, so there
+# is a wall to defend in front of every zombie.
 HOUSE_X = 180.0
 HOUSE_Y = 320.0
-HOUSE_W = 136.0
-HOUSE_H = 108.0
+HOUSE_W = 300.0
+HOUSE_H = 84.0
 HOUSE_LEFT = HOUSE_X - HOUSE_W / 2
 HOUSE_RIGHT = HOUSE_X + HOUSE_W / 2
 HOUSE_TOP = HOUSE_Y - HOUSE_H / 2
 HOUSE_BOTTOM = HOUSE_Y + HOUSE_H / 2
 HOUSE_HP = 1000
 
-# Where each player stands, in the order they joined.
-PLAYER_SLOTS: Tuple[Tuple[float, float], ...] = (
-    (146.0, 290.0),
-    (214.0, 290.0),
-    (146.0, 350.0),
-    (214.0, 350.0),
+# Players stand just inside the top wall (side -1, facing up the map)
+# or the bottom wall (side 1, facing down), and slide along it between
+# TRACK_LEFT and TRACK_RIGHT.
+TOP, BOTTOM = -1, 1
+TRACK_LEFT = HOUSE_LEFT + 12.0
+TRACK_RIGHT = HOUSE_RIGHT - 12.0
+TRACK_INSET = 10.0
+# How fast a player slides, map units a second, and how long changing
+# walls takes. The phones move the players; these are for them.
+MOVE_SPEED = 320.0
+CROSS_SECONDS = 0.25
+# Where each player starts, in the order they joined: which wall, and
+# how far along it (0 = left end, 1 = right end).
+PLAYER_STARTS: Tuple[Tuple[int, float], ...] = (
+    (TOP, 0.35),
+    (BOTTOM, 0.65),
+    (TOP, 0.65),
+    (BOTTOM, 0.35),
 )
+MAX_PLAYERS = len(PLAYER_STARTS)
+# A bolt or bullet hits a zombie that is within this of its line, on
+# top of the zombie's own size: being roughly in front is enough.
+SHOT_WIDTH = 5.0
 
-# The crowd at a wall stands this far past the house's corners, and
-# this many map units deep, so dozens of zombies fit.
-PILE_OVERHANG = 12.0
+# The crowd at a wall stands this many map units deep, so dozens of
+# zombies fit.
 PILE_DEPTH = 30.0
 # The most zombies one wave brings.
 MAX_WAVE = 50
@@ -96,7 +119,7 @@ class Weapon:
     name: str
     # 'shot'  one bolt or bullet; hurts the first zombie it touches
     # 'cone'  a spray; hurts every zombie in a wedge in front of the player
-    # 'lob'   thrown to a spot; hurts (or freezes) every zombie around
+    # 'lob'   thrown straight out; hurts (or freezes) every zombie around
     #         where it lands
     # 'roll'  let go from where the player stands; rolls straight out
     #         to the edge of the map, hitting every zombie it touches
@@ -120,53 +143,56 @@ class Weapon:
         return self.kind != "shot"
 
 
+# From a wall to past the edge of the map.
+FULL_RANGE = HOUSE_TOP + 60.0
+
 WEAPONS: Dict[str, Weapon] = {
     w.key: w
     for w in (
         Weapon(
             "crossbow", "Crossbow", "shot",
-            damage=40, range=320, speed=520, reload=0.5, ammo=None,
+            damage=40, range=200, speed=520, reload=0.5, ammo=None,
             blurb="Dependable. Never runs out of bolts.",
         ),
         Weapon(
             "machine_gun", "Machine gun", "shot",
-            damage=16, range=330, speed=760, reload=0.1, ammo=180,
+            damage=16, range=215, speed=760, reload=0.1, ammo=180,
             blurb="Small bullets, lots of them.",
         ),
         Weapon(
             "sniper", "Sniper rifle", "shot",
-            damage=260, range=760, speed=1500, reload=1.5, ammo=14,
-            blurb="Reaches the whole map and hits hard. Slow to reload.",
+            damage=260, range=FULL_RANGE, speed=1500, reload=1.5, ammo=14,
+            blurb="Reaches the edge of the map and hits hard. Slow to reload.",
         ),
         Weapon(
             "shotgun", "Shotgun", "cone",
-            damage=70, range=170, speed=700, reload=0.85, ammo=26,
+            damage=70, range=125, speed=700, reload=0.85, ammo=26,
             spread=math.radians(20), falloff=0.5,
             blurb="Hits everything in front of you, up close.",
         ),
         Weapon(
             "flamethrower", "Flamethrower", "cone",
-            damage=11, range=120, speed=300, reload=0.08, ammo=260,
+            damage=11, range=95, speed=300, reload=0.08, ammo=260,
             spread=math.radians(17), falloff=0.7,
             blurb="Burns a whole crowd, but only at the doorstep.",
         ),
         Weapon(
             "grenade", "Grenade", "lob",
-            damage=220, range=290, speed=260, reload=1.3, ammo=9,
+            damage=220, range=230, speed=260, reload=1.3, ammo=9,
             radius=75, falloff=0.4,
-            blurb="Throw it where you tap. A big blast.",
+            blurb="Goes off at the first zombie in front of you. A big blast.",
         ),
         Weapon(
             "snowball", "Snowball", "lob",
-            damage=0, range=300, speed=320, reload=1.2, ammo=10,
+            damage=0, range=240, speed=320, reload=1.2, ammo=10,
             radius=70, freeze=6.0,
             blurb="Freezes the whole group where it lands. Doesn't hurt them.",
         ),
         Weapon(
             "boulder", "Boulder", "roll",
-            damage=100_000, range=math.hypot(WORLD_W, WORLD_H), speed=190,
+            damage=100_000, range=FULL_RANGE, speed=190,
             reload=1.0, ammo=2, radius=20, given=True,
-            blurb="Rolls straight out from the house and flattens everything in its way.",
+            blurb="Rolls straight out from where you stand and flattens everything in its way.",
         ),
     )
 }
@@ -179,8 +205,14 @@ GIVEN_WEAPONS: Tuple[str, ...] = tuple(w.key for w in WEAPONS.values() if w.give
 DEFAULT_LOADOUT: Tuple[str, ...] = ("shotgun", "machine_gun")
 
 # A phone's clock and the server's never agree exactly, and a bullet
-# reported as a hit left a moment ago: allow this much extra reach.
+# reported as a hit left a moment ago: allow this much extra reach, and
+# this much to either side of the line it was fired along.
 _REACH_SLACK = 48.0
+_LANE_SLACK = 30.0
+# A thrown weapon lands at least this far out, and this far out when
+# the phone doesn't say.
+_MIN_THROW = 30.0
+_USUAL_THROW = 0.6
 # Shots may arrive bunched up after a network hiccup. Each weapon can
 # be this far "ahead" of its reload time before shots are refused.
 _BURST_SECONDS = 0.5
@@ -467,7 +499,7 @@ def difficulty(level: int, players: int) -> Dict[str, Any]:
     in walkers; ``wave_every`` the seconds between waves at that point.
     """
     step = max(1, min(MAX_LEVEL, int(level))) - 1
-    team = max(1, min(len(PLAYER_SLOTS), int(players)))
+    team = max(1, min(MAX_PLAYERS, int(players)))
     crowd = 0.4 + 0.6 * team
     return {
         "hp": (1.0 + 0.07 * step) * (1.0 + 0.08 * (team - 1)),
@@ -540,18 +572,19 @@ def _spawn(
     t0: float,
 ) -> Zombie:
     x0 = rng.uniform(16.0, WORLD_W - 16.0)
+    # Mostly straight at the house, drifting a little to one side.
+    aim = min(HOUSE_RIGHT - 8.0, max(HOUSE_LEFT + 8.0, x0 + rng.uniform(-70.0, 70.0)))
     off = kind.radius + 8.0 + rng.uniform(0.0, 26.0)
     y0 = -off if side < 0 else WORLD_H + off
     if kind.flying:
-        # Bats swoop on to the roof.
-        tx = HOUSE_X + rng.uniform(-0.36, 0.36) * HOUSE_W
-        ty = HOUSE_Y + side * rng.uniform(0.08, 0.36) * HOUSE_H
+        # Bats hover over the crowd, a little way out from the wall.
+        gap = rng.uniform(6.0, PILE_DEPTH)
     else:
         # Everyone else piles up, several deep, against the wall they
         # came to.
-        tx = rng.uniform(HOUSE_LEFT - PILE_OVERHANG, HOUSE_RIGHT + PILE_OVERHANG)
         gap = kind.radius + rng.uniform(0.0, PILE_DEPTH)
-        ty = HOUSE_TOP - gap if side < 0 else HOUSE_BOTTOM + gap
+    tx = aim
+    ty = HOUSE_TOP - gap if side < 0 else HOUSE_BOTTOM + gap
     start, end = (x0, y0), (tx, ty)
     corners = [end] if kind.flying else _around_trees(rng, start, end, trees, kind.radius)
     return Zombie(
@@ -574,7 +607,7 @@ class _Fighter:
     """A player in a round: where they stand and what they carry."""
 
     __slots__ = (
-        "player_id", "slot", "x", "y", "weapons", "weapon", "ammo", "kills",
+        "player_id", "slot", "x", "side", "weapons", "weapon", "ammo", "kills",
         "shots", "ack", "_tokens", "_stamp", "_flying",
     )
 
@@ -583,7 +616,8 @@ class _Fighter:
     ) -> None:
         self.player_id = player_id
         self.slot = slot
-        self.x, self.y = PLAYER_SLOTS[slot]
+        self.side, along = PLAYER_STARTS[slot]
+        self.x = round(TRACK_LEFT + (TRACK_RIGHT - TRACK_LEFT) * along, 1)
         self.weapons: List[str] = [DEFAULT_WEAPON, *picks, *GIVEN_WEAPONS]
         self.weapon = 0  # index into ``weapons``
         self.ammo: List[Optional[int]] = [
@@ -594,8 +628,13 @@ class _Fighter:
         self.ack = 0  # highest message number handled, for the phone's bookkeeping
         self._tokens: List[float] = [_burst(WEAPONS[w]) for w in self.weapons]
         self._stamp: List[Optional[float]] = [None] * len(self.weapons)
-        # shot id -> (weapon, when it was fired): bolts and bullets in the air
-        self._flying: Dict[int, Tuple[Weapon, float]] = {}
+        # shot id -> (weapon, when it was fired, from where, facing which
+        # way): bolts and bullets in the air
+        self._flying: Dict[int, Tuple[Weapon, float, float, int]] = {}
+
+    @property
+    def y(self) -> float:
+        return track_y(self.side)
 
 
 class _Roll:
@@ -603,13 +642,18 @@ class _Roll:
 
     __slots__ = ("fighter", "weapon", "x", "y", "ux", "uy", "gone", "limit")
 
-    def __init__(self, fighter: _Fighter, weapon: Weapon, angle: float) -> None:
+    def __init__(self, fighter: _Fighter, weapon: Weapon) -> None:
         self.fighter = fighter
         self.weapon = weapon
         self.x, self.y = fighter.x, fighter.y
-        self.ux, self.uy = math.cos(angle), math.sin(angle)
+        self.ux, self.uy = 0.0, float(fighter.side)
         self.gone = 0.0
         self.limit = weapon.range
+
+
+def track_y(side: int) -> float:
+    """How far down the map a player on that wall stands."""
+    return HOUSE_TOP + TRACK_INSET if side < 0 else HOUSE_BOTTOM - TRACK_INSET
 
 
 def _burst(weapon: Weapon) -> float:
@@ -625,9 +669,9 @@ def _number(value: Any) -> Optional[float]:
 class Round:
     """One level in play: the zombies, the house and the players' weapons.
 
-    ``advance`` moves the clock on; ``fire`` / ``hit`` / ``switch`` are
-    what players do; ``drain`` hands back what changed since it was
-    last called, ready to send to every phone.
+    ``advance`` moves the clock on; ``move`` / ``fire`` / ``hit`` /
+    ``switch`` are what players do; ``drain`` hands back what changed
+    since it was last called, ready to send to every phone.
     """
 
     def __init__(
@@ -649,7 +693,7 @@ class Round:
         self.house = float(HOUSE_HP)
         self.over: Optional[str] = None  # 'won' or 'lost'
         self.fighters: Dict[int, _Fighter] = {}
-        for slot, (player_id, picks) in enumerate(players[: len(PLAYER_SLOTS)]):
+        for slot, (player_id, picks) in enumerate(players[:MAX_PLAYERS]):
             self.fighters[player_id] = _Fighter(
                 player_id,
                 slot,
@@ -668,6 +712,7 @@ class Round:
         self._hurt: Dict[int, int] = {}       # zombie id -> player who hit it last
         self._fired: List[List[Any]] = []
         self._switched: Dict[int, int] = {}
+        self._moved: Dict[int, _Fighter] = {}
         self._acked: Dict[int, int] = {}
         self._sent_house = int(HOUSE_HP)
         self._sent_at = -1e9
@@ -712,6 +757,21 @@ class Round:
 
     # ---- what players do -------------------------------------------------
 
+    def move(self, player_id: int, message: Dict[str, Any]) -> None:
+        """A player slid along their wall, or changed walls."""
+        fighter = self.fighters.get(player_id)
+        if fighter is not None:
+            self._place(fighter, message)
+
+    def _place(self, fighter: _Fighter, message: Dict[str, Any]) -> None:
+        x, side = _number(message.get("x")), message.get("d")
+        if x is None or side not in (TOP, BOTTOM) or isinstance(side, bool):
+            return
+        x = round(min(TRACK_RIGHT, max(TRACK_LEFT, x)), 1)
+        if x != fighter.x or side != fighter.side:
+            fighter.x, fighter.side = x, side
+            self._moved[fighter.player_id] = fighter
+
     def switch(self, player_id: int, message: Dict[str, Any]) -> None:
         fighter = self.fighters.get(player_id)
         index = message.get("w")
@@ -721,20 +781,23 @@ class Round:
             self._draw(fighter, index)
 
     def fire(self, player_id: int, message: Dict[str, Any]) -> bool:
-        """A player pulled the trigger. Returns whether the shot counted."""
+        """A player fired a weapon, straight out from where they stand.
+
+        The message may say where that is (``x``, ``d``), so the shot
+        leaves from where the player saw themselves. Returns whether
+        the shot counted.
+        """
         fighter = self.fighters.get(player_id)
         if fighter is None:
             return False
         self._ack(fighter, message)
         index = message.get("w")
-        angle = _number(message.get("a"))
         if (
             self.over is not None
             or self.t < 0
             or not isinstance(index, int)
             or isinstance(index, bool)
             or not 0 <= index < len(fighter.weapons)
-            or angle is None
         ):
             return False
         weapon = WEAPONS[fighter.weapons[index]]
@@ -748,34 +811,34 @@ class Round:
         if left is not None:
             fighter.ammo[index] = left - 1
         fighter.shots += 1
+        self._place(fighter, message)
 
-        # Where the player aimed, no further away than the weapon reaches.
-        tx, ty = _number(message.get("x")), _number(message.get("y"))
-        if tx is None or ty is None:
-            tx = fighter.x + math.cos(angle) * weapon.range
-            ty = fighter.y + math.sin(angle) * weapon.range
-        dx, dy = tx - fighter.x, ty - fighter.y
-        reach = math.hypot(dx, dy)
-        if reach > weapon.range:
-            dx, dy = dx * weapon.range / reach, dy * weapon.range / reach
-            reach = weapon.range
-        tx, ty = fighter.x + dx, fighter.y + dy
-        self._fired.append(
-            [player_id, index, round(angle, 3), round(tx, 1), round(ty, 1)]
-        )
-
+        throw = 0.0
         if weapon.kind == "cone":
-            self._spray(fighter, weapon, angle)
+            self._spray(fighter, weapon)
         elif weapon.kind == "lob":
-            self._lobs.append((self.t + reach / weapon.speed, fighter, weapon, tx, ty))
+            # How far out it lands: the phone picks (the first zombie
+            # in front of the player), within what the weapon can do.
+            throw = _number(message.get("r"))
+            if throw is None:
+                throw = weapon.range * _USUAL_THROW
+            throw = round(min(weapon.range, max(_MIN_THROW, throw)), 1)
+            self._lobs.append((
+                self.t + throw / weapon.speed,
+                fighter,
+                weapon,
+                fighter.x,
+                fighter.y + fighter.side * throw,
+            ))
         elif weapon.kind == "roll":
-            self._rolls.append(_Roll(fighter, weapon, angle))
+            self._rolls.append(_Roll(fighter, weapon))
         else:
             shot_id = message.get("s")
             if isinstance(shot_id, int) and not isinstance(shot_id, bool):
                 if len(fighter._flying) > 200:
                     self._forget_old_shots(fighter)
-                fighter._flying[shot_id] = (weapon, self.clock())
+                fighter._flying[shot_id] = (weapon, self.clock(), fighter.x, fighter.side)
+        self._fired.append([player_id, index, fighter.x, fighter.side, throw])
         return True
 
     def hit(self, player_id: int, message: Dict[str, Any]) -> bool:
@@ -790,14 +853,18 @@ class Round:
         flying = fighter._flying.pop(shot_id, None)
         if flying is None or self.over is not None:
             return False
-        weapon, fired_at = flying
+        weapon, fired_at, from_x, side = flying
         if self.clock() - fired_at > weapon.range / weapon.speed + 1.5:
             return False
         zombie = self._active.get(zombie_id)
         if zombie is None:
             return False
         x, y = zombie.position(self.t)
-        if math.hypot(x - fighter.x, y - fighter.y) > weapon.range + _REACH_SLACK:
+        out = (y - track_y(side)) * side
+        if (
+            abs(x - from_x) > zombie.radius + SHOT_WIDTH + _LANE_SLACK
+            or not -_REACH_SLACK <= out <= weapon.range + _REACH_SLACK
+        ):
             return False
         self._damage(zombie, weapon.damage, fighter)
         return True
@@ -835,9 +902,9 @@ class Round:
     def _forget_old_shots(self, fighter: _Fighter) -> None:
         now = self.clock()
         fighter._flying = {
-            shot_id: (weapon, fired_at)
-            for shot_id, (weapon, fired_at) in fighter._flying.items()
-            if now - fired_at <= weapon.range / weapon.speed + 1.5
+            shot_id: shot
+            for shot_id, shot in fighter._flying.items()
+            if now - shot[1] <= shot[0].range / shot[0].speed + 1.5
         }
 
     def _damage(self, zombie: Zombie, amount: float, fighter: _Fighter) -> None:
@@ -851,7 +918,8 @@ class Round:
             fighter.kills += 1
         self._hurt[zombie.id] = fighter.player_id
 
-    def _spray(self, fighter: _Fighter, weapon: Weapon, angle: float) -> None:
+    def _spray(self, fighter: _Fighter, weapon: Weapon) -> None:
+        angle = fighter.side * math.pi / 2
         for zombie in list(self._active.values()):
             x, y = zombie.position(self.t)
             share = cone_share(
@@ -895,7 +963,8 @@ class Round:
         """
         house = int(math.ceil(self.house))
         quiet = not (
-            self._hurt or self._fired or self._switched or self._acked or self._frozen
+            self._hurt or self._fired or self._switched or self._acked
+            or self._frozen or self._moved
         )
         if (
             quiet
@@ -917,6 +986,9 @@ class Round:
         if self._fired:
             batch["f"] = self._fired
             self._fired = []
+        if self._moved:
+            batch["m"] = [[f.player_id, f.x, f.side] for f in self._moved.values()]
+            self._moved = {}
         if self._switched:
             batch["w"] = [[pid, index] for pid, index in self._switched.items()]
             self._switched = {}
@@ -952,9 +1024,8 @@ class Round:
             "p": [
                 {
                     "id": f.player_id,
-                    "slot": f.slot,
                     "x": f.x,
-                    "y": f.y,
+                    "side": f.side,
                     "weapons": f.weapons,
                     "weapon": f.weapon,
                     "kills": f.kills,
@@ -1028,7 +1099,16 @@ def rules_view() -> Dict[str, Any]:
         "house": {
             "x": HOUSE_X, "y": HOUSE_Y, "w": HOUSE_W, "h": HOUSE_H, "hp": HOUSE_HP,
         },
-        "slots": [list(slot) for slot in PLAYER_SLOTS],
+        "track": {
+            "left": TRACK_LEFT,
+            "right": TRACK_RIGHT,
+            "top": track_y(TOP),
+            "bottom": track_y(BOTTOM),
+        },
+        "move_speed": MOVE_SPEED,
+        "cross_seconds": CROSS_SECONDS,
+        "shot_width": SHOT_WIDTH,
+        "pile_depth": PILE_DEPTH,
         "countdown": COUNTDOWN_SECONDS,
         "default_weapon": DEFAULT_WEAPON,
         "loadout_picks": LOADOUT_PICKS,

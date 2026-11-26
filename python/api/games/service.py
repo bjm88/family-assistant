@@ -415,7 +415,7 @@ def _join(
     game: models.Game, player: models.GamePlayer, *, style: Any, color: Any
 ) -> None:
     game_def = game_type_of(game)
-    what = "survivor" if game_def.realtime else "turkey"
+    what = "character" if game_def.realtime else "turkey"
     if style not in game_def.styles or color not in AVATAR_COLORS:
         raise GameError(f"Pick a {what} and a shirt colour first.")
     already_in = player.joined_at is not None

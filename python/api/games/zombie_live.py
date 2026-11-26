@@ -12,19 +12,23 @@ sends everyone what changed. Only the result is stored
 What goes over the socket, on top of the messages every game has:
 
 Phone → server
-    ``{"type": "zf", "w", "a", "x", "y", "s", "q"}``  fired weapon ``w``
-    (index into the player's weapons) at angle ``a`` towards ``x, y``;
-    ``s`` numbers the shot, ``q`` numbers the message.
+    ``{"type": "zm", "x", "d"}``  moved to ``x`` along wall ``d``
+    (-1 the top wall, 1 the bottom).
+    ``{"type": "zf", "w", "x", "d", "r", "s", "q"}``  fired weapon ``w``
+    (index into the player's weapons) straight out from ``x`` on wall
+    ``d``; ``r`` is how far out a thrown weapon should land; ``s``
+    numbers the shot, ``q`` numbers the message.
     ``{"type": "zh", "s", "z", "q"}``  shot ``s`` hit zombie ``z``.
-    ``{"type": "zw", "w"}``  switched to weapon ``w``.
+    ``{"type": "zw", "w"}``  switched to weapon ``w`` without firing it.
 
 Server → phone
     ``{"type": "zs", ...}``  the whole level, once, on (re)connecting
     (:meth:`Round.snapshot`).
-    ``{"type": "zt", "t", "h", "d", "f", "w", "a", "o"}``  what changed
-    since the last one (:meth:`Round.drain`): the clock, the house's
-    points, zombies hurt, shots fired, weapons switched, and how far
-    each player's messages have been handled.
+    ``{"type": "zt", "t", "h", "d", "fr", "f", "m", "w", "a", "o"}``
+    what changed since the last one (:meth:`Round.drain`): the clock,
+    the house's points, zombies hurt, zombies frozen, shots fired,
+    players who moved, weapons switched, and how far each player's
+    messages have been handled.
 
 The clock stops while nobody is connected, so a dropped connection
 doesn't cost a solo player the house. A level nobody comes back to is
@@ -59,7 +63,7 @@ MAX_STEP_SECONDS = 0.5
 ABANDON_AFTER_SECONDS = 180.0
 
 # The messages that are part of playing a level, handled here.
-LIVE_TYPES = frozenset({"zf", "zh", "zw"})
+LIVE_TYPES = frozenset({"zm", "zf", "zh", "zw"})
 
 
 class _Live:
@@ -122,7 +126,9 @@ def handle(game_id: int, player_id: int, message: Dict[str, Any]) -> None:
         return
     try:
         kind = message.get("type")
-        if kind == "zf":
+        if kind == "zm":
+            live.round.move(player_id, message)
+        elif kind == "zf":
             live.round.fire(player_id, message)
         elif kind == "zh":
             live.round.hit(player_id, message)

@@ -34,14 +34,16 @@ AVATAR_STYLES: Tuple[str, ...] = (
     "hippie",
     "beer",
 )
-# Survivors are seen from above, so what tells them apart is on their head.
+# Who defends the house in Zombie Apocalypse.
 SURVIVOR_STYLES: Tuple[str, ...] = (
-    "cap",
-    "helmet",
-    "cowboy",
-    "beanie",
-    "mohawk",
-    "pigtails",
+    "army_guy",
+    "army_girl",
+    "dad",
+    "mom",
+    "girl",
+    "boy",
+    "uncle",
+    "grandma",
 )
 AVATAR_COLORS: Tuple[str, ...] = (
     "red",
