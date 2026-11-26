@@ -33,8 +33,17 @@ say as little as possible over the network:
   connection is a hit. The server checks the report is plausible — the
   shot was really fired, with ammunition, the zombie is in front of
   where it was fired from and the weapon reaches that far — and applies
-  the damage. Sprays (shotgun, flamethrower), grenades, snowballs and
-  boulders are worked out here, from where the zombies are at the time.
+  the damage. Sprays (shotgun, flamethrower), the chainsaw, grenades,
+  snowballs and boulders are worked out here, from where the zombies
+  are at the time.
+* **Boulders are roped to the walls of the house**, two outside each
+  wall at the left and two at the right. Any player can cut one side's
+  loose, once a level (``zb``): all four roll away from the house, up
+  the map and down it, flattening whatever is in their way.
+* **Crates of TNT turn up on the map** when there are zombies about,
+  the more of them the oftener (:meth:`Round._tnt`). Anything that
+  hurts sets one off, and it blows up everything around it. The phones
+  are told when one lands and when one goes off.
 * **Players say where they are** (``zm``, and with every shot); the
   server keeps them on the walls and passes it on.
 * **Each player has a guard dog** that lives in the house, runs out at
@@ -144,8 +153,9 @@ class Weapon:
     # 'cone'  a spray; hurts every zombie in a wedge in front of the player
     # 'lob'   thrown straight out; hurts (or freezes) every zombie around
     #         where it lands
-    # 'roll'  let go from where the player stands; rolls straight out
-    #         to the edge of the map, hitting every zombie it touches
+    # 'roll'  rolls straight out from the house to the edge of the map,
+    #         hitting every zombie it touches: the boulders, which are
+    #         nobody's to carry
     kind: str
     damage: float
     range: float          # how far it reaches, map units
@@ -157,8 +167,7 @@ class Weapon:
     radius: float = 0.0   # 'lob': how far the blast reaches; 'roll': how wide it is
     falloff: float = 1.0  # share of the damage dealt at the far edge
     freeze: float = 0.0   # seconds the zombies it catches stand frozen
-    # Every player carries it, with exactly ``ammo`` uses a level
-    # however long the level is; it isn't one of the weapons they pick.
+    # Every player carries it; it isn't one of the weapons they pick.
     given: bool = False
 
     @property
@@ -179,43 +188,45 @@ WEAPONS: Dict[str, Weapon] = {
         ),
         Weapon(
             "machine_gun", "Machine gun", "shot",
-            damage=16, range=215, speed=760, reload=0.1, ammo=180,
+            damage=16, range=215, speed=760, reload=0.1, ammo=360,
             blurb="Small bullets, lots of them.",
         ),
         Weapon(
             "sniper", "Sniper rifle", "shot",
-            damage=260, range=FULL_RANGE, speed=1500, reload=1.5, ammo=14,
+            damage=260, range=FULL_RANGE, speed=1500, reload=1.5, ammo=28,
             blurb="Reaches the edge of the map and hits hard. Slow to reload.",
         ),
         Weapon(
             "shotgun", "Shotgun", "cone",
-            damage=70, range=125, speed=700, reload=0.85, ammo=26,
+            damage=70, range=125, speed=700, reload=0.85, ammo=52,
             spread=math.radians(20), falloff=0.5,
             blurb="Hits everything in front of you, up close.",
         ),
         Weapon(
             "flamethrower", "Flamethrower", "cone",
-            damage=11, range=95, speed=300, reload=0.08, ammo=260,
+            damage=11, range=95, speed=300, reload=0.08, ammo=520,
             spread=math.radians(17), falloff=0.7,
             blurb="Burns a whole crowd, but only at the doorstep.",
         ),
         Weapon(
             "grenade", "Grenade", "lob",
-            damage=220, range=230, speed=260, reload=1.3, ammo=9,
+            damage=220, range=230, speed=260, reload=1.3, ammo=18,
             radius=75, falloff=0.4,
             blurb="Goes off at the first zombie in front of you. A big blast.",
         ),
         Weapon(
             "snowball", "Snowball", "lob",
-            damage=0, range=240, speed=320, reload=1.2, ammo=10,
+            damage=0, range=240, speed=320, reload=1.2, ammo=20,
             radius=70, freeze=6.0,
             blurb="Freezes the whole group where it lands. Doesn't hurt them.",
         ),
+        # For when they are at the wall: it reaches the crowd piled up
+        # against it (``PILE_DEPTH``) and nothing further out.
         Weapon(
-            "boulder", "Boulder", "roll",
-            damage=100_000, range=FULL_RANGE, speed=190,
-            reload=1.0, ammo=2, radius=20, given=True,
-            blurb="Rolls straight out from where you stand and flattens everything in its way.",
+            "chainsaw", "Chainsaw", "cone",
+            damage=14, range=44, speed=200, reload=0.12, ammo=None,
+            spread=math.radians(32), given=True,
+            blurb="Cuts up whatever is at the wall in front of you. Reaches no further.",
         ),
     )
 }
@@ -223,7 +234,7 @@ WEAPON_KEYS: Tuple[str, ...] = tuple(WEAPONS)
 DEFAULT_WEAPON = "crossbow"
 # Everyone carries the crossbow, this many weapons of their choice...
 LOADOUT_PICKS = 2
-# ...and these, which nobody has to pick (two boulders a level).
+# ...and these, which nobody has to pick.
 GIVEN_WEAPONS: Tuple[str, ...] = tuple(w.key for w in WEAPONS.values() if w.given)
 DEFAULT_LOADOUT: Tuple[str, ...] = ("shotgun", "machine_gun")
 
@@ -240,6 +251,66 @@ _USUAL_THROW = 0.6
 # be this far "ahead" of its reload time before shots are refused.
 _BURST_SECONDS = 0.5
 _RATE_TOLERANCE = 1.1
+
+
+# ---------------------------------------------------------------------------
+# The boulders at the house
+# ---------------------------------------------------------------------------
+
+BOULDER = Weapon(
+    "boulder", "Boulder", "roll",
+    damage=100_000, range=FULL_RANGE, speed=190, reload=0, ammo=None, radius=20,
+    blurb="Rolls straight out from the house and flattens everything in its way.",
+)
+# Where along the house each lot is roped up, left and right: two
+# against the top wall and two against the bottom, side by side, this
+# far either side of that. Cut loose, the pair at each wall clears a
+# lane a hundred wide from the house to the edge of the map.
+SMASH_X: Tuple[float, ...] = (HOUSE_X - 75.0, HOUSE_X + 75.0)
+SMASH_APART = 21.0
+# How far out from the wall they sit, so the pair at the bottom wall
+# doesn't hide whoever is defending it.
+SMASH_OUT = 22.0
+
+
+# ---------------------------------------------------------------------------
+# TNT
+# ---------------------------------------------------------------------------
+
+# A crate of TNT is no player's weapon, but it goes off like one: a
+# grenade's blast and then some.
+TNT = Weapon(
+    "tnt", "TNT", "lob",
+    damage=240, range=0, speed=0, reload=0, ammo=None,
+    radius=90, falloff=0.4,
+    blurb="Shoot it and it blows up everything around it.",
+)
+# Half the width of a crate: what a bolt, a spray or a boulder has to touch.
+TNT_SIZE = 9.0
+# Crates land this far out from a wall: in reach of a crossbow, and
+# near enough for one at the near end to clear the crowd at the wall.
+TNT_BAND: Tuple[float, float] = (40.0, 170.0)
+# One nobody has shot is taken away after this long.
+TNT_SECONDS = 25.0
+# The most on the map at once, and how far apart they land.
+TNT_MAX = 3
+TNT_APART = 60.0
+# None in the first seconds of a level, nor this soon after the last.
+TNT_FIRST = 5.0
+TNT_GAP = 6.0
+# How many land a second while there are zombies on the map: this, and
+# this much more for every walker's worth of them, up to a limit. A
+# handful of zombies gets a crate every half a minute or so, an
+# invasion of forty one every six or seven seconds.
+TNT_RATE = 0.01
+TNT_RATE_PER_THREAT = 0.004
+TNT_MAX_RATE = 0.16
+# Each one comes this much sooner or later than that, by luck.
+TNT_LUCK: Tuple[float, float] = (0.5, 1.5)
+# It lands in the way of one of the zombies: where that one will be in
+# this many seconds, give or take this far across and along.
+TNT_LEAD: Tuple[float, float] = (1.5, 4.0)
+TNT_SCATTER: Tuple[float, float] = (30.0, 25.0)
 
 
 def ammo_for(weapon: Weapon, duration: float) -> Optional[int]:
@@ -912,13 +983,31 @@ class _Roll:
 
     __slots__ = ("fighter", "weapon", "x", "y", "ux", "uy", "gone", "limit")
 
-    def __init__(self, fighter: _Fighter, weapon: Weapon) -> None:
+    def __init__(self, fighter: _Fighter, weapon: Weapon, x: float, side: int) -> None:
+        """Let go at ``x`` from the wall on ``side``; what it kills is ``fighter``'s."""
         self.fighter = fighter
         self.weapon = weapon
-        self.x, self.y = fighter.x, fighter.y
-        self.ux, self.uy = 0.0, float(fighter.side)
+        self.x = x
+        self.y = HOUSE_TOP if side == TOP else HOUSE_BOTTOM
+        self.ux, self.uy = 0.0, float(side)
         self.gone = 0.0
         self.limit = weapon.range
+
+
+class _Crate:
+    """A crate of TNT standing on the map until something sets it off."""
+
+    __slots__ = ("id", "x", "y", "until")
+
+    def __init__(self, crate_id: int, x: float, y: float, until: float) -> None:
+        self.id = crate_id
+        # Rounded as they are sent.
+        self.x, self.y = round(x, 1), round(y, 1)
+        self.until = round(until, 1)
+
+    def wire(self) -> List[Any]:
+        """``[id, x, y, when it is taken away]``."""
+        return [self.id, self.x, self.y, self.until]
 
 
 def track_y(side: int) -> float:
@@ -989,6 +1078,17 @@ class Round:
         self._set_off: List[Zombie] = []      # vampires out since the last drain()
         self._lobs: List[Tuple[float, _Fighter, Weapon, float, float]] = []
         self._rolls: List[_Roll] = []
+        self.smashes = [True] * len(SMASH_X)  # the boulders still roped up
+        self._smashed: List[List[int]] = []   # which lot, player: cut loose since the last drain()
+        self.crates: Dict[int, _Crate] = {}   # TNT on the map
+        self._crate_ids = 0
+        self._tnt_rng = random.Random(f"tnt:{seed}")
+        self._tnt_at = TNT_FIRST              # when to next think about a crate
+        self._tnt_due = 0.0                   # how nearly it is time for one...
+        self._tnt_when = self._tnt_rng.uniform(*TNT_LUCK)  # ...of this much
+        self._tnt_after = 0.0                 # none may land before this
+        self._landed: List[_Crate] = []       # crates down since the last drain()
+        self._blown: List[List[int]] = []     # crate, player: gone off since then
         self._frozen: Dict[int, Zombie] = {}  # frozen since the last drain()
         # What has changed since the last drain().
         self._hurt: Dict[int, int] = {}       # zombie id -> player who hit it last
@@ -1019,6 +1119,7 @@ class Round:
             and self._waiting[0].t0 <= t
         ):
             self._release(self._waiting.pop(0))
+        self._tnt()
         if self._lobs:
             due = [lob for lob in self._lobs if lob[0] <= t]
             if due:
@@ -1056,6 +1157,68 @@ class Round:
         self._active[vampire.id] = vampire
         self._lone = vampire
         self._set_off.append(vampire)
+
+    def _tnt(self) -> None:
+        """Take away crates nobody shot, and perhaps put down a new one."""
+        t = self.t
+        if self.crates:
+            for crate in [c for c in self.crates.values() if c.until <= t]:
+                del self.crates[crate.id]
+        # Second by second the next one comes nearer, faster the more
+        # zombies there are to blow up.
+        while self._tnt_at <= t:
+            self._tnt_at += 1.0
+            threat = sum(z.type.threat for z in self._active.values())
+            if not threat:
+                continue
+            self._tnt_due = min(
+                self._tnt_when,
+                self._tnt_due + min(TNT_MAX_RATE, TNT_RATE + TNT_RATE_PER_THREAT * threat),
+            )
+            if (
+                self._tnt_due < self._tnt_when
+                or t < self._tnt_after
+                or len(self.crates) >= TNT_MAX
+            ):
+                continue
+            spot = self._tnt_spot()
+            if spot is None:
+                continue
+            self._crate_ids += 1
+            crate = _Crate(self._crate_ids, spot[0], spot[1], t + TNT_SECONDS)
+            self.crates[crate.id] = crate
+            self._landed.append(crate)
+            self._tnt_due = 0.0
+            self._tnt_when = self._tnt_rng.uniform(*TNT_LUCK)
+            self._tnt_after = t + TNT_GAP
+
+    def _tnt_spot(self) -> Optional[Tuple[float, float]]:
+        """Somewhere for a crate to land, in the way of the zombies."""
+        rng = self._tnt_rng
+        zombies = list(self._active.values())
+        near, far = TNT_BAND
+        for _ in range(8):
+            zombie = rng.choice(zombies)
+            x, y = zombie.position(self.t + rng.uniform(*TNT_LEAD))
+            x += rng.uniform(-1.0, 1.0) * TNT_SCATTER[0]
+            x = min(TRACK_RIGHT, max(TRACK_LEFT, x))
+            # In front of whichever wall that zombie is making for.
+            side = TOP if zombie.ty < HOUSE_Y else BOTTOM
+            out = (HOUSE_TOP - y) if side == TOP else (y - HOUSE_BOTTOM)
+            out += rng.uniform(-1.0, 1.0) * TNT_SCATTER[1]
+            out = min(far, max(near, out))
+            y = HOUSE_TOP - out if side == TOP else HOUSE_BOTTOM + out
+            if any(
+                math.hypot(x - cx, y - cy) < radius + TNT_SIZE + _TREE_CLEARANCE
+                for cx, cy, radius in self.trees
+            ):
+                continue
+            if any(
+                math.hypot(x - c.x, y - c.y) < TNT_APART for c in self.crates.values()
+            ):
+                continue
+            return x, y
+        return None
 
     # ---- what players do -------------------------------------------------
 
@@ -1132,8 +1295,6 @@ class Round:
                 fighter.x,
                 fighter.y + fighter.side * throw,
             ))
-        elif weapon.kind == "roll":
-            self._rolls.append(_Roll(fighter, weapon))
         else:
             shot_id = message.get("s")
             if isinstance(shot_id, int) and not isinstance(shot_id, bool):
@@ -1143,14 +1304,44 @@ class Round:
         self._fired.append([player_id, index, fighter.x, fighter.side, throw])
         return True
 
+    def smash(self, player_id: int, message: Dict[str, Any]) -> bool:
+        """A player cut loose the boulders at the left (``b`` 0) or the right (1).
+
+        Once a level for each. Returns whether they rolled.
+        """
+        fighter = self.fighters.get(player_id)
+        index = message.get("b")
+        if (
+            fighter is None
+            or self.over is not None
+            or self.t < 0
+            or not isinstance(index, int)
+            or isinstance(index, bool)
+            or not 0 <= index < len(SMASH_X)
+            or not self.smashes[index]
+        ):
+            return False
+        self.smashes[index] = False
+        for wall in (TOP, BOTTOM):
+            for off in (-SMASH_APART, SMASH_APART):
+                self._rolls.append(_Roll(fighter, BOULDER, SMASH_X[index] + off, wall))
+        self._smashed.append([index, player_id])
+        return True
+
     def hit(self, player_id: int, message: Dict[str, Any]) -> bool:
-        """A player's phone says one of their bolts or bullets hit a zombie."""
+        """A player's phone says one of their bolts or bullets hit something.
+
+        ``z`` is the zombie it hit, or ``c`` the crate of TNT.
+        """
         fighter = self.fighters.get(player_id)
         if fighter is None:
             return False
         self._ack(fighter, message)
-        shot_id, zombie_id = message.get("s"), message.get("z")
-        if not isinstance(shot_id, int) or not isinstance(zombie_id, int):
+        shot_id = message.get("s")
+        zombie_id, crate_id = message.get("z"), message.get("c")
+        if not isinstance(shot_id, int) or not isinstance(
+            crate_id if zombie_id is None else zombie_id, int
+        ):
             return False
         flying = fighter._flying.pop(shot_id, None)
         if flying is None or self.over is not None:
@@ -1158,6 +1349,19 @@ class Round:
         weapon, fired_at, from_x, side = flying
         if self.clock() - fired_at > weapon.range / weapon.speed + 1.5:
             return False
+        if zombie_id is None:
+            # A crate doesn't move, so there is little to allow for.
+            crate = self.crates.get(crate_id)
+            if crate is None:
+                return False
+            out = (crate.y - track_y(side)) * side
+            if (
+                abs(crate.x - from_x) > TNT_SIZE + SHOT_WIDTH + 2.0
+                or not 0.0 < out <= weapon.range + TNT_SIZE
+            ):
+                return False
+            self._explode(crate, fighter)
+            return True
         zombie = self._active.get(zombie_id)
         if zombie is None:
             return False
@@ -1232,6 +1436,9 @@ class Round:
             )
             if share > 0:
                 self._damage(zombie, weapon.damage * share, fighter)
+        for crate in list(self.crates.values()):
+            if cone_share(weapon, fighter.x, fighter.y, angle, crate.x, crate.y, TNT_SIZE) > 0:
+                self._explode(crate, fighter)
 
     def _blast(self, fighter: _Fighter, weapon: Weapon, bx: float, by: float) -> None:
         for zombie in list(self._active.values()):
@@ -1242,6 +1449,18 @@ class Round:
                     zombie.freeze(self.t, weapon.freeze)
                     self._frozen[zombie.id] = zombie
                 self._damage(zombie, weapon.damage * share, fighter)
+        if weapon.damage > 0:
+            # One crate of TNT sets off the next.
+            for crate in list(self.crates.values()):
+                if math.hypot(crate.x - bx, crate.y - by) <= weapon.radius + TNT_SIZE:
+                    self._explode(crate, fighter)
+
+    def _explode(self, crate: _Crate, fighter: _Fighter) -> None:
+        """A crate of TNT goes off; what it kills is ``fighter``'s."""
+        if self.crates.pop(crate.id, None) is None:
+            return
+        self._blown.append([crate.id, fighter.player_id])
+        self._blast(fighter, TNT, crate.x, crate.y)
 
     def _roll_on(self, roll: "_Roll", dt: float) -> None:
         """Move a boulder on, flattening every zombie it rolls over."""
@@ -1257,6 +1476,15 @@ class Round:
                 and abs(dx * roll.uy - dy * roll.ux) <= reach
             ):
                 self._damage(zombie, roll.weapon.damage, roll.fighter)
+        reach = roll.weapon.radius + TNT_SIZE
+        for crate in list(self.crates.values()):
+            dx, dy = crate.x - roll.x, crate.y - roll.y
+            along = dx * roll.ux + dy * roll.uy
+            if (
+                start - reach <= along <= roll.gone + reach
+                and abs(dx * roll.uy - dy * roll.ux) <= reach
+            ):
+                self._explode(crate, roll.fighter)
 
     # ---- guard dogs --------------------------------------------------------
 
@@ -1373,6 +1601,7 @@ class Round:
         quiet = not (
             self._hurt or self._fired or self._switched or self._acked
             or self._frozen or self._moved or self._set_off or dogs
+            or self._landed or self._blown or self._smashed
         )
         if (
             quiet
@@ -1386,6 +1615,15 @@ class Round:
             # A vampire's rail, the way the rest were sent in the snapshot.
             batch["z"] = [z.wire() for z in self._set_off]
             self._set_off = []
+        if self._landed:
+            batch["c"] = [c.wire() for c in self._landed]
+            self._landed = []
+        if self._blown:
+            batch["x"] = self._blown
+            self._blown = []
+        if self._smashed:
+            batch["b"] = self._smashed
+            self._smashed = []
         if self._hurt:
             batch["d"] = [
                 [zombie_id, int(math.ceil(self._by_id[zombie_id].hp)), player_id]
@@ -1435,6 +1673,8 @@ class Round:
             ],
             "dead": [z.id for z in self.zombies if not z.alive],
             "fr": [[z.id, z.stop, z.until] for z in self._active.values() if z.lag],
+            "tnt": [c.wire() for c in self.crates.values()],
+            "smash": [int(there) for there in self.smashes],
             "p": [
                 {
                     "id": f.player_id,
@@ -1565,6 +1805,19 @@ def rules_view() -> Dict[str, Any]:
             }
             for z in ZOMBIE_TYPES.values()
         ],
+        "smash": {
+            "x": list(SMASH_X),
+            "apart": SMASH_APART,
+            "out": SMASH_OUT,
+            "radius": BOULDER.radius,
+            "speed": BOULDER.speed,
+            "range": BOULDER.range,
+        },
+        "tnt": {
+            "radius": TNT.radius,
+            "size": TNT_SIZE,
+            "seconds": TNT_SECONDS,
+        },
         "bat_weave": BAT_WEAVE,
         "bat_weave_rate": BAT_WEAVE_RATE,
         "guard_dogs": [

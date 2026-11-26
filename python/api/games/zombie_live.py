@@ -18,18 +18,22 @@ Phone → server
     (index into the player's weapons) straight out from ``x`` on wall
     ``d``; ``r`` is how far out a thrown weapon should land; ``s``
     numbers the shot, ``q`` numbers the message.
-    ``{"type": "zh", "s", "z", "q"}``  shot ``s`` hit zombie ``z``.
+    ``{"type": "zh", "s", "z", "q"}``  shot ``s`` hit zombie ``z``
+    (or, with ``c`` in place of ``z``, crate of TNT ``c``).
     ``{"type": "zw", "w"}``  switched to weapon ``w`` without firing it.
+    ``{"type": "zb", "b"}``  cut loose the boulders at the left of the
+    house (``b`` 0) or the right (1).
 
 Server → phone
     ``{"type": "zs", ...}``  the whole level, once, on (re)connecting
     (:meth:`Round.snapshot`).
-    ``{"type": "zt", "t", "h", "z", "d", "fr", "f", "m", "w", "g", "a", "o"}``
-    what changed since the last one (:meth:`Round.drain`): the clock,
-    the house's points, a vampire setting off, zombies hurt, zombies
-    frozen, shots fired, players who moved, weapons switched, where the
-    guard dogs are, and how far each player's messages have been
-    handled.
+    ``{"type": "zt", "t", "h", "z", "c", "x", "b", "d", "fr", "f", "m",
+    "w", "g", "a", "o"}``  what changed since the last one
+    (:meth:`Round.drain`): the clock, the house's points, a vampire
+    setting off, crates of TNT landing and going off, boulders cut
+    loose, zombies hurt, zombies frozen, shots fired, players who
+    moved, weapons switched, where the guard dogs are, and how far each
+    player's messages have been handled.
 
 The clock stops while nobody is connected, so a dropped connection
 doesn't cost a solo player the house. A level nobody comes back to is
@@ -64,7 +68,7 @@ MAX_STEP_SECONDS = 0.5
 ABANDON_AFTER_SECONDS = 180.0
 
 # The messages that are part of playing a level, handled here.
-LIVE_TYPES = frozenset({"zm", "zf", "zh", "zw"})
+LIVE_TYPES = frozenset({"zm", "zf", "zh", "zw", "zb"})
 
 
 class _Live:
@@ -135,6 +139,8 @@ def handle(game_id: int, player_id: int, message: Dict[str, Any]) -> None:
             live.round.hit(player_id, message)
         elif kind == "zw":
             live.round.switch(player_id, message)
+        elif kind == "zb":
+            live.round.smash(player_id, message)
     except Exception:  # noqa: BLE001 - one bad message must not end the level
         logger.exception("game %s: could not apply %r", game_id, message.get("type"))
 

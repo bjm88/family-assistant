@@ -576,9 +576,12 @@ export function drawHeld(ctx: Ctx, weapon: string, recoil: number) {
     case "snowball":
       blob(ctx, 6.5, 0, 3, 3, "#ffffff", "#a5d8ff");
       break;
-    case "boulder":
-      blob(ctx, 7.5, 0, 4.8, 4.8, "#8c939b", INK);
-      dot(ctx, 6.4, -1.5, 1.2, "#a9b0b8");
+    case "chainsaw":
+      // The engine in the hands, the bar and its chain out in front.
+      limb(ctx, 5.5, 0, 17, 0, 3.4, "#2b3036");
+      limb(ctx, 6, 0, 16.5, 0, 1.8, "#c9cdd2");
+      box(ctx, 0.5, -3.2, 6.5, 6.4, 1.2, "#f76707", INK);
+      limb(ctx, 2, -3.2, 5, -4.6, 1.1, "#2b3036");
       break;
   }
   ctx.restore();
@@ -1119,4 +1122,61 @@ export function drawBoulder(ctx: Ctx, radius: number, spin: number) {
   ctx.lineTo(-radius * 0.2, radius * 0.7);
   ctx.stroke();
   ctx.restore();
+}
+
+/**
+ * A crate of TNT standing on (0, 0), `size` to either side. `spark`
+ * (0 to 1) is how brightly its fuse is burning just now.
+ */
+export function drawTnt(ctx: Ctx, size: number, spark: number) {
+  const tall = size * 1.6;
+  ctx.lineWidth = 0.9;
+  box(ctx, -size, -tall, size * 2, tall, 1.4, "#c92a2a", "#3b0b0b");
+  // The lid catches the light; the boards under it are in shadow.
+  ctx.fillStyle = "#f25c54";
+  ctx.fillRect(-size + 0.9, -tall + 0.9, size * 2 - 1.8, 2.2);
+  ctx.fillStyle = "#8f1d1d";
+  ctx.fillRect(-size + 0.9, -3, size * 2 - 1.8, 2.1);
+  ctx.fillStyle = "#ffe8a3";
+  ctx.fillRect(-size + 0.5, -tall * 0.72, size * 2 - 1, tall * 0.44);
+  ctx.fillStyle = "#3b0b0b";
+  ctx.font = `900 ${(tall * 0.42).toFixed(1)}px system-ui, sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("TNT", 0, -tall * 0.49);
+  ctx.strokeStyle = "#3a2f25";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(size * 0.45, -tall);
+  ctx.quadraticCurveTo(size * 0.9, -tall - 4.5, size * 0.4, -tall - 6.5);
+  ctx.stroke();
+  dot(ctx, size * 0.4, -tall - 6.5, 1.9 + spark, "rgba(255,146,43,0.55)");
+  dot(ctx, size * 0.4, -tall - 6.5, 1 + spark * 0.5, "#fff3bf");
+}
+
+/**
+ * The ropes on two boulders `radius` across that sit `apart` to either
+ * side of (0, 0): a turn round each one and two lines to the top of the
+ * wall, whose foot is `toWall` down the screen from theirs.
+ */
+export function drawRopes(ctx: Ctx, radius: number, apart: number, toWall: number) {
+  const band = -radius * 0.85;
+  const top = toWall - WALL_H - WALL_T * 0.5;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  for (const cx of [-apart, apart]) {
+    ctx.moveTo(cx - radius * 0.9, band - 1);
+    ctx.quadraticCurveTo(cx, band + 4, cx + radius * 0.9, band - 1);
+    for (const way of [-1, 1]) {
+      ctx.moveTo(cx + way * radius * 0.5, band + 1.5);
+      ctx.lineTo(cx + way * radius * 0.4, top);
+    }
+  }
+  ctx.lineWidth = 2.8;
+  ctx.strokeStyle = "#4a3520";
+  ctx.stroke();
+  ctx.lineWidth = 1.4;
+  ctx.strokeStyle = "#e0c391";
+  ctx.stroke();
 }
