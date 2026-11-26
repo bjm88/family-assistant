@@ -351,11 +351,11 @@ one is harder. If the house falls, the same level is offered again.
 - **Shooting.** Tapping a weapon fires it straight out from where the
   character stands; there is nothing to aim. Tapping a different weapon
   switches to it and fires in the same tap, and a weapon just switched
-  to is always ready. The machine gun, flamethrower and crossbow keep
-  firing while the button is held. A button fills back up while its
-  weapon reloads and shows the shots left.
-- **Weapons.** Everyone carries the crossbow, which never runs out, and
-  two boulders a level. Before each level every player picks two more:
+  to is always ready. The machine gun, flamethrower, crossbow and
+  chainsaw keep going while the button is held. A button fills back up
+  while its weapon reloads and shows the shots left.
+- **Weapons.** Everyone carries the crossbow and the chainsaw, which
+  never run out. Before each level every player picks two more:
 
   | Weapon | What it does |
   | --- | --- |
@@ -366,9 +366,25 @@ one is harder. If the house falls, the same level is offered again.
   | Flamethrower | Burns everything in a short wedge for as long as you hold it. |
   | Grenade | Thrown at the first zombie in front of you; a big blast. |
   | Snowball | Thrown the same way; freezes the group it lands on for 6 seconds and doesn't hurt them. |
-  | Boulder | Rolls straight out from where you stand to the edge of the map and flattens everything it touches. Two a level, no more. |
+  | Chainsaw | Cuts up whatever is at the wall right in front of you, and reaches no further. Unlimited. |
 
-  A longer level comes with more ammunition (except boulders).
+  A longer level comes with more ammunition.
+- **The boulders.** Two pairs of boulders are roped to the outside of
+  the house at its left end, one pair at the top wall and one at the
+  bottom, and two pairs at its right end. Tapping either pair on the
+  map cuts that end's four loose: two roll up the map and two roll
+  down it, flattening everything in a lane about a quarter of the map
+  wide on both sides of the house. Each end can be used once a level,
+  by any player who is fighting.
+- **TNT.** Crates of TNT land in the grounds, in front of the walls
+  and near where the zombies are heading. Anything that hits one sets
+  it off (a bolt, a bullet, flame, a grenade, a boulder, another
+  crate, though not a snowball), and it blows up everything around it,
+  over a wider patch than a grenade. The more there is on the map the
+  more often they come: a few in a quiet level, one every several
+  seconds in a big invasion. Up to three stand at once, and one that
+  nobody shoots is taken away after 25 seconds. Its kills count for
+  whoever set it off.
 - **Guard dogs.** Before a level each player also picks a dog. It
   waits in the house, at its own end, and runs out at any zombie on
   the ground that comes close to the walls (bats are out of its
@@ -409,7 +425,8 @@ one is harder. If the house falls, the same level is offered again.
   from the next one. Anyone in the game can start the next level.
 - On a computer: drag the slide with the mouse, or A/D and the arrow
   keys to slide, W/S to change walls, 1 to 4 to fire, space for the
-  weapon in hand.
+  weapon in hand, Q and E (or a click on them) to cut loose the left
+  and the right boulders.
 
 #### Chinese Checkers
 
