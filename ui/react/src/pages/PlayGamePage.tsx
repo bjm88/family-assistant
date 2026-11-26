@@ -4,11 +4,13 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Bot, Check, Copy, Eye, Flag, Play, RotateCcw, Share2, Trophy, UserPlus, WifiOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/cn";
-import { SHIRT_COLOR_KEYS, SHIRT_COLORS, Turkey, TURKEY_STYLES } from "@/games/Turkey";
+import { SHIRT_COLOR_KEYS, SHIRT_COLORS, Turkey, TURKEY_STYLES, turkeyStyle } from "@/games/Turkey";
 import { TurkeyBoard } from "@/games/TurkeyBoard";
 import { canShare, copyLink, recallGuestName, recallSeat, rememberSeat, shareJoinLink } from "@/games/share";
 import { useGameSocket } from "@/games/useGameSocket";
+import { LiveFeed, ZOMBIE_GAME, ZombieGame, ZombieGameOver, ZombieWelcome } from "@/games/zombies/ZombieGame";
 import type {
+  AvatarStyle,
   GameAction,
   GamePlayer,
   GameView,
@@ -30,6 +32,10 @@ import "@/games/games.css";
 // JoinGamePage, further down, is the page behind a game's shareable
 // link, /play/join/<invite token>: the same welcome, plus a box for
 // the guest's name. Joining there gives them a /play/<token> of their own.
+//
+// That is Turkey TicTacToe. Zombie Apocalypse has the same pages with
+// its own screens (games/zombies/ZombieGame.tsx); this file only picks
+// which game's screens to show.
 
 const GUEST_NAME_MAX_LENGTH = 24;
 
@@ -62,6 +68,8 @@ export default function PlayGamePage() {
   const [fatal, setFatal] = useState<string | null>(null);
   const [notice, flash] = useNotice();
   const [picking, setPicking] = useState(false);
+  // What the server says while a level of Zombie Apocalypse is played.
+  const feed = useRef(new LiveFeed()).current;
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -84,6 +92,7 @@ export default function PlayGamePage() {
     onState: setGame,
     onError: flash,
     onDropped: load,
+    onLive: (message) => feed.push(message),
   });
 
   const act = useCallback(
@@ -95,8 +104,43 @@ export default function PlayGamePage() {
 
   useGameTitle(game?.game_name);
 
+  // Nothing kept from a level that is over may leak into the next one.
+  const status = game?.status;
+  useEffect(() => {
+    if (status !== "playing") feed.clear();
+  }, [status, feed]);
+
   if (fatal) return <Sorry message={fatal} />;
   if (!game) return <Loading />;
+  if (game.game_type === ZOMBIE_GAME) {
+    if (game.status === "ended") return <ZombieGameOver game={game} />;
+    if (!game.you.joined || picking) {
+      return (
+        <ZombieWelcome
+          game={game}
+          ready={link === "open"}
+          notice={notice}
+          onJoin={(style, color) => {
+            act({ type: "join", style, color });
+            setPicking(false);
+          }}
+          onCancel={picking ? () => setPicking(false) : undefined}
+        />
+      );
+    }
+    return (
+      <ZombieGame
+        game={game}
+        online={link === "open"}
+        notice={notice}
+        act={act}
+        flash={flash}
+        send={send}
+        feed={feed}
+        onChangeCharacter={() => setPicking(true)}
+      />
+    );
+  }
   if (game.status === "ended") return <GameOver game={game} />;
   if (!game.you.joined || picking) {
     return (
@@ -164,7 +208,7 @@ export function JoinGamePage() {
 
   useGameTitle(game?.game_name);
 
-  const join = async (style: TurkeyStyle, color: ShirtColor, name: string) => {
+  const join = async (style: AvatarStyle, color: ShirtColor, name: string) => {
     if (!inviteToken || joining) return;
     setJoining(true);
     setProblem(null);
@@ -185,7 +229,8 @@ export function JoinGamePage() {
 
   if (fatal) return <Sorry message={fatal} />;
   if (!game || seat) return <Loading />;
-  if (game.status === "ended") return <GameOver game={game} />;
+  const zombies = game.game_type === ZOMBIE_GAME;
+  if (game.status === "ended") return zombies ? <ZombieGameOver game={game} /> : <GameOver game={game} />;
   if (game.is_full) {
     return (
       <Sorry
@@ -193,6 +238,9 @@ export function JoinGamePage() {
         detail={`${listNames(game.players.filter((p) => p.joined).map((p) => p.name))} are already playing. Ask ${game.invited_by} to start another game.`}
       />
     );
+  }
+  if (zombies) {
+    return <ZombieWelcome game={game} ready={!joining} notice={null} problem={problem} onJoin={join} />;
   }
   return <Welcome game={game} ready={!joining} notice={null} problem={problem} onJoin={join} />;
 }
@@ -218,8 +266,9 @@ function AiTag({ player, className }: { player: GamePlayer; className?: string }
 }
 
 function PlayerTurkey({ player, size, className }: { player: GamePlayer; size: number; className?: string }) {
-  if (!player.avatar_style || !player.avatar_color) return <NotHereYet size={size} />;
-  return <Turkey style={player.avatar_style} color={player.avatar_color} size={size} className={className} title={player.name} />;
+  const style = turkeyStyle(player.avatar_style);
+  if (!style || !player.avatar_color) return <NotHereYet size={size} />;
+  return <Turkey style={style} color={player.avatar_color} size={size} className={className} title={player.name} />;
 }
 
 /** Stand-in for someone who was invited but hasn't picked a turkey: an egg. */
@@ -351,7 +400,7 @@ function Welcome({ game, ready, notice, problem, onJoin, onCancel }: WelcomeProp
   }
   const firstFree = SHIRT_COLOR_KEYS.find((c) => !takenBy.has(c)) ?? SHIRT_COLOR_KEYS[0];
 
-  const [style, setStyle] = useState<TurkeyStyle>(me?.avatar_style ?? "happy");
+  const [style, setStyle] = useState<TurkeyStyle>(turkeyStyle(me?.avatar_style) ?? "happy");
   const [picked, setPicked] = useState<ShirtColor | null>(me?.avatar_color ?? null);
   const [name, setName] = useState(() => (you ? "" : recallGuestName().slice(0, GUEST_NAME_MAX_LENGTH)));
   // If someone else takes the colour while this player is choosing,

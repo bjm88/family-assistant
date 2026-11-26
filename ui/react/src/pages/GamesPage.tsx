@@ -8,7 +8,9 @@ import { PageHeader } from "@/components/PageHeader";
 import { Modal } from "@/components/Modal";
 import { useConfirm } from "@/components/ConfirmDialog";
 import { useToast } from "@/components/Toast";
+import { Avatar } from "@/games/Avatar";
 import { Turkey } from "@/games/Turkey";
+import { Survivor } from "@/games/zombies/Survivor";
 import { copyLink, shareJoinLink } from "@/games/share";
 import type {
   AiLevel,
@@ -19,6 +21,7 @@ import type {
   GameSummaryPlayer,
 } from "@/games/types";
 import "@/games/games.css";
+import "@/games/zombies/zombies.css";
 
 // The family's Games page: start a game and invite people, hop back
 // into one that's going, and see who has won the most.
@@ -68,6 +71,8 @@ export default function GamesPage() {
     return <div className="text-sm text-destructive">{(error as Error)?.message ?? "Couldn't load games."}</div>;
   }
 
+  // Zombie Apocalypse is played in levels, not rounds.
+  const inLevels = new Set(data.catalog.filter((g) => g.realtime).map((g) => g.key));
   const active = data.games.filter((g) => g.status !== "ended");
   const finished = data.games.filter((g) => g.status === "ended" && g.rounds_played > 0).slice(0, 5);
 
@@ -93,33 +98,60 @@ export default function GamesPage() {
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <div className="space-y-6 lg:col-span-2">
-          {data.catalog.map((game) => (
-            <section key={game.key} className="turkey-theme overflow-hidden rounded-xl border border-[#e9b872] shadow-sm">
-              <div className="flex flex-col items-center gap-4 p-5 sm:flex-row sm:p-6">
-                <div className="flex shrink-0 items-end -space-x-6">
-                  <Turkey style="cheerleader" color="purple" size={84} />
-                  <Turkey style="happy" color="blue" size={108} className="relative z-10" />
-                  <Turkey style="beer" color="green" size={84} />
+          {data.catalog.map((game) =>
+            game.realtime ? (
+              <section key={game.key} className="zombie-theme overflow-hidden rounded-xl border border-[#2f4a34] shadow-sm">
+                <div className="flex flex-col items-center gap-4 p-5 sm:flex-row sm:p-6">
+                  <div className="flex shrink-0 items-end -space-x-5">
+                    <Survivor style="grandma" color="purple" size={84} />
+                    <Survivor style="army_guy" color="green" size={108} className="relative z-10" />
+                    <Survivor style="uncle" color="orange" size={84} />
+                  </div>
+                  <div className="min-w-0 flex-1 text-center sm:text-left">
+                    <h2 className="za-title text-3xl leading-none">{game.name}</h2>
+                    <p className="mt-2 text-sm font-semibold">{game.tagline}</p>
+                    <p className="za-soft mt-1 text-xs">
+                      {playerCount(game)} on one team · played live, a couple of minutes a level · every level is
+                      harder · invite anyone with a link, no sign-in needed
+                    </p>
+                    <button
+                      type="button"
+                      className="za-btn za-btn-primary mt-4"
+                      onClick={() => setDialog({ kind: "new", game })}
+                    >
+                      <Play className="h-5 w-5 fill-current" /> Start a game
+                    </button>
+                  </div>
                 </div>
-                <div className="min-w-0 flex-1 text-center sm:text-left">
-                  <h2 className="tg-title text-3xl leading-none">{game.name}</h2>
-                  <p className="mt-2 text-sm font-semibold">{game.tagline}</p>
-                  <p className="mt-1 text-xs text-[color:var(--tg-ink-soft)]">
-                    {game.min_players}–{game.max_players} players · a few minutes a round · everyone gets a link by
-                    text or email, no sign-in needed
-                    {game.can_play_ai && ` · or play ${data.ai_name} on your own`}
-                  </p>
-                  <button
-                    type="button"
-                    className="tg-btn tg-btn-primary mt-4"
-                    onClick={() => setDialog({ kind: "new", game })}
-                  >
-                    <Play className="h-5 w-5 fill-current" /> Start a game
-                  </button>
+              </section>
+            ) : (
+              <section key={game.key} className="turkey-theme overflow-hidden rounded-xl border border-[#e9b872] shadow-sm">
+                <div className="flex flex-col items-center gap-4 p-5 sm:flex-row sm:p-6">
+                  <div className="flex shrink-0 items-end -space-x-6">
+                    <Turkey style="cheerleader" color="purple" size={84} />
+                    <Turkey style="happy" color="blue" size={108} className="relative z-10" />
+                    <Turkey style="beer" color="green" size={84} />
+                  </div>
+                  <div className="min-w-0 flex-1 text-center sm:text-left">
+                    <h2 className="tg-title text-3xl leading-none">{game.name}</h2>
+                    <p className="mt-2 text-sm font-semibold">{game.tagline}</p>
+                    <p className="mt-1 text-xs text-[color:var(--tg-ink-soft)]">
+                      {playerCount(game)} · a few minutes a round · everyone gets a link by text or email, no sign-in
+                      needed
+                      {game.can_play_ai && ` · or play ${data.ai_name} on your own`}
+                    </p>
+                    <button
+                      type="button"
+                      className="tg-btn tg-btn-primary mt-4"
+                      onClick={() => setDialog({ kind: "new", game })}
+                    >
+                      <Play className="h-5 w-5 fill-current" /> Start a game
+                    </button>
+                  </div>
                 </div>
-              </div>
-            </section>
-          ))}
+              </section>
+            )
+          )}
 
           <section className="card">
             <div className="card-header">
@@ -145,13 +177,15 @@ export default function GamesPage() {
                               game.status === "playing" && "border-green-200 bg-green-50 text-green-700"
                             )}
                           >
-                            {STATUS_LABEL[game.status]}
+                            {game.status === "round_over" && inLevels.has(game.game_type)
+                              ? "Between levels"
+                              : STATUS_LABEL[game.status]}
                           </span>
                         </div>
                         <div className="mt-0.5 text-xs text-muted-foreground">
                           Started by {game.host_name} {timeAgo(game.created_at)}
                           {game.rounds_played > 0 &&
-                            ` · ${game.rounds_played} ${game.rounds_played === 1 ? "round" : "rounds"} played`}
+                            ` · ${count(game.rounds_played, inLevels.has(game.game_type) ? "level" : "round")} played`}
                         </div>
                       </div>
                       <div className="flex flex-wrap items-center gap-2">
@@ -209,7 +243,7 @@ export default function GamesPage() {
                       {game.players.map((p) => (
                         <li key={p.player_id} className="flex items-center gap-2 rounded-lg bg-muted/60 px-2 py-1.5">
                           {p.avatar_style && p.avatar_color ? (
-                            <Turkey style={p.avatar_style} color={p.avatar_color} size={36} />
+                            <Avatar gameType={game.game_type} style={p.avatar_style} color={p.avatar_color} size={36} />
                           ) : (
                             <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-dashed border-border bg-white text-sm font-semibold text-muted-foreground">
                               {p.name.slice(0, 1).toUpperCase()}
@@ -264,9 +298,7 @@ export default function GamesPage() {
                         .sort((a, b) => b.wins - a.wins)
                         .map((p) => (
                           <span key={p.player_id} className="inline-flex items-center gap-1">
-                            {p.avatar_style && p.avatar_color && (
-                              <Turkey style={p.avatar_style} color={p.avatar_color} size={24} />
-                            )}
+                            <Avatar gameType={game.game_type} style={p.avatar_style} color={p.avatar_color} size={24} />
                             {p.name} <span className="font-semibold tabular-nums">{p.wins}</span>
                           </span>
                         ))}
@@ -291,7 +323,9 @@ export default function GamesPage() {
                 </div>
                 {board.length === 0 ? (
                   <div className="card-body text-sm text-muted-foreground">
-                    No rounds won yet. The first win puts you on top.
+                    {game.realtime
+                      ? "No levels survived yet. Hold the house once and you're on top."
+                      : "No rounds won yet. The first win puts you on top."}
                   </div>
                 ) : (
                   <ol className="divide-y divide-border">
@@ -312,10 +346,11 @@ export default function GamesPage() {
                         </span>
                         <span className="text-right leading-tight">
                           <span className="font-semibold tabular-nums">
-                            {entry.wins} {entry.wins === 1 ? "win" : "wins"}
+                            {game.realtime ? `${count(entry.wins, "level")} survived` : count(entry.wins, "win")}
                           </span>
                           <span className="block text-[11px] text-muted-foreground">
-                            {entry.games} {entry.games === 1 ? "game" : "games"}
+                            {game.realtime && entry.best ? `best: level ${entry.best} · ` : ""}
+                            {count(entry.games, "game")}
                           </span>
                         </span>
                       </li>
@@ -345,6 +380,16 @@ export default function GamesPage() {
       )}
     </div>
   );
+}
+
+function count(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+function playerCount(game: GameCatalogEntry): string {
+  return game.min_players === game.max_players
+    ? count(game.min_players, "player")
+    : `${game.min_players}–${game.max_players} players`;
 }
 
 /** The viewer's own seat in a game, if they have one. */
