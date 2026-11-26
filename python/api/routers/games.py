@@ -21,6 +21,9 @@ Two kinds of caller, two kinds of auth:
   The socket carries everything a player does (``join``, ``start``,
   ``move``, ``play_again``, ``end``; ``ping`` to keep the line open)
   and pushes the whole game back to every player after each change.
+  While a level of a real-time game is being played it also carries
+  that level's own, much smaller messages; see
+  :mod:`api.games.zombie_live`.
 
 * **Guests** hold the game's shareable link, ``/play/join/<token>``,
   which the host copies and passes on. It isn't tied to a person: the
@@ -60,7 +63,7 @@ from starlette.concurrency import run_in_threadpool
 from .. import models, schemas
 from ..auth import CurrentUser, require_family_member, require_user
 from ..db import get_db, session_scope
-from ..games import ai_turns, invites, service
+from ..games import ai_turns, invites, service, zombie_live
 from ..games.catalog import GAME_TYPES
 from ..games.hub import hub
 
@@ -137,6 +140,7 @@ def games_overview(
                 "min_players": g.min_players,
                 "max_players": g.max_players,
                 "can_play_ai": g.ai is not None,
+                "realtime": g.realtime,
             }
             for g in GAME_TYPES.values()
         ],
@@ -291,8 +295,14 @@ async def end_game(game_id: int, request: Request) -> Dict[str, Any]:
                 game, viewer_person_id=me, viewer_is_admin=user.is_admin
             )
 
+    def work_then_stop() -> Dict[str, Any]:
+        summary = work()
+        # A level being played ends with the game.
+        zombie_live.stop(game_id)
+        return summary
+
     try:
-        return await hub.run(game_id, work)
+        return await hub.run(game_id, work_then_stop)
     except service.GameError as exc:
         raise _http_error(exc) from exc
 
@@ -373,20 +383,39 @@ async def guest_join(
     return seat
 
 
-def _seat(token: str) -> Optional[Tuple[int, int]]:
-    """``(game_id, player_id)`` for a usable token, else ``None``."""
+def _seat(token: str) -> Optional[Tuple[int, int, bool, bool]]:
+    """``(game_id, player_id, is it a real-time game, is a round being
+    played)`` for a usable token, else ``None``."""
     with session_scope() as db:
         player = service.find_player(db, token)
         if player is None or service.is_expired(player.game):
             return None
-        return player.game_id, player.game_player_id
+        game = player.game
+        return (
+            player.game_id,
+            player.game_player_id,
+            service.game_type_of(game).realtime,
+            game.status == "playing",
+        )
 
 
-def _apply(token: str, action: Dict[str, Any]) -> bool:
-    """Carry out a player's action. Returns whether the AI is now up."""
+def _apply(token: str, action: Dict[str, Any]) -> Dict[str, Any]:
+    """Carry out a player's action. Returns what has to happen next:
+    whether the AI is up, and whether the game is played in real time."""
     with session_scope() as db:
         game = service.apply_action(db, token, action)
-        return service.ai_to_move(game) is not None
+        game_id = game.game_id
+        realtime = service.game_type_of(game).realtime
+        playing = service.current_status(game) == "playing"
+        level = service.live_round(game)
+        ai_up = service.ai_to_move(game) is not None
+    # The change is committed, and the hub still holds this game's lock.
+    if realtime:
+        if level is not None and action.get("type") in ("start", "play_again"):
+            zombie_live.prepare(game_id, level)
+        elif not playing:
+            zombie_live.stop(game_id)
+    return {"ai_up": ai_up, "realtime": realtime}
 
 
 async def _receive_action(websocket: WebSocket) -> Optional[Dict[str, Any]]:
@@ -412,21 +441,29 @@ async def play_socket(websocket: WebSocket, token: str) -> None:
         # from GET /api/games/play/{token}.
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
-    game_id, player_id = seat
+    game_id, player_id, realtime, playing = seat
     await websocket.accept()
     await hub.connect(game_id, player_id, websocket)
     try:
         # Sends this player the game, and shows the others they're here.
         await hub.run(game_id)
-        # If the server restarted while the AI was thinking, this is
-        # what gets it going again.
-        ai_turns.nudge(game_id)
+        if realtime:
+            # The level being played, if there is one.
+            await zombie_live.greet(game_id, player_id, websocket, playing=playing)
+        else:
+            # If the server restarted while the AI was thinking, this
+            # is what gets it going again.
+            ai_turns.nudge(game_id)
         while True:
             action = await _receive_action(websocket)
             if action is None:
                 await websocket.send_json(
                     {"type": "error", "message": "That didn't make sense to the game."}
                 )
+            elif action.get("type") in zombie_live.LIVE_TYPES:
+                # Part of playing a level: applied in memory, no reply.
+                if realtime:
+                    zombie_live.handle(game_id, player_id, action)
             elif action.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
             else:
@@ -447,8 +484,11 @@ async def _act(
     websocket: WebSocket, game_id: int, token: str, action: Dict[str, Any]
 ) -> None:
     try:
-        if await hub.run(game_id, partial(_apply, token, action)):
+        after = await hub.run(game_id, partial(_apply, token, action))
+        if after["ai_up"]:
             ai_turns.nudge(game_id)
+        if after["realtime"]:
+            zombie_live.launch(game_id)
     except service.GameError as exc:
         await websocket.send_json({"type": "error", "message": str(exc)})
     except Exception:  # noqa: BLE001 - one bad action must not drop the player

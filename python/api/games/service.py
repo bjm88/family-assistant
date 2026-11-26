@@ -13,6 +13,11 @@ Besides the family members who were invited, a game can have guests —
 anyone who opens its shareable link (``/play/join/<invite_token>``) and
 types a name — and the AI, which is given a seat when the game is
 created and plays its own turns (:func:`play_ai_turn`).
+
+A real-time game (Zombie Apocalypse) uses the same seats, links and
+statuses, but a "round" is a level played live: this module starts it
+(``playing``) and records how it went (``round_over``), and
+:mod:`.zombie_live` runs it in between without touching the database.
 """
 
 from __future__ import annotations
@@ -26,7 +31,8 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import get_settings
-from .catalog import AVATAR_COLORS, AVATAR_STYLES, GAME_TYPES, GameType
+from . import zombie_apocalypse as zombies
+from .catalog import AVATAR_COLORS, GAME_TYPES, GameType
 from .turkey_tictactoe import RuleError
 
 # A family can only have this many games going at once. Each new game
@@ -228,7 +234,7 @@ def create_game(
                 join_token=models.generate_join_token(),
                 invite_status="not_sent",
                 joined_at=utcnow(),
-                avatar_style=random.choice(AVATAR_STYLES),
+                avatar_style=random.choice(game_def.styles),
                 avatar_color=random.choice(AVATAR_COLORS),
             )
         )
@@ -387,14 +393,16 @@ def apply_action(db: Session, token: str, action: Dict[str, Any]) -> models.Game
     try:
         if kind == "join":
             _join(game, player, style=action.get("style"), color=action.get("color"))
+        elif kind == "end":
+            end_game(game)
+        elif game_type_of(game).realtime:
+            _zombie_action(game, player, kind, action)
         elif kind == "start":
             _start(game, player)
         elif kind == "move":
             _move(game, player, action.get("cell"))
         elif kind == "play_again":
             _play_again(game, player)
-        elif kind == "end":
-            end_game(game)
         else:
             raise GameError("That isn't something you can do in this game.")
     except RuleError as exc:
@@ -406,11 +414,13 @@ def apply_action(db: Session, token: str, action: Dict[str, Any]) -> models.Game
 def _join(
     game: models.Game, player: models.GamePlayer, *, style: Any, color: Any
 ) -> None:
-    if style not in AVATAR_STYLES or color not in AVATAR_COLORS:
-        raise GameError("Pick a turkey and a shirt colour first.")
+    game_def = game_type_of(game)
+    what = "survivor" if game_def.realtime else "turkey"
+    if style not in game_def.styles or color not in AVATAR_COLORS:
+        raise GameError(f"Pick a {what} and a shirt colour first.")
     already_in = player.joined_at is not None
     if already_in and game.status != "lobby":
-        raise GameError("You can't change turkeys once the game has started.")
+        raise GameError(f"You can't change {what}s once the game has started.")
     for other in game.players:
         if (
             other is not player
@@ -428,7 +438,7 @@ def _join(
                 f"{seat_name(other)} already has that colour — pick another."
             )
     if not already_in:
-        if len(joined_players(game)) >= game_type_of(game).max_players:
+        if len(joined_players(game)) >= game_def.max_players:
             raise GameError("This game is full.")
         player.joined_at = utcnow()
     player.avatar_style = style
@@ -493,7 +503,7 @@ def end_game(game: models.Game) -> None:
 
 def ai_to_move(game: models.Game) -> Optional[models.GamePlayer]:
     """The AI's seat, when a round is being played and it is the AI's turn."""
-    if current_status(game) != "playing":
+    if current_status(game) != "playing" or game_type_of(game).realtime:
         return None
     turn = game_type_of(game).rules.current_player_id(game.state)
     player = next((p for p in game.players if p.game_player_id == turn), None)
@@ -521,6 +531,184 @@ def play_ai_turn(db: Session, game_id: int) -> bool:
     _move(game, player, cell)
     db.flush()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Zombie Apocalypse: what lasts between levels
+# ---------------------------------------------------------------------------
+#
+# ``games.state`` for this game:
+#
+#   level        the level that is played next (or is being played)
+#   duration     seconds the house has to survive
+#   loadouts     {player id: [weapon, weapon]} — what each player picked
+#   round        while a level is being played: its level, seed and who
+#                is fighting; otherwise None
+#   last         how the level before went (zombie_apocalypse.Round.result)
+#   best_level   the highest level survived in this game
+#   kills        {player id: zombies killed, all levels}
+
+
+def _zombie_state(game: models.Game) -> Dict[str, Any]:
+    """A copy of ``games.state`` with everything filled in."""
+    state = dict(game.state or {})
+    state.setdefault("level", 1)
+    state.setdefault("duration", zombies.DEFAULT_DURATION)
+    state["loadouts"] = dict(state.get("loadouts") or {})
+    state["kills"] = dict(state.get("kills") or {})
+    state.setdefault("round", None)
+    state.setdefault("last", None)
+    state.setdefault("best_level", 0)
+    state["best"] = dict(state.get("best") or {})
+    return state
+
+
+def _loadout(state: Dict[str, Any], player: models.GamePlayer) -> List[str]:
+    picked = zombies.clean_loadout(state["loadouts"].get(str(player.game_player_id)))
+    return picked or list(zombies.DEFAULT_LOADOUT)
+
+
+def _zombie_action(
+    game: models.Game, player: models.GamePlayer, kind: Any, action: Dict[str, Any]
+) -> None:
+    _require_joined(player)
+    if kind in ("start", "play_again"):
+        _zombie_start(game)
+        return
+    if kind not in ("loadout", "settings"):
+        raise GameError("That isn't something you can do in this game.")
+    if game.status == "playing":
+        raise GameError("That has to wait until this level is over.")
+    state = _zombie_state(game)
+    if kind == "loadout":
+        picks = zombies.clean_loadout(action.get("weapons"))
+        if picks is None:
+            raise GameError(
+                f"Pick {zombies.LOADOUT_PICKS} different weapons to go with your crossbow."
+            )
+        state["loadouts"][str(player.game_player_id)] = picks
+    else:
+        if not player.is_host:
+            raise GameError("Only the person who started the game can change that.")
+        duration = action.get("duration")
+        if duration not in zombies.DURATIONS:
+            raise GameError("Pick how long the house has to hold out.")
+        state["duration"] = duration
+    game.state = state
+
+
+def _zombie_start(game: models.Game) -> None:
+    if game.status not in ("lobby", "round_over"):
+        raise GameError("A level is already being played.")
+    players = joined_players(game)
+    if len(players) < game_type_of(game).min_players:
+        raise GameError("Join the game first.")
+    state = _zombie_state(game)
+    state["round"] = {
+        "level": state["level"],
+        "duration": state["duration"],
+        "seed": random.randrange(2**31),
+        "players": [p.game_player_id for p in players],
+    }
+    game.state = state
+    game.status = "playing"
+
+
+def live_round(game: models.Game) -> Optional[Dict[str, Any]]:
+    """The level being played, as :mod:`.zombie_live` needs it to run it.
+
+    ``None`` when the game isn't real-time or no level is under way.
+    """
+    if not game_type_of(game).realtime or current_status(game) != "playing":
+        return None
+    state = _zombie_state(game)
+    current = state["round"]
+    if not current:
+        return None
+    by_id = {p.game_player_id: p for p in game.players}
+    return {
+        "level": current["level"],
+        "duration": current["duration"],
+        "seed": current["seed"],
+        "players": [
+            (player_id, _loadout(state, by_id[player_id]))
+            for player_id in current["players"]
+            if player_id in by_id
+        ],
+    }
+
+
+def finish_zombie_round(db: Session, game_id: int, result: Dict[str, Any]) -> bool:
+    """Record how a level went. Returns whether there was one to record.
+
+    Surviving counts as a win for everyone who fought, and moves the
+    game on to the next level; losing leaves it on the same one.
+    """
+    try:
+        game = _lock_game(db, game_id)
+    except GameError:
+        return False
+    state = _zombie_state(game)
+    current = state["round"]
+    if game.status != "playing" or not current or current["seed"] != result.get("seed"):
+        return False
+    fought = set(current["players"])
+    for player_id, count in (result.get("kills") or {}).items():
+        state["kills"][player_id] = state["kills"].get(player_id, 0) + int(count)
+    if result.get("won"):
+        for player in game.players:
+            if player.game_player_id in fought:
+                player.wins += 1
+                key = str(player.game_player_id)
+                state["best"][key] = max(state["best"].get(key, 0), current["level"])
+        state["best_level"] = max(state["best_level"], current["level"])
+        state["level"] = min(zombies.MAX_LEVEL, current["level"] + 1)
+    state["last"] = {k: v for k, v in result.items() if k != "seed"}
+    state["round"] = None
+    game.state = state
+    game.status = "round_over"
+    game.rounds_played += 1
+    db.flush()
+    return True
+
+
+def abandon_zombie_round(db: Session, game_id: int) -> bool:
+    """Call off a level that can't be finished, as if it was never started.
+
+    That is what happens when the server restarts in the middle of one
+    (the level only exists in memory) or everybody leaves for good.
+    """
+    try:
+        game = _lock_game(db, game_id)
+    except GameError:
+        return False
+    if not game_type_of(game).realtime or game.status != "playing":
+        return False
+    state = _zombie_state(game)
+    state["round"] = None
+    game.state = state
+    game.status = "round_over" if game.rounds_played else "lobby"
+    db.flush()
+    return True
+
+
+def _zombie_view(game: models.Game, status: str) -> Dict[str, Any]:
+    state = _zombie_state(game)
+    current = state["round"] if status == "playing" else None
+    return {
+        "level": state["level"],
+        "duration": state["duration"],
+        "durations": list(zombies.DURATIONS),
+        "loadouts": {
+            str(p.game_player_id): _loadout(state, p) for p in joined_players(game)
+        },
+        "fighting": list(current["players"]) if current else [],
+        "last": state["last"],
+        "best_level": state["best_level"],
+        "kills": state["kills"],
+        "coming": zombies.difficulty(state["level"], len(joined_players(game)))["types"],
+        "rules": zombies.rules_view(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +751,8 @@ def game_view(
             ),
         }
     host = next((p for p in game.players if p.is_host), None)
-    return {
+    enough = len(joined_players(game)) >= game_def.min_players
+    view = {
         "game_id": game.game_id,
         "game_type": game.game_type,
         "game_name": game_def.name,
@@ -572,12 +761,16 @@ def game_view(
         "min_players": game_def.min_players,
         "max_players": game_def.max_players,
         "rounds_played": game.rounds_played,
-        "can_start": status == "lobby"
-        and len(joined_players(game)) >= game_def.min_players,
+        # A real-time game starts its next level the same way as its first.
+        "can_start": enough
+        and (status == "lobby" or (game_def.realtime and status == "round_over")),
         "is_full": len(joined_players(game)) >= game_def.max_players,
         "players": [_player_view(p, connected) for p in game.players],
         "board": board,
     }
+    if game_def.realtime:
+        view["zombie"] = _zombie_view(game, status)
+    return view
 
 
 def view_for_player(
@@ -727,11 +920,15 @@ def leaderboard(db: Session, family_id: int) -> Dict[str, List[Dict[str, Any]]]:
 
     Family members are counted per person. A guest is whoever played
     under that name (ignoring case), and the AI is one entry however
-    hard it was playing.
+    hard it was playing. For Zombie Apocalypse a win is a level
+    survived, and its entries also have ``best``: the highest level the
+    player has survived.
     """
     rows = db.execute(
         select(
             models.Game.game_type,
+            models.Game.state,
+            models.GamePlayer.game_player_id,
             models.GamePlayer.person_id,
             models.GamePlayer.player_name,
             models.GamePlayer.ai_level,
@@ -767,6 +964,10 @@ def leaderboard(db: Session, family_id: int) -> Dict[str, List[Dict[str, Any]]]:
         entry["name"] = name  # as most recently spelled
         entry["wins"] += row.wins
         entry["games"] += 1
+        game_def = GAME_TYPES.get(row.game_type)
+        if game_def is not None and game_def.realtime:
+            best = ((row.state or {}).get("best") or {}).get(str(row.game_player_id))
+            entry["best"] = max(entry.get("best", 0), best if isinstance(best, int) else 0)
     out: Dict[str, List[Dict[str, Any]]] = {}
     for (game_type, _kind, _who), entry in totals.items():
         out.setdefault(game_type, []).append(entry)

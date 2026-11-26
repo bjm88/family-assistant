@@ -33,6 +33,10 @@ T = TypeVar("T")
 MAX_SOCKETS_PER_PLAYER = 3
 # A phone that has stopped reading must not hold up everyone else.
 SEND_TIMEOUT_SECONDS = 5.0
+# The same, for a real-time game's updates, which go out many times a
+# second: a phone that can't take one this quickly is dropped, and gets
+# the whole level again when it reconnects.
+LIVE_SEND_TIMEOUT_SECONDS = 1.0
 
 
 class GameHub:
@@ -86,6 +90,44 @@ class GameHub:
             if entry[1] == 0 and game_id not in self._sockets:
                 self._locks.pop(game_id, None)
 
+    async def broadcast_text(
+        self,
+        game_id: int,
+        text: str,
+        *,
+        timeout: float = LIVE_SEND_TIMEOUT_SECONDS,
+    ) -> None:
+        """Send one already-encoded message to every phone in a game.
+
+        For a real-time game's updates: nothing is read from the
+        database, the message is encoded once, and the phones are
+        written to side by side.
+        """
+        await self.send_each(game_id, lambda _player_id: text, timeout=timeout)
+
+    async def send_each(
+        self,
+        game_id: int,
+        text_for: Callable[[int], Optional[str]],
+        *,
+        timeout: float = LIVE_SEND_TIMEOUT_SECONDS,
+    ) -> None:
+        """Like :meth:`broadcast_text`, with a message made per player."""
+        targets = []
+        for player_id, sockets in list(self._sockets.get(game_id, {}).items()):
+            text = text_for(player_id)
+            if text is not None:
+                targets.extend((player_id, ws, text) for ws in sockets)
+        if not targets:
+            return
+        sent = await asyncio.gather(
+            *(_send_text(ws, text, timeout) for _pid, ws, text in targets)
+        )
+        for (player_id, ws, _text), ok in zip(targets, sent):
+            if not ok:
+                self.disconnect(game_id, player_id, ws)
+                await _close_quietly(ws)
+
     async def _send_state(self, game_id: int) -> None:
         player_ids = self.connected_player_ids(game_id)
         if not player_ids:
@@ -110,6 +152,14 @@ def _load_views(game_id: int, player_ids: Set[int]) -> Dict[int, Dict[str, Any]]
 async def _send(ws: WebSocket, message: Dict[str, Any]) -> bool:
     try:
         await asyncio.wait_for(ws.send_json(message), timeout=SEND_TIMEOUT_SECONDS)
+        return True
+    except Exception:  # noqa: BLE001 - a dead socket is dropped, not fatal
+        return False
+
+
+async def _send_text(ws: WebSocket, text: str, timeout: float) -> bool:
+    try:
+        await asyncio.wait_for(ws.send_text(text), timeout=timeout)
         return True
     except Exception:  # noqa: BLE001 - a dead socket is dropped, not fatal
         return False
