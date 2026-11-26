@@ -80,6 +80,23 @@ const WEAPON_ART: Record<string, ReactNode> = {
       <path d="M41 3 V11 M37 7 H45 M38.2 4.2 L43.8 9.8 M43.8 4.2 L38.2 9.8" stroke="#a5d8ff" strokeWidth="1.2" strokeLinecap="round" />
     </>
   ),
+  chainsaw: (
+    <>
+      <rect x="19" y="13" width="27" height="7.5" rx="3.7" fill="#ced4da" {...line} />
+      <path
+        d="M21 13 H43 M21 20.5 H43"
+        stroke="#343a40"
+        strokeWidth="2.2"
+        strokeDasharray="2 2"
+        strokeLinecap="butt"
+      />
+      <path d="M5 8 Q12 1 19 8" fill="none" stroke="#343a40" strokeWidth="2.4" strokeLinecap="round" />
+      <rect x="3" y="8" width="19" height="16" rx="3" fill="#f76707" {...line} />
+      <rect x="6.5" y="11.5" width="8" height="5" rx="1" fill="#343a40" />
+      <path d="M8 24 L7 29 H13 L13.5 24 Z" fill="#343a40" {...line} />
+      <circle cx="18" cy="20" r="1.6" fill="#ffd43b" stroke={INK} strokeWidth="0.8" />
+    </>
+  ),
   boulder: (
     <>
       <path d="M2 27 H7 M3 22 H6" stroke="#b9a98a" strokeWidth="1.6" strokeLinecap="round" />

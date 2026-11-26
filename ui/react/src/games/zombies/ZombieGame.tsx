@@ -536,7 +536,13 @@ function Battle({ game, zombie, online, send, feed, onPhase, onEnd }: BattleProp
 
       <div className="za-stage">
         <canvas ref={backdropRef} aria-hidden />
-        <canvas ref={canvasRef} aria-label="The house and the grounds around it" />
+        <canvas
+          ref={canvasRef}
+          aria-label="The house and the grounds around it. Tap the boulders at the walls to let them roll."
+          onPointerDown={(event) => {
+            if (engineRef.current?.tap(event.clientX, event.clientY)) event.preventDefault();
+          }}
+        />
         {!online && (
           <div className="absolute left-1/2 top-2 z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-[#ffd43b] px-3 py-1 text-xs font-extrabold text-[#3d2f00]">
             <WifiOff className="h-3.5 w-3.5" /> Reconnecting…
@@ -687,7 +693,6 @@ const KIND_LABEL: Record<string, string> = {
   shot: "One zombie a shot",
   cone: "Sprays a crowd",
   lob: "Blast",
-  roll: "Rolls through",
 };
 
 function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: SetupProps) {
@@ -871,7 +876,7 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
         <section className="za-card p-4">
           <h2 className="text-lg font-black">Your weapons</h2>
           <p className="za-soft text-xs font-semibold">
-            Everyone has the crossbow and two boulders. Pick {rules.loadout_picks} more — you can change them before
+            Everyone has the crossbow and the chainsaw. Pick {rules.loadout_picks} more — you can change them before
             every level.
           </p>
           <div className="mt-3 grid grid-cols-2 gap-2">
@@ -1006,6 +1011,9 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
           <ul className="za-soft mt-1 list-disc space-y-0.5 pl-5 font-semibold">
             <li>Everything is under the map. Slide the bar to move along the wall; the arrows in the corner turn you round to defend the other wall.</li>
             <li>Tap a weapon to fire it straight ahead. Hold the fast ones down.</li>
+            <li>The chainsaw is for when they are at your wall: it reaches no further.</li>
+            <li>Shoot a crate of TNT and it blows up everything around it. More land when the zombies are many.</li>
+            <li>Tap the boulders roped to the house and they roll up and down the map, flattening everything in their way: once a level for the left ones, once for the right.</li>
             <li>Your dog looks after itself: out to bite whatever gets close, back in for a rest.</li>
             <li>Ogres start coming half-way through every level, two for each of you or more.</li>
             <li>Watch for the vampire: fast, never in a straight line, and hard on the walls. There is only ever one.</li>

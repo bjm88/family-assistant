@@ -10,7 +10,9 @@ import {
   drawGround,
   drawGuardDog,
   drawIce,
+  drawRopes,
   drawSurvivor,
+  drawTnt,
   drawTree,
   drawWall,
 } from "./draw";
@@ -36,6 +38,12 @@ import { isSurvivorStyle } from "./survivors";
 // The player's own bolts and bullets are flown here and the hits
 // reported; sprays are guessed at straight away and corrected when the
 // server answers, so nothing waits on the network to look right.
+//
+// Two things on the map are there to be used. Crates of TNT land among
+// the zombies: the server says where, and a bolt that hits one sets it
+// off. And boulders are roped up outside the walls, towards each end of
+// the house: a tap on them (the only thing the map itself is tapped
+// for) cuts that end's loose.
 //
 // None of this is React state: the screen around the map only hears
 // the few numbers it shows (`Hud`), a few times a second.
@@ -68,6 +76,13 @@ const WALL = 2;
 const FIGHTER = 3;
 const HOUND = 4;
 const ROLL = 5;
+const CRATE = 6;
+const ROPED = 7;
+/** A crate of TNT takes this long to drop in, from this high up the screen. */
+const DROP = 0.4;
+const DROP_HEIGHT = 80;
+/** A crate this phone shot stays hidden this long, for the server to agree. */
+const CRATE_WAIT = 1.5;
 
 const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
 const round1 = (v: number) => Math.round(v * 10) / 10;
@@ -187,12 +202,37 @@ interface Lob {
   life: number;
 }
 
+/** A boulder rolling away from the wall at `y0`. */
 interface Roll {
-  w: ZombieWeapon;
   x: number;
   y0: number;
   side: number;
   gone: number;
+}
+
+/** A crate of TNT. */
+interface Crate {
+  id: number;
+  x: number;
+  y: number;
+  /** On the level's clock: when it landed, and when it is taken away. */
+  born: number;
+  until: number;
+  landed: boolean;
+  /** This phone's bolt hit it: not drawn until this, unless the server says it never went off. */
+  hid: number;
+}
+
+/** Two boulders roped up side by side outside a wall. */
+interface Roped {
+  /** Which end of the house: 0 left, 1 right. */
+  index: number;
+  side: number;
+  x: number;
+  /** Where they sit, down the map. */
+  y: number;
+  /** 0 to 1: how far they have faded to show a zombie standing behind them. */
+  faded: number;
 }
 
 interface Effect {
@@ -269,6 +309,10 @@ interface Snapshot {
   fr: number[][];
   p: { id: number; x: number; side: number; weapons: string[]; weapon: number; kills: number }[];
   dogs?: { dog: string; home: number[]; at: number[] }[];
+  /** Crates of TNT standing: id, x, y, when it is taken away. */
+  tnt?: number[][];
+  /** For each end of the house, whether its boulders are still roped up. */
+  smash?: number[];
   ammo: (number | null)[] | null;
   ack: number;
 }
@@ -283,6 +327,12 @@ interface Batch {
   w?: number[][];
   /** Zombies setting off now that weren't in the snapshot, as they are there. */
   z?: number[][];
+  /** Crates of TNT that landed, as in the snapshot. */
+  c?: number[][];
+  /** Crates that went off: id, whose doing. */
+  x?: number[][];
+  /** Boulders cut loose: which end of the house, whose doing. */
+  b?: number[][];
   /** Guard dogs: player, x, y, state, health %, when its rest ends. */
   g?: number[][];
   a?: Record<string, number>;
@@ -413,6 +463,8 @@ export class ZombieEngine {
   private bolts: Bolt[] = [];
   private lobs: Lob[] = [];
   private rolls: Roll[] = [];
+  private crates: Crate[] = [];
+  private roped: Roped[] = [];
   private named: Fighter[] = [];
   private effects: Effect[] = [];
 
@@ -569,6 +621,17 @@ export class ZombieEngine {
     this.lobs = [];
     this.rolls = [];
     this.effects = [];
+    this.crates = [];
+    for (const row of snap.tnt ?? []) this.crate(row, true);
+    this.roped = [];
+    const { smash, house } = rules;
+    (snap.smash ?? []).forEach((there, index) => {
+      if (!there || smash.x[index] === undefined) return;
+      for (const side of [TOP, BOTTOM]) {
+        const y = house.y + side * (house.h / 2 + smash.out);
+        this.roped.push({ index, side, x: smash.x[index], y, faded: 0 });
+      }
+    });
 
     if (JSON.stringify(snap.trees) !== JSON.stringify(this.trees) || !this.painted) {
       this.trees = snap.trees;
@@ -647,6 +710,18 @@ export class ZombieEngine {
       }
     }
 
+    if (batch.c) for (const row of batch.c) this.crate(row, false);
+    if (batch.x) {
+      for (const [id] of batch.x) {
+        const crate = this.crates.find((c) => c.id === id);
+        if (!crate) continue;
+        this.crates = this.crates.filter((c) => c !== crate);
+        // This phone's own bolt set it off, and showed as much, a moment ago.
+        if (!crate.hid) this.blowUp(crate);
+      }
+    }
+    if (batch.b) for (const [index] of batch.b) this.cut(index);
+
     if (batch.d) {
       for (const [id, hp, by] of batch.d) {
         const z = this.byId.get(id);
@@ -713,6 +788,48 @@ export class ZombieEngine {
       this.wish = -1;
     }
     if (batch.d || batch.o) this.emitHud();
+  }
+
+  /** A crate of TNT as the server sends it; `standing` if it was there before this phone looked. */
+  private crate(row: number[], standing: boolean) {
+    const [id, x, y, until] = row;
+    if (this.crates.some((c) => c.id === id)) return;
+    const born = until - this.rules.tnt.seconds;
+    this.crates.push({ id, x, y, born, until, landed: standing, hid: 0 });
+  }
+
+  private blowUp(crate: Crate) {
+    const { radius } = this.rules.tnt;
+    this.effect("boom", crate.x, crate.y, 0.6, radius, 0);
+    this.effect("boom", crate.x, crate.y, 0.35, radius * 0.45, 0);
+    for (let i = 0; i < 10; i++) {
+      const angle = Math.random() * TAU;
+      const speed = 60 + Math.random() * 110;
+      this.effect(
+        "dust",
+        crate.x,
+        crate.y,
+        0.5 + Math.random() * 0.4,
+        3 + Math.random() * 4,
+        0,
+        Math.cos(angle) * speed,
+        Math.sin(angle) * speed
+      );
+    }
+  }
+
+  /** The boulders at one end of the house are let go: two up the map, two down it. */
+  private cut(index: number) {
+    const loose = this.roped.filter((r) => r.index === index);
+    if (!loose.length) return;
+    this.roped = this.roped.filter((r) => r.index !== index);
+    const { smash, house } = this.rules;
+    for (const r of loose) {
+      for (const off of [-smash.apart, smash.apart]) {
+        this.rolls.push({ x: r.x + off, y0: house.y + (r.side * house.h) / 2, side: r.side, gone: smash.out });
+        this.effect("dust", r.x + off, r.y, 0.6, 9, 0);
+      }
+    }
   }
 
   private freeze(id: number, stop: number, until: number) {
@@ -845,6 +962,23 @@ export class ZombieEngine {
     if (weapon.kind === "shot") {
       this.bolts.push({ w: weapon, x, y0, side, gone: 8, mine, shot });
       this.effect("flash", x, y0 + side * 14, 0.06, 3, SHOT_HEIGHT);
+    } else if (weapon.key === "chainsaw") {
+      // Chips fly off whatever it is cutting.
+      for (let i = 0; i < 2; i++) {
+        const angle = (side * Math.PI) / 2 + (Math.random() * 2 - 1) * weapon.spread;
+        const speed = weapon.speed * (0.5 + Math.random() * 0.7);
+        const from = 16 + Math.random() * 10;
+        this.effect(
+          "spark",
+          x + Math.cos(angle) * from,
+          y0 + Math.sin(angle) * from,
+          0.1 + Math.random() * 0.1,
+          1 + Math.random(),
+          SHOT_HEIGHT - 2,
+          Math.cos(angle) * speed,
+          Math.sin(angle) * speed
+        );
+      }
     } else if (weapon.kind === "cone") {
       const flames = weapon.key === "flamethrower";
       const count = flames ? 3 : 9;
@@ -867,9 +1001,37 @@ export class ZombieEngine {
     } else if (weapon.kind === "lob") {
       const out = clamp(reach || weapon.range * 0.6, 30, weapon.range);
       this.lobs.push({ w: weapon, x, y0, side, reach: out, age: 0, life: out / weapon.speed });
-    } else {
-      this.rolls.push({ w: weapon, x, y0, side, gone: 0 });
     }
+  }
+
+  /**
+   * The map was tapped at this point of the window. The only things on
+   * it to tap are the boulders: returns whether some were cut loose.
+   */
+  tap(clientX: number, clientY: number): boolean {
+    const box = this.canvas.getBoundingClientRect();
+    if (!this.scale) return false;
+    const x = (clientX - box.left - this.offX) / this.scale;
+    const y = (clientY - box.top - this.offY) / this.scale;
+    const { apart, radius } = this.rules.smash;
+    for (const r of this.roped) {
+      // A thumb is not a pointer: a little either side counts.
+      const middle = r.y * TILT - radius * 0.85;
+      if (Math.abs(x - r.x) <= apart + radius + 8 && Math.abs(y - middle) <= radius + 10) {
+        return this.smash(r.index);
+      }
+    }
+    return false;
+  }
+
+  /** Cut loose the boulders at the left of the house (0) or the right (1). */
+  smash(index: number): boolean {
+    const me = this.fighters.get(this.meId);
+    if (!me || !this.started || this.over || this.t < 0) return false;
+    if (!this.roped.some((r) => r.index === index) || this.stalled(performance.now() / 1000)) return false;
+    if (!this.send({ type: "zb", b: index })) return false;
+    this.cut(index);
+    return true;
   }
 
   private stalled(now: number) {
@@ -925,6 +1087,8 @@ export class ZombieEngine {
       if (!event.repeat) this.press(me.weapon);
     } else if (key >= "1" && key <= "9") {
       if (!event.repeat) this.press(Number(key) - 1);
+    } else if (key === "q" || key === "e") {
+      if (!event.repeat) this.smash(key === "q" ? 0 : 1);
     } else return;
     event.preventDefault();
   };
@@ -985,6 +1149,24 @@ export class ZombieEngine {
       if (z.look.turns && spot.dx && z.art !== (spot.dx < 0 ? 1 : 0)) this.wear(z, 1 - z.art);
     }
     if (dead) this.active = this.active.filter((z) => z.alive);
+
+    // Crates of TNT land, and those nobody shot are taken away.
+    if (this.crates.length) {
+      let stale = false;
+      for (const crate of this.crates) {
+        if (!crate.landed && t >= crate.born + DROP) {
+          crate.landed = true;
+          this.effect("dust", crate.x, crate.y, 0.5, 8, 0);
+        }
+        // The server never said it went off: it is still there.
+        if (crate.hid && now > crate.hid) crate.hid = 0;
+        if (t >= crate.until) {
+          stale = true;
+          if (!crate.hid) this.effect("dust", crate.x, crate.y, 0.5, 7, 0);
+        }
+      }
+      if (stale) this.crates = this.crates.filter((crate) => t < crate.until);
+    }
 
     // Players slide to where they are heading, and walk through the
     // house to change walls.
@@ -1047,6 +1229,7 @@ export class ZombieEngine {
   /** Move everything that was fired, and age what it left behind. */
   private fly(dt: number) {
     const width = this.rules.shot_width;
+    const size = this.rules.tnt.size;
     if (this.bolts.length) {
       const keep: Bolt[] = [];
       for (const b of this.bolts) {
@@ -1063,7 +1246,23 @@ export class ZombieEngine {
           nearest = out;
           hit = z;
         }
-        if (hit) {
+        // A crate of TNT stops a bolt like anything else.
+        let crate: Crate | null = null;
+        for (const c of this.crates) {
+          if (c.hid || !c.landed || Math.abs(c.x - b.x) > size + width) continue;
+          const out = (c.y - b.y0) * b.side;
+          if (out + size < from || out - size > b.gone || out >= nearest) continue;
+          nearest = out;
+          crate = c;
+        }
+        if (crate) {
+          this.effect("spark", crate.x, crate.y, 0.14, 3, SHOT_HEIGHT);
+          if (b.mine) {
+            this.send({ type: "zh", s: b.shot, c: crate.id, q: ++this.msgSeq });
+            crate.hid = this.lastFrame + CRATE_WAIT;
+            this.blowUp(crate);
+          }
+        } else if (hit) {
           this.effect("spark", hit.x, hit.y, 0.14, 3, hit.look.alt + Math.min(SHOT_HEIGHT, hit.look.tall * 0.6));
           if (b.mine) {
             const q = ++this.msgSeq;
@@ -1101,20 +1300,21 @@ export class ZombieEngine {
       this.lobs = keep;
     }
     if (this.rolls.length) {
+      const { radius, speed, range } = this.rules.smash;
       for (const roll of this.rolls) {
-        roll.gone += roll.w.speed * dt;
+        roll.gone += speed * dt;
         if (Math.random() < dt * 30) {
           this.effect(
             "dust",
-            roll.x + (Math.random() * 2 - 1) * roll.w.radius * 0.7,
-            roll.y0 + roll.side * (roll.gone - roll.w.radius),
+            roll.x + (Math.random() * 2 - 1) * radius * 0.7,
+            roll.y0 + roll.side * (roll.gone - radius),
             0.5,
             3 + Math.random() * 3,
             0
           );
         }
       }
-      this.rolls = this.rolls.filter((roll) => roll.gone < roll.w.range);
+      this.rolls = this.rolls.filter((roll) => roll.gone < range);
     }
     if (this.effects.length) {
       let done = false;
@@ -1314,6 +1514,8 @@ export class ZombieEngine {
     for (const f of this.fighters.values()) this.put(this.fighterY(f), FIGHTER, f);
     for (const dog of this.dogs.values()) this.put(dog.y, HOUND, dog);
     for (const roll of this.rolls) this.put(roll.y0 + roll.side * roll.gone, ROLL, roll);
+    for (const crate of this.crates) if (!crate.hid) this.put(crate.y, CRATE, crate);
+    for (const roped of this.roped) this.put(roped.y, ROPED, roped);
     const items = this.items;
     for (let i = 1; i < this.itemCount; i++) {
       const item = items[i];
@@ -1344,6 +1546,12 @@ export class ZombieEngine {
           break;
         case HOUND:
           this.drawHound(ctx, item.ref as Hound, t);
+          break;
+        case CRATE:
+          this.drawCrate(ctx, item.ref as Crate, t, now);
+          break;
+        case ROPED:
+          this.drawRoped(ctx, item.ref as Roped, now);
           break;
         default:
           this.drawRoll(ctx, item.ref as Roll);
@@ -1524,16 +1732,81 @@ export class ZombieEngine {
   }
 
   private drawRoll(ctx: CanvasRenderingContext2D, roll: Roll) {
-    const r = roll.w.radius;
-    const y = (roll.y0 + roll.side * roll.gone) * TILT;
+    this.drawStone(ctx, roll.x, roll.y0 + roll.side * roll.gone, (roll.side * roll.gone) / this.rules.smash.radius);
+  }
+
+  /** A boulder on the ground at `(x, y)` of the map. */
+  private drawStone(ctx: CanvasRenderingContext2D, x: number, y: number, spin: number) {
+    const r = this.rules.smash.radius;
     ctx.fillStyle = "rgba(0,0,0,0.3)";
     ctx.beginPath();
-    ctx.ellipse(roll.x, y, r, r * 0.42, 0, 0, TAU);
+    ctx.ellipse(x, y * TILT, r, r * 0.42, 0, 0, TAU);
     ctx.fill();
     ctx.save();
-    ctx.translate(roll.x, y - r * 0.85);
-    drawBoulder(ctx, r * 0.95, (roll.side * roll.gone) / r);
+    ctx.translate(x, y * TILT - r * 0.85);
+    drawBoulder(ctx, r * 0.95, spin);
     ctx.restore();
+  }
+
+  /** Two boulders waiting outside a wall, roped to it, and the word that says what to do. */
+  private drawRoped(ctx: CanvasRenderingContext2D, roped: Roped, now: number) {
+    const { apart, radius, out } = this.rules.smash;
+    const y = roped.y * TILT;
+    // Whatever stands just behind them has to be seen to be shot, so they fade to show it.
+    const behind = (radius * 1.8) / TILT;
+    let hiding = 0;
+    for (const z of this.active) {
+      if (z.kind.flying || !z.alive || z.gone || z.y >= roped.y || z.y < roped.y - behind) continue;
+      if (Math.abs(z.x - roped.x) < apart + radius) {
+        hiding = 1;
+        break;
+      }
+    }
+    if (roped.side === BOTTOM) {
+      // And so does whoever is defending the wall they sit against.
+      for (const f of this.fighters.values()) {
+        if (f.side === BOTTOM && f.cross <= 0 && Math.abs(f.x - roped.x) < apart + radius) hiding = 1;
+      }
+    }
+    roped.faded += (hiding - roped.faded) * 0.2;
+    ctx.globalAlpha = 1 - 0.5 * roped.faded;
+    this.drawStone(ctx, roped.x - apart, roped.y, 0.4 + roped.index);
+    this.drawStone(ctx, roped.x + apart, roped.y, 2.1 - roped.index);
+    ctx.globalAlpha = 1;
+    ctx.save();
+    ctx.translate(roped.x, y);
+    drawRopes(ctx, radius, apart, -roped.side * out * TILT);
+    const ready = !!this.fighters.get(this.meId) && this.started && !this.over && this.t >= 0;
+    if (ready) {
+      const beat = 0.5 + 0.5 * Math.sin(now * 4 + roped.index * 2);
+      ctx.font = "900 8px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.lineWidth = 2.4;
+      ctx.strokeStyle = "rgba(0,0,0,0.8)";
+      ctx.strokeText("TAP", 0, -radius * 0.85);
+      ctx.fillStyle = `rgb(255,${Math.round(212 + 43 * beat)},${Math.round(59 + 130 * beat)})`;
+      ctx.fillText("TAP", 0, -radius * 0.85);
+    }
+    ctx.restore();
+  }
+
+  private drawCrate(ctx: CanvasRenderingContext2D, crate: Crate, t: number, now: number) {
+    const size = this.rules.tnt.size;
+    const fall = clamp(1 - (t - crate.born) / DROP, 0, 1);
+    const y = crate.y * TILT;
+    ctx.fillStyle = "rgba(0,0,0,0.3)";
+    ctx.beginPath();
+    ctx.ellipse(crate.x, y, size * (1.15 - 0.5 * fall), size * (0.45 - 0.2 * fall), 0, 0, TAU);
+    ctx.fill();
+    // About to be taken away: it flickers.
+    const left = crate.until - t;
+    if (left < 3 && Math.sin(left * 16) > 0) ctx.globalAlpha = 0.4;
+    ctx.save();
+    ctx.translate(crate.x, y - fall * fall * DROP_HEIGHT);
+    drawTnt(ctx, size, 0.5 + 0.5 * Math.sin(now * 14 + crate.id));
+    ctx.restore();
+    ctx.globalAlpha = 1;
   }
 
   /**
@@ -1558,8 +1831,6 @@ export class ZombieEngine {
       ctx.lineTo(me.x + half, y0 + side * weapon.range);
       ctx.closePath();
       ctx.fill();
-    } else if (weapon.kind === "roll") {
-      ctx.fillRect(me.x - weapon.radius, side < 0 ? y0 - weapon.range : y0, weapon.radius * 2, weapon.range);
     } else {
       const reach = weapon.kind === "lob" ? this.throwFor(weapon, me) : weapon.range;
       ctx.setLineDash([3, 4]);

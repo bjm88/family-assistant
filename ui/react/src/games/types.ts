@@ -85,12 +85,12 @@ export interface GameInviteLink {
 
 // ---- Zombie Apocalypse (see python/api/games/zombie_apocalypse.py) ------
 
-export type WeaponKind = "shot" | "cone" | "lob" | "roll";
+export type WeaponKind = "shot" | "cone" | "lob";
 
 export interface ZombieWeapon {
   key: string;
   name: string;
-  /** shot: one bolt; cone: a spray; lob: thrown, bursts where it lands; roll: a boulder. */
+  /** shot: one bolt; cone: a spray (or the chainsaw); lob: thrown, bursts where it lands. */
   kind: WeaponKind;
   area: boolean;
   damage: number;
@@ -151,6 +151,14 @@ export interface ZombieRules {
   default_loadout: string[];
   weapons: ZombieWeapon[];
   zombies: ZombieKind[];
+  /**
+   * The boulders roped up outside the walls: where along the house each
+   * lot is, how far either side of that its two boulders sit, how far
+   * out from the wall, and how big, fast and far they roll.
+   */
+  smash: { x: number[]; apart: number; out: number; radius: number; speed: number; range: number };
+  /** Crates of TNT: how far the blast reaches, half a crate's width, and how long one stands. */
+  tnt: { radius: number; size: number; seconds: number };
   bat_weave: number;
   bat_weave_rate: number;
   guard_dogs: GuardDog[];
