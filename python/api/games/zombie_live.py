@@ -24,11 +24,12 @@ Phone → server
 Server → phone
     ``{"type": "zs", ...}``  the whole level, once, on (re)connecting
     (:meth:`Round.snapshot`).
-    ``{"type": "zt", "t", "h", "d", "fr", "f", "m", "w", "g", "a", "o"}``
+    ``{"type": "zt", "t", "h", "z", "d", "fr", "f", "m", "w", "g", "a", "o"}``
     what changed since the last one (:meth:`Round.drain`): the clock,
-    the house's points, zombies hurt, zombies frozen, shots fired,
-    players who moved, weapons switched, where the guard dogs are, and
-    how far each player's messages have been handled.
+    the house's points, a vampire setting off, zombies hurt, zombies
+    frozen, shots fired, players who moved, weapons switched, where the
+    guard dogs are, and how far each player's messages have been
+    handled.
 
 The clock stops while nobody is connected, so a dropped connection
 doesn't cost a solo player the house. A level nobody comes back to is

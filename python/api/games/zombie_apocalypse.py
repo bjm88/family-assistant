@@ -5,7 +5,9 @@ The family's house stands across the middle of the map. Zombies come in
 waves from off the top and bottom of the screen, walk to the house and
 attack it. The house starts with ``HOUSE_HP`` points; if any are left
 when the clock runs out the players have survived the level, and the
-next one is harder. Every level ends with an ogre, or several.
+next one is harder. From half-way through every level the ogres come,
+two for each player or more, and at any moment a vampire may dart in:
+never more than one at a time.
 
 Each player slides left and right along the top or the bottom wall of
 the house, and can change walls. They always face out, and every weapon
@@ -20,7 +22,9 @@ say as little as possible over the network:
   speed. Where a zombie is at any moment is a pure function of that
   (:meth:`Zombie.position`), so the server sends the whole schedule
   once and never sends a position again. The React app has the same
-  function (``ui/react/src/games/zombies/engine.ts``).
+  function (``ui/react/src/games/zombies/engine.ts``). Vampires are
+  the exception to "once": each waits for the one before it to be
+  dead, so its rail is sent when it sets off.
 * **The server owns the outcome**: each zombie's health, who is dead,
   the house's points, ammunition, the clock, and whether the level was
   survived.
@@ -103,12 +107,23 @@ MAX_WAVE = 50
 WAVE_START = 0.35
 WAVE_GROWTH = 1.65
 
-# Every level ends with an ogre (more of them on higher levels). They
-# reach the house with about this long left on the clock.
+# Ogres close every level: this many for each player, one more for
+# every few levels, up to a limit. The first sets off when this share
+# of the level has gone and the rest follow through what is left, the
+# last of them reaching the house with about this long on the clock.
 BOSS_KIND = "ogre"
+BOSSES_PER_PLAYER = 2
+BOSS_EVERY_LEVELS = 4
+MAX_BOSSES_PER_PLAYER = 6
+BOSS_FROM = 0.5
 BOSS_SECONDS_LEFT = 16.0
-BOSS_EVERY_LEVELS = 3
-MAX_BOSSES = 5
+# When there isn't that much of the level to spread them over, they
+# still come this far apart.
+BOSS_STAGGER = 2.5
+# The first levels' ogres are young ones: this share of an ogre's
+# strength on level 1, and this much more each level until full-grown.
+BOSS_HP_START = 0.55
+BOSS_HP_GROWTH = 0.15
 
 DURATIONS: Tuple[int, ...] = (60, 120, 180, 300)
 DEFAULT_DURATION = 120
@@ -253,6 +268,21 @@ def clean_loadout(raw: Any) -> Optional[List[str]]:
 # ---------------------------------------------------------------------------
 
 
+# A vampire darts this far to one side of its line and then the other,
+# coming this much nearer the house with each dart; the last stretch to
+# the wall it runs straight.
+VAMPIRE_SPEED = 72.0
+VAMPIRE_DART = (30.0, 55.0)
+VAMPIRE_STRIDE = (36.0, 58.0)
+VAMPIRE_RUN_IN = 46.0
+# The first comes when this share of the level has gone. After a
+# vampire is killed the next leaves the players in peace for a moment,
+# and none sets off with less than this left on the clock.
+VAMPIRE_FIRST = (0.12, 0.2)
+VAMPIRE_REST = 4.0
+VAMPIRE_LAST = 12.0
+
+
 @dataclass(frozen=True)
 class ZombieType:
     key: str
@@ -263,8 +293,13 @@ class ZombieType:
     radius: float
     threat: float      # how much of a wave's budget one costs
     from_level: int    # first level it turns up in
-    weight: float      # how often it is picked, next to the others
+    weight: float      # how often a wave picks it, next to the others
     flying: bool = False
+    # Darts from side to side on its way in instead of walking straight.
+    zigzag: bool = False
+    # Comes on its own, not in the waves, and only when the last of its
+    # kind is dead: there is never more than one on the map.
+    lone: bool = False
 
 
 # Small and individually weak, so that dozens can be on the map at
@@ -275,11 +310,15 @@ ZOMBIE_TYPES: Dict[str, ZombieType] = {
         ZombieType("walker", "Zombie", hp=30, speed=22, dps=3, radius=8,
                    threat=1.0, from_level=1, weight=5.0),
         ZombieType("dog", "Zombie dog", hp=18, speed=58, dps=2, radius=6,
-                   threat=0.8, from_level=2, weight=3.0),
+                   threat=0.8, from_level=1, weight=3.0),
         ZombieType("bat", "Bat", hp=12, speed=75, dps=1.5, radius=6,
-                   threat=0.7, from_level=3, weight=2.5, flying=True),
+                   threat=0.7, from_level=2, weight=2.5, flying=True),
         ZombieType("ogre", "Ogre", hp=400, speed=14, dps=14, radius=15,
                    threat=6.0, from_level=4, weight=0.7),
+        # Its speed is along its zigzag, so it closes on the house at a
+        # little over half of it: twice as fast as a zombie walks.
+        ZombieType("vampire", "Vampire", hp=120, speed=VAMPIRE_SPEED, dps=8, radius=8,
+                   threat=3.0, from_level=1, weight=0.0, zigzag=True, lone=True),
     )
 }
 ZOMBIE_KEYS: Tuple[str, ...] = tuple(ZOMBIE_TYPES)
@@ -410,6 +449,12 @@ class Zombie:
         self.stop = 0.0
         self.until = -1e9
         self.lag = 0.0
+
+    def set_off(self, t0: float) -> None:
+        """Start down the rail at ``t0`` instead of when it was going to."""
+        walk = self.arrive - self.t0
+        self.t0 = round(t0, 2)
+        self.arrive = self.t0 + walk
 
     def clock(self, t: float) -> float:
         """This zombie's own time at ``t``: the level's, less time spent frozen."""
@@ -570,8 +615,10 @@ def difficulty(level: int, players: int) -> Dict[str, Any]:
 
     ``wave_budget`` is the size of a wave half-way through the level,
     in walkers; ``wave_every`` the seconds between waves at that point.
-    ``types`` are the kinds the waves are made of, and ``bosses`` how
-    many ogres turn up for the end of the level whatever the waves had.
+    ``types`` are the kinds the waves are made of, ``bosses`` how many
+    ogres come from half-way through the level whatever the waves had,
+    and ``lone`` the kinds that come one at a time, about every
+    ``lone_every`` seconds.
     """
     step = max(1, min(MAX_LEVEL, int(level))) - 1
     team = max(1, min(MAX_PLAYERS, int(players)))
@@ -583,15 +630,26 @@ def difficulty(level: int, players: int) -> Dict[str, Any]:
         "wave_every": max(5.0, 9.0 - 0.25 * step),
         "wave_budget": (6.0 + 0.7 * step) * crowd,
         "both_sides": max(0.0, min(0.8, 0.12 * (step - 1))),
-        "types": [z.key for z in ZOMBIE_TYPES.values() if z.from_level <= step + 1],
-        "bosses": min(MAX_BOSSES, 1 + step // BOSS_EVERY_LEVELS),
+        "types": [
+            z.key for z in ZOMBIE_TYPES.values()
+            if z.from_level <= step + 1 and not z.lone
+        ],
+        "bosses": team * min(
+            MAX_BOSSES_PER_PLAYER, BOSSES_PER_PLAYER + step // BOSS_EVERY_LEVELS
+        ),
+        "boss_hp": min(1.0, BOSS_HP_START + BOSS_HP_GROWTH * step),
+        "lone": [
+            z.key for z in ZOMBIE_TYPES.values()
+            if z.from_level <= step + 1 and z.lone
+        ],
+        "lone_every": max(16.0, 34.0 - 2.0 * step),
     }
 
 
 def kinds_coming(level: int, players: int) -> List[str]:
     """Every kind of zombie a level has, in the usual order."""
     diff = difficulty(level, players)
-    kinds = set(diff["types"])
+    kinds = {*diff["types"], *diff["lone"]}
     if diff["bosses"]:
         kinds.add(BOSS_KIND)
     return [key for key in ZOMBIE_KEYS if key in kinds]
@@ -606,8 +664,12 @@ def build_level(
     second or two in and keep coming until just before the end; each
     spends a budget on zombies picked at random from the kinds this
     level has, and comes in from the top, the bottom, or both. The
-    level's ogres set off so as to reach the house for the last
-    ``BOSS_SECONDS_LEFT`` seconds.
+    level's ogres set off from half-way through, at one wall and then
+    the other, the last of them in time to reach the house for the
+    final ``BOSS_SECONDS_LEFT`` seconds.
+
+    Vampires are in the list at the earliest they may set off. A
+    :class:`Round` keeps each one back until the one before it is dead.
     """
     rng = random.Random(seed)
     trees = build_trees(seed)
@@ -643,13 +705,27 @@ def build_level(
         side = -side
         t += diff["wave_every"] * (1.2 - 0.5 * gone) * rng.uniform(0.85, 1.15)
     side = rng.choice((-1, 1))
-    for n in range(diff["bosses"]):
-        boss = _spawn(rng, ZOMBIE_TYPES[BOSS_KIND], diff, trees, side, t0=0.0)
-        walk = boss.arrive
-        boss.t0 = round(max(1.0, duration - BOSS_SECONDS_LEFT - walk - 2.5 * n), 2)
-        boss.arrive = boss.t0 + walk
+    first = duration * BOSS_FROM
+    bosses = diff["bosses"]
+    for n in range(bosses):
+        boss = _spawn(
+            rng, ZOMBIE_TYPES[BOSS_KIND], diff, trees, side, t0=0.0, hp=diff["boss_hp"]
+        )
+        # What is left of the level once the last has had time to walk in.
+        spare = duration - BOSS_SECONDS_LEFT - boss.arrive - first
+        spread = spare * n / (bosses - 1) if bosses > 1 else 0.0
+        boss.set_off(first + max(BOSS_STAGGER * n, spread))
         zombies.append(boss)
         side = -side
+    # Closer together in a short level, so that it has more than one.
+    every = min(diff["lone_every"], duration * 0.4)
+    for key in diff["lone"]:
+        t = duration * rng.uniform(*VAMPIRE_FIRST)
+        while t < duration - VAMPIRE_LAST:
+            zombies.append(
+                _spawn(rng, ZOMBIE_TYPES[key], diff, trees, rng.choice((-1, 1)), t0=t)
+            )
+            t += every * rng.uniform(0.85, 1.15)
     zombies.sort(key=lambda z: z.t0)
     for index, zombie in enumerate(zombies, start=1):
         zombie.id = index
@@ -665,6 +741,7 @@ def _spawn(
     side: int,
     *,
     t0: float,
+    hp: float = 1.0,
 ) -> Zombie:
     x0 = rng.uniform(16.0, WORLD_W - 16.0)
     # Mostly straight at the house, drifting a little to one side.
@@ -681,16 +758,77 @@ def _spawn(
     tx = aim
     ty = HOUSE_TOP - gap if side < 0 else HOUSE_BOTTOM + gap
     start, end = (x0, y0), (tx, ty)
-    corners = [end] if kind.flying else _around_trees(rng, start, end, trees, kind.radius)
+    if kind.flying:
+        corners = [end]
+    elif kind.zigzag:
+        corners = _zigzag(rng, start, end, trees, kind.radius)
+    else:
+        corners = _around_trees(rng, start, end, trees, kind.radius)
     return Zombie(
         0,
         kind,
         t0=t0,
         path=[start, *corners],
         speed=kind.speed * diff["speed"] * rng.uniform(0.9, 1.1),
-        hp=kind.hp * diff["hp"],
+        hp=kind.hp * diff["hp"] * hp,
         dps=kind.dps * diff["dps"],
     )
+
+
+def _zigzag(
+    rng: random.Random,
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+    trees: Sequence[Tree],
+    radius: float,
+) -> List[Tuple[float, float]]:
+    """The corners of a vampire's way in: side to side across its line.
+
+    Returns the points after ``start``, ending with ``end``, like
+    :func:`_around_trees`, which each dart is bent round the trees by.
+    No two vampires dart alike: how far to the side and how far on each
+    one goes is drawn afresh every time.
+    """
+    (x0, y0), (tx, ty) = start, end
+    depth = abs(ty - y0)
+    heading = 1.0 if ty > y0 else -1.0
+    way = rng.choice((-1.0, 1.0))
+    corners: List[Tuple[float, float]] = []
+    here = start
+    gone = rng.uniform(*VAMPIRE_STRIDE)
+    while gone <= depth - VAMPIRE_RUN_IN:
+        y = y0 + heading * gone
+        # Along the edge of the map it keeps far enough in to have room
+        # to dart both ways.
+        room = radius + 6.0 + VAMPIRE_DART[0]
+        middle = min(WORLD_W - room, max(room, x0 + (tx - x0) * gone / depth))
+        dart = rng.uniform(*VAMPIRE_DART)
+        # Where a tree stands in the way it turns short of it...
+        for share in (1.0, 0.8, 0.6, 0.4):
+            x = middle + way * dart * share
+            x = min(WORLD_W - radius - 6.0, max(radius + 6.0, x))
+            if any(
+                math.hypot(x - cx, y - cy) <= tree_radius + radius + _TREE_CLEARANCE + 2.0
+                for cx, cy, tree_radius in trees
+            ):
+                continue
+            dart_to = _around_trees(rng, here, (x, y), trees, radius)
+            # ...and it doesn't double back to get round one.
+            if all(
+                (by - ay) * heading > -6.0
+                for (_ax, ay), (_bx, by) in zip([here, *dart_to], dart_to)
+            ):
+                break
+        else:
+            # With no room at all, it turns a little further on.
+            gone += 5.0
+            continue
+        corners.extend(dart_to)
+        here = (x, y)
+        way = -way
+        gone += rng.uniform(*VAMPIRE_STRIDE)
+    corners.extend(_around_trees(rng, here, end, trees, radius))
+    return corners
 
 
 # ---------------------------------------------------------------------------
@@ -837,10 +975,18 @@ class Round:
             dog = clean_guard_dog(more[0] if more else None) or DEFAULT_GUARD_DOG
             self.dogs[player_id] = _Dog(fighter, GUARD_DOGS[dog])
         self.trees = build_trees(seed)
-        self.zombies = build_level(level, len(self.fighters), duration, seed)
-        self._by_id = {z.id: z for z in self.zombies}
+        plan = build_level(level, len(self.fighters), duration, seed)
+        # Those that come when the plan says, in order: what the phones
+        # are sent. A vampire joins them, where it belongs in that
+        # order, when it sets off.
+        self.zombies = [z for z in plan if not z.type.lone]
+        self._waiting = [z for z in plan if z.type.lone]
+        self._lone: Optional[Zombie] = None  # the vampire on the map
+        self._lone_from = 0.0                # the next may not set off before this
+        self._by_id = {z.id: z for z in plan}
         self._next = 0                       # next zombie to appear
         self._active: Dict[int, Zombie] = {}  # on the map and alive
+        self._set_off: List[Zombie] = []      # vampires out since the last drain()
         self._lobs: List[Tuple[float, _Fighter, Weapon, float, float]] = []
         self._rolls: List[_Roll] = []
         self._frozen: Dict[int, Zombie] = {}  # frozen since the last drain()
@@ -866,6 +1012,13 @@ class Round:
             self._next += 1
             if zombie.alive:
                 self._active[zombie.id] = zombie
+        if (
+            self._waiting
+            and self._lone is None
+            and t >= self._lone_from
+            and self._waiting[0].t0 <= t
+        ):
+            self._release(self._waiting.pop(0))
         if self._lobs:
             due = [lob for lob in self._lobs if lob[0] <= t]
             if due:
@@ -892,6 +1045,17 @@ class Round:
             self.over = "lost"
         elif t >= self.duration:
             self.over = "won"
+
+    def _release(self, vampire: Zombie) -> None:
+        """Send the next vampire in, now that no other is on the map."""
+        vampire.set_off(self.t)
+        # Everything before ``_next`` has set off and nothing after it
+        # has, so this keeps the list in the order the phones expect.
+        self.zombies.insert(self._next, vampire)
+        self._next += 1
+        self._active[vampire.id] = vampire
+        self._lone = vampire
+        self._set_off.append(vampire)
 
     # ---- what players do -------------------------------------------------
 
@@ -1054,6 +1218,9 @@ class Round:
             zombie.alive = False
             self._active.pop(zombie.id, None)
             fighter.kills += 1
+            if zombie is self._lone:
+                self._lone = None
+                self._lone_from = self.t + VAMPIRE_REST
         self._hurt[zombie.id] = fighter.player_id
 
     def _spray(self, fighter: _Fighter, weapon: Weapon) -> None:
@@ -1205,7 +1372,7 @@ class Round:
                 dogs.append(wire)
         quiet = not (
             self._hurt or self._fired or self._switched or self._acked
-            or self._frozen or self._moved or dogs
+            or self._frozen or self._moved or self._set_off or dogs
         )
         if (
             quiet
@@ -1215,6 +1382,10 @@ class Round:
         ):
             return None
         batch: Dict[str, Any] = {"type": "zt", "t": round(self.t, 2), "h": house}
+        if self._set_off:
+            # A vampire's rail, the way the rest were sent in the snapshot.
+            batch["z"] = [z.wire() for z in self._set_off]
+            self._set_off = []
         if self._hurt:
             batch["d"] = [
                 [zombie_id, int(math.ceil(self._by_id[zombie_id].hp)), player_id]

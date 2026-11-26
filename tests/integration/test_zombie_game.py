@@ -125,6 +125,7 @@ def _clear(rnd) -> None:
     """Take every zombie off the map and stop new ones arriving."""
     rnd._active.clear()
     rnd._next = len(rnd.zombies)
+    rnd._waiting.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -415,14 +416,22 @@ def test_damage_falls_off_towards_the_edge_of_a_spray_and_a_blast():
 # ---------------------------------------------------------------------------
 
 
-def test_there_are_zombies_dogs_bats_and_ogres():
+def test_there_are_zombies_dogs_bats_ogres_and_vampires():
     z = za.ZOMBIE_TYPES
-    assert list(z) == ["walker", "dog", "bat", "ogre"]
+    # New kinds go on the end: the phones are sent a kind as its place here.
+    assert list(z) == ["walker", "dog", "bat", "ogre", "vampire"]
     # Ogres are big, slow and strong; dogs are small and quick; bats fly.
     assert z["ogre"].hp > 5 * z["walker"].hp and z["ogre"].radius > z["walker"].radius
     assert z["ogre"].speed < z["walker"].speed < z["dog"].speed
     assert z["dog"].radius < z["walker"].radius and z["dog"].hp < z["walker"].hp
     assert [k for k, kind in z.items() if kind.flying] == ["bat"]
+    # Vampires are quicker than zombies, harder on the walls, and the
+    # only ones that zigzag and that come one at a time.
+    assert z["vampire"].speed > 2 * z["walker"].speed
+    assert z["walker"].dps * 2 < z["vampire"].dps < z["ogre"].dps
+    assert z["walker"].hp < z["vampire"].hp < z["ogre"].hp
+    assert [k for k, kind in z.items() if kind.zigzag] == ["vampire"]
+    assert [k for k, kind in z.items() if kind.lone] == ["vampire"]
 
 
 def test_a_level_is_made_at_random_but_the_same_seed_gives_the_same_level():
@@ -528,13 +537,17 @@ def test_levels_bring_new_kinds_and_tougher_faster_more_numerous_zombies():
     def kinds(level):
         return {z.type.key for seed in range(6) for z in za.build_level(level, 1, 120, seed)}
 
-    # (Every level has an ogre at the end; see the test after this one.)
-    assert kinds(1) == {"walker", "ogre"}
-    assert kinds(2) == {"walker", "dog", "ogre"}
-    assert kinds(3) == {"walker", "dog", "bat", "ogre"}
-    assert kinds(6) == {"walker", "dog", "bat", "ogre"}
-    assert za.kinds_coming(1, 1) == ["walker", "ogre"]
-    assert za.kinds_coming(3, 2) == ["walker", "dog", "bat", "ogre"]
+    # Dogs from the first level, bats from the second. (Every level
+    # has its ogres and its vampires; see the tests after this one.)
+    assert kinds(1) == {"walker", "dog", "ogre", "vampire"}
+    assert kinds(2) == {"walker", "dog", "bat", "ogre", "vampire"}
+    assert kinds(6) == {"walker", "dog", "bat", "ogre", "vampire"}
+    assert za.kinds_coming(1, 1) == ["walker", "dog", "ogre", "vampire"]
+    assert za.kinds_coming(2, 2) == ["walker", "dog", "bat", "ogre", "vampire"]
+    # The waves are made of the first three, and from level 4 of ogres too.
+    assert za.difficulty(1, 1)["types"] == ["walker", "dog"]
+    assert za.difficulty(3, 1)["types"] == ["walker", "dog", "bat"]
+    assert za.difficulty(4, 1)["types"] == ["walker", "dog", "bat", "ogre"]
 
     previous = None
     for level in range(1, 15):
@@ -566,27 +579,184 @@ def test_levels_bring_new_kinds_and_tougher_faster_more_numerous_zombies():
     assert list(crowded.fighters) == [1, 2]
 
 
-def test_every_level_ends_with_an_ogre_and_higher_levels_with_more():
-    for level, bosses in [(1, 1), (2, 1), (3, 1), (4, 2), (6, 2), (7, 3), (10, 4)]:
-        assert za.difficulty(level, 1)["bosses"] == bosses
+def test_ogres_come_from_half_way_two_for_each_player_and_more_on_higher_levels():
+    # Two each to begin with, and another each every few levels.
+    for level, each in [(1, 2), (2, 2), (4, 2), (5, 3), (8, 3), (9, 4), (13, 5), (17, 6), (40, 6)]:
+        assert za.difficulty(level, 1)["bosses"] == each, level
+        assert za.difficulty(level, 2)["bosses"] == 2 * each, level
+
     for level in (1, 2, 5, 9):
-        for duration in (60, 120, 300):
-            for seed in range(4):
-                zombies = za.build_level(level, 1, duration, seed)
-                ogres = [z for z in zombies if z.type.key == "ogre"]
-                # The ones that close the level get to the house for
-                # its last quarter of a minute, and no sooner.
-                last = [z for z in ogres if duration - 30 <= z.arrive <= duration - 10]
-                assert len(last) >= za.difficulty(level, 1)["bosses"], (level, duration, seed)
-                assert all(z.t0 >= 1 for z in last)
-                if level < za.ZOMBIE_TYPES["ogre"].from_level:
-                    assert len(ogres) == len(last) == 1  # no others this early
-    # With more than one, they come at both walls.
-    last = [z for z in za.build_level(5, 1, 120, 3) if z.type.key == "ogre" and z.arrive >= 90]
-    assert {z.y0 < 0 for z in last} == {True, False}
+        for team in (1, 2):
+            bosses = za.difficulty(level, team)["bosses"]
+            for duration in (60, 120, 300):
+                for seed in range(4):
+                    zombies = za.build_level(level, team, duration, seed)
+                    ogres = [z for z in zombies if z.type.key == "ogre"]
+                    late = [z for z in ogres if z.t0 >= duration / 2]
+                    where = (level, team, duration, seed)
+                    assert len(late) >= bosses >= 2 * team, where
+                    # The first sets off as the clock reaches half-way.
+                    assert late[0].t0 == duration / 2, where
+                    if level < za.ZOMBIE_TYPES["ogre"].from_level:
+                        # No others this early: none in the first half,
+                        # at one wall and then the other in the second.
+                        assert ogres == late and len(ogres) == bosses, where
+                        sides = [z.y0 < 0 for z in ogres]
+                        assert all(a != b for a, b in zip(sides, sides[1:])), where
+                        gaps = [b.t0 - a.t0 for a, b in zip(ogres, ogres[1:])]
+                        assert min(gaps) >= za.BOSS_STAGGER - 0.01, where
+                        if duration >= 120:
+                            # Spread over what is left of the level, the
+                            # last reaching the house in time to be a fight.
+                            assert max(gaps) - min(gaps) < 6, where
+                            assert duration - 20 <= ogres[-1].arrive <= duration - 12, where
+
+    # The first levels' ogres are young ones, still far stronger than
+    # anything else on the map; from level 4 they are full-grown.
+    ogre = za.ZOMBIE_TYPES["ogre"]
+    strength = {}
+    for level in (1, 2, 3, 4, 5):
+        late = [
+            z for z in za.build_level(level, 1, 120, 1)
+            if z.type.key == "ogre" and z.t0 >= 60
+        ]
+        strength[level] = min(z.max_hp for z in late) / (ogre.hp * za.difficulty(level, 1)["hp"])
+    assert 0.5 < strength[1] < strength[2] < strength[3] < strength[4]
+    assert strength[4] == pytest.approx(1.0, abs=0.01) == pytest.approx(strength[5], abs=0.01)
+    assert ogre.hp * za.difficulty(1, 1)["boss_hp"] > 5 * za.ZOMBIE_TYPES["walker"].hp
 
 
-def test_bats_weave_as_they_fly_in_and_everyone_else_walks_straight():
+def test_a_vampire_zigzags_in_quicker_than_a_zombie_and_is_harder_on_the_walls():
+    seen = swung = 0
+    quicker = []
+    for seed in range(8):
+        for level, duration in ((1, 120), (1, 60), (3, 180), (8, 300)):
+            zombies = za.build_level(level, 2, duration, seed)
+            vampires = [z for z in zombies if z.type.key == "vampire"]
+            walkers = [z for z in zombies if z.type.key == "walker"]
+            # From the very first level, and more than once in it.
+            assert len(vampires) >= 2, (seed, level, duration)
+            assert all(0 < z.t0 <= duration - za.VAMPIRE_LAST for z in vampires)
+            # For all its darting about, the slowest of them is at the
+            # house before the quickest zombie would be.
+            took = [v.arrive - v.t0 for v in vampires]
+            walked = [w.arrive - w.t0 for w in walkers]
+            assert max(took) < min(walked)
+            quicker.append((sum(took) / len(took)) / (sum(walked) / len(walked)))
+            for v in vampires:
+                seen += 1
+                assert v.dps > 2 * max(w.dps for w in walkers)
+                assert v.max_hp > 3 * max(w.max_hp for w in walkers)
+                # Side to side: the corners of its rail turn one way and
+                # then the other, well off the straight line...
+                xs = [x for x, _y in v.path]
+                turns = [b - a for a, b in zip(xs, xs[1:]) if abs(b - a) > 12]
+                swings = sum(1 for a, b in zip(turns, turns[1:]) if (a > 0) != (b > 0))
+                assert swings >= 2, (seed, level, v.path)
+                swung += swings
+                assert max(xs) - min(xs) > 25
+                # Which is a good deal further than the straight way.
+                assert v._dist > 1.1 * math.dist(v.path[0], v.path[-1])
+                assert all(v.radius <= x <= za.WORLD_W - v.radius for x in xs[1:])
+                # ...and nearer the house all the while (but for a step
+                # back round a tree), to a spot at its wall.
+                out = [abs(y - za.HOUSE_Y) for _x, y in v.path]
+                assert out[0] == max(out) and out[-1] == min(out)
+                assert all(b < a + 25 for a, b in zip(out, out[1:]))
+                assert za.HOUSE_LEFT <= v.tx <= za.HOUSE_RIGHT
+                assert za.HOUSE_H / 2 < out[-1] <= za.HOUSE_H / 2 + za.PILE_DEPTH + v.radius
+    assert seen > 100 and swung / seen > 3.5
+    # In about half the time, on the whole.
+    assert sum(quicker) / len(quicker) < 0.55 and max(quicker) < 0.75
+    # No two come in alike.
+    a, b = [z.path for z in za.build_level(1, 1, 120, 2) if z.type.key == "vampire"][:2]
+    assert [round(x - a[0][0]) for x, _ in a] != [round(x - b[0][0]) for x, _ in b]
+
+
+def test_only_one_vampire_is_out_at_a_time():
+    rnd, clock = _round(level=1, players=2, seed=9)
+    # Nobody is going to defend this house, and it has to last the level.
+    rnd.house = 1e7
+    planned = list(rnd._waiting)
+    assert len(planned) >= 3 and all(z.type.key == "vampire" for z in planned)
+    # The phones aren't told about one until it sets off.
+    assert not any(z.type.key == "vampire" for z in rnd.zombies)
+    snap = rnd.snapshot(1)
+    assert {row[0] for row in snap["z"]}.isdisjoint(z.id for z in planned)
+    assert len(snap["z"]) == len(rnd.zombies)
+
+    first, second, third = planned[:3]
+    due = second.t0
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + first.t0 - 0.3)
+    rnd.drain()
+    assert rnd._lone is None
+    _advance(rnd, clock, 0.5)
+    # Out it comes, when the plan said, and the phones get its rail.
+    assert rnd._lone is first and first.id in rnd._active
+    batch = rnd.drain()
+    assert batch["z"] == [first.wire()]
+    assert first.wire()[1] == za.ZOMBIE_KEYS.index("vampire")
+    assert rnd.drain() is None or "z" not in rnd.drain()
+    # It is in the list where it belongs: the order they set off in.
+    assert [z.t0 for z in rnd.zombies] == sorted(z.t0 for z in rnd.zombies)
+    assert first in rnd.zombies and first.wire() in rnd.snapshot(1)["z"]
+
+    # Nobody kills it. It gets to the house and sets about the wall;
+    # the next one's time comes and goes, and it stays away.
+    _advance(rnd, clock, due + 6 - rnd.t)
+    out = [z for z in rnd._active.values() if z.type.key == "vampire"]
+    assert out == [first] and rnd.t > first.arrive
+    assert second.t0 == due and second.id not in rnd._active
+    for _ in range(40):
+        _advance(rnd, clock, 0.5)
+        assert sum(z.type.key == "vampire" for z in rnd._active.values()) == 1
+    assert rnd._waiting[0] is second
+
+    # Kill it, and after a moment's peace the next sets off.
+    rnd.drain()
+    rnd._damage(first, 10_000, rnd.fighters[1])
+    killed = rnd.t
+    assert not first.alive and rnd._lone is None
+    _advance(rnd, clock, za.VAMPIRE_REST - 0.5)
+    assert second.id not in rnd._active
+    assert not any("z" in b for b in [rnd.drain()] if b)
+    _advance(rnd, clock, 1.0)
+    assert rnd._lone is second and second.id in rnd._active
+    # From now, not from when it was due: it starts at the edge of the map.
+    assert killed + za.VAMPIRE_REST <= second.t0 <= rnd.t
+    assert second.position(second.t0) == pytest.approx((second.x0, second.y0))
+    assert second.arrive == pytest.approx(second.t0 + second._dist / second.speed)
+    assert rnd.drain()["z"] == [second.wire()]
+    snap = rnd.snapshot(2)
+    ids = [row[0] for row in snap["z"]]
+    assert first.id in ids and second.id in ids and third.id not in ids
+    assert first.id in snap["dead"]
+    assert [z.t0 for z in rnd.zombies] == sorted(z.t0 for z in rnd.zombies)
+
+    # Killed on its way in, with the third already due: the third still
+    # waits its moment, and comes alone.
+    rnd._damage(second, 10_000, rnd.fighters[2])
+    assert rnd.fighters[2].kills >= 1
+    _advance(rnd, clock, max(0.0, third.t0 - rnd.t) + za.VAMPIRE_REST + 0.5)
+    assert rnd._lone is third
+    assert sum(z.type.key == "vampire" for z in rnd._active.values()) == 1
+
+
+def test_a_vampire_left_alone_takes_the_wall_down_faster_than_a_zombie():
+    rnd, clock = _round()
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + 1)
+    _clear(rnd)
+    _plant(rnd, 150, za.HOUSE_TOP - 10, dps=za.ZOMBIE_TYPES["walker"].dps)
+    _advance(rnd, clock, 10)
+    to_a_walker = 1000 - rnd.house
+    _clear(rnd)
+    _plant(rnd, 150, za.HOUSE_TOP - 10, kind="vampire", dps=za.ZOMBIE_TYPES["vampire"].dps)
+    house = rnd.house
+    _advance(rnd, clock, 10)
+    assert house - rnd.house > 2.5 * to_a_walker > 0
+
+
+def test_bats_weave_as_they_fly_in_and_zombies_walk_straight():
     zombies = za.build_level(5, 2, 120, seed=2)
     bat = next(z for z in zombies if z.flying)
     walker = next(z for z in zombies if z.type.key == "walker" and len(z.path) == 2)
@@ -1122,7 +1292,7 @@ def test_one_player_sets_up_and_loses_the_house_by_standing_still(
         assert (z["level"], z["duration"], z["best_level"], z["last"]) == (1, 120, 0, None)
         assert z["durations"] == [60, 120, 180, 300]
         assert z["loadouts"] == {str(me): ["shotgun", "machine_gun"]}
-        assert z["coming"] == ["walker", "ogre"]
+        assert z["coming"] == ["walker", "dog", "ogre", "vampire"]
         rules = z["rules"]
         assert [w["key"] for w in rules["weapons"]] == list(za.WEAPONS)
         assert [k["key"] for k in rules["zombies"]] == list(za.ZOMBIE_TYPES)
@@ -1230,6 +1400,8 @@ def _fight(driver, shooters: Dict[int, Any], snap: Dict[str, Any]) -> Dict[str, 
         if message["type"] != "zt":
             continue
         t = message["t"]
+        for wire in message.get("z", ()):
+            zombies[wire[0]] = _rail(wire)  # a vampire has set off
         for zid, hp, _by in message.get("d", ()):
             zombies[zid]["hp"] = hp
         if t < 0:
@@ -1291,7 +1463,7 @@ def test_a_family_member_and_a_guest_survive_a_level_together_and_move_up(
             assert z["last"]["won"] is True and z["last"]["house"] > 0
             assert z["last"]["seconds"] == 60
             assert (z["level"], z["best_level"]) == (2, 1)
-            assert z["coming"] == ["walker", "dog", "ogre"]
+            assert z["coming"] == ["walker", "dog", "bat", "ogre", "vampire"]
             kills = z["last"]["kills"]
             assert kills[str(ben_id)] > 0 and kills[str(guest_id)] > 0
             assert z["kills"] == kills
@@ -1397,7 +1569,8 @@ def test_someone_who_joins_during_a_level_watches_it_and_fights_in_the_next(
         _until(ben, lambda m: m["type"] == "zs")
 
         with players.websocket_connect(f"/api/games/play/{_token(game, hh.katie)}/ws") as katie:
-            assert _state(katie)["status"] == "playing"
+            # (An update of the level can reach her phone before the game does.)
+            assert _until(katie, lambda m: m["type"] == "state")["game"]["status"] == "playing"
             watching = _until(katie, lambda m: m["type"] == "zs")
             assert watching["ammo"] is None and [p["id"] for p in watching["p"]] == [ben_id]
             # Red is Ben's.
