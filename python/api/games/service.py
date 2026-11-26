@@ -555,6 +555,7 @@ def _zombie_state(game: models.Game) -> Dict[str, Any]:
     state.setdefault("level", 1)
     state.setdefault("duration", zombies.DEFAULT_DURATION)
     state["loadouts"] = dict(state.get("loadouts") or {})
+    state["dogs"] = dict(state.get("dogs") or {})
     state["kills"] = dict(state.get("kills") or {})
     state.setdefault("round", None)
     state.setdefault("last", None)
@@ -568,6 +569,11 @@ def _loadout(state: Dict[str, Any], player: models.GamePlayer) -> List[str]:
     return picked or list(zombies.DEFAULT_LOADOUT)
 
 
+def _guard_dog(state: Dict[str, Any], player: models.GamePlayer) -> str:
+    picked = zombies.clean_guard_dog(state["dogs"].get(str(player.game_player_id)))
+    return picked or zombies.DEFAULT_GUARD_DOG
+
+
 def _zombie_action(
     game: models.Game, player: models.GamePlayer, kind: Any, action: Dict[str, Any]
 ) -> None:
@@ -575,7 +581,7 @@ def _zombie_action(
     if kind in ("start", "play_again"):
         _zombie_start(game)
         return
-    if kind not in ("loadout", "settings"):
+    if kind not in ("loadout", "guard_dog", "settings"):
         raise GameError("That isn't something you can do in this game.")
     if game.status == "playing":
         raise GameError("That has to wait until this level is over.")
@@ -587,6 +593,11 @@ def _zombie_action(
                 f"Pick {zombies.LOADOUT_PICKS} different weapons to go with your crossbow."
             )
         state["loadouts"][str(player.game_player_id)] = picks
+    elif kind == "guard_dog":
+        dog = zombies.clean_guard_dog(action.get("dog"))
+        if dog is None:
+            raise GameError("Pick one of the guard dogs.")
+        state["dogs"][str(player.game_player_id)] = dog
     else:
         if not player.is_host:
             raise GameError("Only the person who started the game can change that.")
@@ -608,7 +619,7 @@ def _zombie_start(game: models.Game) -> None:
         "level": state["level"],
         "duration": state["duration"],
         "seed": random.randrange(2**31),
-        "players": [p.game_player_id for p in players],
+        "players": [p.game_player_id for p in players[: zombies.MAX_PLAYERS]],
     }
     game.state = state
     game.status = "playing"
@@ -631,7 +642,11 @@ def live_round(game: models.Game) -> Optional[Dict[str, Any]]:
         "duration": current["duration"],
         "seed": current["seed"],
         "players": [
-            (player_id, _loadout(state, by_id[player_id]))
+            (
+                player_id,
+                _loadout(state, by_id[player_id]),
+                _guard_dog(state, by_id[player_id]),
+            )
             for player_id in current["players"]
             if player_id in by_id
         ],
@@ -702,11 +717,14 @@ def _zombie_view(game: models.Game, status: str) -> Dict[str, Any]:
         "loadouts": {
             str(p.game_player_id): _loadout(state, p) for p in joined_players(game)
         },
+        "guard_dogs": {
+            str(p.game_player_id): _guard_dog(state, p) for p in joined_players(game)
+        },
         "fighting": list(current["players"]) if current else [],
         "last": state["last"],
         "best_level": state["best_level"],
         "kills": state["kills"],
-        "coming": zombies.difficulty(state["level"], len(joined_players(game)))["types"],
+        "coming": zombies.kinds_coming(state["level"], len(joined_players(game))),
         "rules": zombies.rules_view(),
     }
 

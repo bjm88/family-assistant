@@ -87,9 +87,9 @@ GAME_TYPES: Dict[str, GameType] = {
     zombie_apocalypse.GAME_KEY: GameType(
         key=zombie_apocalypse.GAME_KEY,
         name="Zombie Apocalypse",
-        tagline="Defend the family house together until the clock runs out.",
+        tagline="Defend the family house until the clock runs out, alone or with a partner.",
         min_players=1,
-        max_players=4,
+        max_players=2,
         rules=zombie_apocalypse,
         styles=SURVIVOR_STYLES,
         realtime=True,

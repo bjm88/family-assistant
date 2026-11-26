@@ -48,15 +48,25 @@ class _Clock:
         return self.now
 
 
-def _round(level=1, players=1, duration=120, seed=7, picks=("shotgun", "machine_gun")):
+def _round(
+    level=1, players=1, duration=120, seed=7, picks=("shotgun", "machine_gun"), dogs=()
+):
+    """A level with a clock the test moves by hand.
+
+    ``dogs`` names each player's guard dog. Left empty the dogs are
+    shut out of the level, so a test about weapons sees only what the
+    weapons did.
+    """
     clock = _Clock()
     rnd = za.Round(
         level=level,
         duration=duration,
         seed=seed,
-        players=[(i + 1, picks) for i in range(players)],
+        players=[(i + 1, picks, *dogs[i : i + 1]) for i in range(players)],
         clock=clock,
     )
+    if not dogs:
+        rnd.dogs.clear()
     return rnd, clock
 
 
@@ -448,7 +458,7 @@ def test_zombies_run_in_from_off_the_top_and_bottom_of_the_map_in_waves():
     assert sum(1 for g in gaps if g > 2.0) >= 5
 
 
-@pytest.mark.parametrize("level,team", [(1, 1), (4, 2), (8, 4)])
+@pytest.mark.parametrize("level,team", [(1, 1), (4, 2), (8, 2)])
 def test_a_level_starts_with_a_few_zombies_and_builds_to_a_crowd(level, team):
     for seed in range(5):
         zombies = za.build_level(level, team, 120, seed)
@@ -463,7 +473,7 @@ def test_a_level_starts_with_a_few_zombies_and_builds_to_a_crowd(level, team):
 
 
 def test_dozens_of_zombies_are_on_the_map_at_once_and_fit_around_the_house():
-    rnd, clock = _round(level=6, players=4, seed=4)
+    rnd, clock = _round(level=9, players=2, seed=4)
     most = 0
     while rnd.over is None:
         _advance(rnd, clock, 1.0)
@@ -518,10 +528,13 @@ def test_levels_bring_new_kinds_and_tougher_faster_more_numerous_zombies():
     def kinds(level):
         return {z.type.key for seed in range(6) for z in za.build_level(level, 1, 120, seed)}
 
-    assert kinds(1) == {"walker"}
-    assert kinds(2) == {"walker", "dog"}
-    assert kinds(3) == {"walker", "dog", "bat"}
+    # (Every level has an ogre at the end; see the test after this one.)
+    assert kinds(1) == {"walker", "ogre"}
+    assert kinds(2) == {"walker", "dog", "ogre"}
+    assert kinds(3) == {"walker", "dog", "bat", "ogre"}
     assert kinds(6) == {"walker", "dog", "bat", "ogre"}
+    assert za.kinds_coming(1, 1) == ["walker", "ogre"]
+    assert za.kinds_coming(3, 2) == ["walker", "dog", "bat", "ogre"]
 
     previous = None
     for level in range(1, 15):
@@ -545,8 +558,32 @@ def test_levels_bring_new_kinds_and_tougher_faster_more_numerous_zombies():
 
     # More players, more zombies.
     solo = sum(len(za.build_level(4, 1, 120, s)) for s in range(6))
-    four = sum(len(za.build_level(4, 4, 120, s)) for s in range(6))
-    assert four > 2 * solo
+    pair = sum(len(za.build_level(4, 2, 120, s)) for s in range(6))
+    assert pair > 1.4 * solo
+    # Two is as many as can play: a third is left out of the level.
+    assert za.MAX_PLAYERS == 2
+    crowded, _ = _round(players=3)
+    assert list(crowded.fighters) == [1, 2]
+
+
+def test_every_level_ends_with_an_ogre_and_higher_levels_with_more():
+    for level, bosses in [(1, 1), (2, 1), (3, 1), (4, 2), (6, 2), (7, 3), (10, 4)]:
+        assert za.difficulty(level, 1)["bosses"] == bosses
+    for level in (1, 2, 5, 9):
+        for duration in (60, 120, 300):
+            for seed in range(4):
+                zombies = za.build_level(level, 1, duration, seed)
+                ogres = [z for z in zombies if z.type.key == "ogre"]
+                # The ones that close the level get to the house for
+                # its last quarter of a minute, and no sooner.
+                last = [z for z in ogres if duration - 30 <= z.arrive <= duration - 10]
+                assert len(last) >= za.difficulty(level, 1)["bosses"], (level, duration, seed)
+                assert all(z.t0 >= 1 for z in last)
+                if level < za.ZOMBIE_TYPES["ogre"].from_level:
+                    assert len(ogres) == len(last) == 1  # no others this early
+    # With more than one, they come at both walls.
+    last = [z for z in za.build_level(5, 1, 120, 3) if z.type.key == "ogre" and z.arrive >= 90]
+    assert {z.y0 < 0 for z in last} == {True, False}
 
 
 def test_bats_weave_as_they_fly_in_and_everyone_else_walks_straight():
@@ -716,7 +753,7 @@ def test_two_minutes_is_the_default_and_the_levels_can_be_shorter_or_longer():
     assert short.over == "won" and 60 <= short.t < 61
 
 
-@pytest.mark.parametrize("team", [1, 4])
+@pytest.mark.parametrize("team", [1, 2])
 def test_level_one_can_be_survived_with_just_the_crossbow_and_level_twelve_cannot(team):
     easy, clock = _round(level=1, players=team, seed=21)
     _defend(easy, clock)
@@ -779,6 +816,228 @@ def test_updates_say_only_what_changed_and_a_snapshot_says_everything():
 
 
 # ---------------------------------------------------------------------------
+# Guard dogs
+# ---------------------------------------------------------------------------
+
+
+def _dog_round(*dogs: str):
+    """An empty map, the countdown over, and a guard dog for each player."""
+    rnd, clock = _round(players=len(dogs), dogs=dogs)
+    _clear(rnd)
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + 1)
+    rnd.drain()
+    return rnd, clock
+
+
+def _by_the_wall(rnd, x: float, out: float = 40.0, **more):
+    """A zombie standing ``out`` from the top wall of the house."""
+    return _plant(rnd, x, za.HOUSE_TOP - out, **more)
+
+
+def test_there_are_four_guard_dogs_to_choose_from():
+    dogs = za.GUARD_DOGS
+    assert [(d.name, d.breed) for d in dogs.values()] == [
+        ("Juno", "Bernese mountain dog"),
+        ("Wynnie", "Newfoundland"),
+        ("Wolf", "Husky and spaniel mix"),
+        ("Missy", "English bulldog"),
+    ]
+    juno, wynnie, wolf, missy = dogs.values()
+    everyone = list(dogs.values())
+    # Juno is in the middle on strength, bite and speed.
+    for stat in ("hp", "bite", "speed"):
+        numbers = [getattr(d, stat) for d in everyone]
+        assert min(numbers) < getattr(juno, stat) < max(numbers), stat
+    # Wynnie: lots of strength and bite, but slow.
+    assert wynnie.hp == max(d.hp for d in everyone)
+    assert wynnie.bite > juno.bite and wynnie.speed == min(d.speed for d in everyone)
+    # Wolf: very fast, not so strong.
+    assert wolf.speed == max(d.speed for d in everyone) and wolf.speed > 1.5 * juno.speed
+    assert wolf.hp == min(d.hp for d in everyone)
+    # Missy: slow, medium strength, the strongest bite of all.
+    assert missy.bite == max(d.bite for d in everyone) and missy.bite > 1.3 * wynnie.bite
+    assert missy.speed == min(d.speed for d in everyone) and missy.hp == juno.hp
+
+    assert za.clean_guard_dog("wolf") == "wolf"
+    assert za.clean_guard_dog("rex") is None and za.clean_guard_dog(3) is None
+    rules = za.rules_view()
+    assert [d["key"] for d in rules["guard_dogs"]] == ["juno", "wynnie", "wolf", "missy"]
+    assert rules["default_guard_dog"] == "juno" and rules["guard_max_kills"] == 3
+    assert rules["guard_rest"] == [10.0, 20.0]
+
+    # Nobody goes without: a player who never picked gets Juno.
+    rnd = za.Round(level=1, duration=60, seed=1, players=[(1, ()), (2, (), "nope")])
+    assert [d.kind.key for d in rnd.dogs.values()] == ["juno", "juno"]
+
+
+def test_a_guard_dog_waits_in_the_house_and_runs_out_at_a_zombie_that_gets_close():
+    rnd, clock = _dog_round("juno")
+    dog = rnd.dogs[1]
+    home = [za.HOUSE_X + za.GUARD_HOMES[0], za.HOUSE_Y]
+    assert rnd.snapshot(1)["dogs"] == [
+        {"dog": "juno", "home": home, "at": [1, home[0], home[1], za.DOG_HOME, 100, 0.0]}
+    ]
+    # Inside the house, that is.
+    assert za.HOUSE_LEFT < home[0] < za.HOUSE_RIGHT and za.HOUSE_TOP < home[1] < za.HOUSE_BOTTOM
+
+    # Zombies a long way off are the players' business, and so are bats.
+    _by_the_wall(rnd, 100, out=za.GUARD_RANGE + 30)
+    _by_the_wall(rnd, 140, out=20, kind="bat")
+    _advance(rnd, clock, 3)
+    assert dog.state == za.DOG_HOME and (dog.x, dog.y) == tuple(home)
+    assert "g" not in (rnd.drain() or {})
+
+    close = _by_the_wall(rnd, 120, hp=60, dps=0)
+    _advance(rnd, clock, 0.3)
+    assert dog.state == za.DOG_OUT and dog.y < home[1]
+    said = rnd.drain()["g"]
+    assert said == [dog.wire()] and said[0][3] == za.DOG_OUT
+    # Two of Juno's bites see to it, and the kill is her owner's.
+    _advance(rnd, clock, 1.5)
+    assert not close.alive
+    assert rnd.fighters[1].kills == 1 and rnd.result()["dog_kills"] == {"1": 1}
+    assert [close.id, 0, 1] in rnd.drain()["d"]
+
+    # With nothing else in reach she trots home.
+    _advance(rnd, clock, 3)
+    assert dog.state == za.DOG_HOME and (dog.x, dog.y) == tuple(home)
+    assert rnd.drain()["g"][-1][:4] == [1, home[0], home[1], za.DOG_HOME]
+
+
+def test_a_guard_dog_comes_home_after_three_kills_and_rests_ten_seconds():
+    rnd, clock = _dog_round("missy")
+    dog = rnd.dogs[1]
+    for i in range(5):
+        _by_the_wall(rnd, 60 + 12 * i, hp=20, dps=0)
+    while dog.state != za.DOG_HOME or not dog.total:
+        _advance(rnd, clock, 0.1)
+        assert rnd.t < 30
+    assert dog.total == za.GUARD_MAX_KILLS == 3
+    assert len(rnd._active) == 2  # two left standing right outside
+    # Nobody laid a tooth on her, so it is the short rest.
+    assert dog.hp == dog.kind.hp
+    assert dog.ready_at == pytest.approx(rnd.t + za.GUARD_REST[0], abs=0.15)
+    assert dog.wire()[5] == round(dog.ready_at, 1)
+
+    _advance(rnd, clock, za.GUARD_REST[0] - 0.5)
+    assert dog.state == za.DOG_HOME and len(rnd._active) == 2
+    _advance(rnd, clock, 1)
+    assert dog.state == za.DOG_OUT
+    _advance(rnd, clock, 5)
+    assert dog.total == 5 and not rnd._active
+
+
+def test_a_guard_dog_that_gets_hurt_runs_home_and_rests_longer_but_never_dies():
+    rnd, clock = _dog_round("wolf")
+    dog = rnd.dogs[1]
+    brute = _by_the_wall(rnd, 100, kind="ogre", hp=5000, dps=14)
+    worst = 100
+    went_home = 0.0
+    while not went_home:
+        _advance(rnd, clock, 0.1)
+        worst = min(worst, dog.wire()[4])
+        if dog.state == za.DOG_BACK:
+            went_home = rnd.t
+        assert rnd.t < 20
+    # Mauled until he could take no more, having got a few bites in.
+    assert dog.hp == 0 and worst == 0
+    assert brute.alive and brute.hp < 5000 and dog.total == 0
+
+    # Nothing touches him on the way in, and he is still there.
+    while dog.state != za.DOG_HOME:
+        _advance(rnd, clock, 0.1)
+    assert rnd.dogs == {1: dog}
+    assert dog.ready_at == pytest.approx(rnd.t + za.GUARD_REST[1], abs=0.15)
+    _advance(rnd, clock, za.GUARD_REST[1] - 1)
+    assert dog.state == za.DOG_HOME
+    # Rested, he is as good as new and goes straight back out.
+    _advance(rnd, clock, 1.5)
+    assert dog.state == za.DOG_OUT and dog.hp > 0.5 * dog.kind.hp
+
+    # A dog that is only scratched rests somewhere in between.
+    rnd, clock = _dog_round("wynnie")
+    dog = rnd.dogs[1]
+    _by_the_wall(rnd, 100, hp=80, dps=6)
+    while dog.state != za.DOG_HOME or not dog.total:
+        _advance(rnd, clock, 0.1)
+    assert 0 < dog.hp < dog.kind.hp
+    assert za.GUARD_REST[0] + 0.3 < dog.ready_at - rnd.t < za.GUARD_REST[1] - 0.3
+
+
+def test_each_dog_fights_the_way_its_breed_would():
+    def outing(key: str, **zombie):
+        rnd, clock = _dog_round(key)
+        dog = rnd.dogs[1]
+        target = _by_the_wall(rnd, 250, out=70, **zombie)
+        reached = hurt = None
+        while dog.state != za.DOG_HOME or reached is None:
+            _advance(rnd, clock, 0.1)
+            if reached is None and target.hp < target.max_hp:
+                reached = rnd.t
+            if hurt is None and dog.state == za.DOG_BACK:
+                hurt = rnd.t - reached
+            assert rnd.t < 60
+        return reached, hurt, target.max_hp - target.hp
+
+    tough = {"hp": 5000, "dps": 8}
+    reach = {key: outing(key, **tough) for key in za.GUARD_DOGS}
+    # Wolf is there first; Wynnie and Missy bring up the rear.
+    assert reach["wolf"][0] < reach["juno"][0] < reach["wynnie"][0]
+    assert reach["wolf"][0] < reach["juno"][0] < reach["missy"][0]
+    # Wynnie stays in the fight longest and Wolf is seen off soonest.
+    assert reach["wolf"][1] < reach["juno"][1] < reach["wynnie"][1]
+    # Missy does the most damage for the time she is out there.
+    rate = {key: dealt / stayed for key, (_r, stayed, dealt) in reach.items()}
+    assert max(rate, key=rate.get) == "missy" and min(rate, key=rate.get) == "wolf"
+
+
+def test_two_dogs_live_at_either_end_of_the_house_and_share_out_the_zombies():
+    rnd, clock = _dog_round("juno", "wolf")
+    juno, wolf = rnd.dogs[1], rnd.dogs[2]
+    assert juno.hx < za.HOUSE_X < wolf.hx
+    assert [d["dog"] for d in rnd.snapshot(None)["dogs"]] == ["juno", "wolf"]
+
+    left = _by_the_wall(rnd, 70, hp=400, dps=0)
+    right = _by_the_wall(rnd, 110, hp=400, dps=0)
+    _advance(rnd, clock, 0.2)
+    assert {juno.target.id, wolf.target.id} == {left.id, right.id}
+    # Every move a dog makes goes out to the phones, and nothing when
+    # they are lying down.
+    assert sorted(w[0] for w in rnd.drain()["g"]) == [1, 2]
+    _advance(rnd, clock, 12)
+    assert not left.alive and not right.alive
+    # (Whoever finishes first helps the other with theirs.)
+    kills = rnd.result()["dog_kills"]
+    assert set(kills) == {"1", "2"} and sum(kills.values()) == 2
+    _advance(rnd, clock, 4)
+    rnd.drain()
+    _advance(rnd, clock, 1)
+    assert "g" not in (rnd.drain() or {})
+
+
+def test_dogs_stay_put_during_the_countdown_and_help_hold_the_house():
+    rnd, clock = _round(dogs=("juno",))
+    dog = rnd.dogs[1]
+    _plant(rnd, 100, za.HOUSE_TOP - 30, hp=40, dps=0)
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS - 0.5)
+    assert dog.state == za.DOG_HOME
+    _advance(rnd, clock, 1)
+    assert dog.state == za.DOG_OUT
+
+    # Left alone with the level, a dog saves some of the house but not all of it.
+    def left_to(dogs):
+        rnd, clock = _round(duration=60, seed=31, dogs=dogs)
+        while rnd.over is None:
+            _advance(rnd, clock, 1.0)
+        return rnd
+
+    alone, guarded = left_to(()), left_to(("juno",))
+    assert alone.over == guarded.over == "lost"
+    assert guarded.result()["dog_kills"]["1"] >= 3
+    assert guarded.t > alone.t
+
+
+# ---------------------------------------------------------------------------
 # Played over the socket
 # ---------------------------------------------------------------------------
 
@@ -820,9 +1079,18 @@ def test_the_games_page_offers_both_games(client, household):
     assert list(catalog) == ["turkey_tictactoe", ZOMBIES]
     zombie = catalog[ZOMBIES]
     assert zombie["name"] == "Zombie Apocalypse"
-    assert (zombie["min_players"], zombie["max_players"]) == (1, 4)
+    assert (zombie["min_players"], zombie["max_players"]) == (1, 2)
     assert zombie["realtime"] is True and zombie["can_play_ai"] is False
     assert catalog["turkey_tictactoe"]["realtime"] is False
+
+    # One player, or one player and one guest.
+    resp = client.post(
+        "/api/games",
+        json={"family_id": household.family_id, "game_type": ZOMBIES,
+              "host_person_id": household.ben.person_id,
+              "invite_person_ids": [household.katie.person_id, household.omar.person_id]},
+    )
+    assert resp.status_code == 400 and "up to 2 players" in resp.json()["detail"]
 
     # It can't be played against the AI.
     resp = client.post(
@@ -854,11 +1122,19 @@ def test_one_player_sets_up_and_loses_the_house_by_standing_still(
         assert (z["level"], z["duration"], z["best_level"], z["last"]) == (1, 120, 0, None)
         assert z["durations"] == [60, 120, 180, 300]
         assert z["loadouts"] == {str(me): ["shotgun", "machine_gun"]}
-        assert z["coming"] == ["walker"]
+        assert z["coming"] == ["walker", "ogre"]
         rules = z["rules"]
         assert [w["key"] for w in rules["weapons"]] == list(za.WEAPONS)
         assert [k["key"] for k in rules["zombies"]] == list(za.ZOMBIE_TYPES)
         assert rules["house"]["hp"] == 1000 and rules["default_weapon"] == "crossbow"
+
+        # Everyone has a guard dog: Juno until they pick another.
+        assert z["guard_dogs"] == {str(me): "juno"}
+        assert [d["name"] for d in rules["guard_dogs"]] == ["Juno", "Wynnie", "Wolf", "Missy"]
+        ben.send_json({"type": "guard_dog", "dog": "rex"})
+        assert "guard dogs" in _until(ben, lambda m: m["type"] == "error")["message"]
+        ben.send_json({"type": "guard_dog", "dog": "missy"})
+        assert _state(ben)["zombie"]["guard_dogs"] == {str(me): "missy"}
 
         # Pick two weapons to go with the crossbow.
         ben.send_json({"type": "loadout", "weapons": ["grenade", "crossbow"]})
@@ -882,19 +1158,25 @@ def test_one_player_sets_up_and_loses_the_house_by_standing_still(
         assert snap["p"][0]["weapons"] == ["crossbow", "grenade", "sniper", "boulder"]
         assert snap["ammo"] == [None, 9, 14, 2]
         assert len(snap["trees"]) == 6
+        assert [(d["dog"], d["at"][0], d["at"][3]) for d in snap["dogs"]] == [("missy", me, 0)]
         assert zombie_live.is_live(game["game_id"])
 
-        # Weapons are chosen between levels, not during one.
+        # Weapons and dogs are chosen between levels, not during one.
         ben.send_json({"type": "loadout", "weapons": ["shotgun", "sniper"]})
+        assert "level is over" in _until(ben, lambda m: m["type"] == "error")["message"]
+        ben.send_json({"type": "guard_dog", "dog": "wolf"})
         assert "level is over" in _until(ben, lambda m: m["type"] == "error")["message"]
 
         # The house's points only ever go down, and when they run out
         # the level is lost.
         seen: List[int] = []
 
+        dog_states = set()
+
         def over(message):
             if message["type"] == "zt":
                 seen.append(message["h"])
+                dog_states.update(wire[3] for wire in message.get("g", ()))
             return _is_state("round_over")(message)
 
         ended = _until(ben, over)["game"]
@@ -902,6 +1184,10 @@ def test_one_player_sets_up_and_loses_the_house_by_standing_still(
         z = ended["zombie"]
         assert z["last"]["won"] is False and z["last"]["house"] == 0
         assert z["last"]["level"] == 1 and z["last"]["seconds"] < 120
+        # Missy went out, came back and lay down again, more than once.
+        assert dog_states == {za.DOG_HOME, za.DOG_OUT, za.DOG_BACK}
+        assert 3 <= z["last"]["dog_kills"][str(me)] <= z["last"]["kills"][str(me)]
+        assert z["guard_dogs"] == {str(me): "missy"}  # and is hers for the next level
         assert (z["level"], z["best_level"]) == (1, 0)  # the same level again
         assert ended["rounds_played"] == 1 and ended["can_start"]
         assert [p["wins"] for p in ended["players"]] == [0]
@@ -979,6 +1265,9 @@ def test_a_family_member_and_a_guest_survive_a_level_together_and_move_up(
         assert seat.status_code == 201, seat.text
         guest_id = seat.json()["player_id"]
         _until(ben, lambda m: m["type"] == "state" and len(m["game"]["players"]) == 2)
+        # Two is company: there is no room for a third.
+        late = _guest_join(players, _invite_token(game), "Late Larry", style="boy", color="green")
+        assert late.status_code == 400 and "full" in late.json()["detail"]
 
         with players.websocket_connect(f"/api/games{seat.json()['play_path']}/ws") as guest:
             _state(guest)
@@ -1002,7 +1291,7 @@ def test_a_family_member_and_a_guest_survive_a_level_together_and_move_up(
             assert z["last"]["won"] is True and z["last"]["house"] > 0
             assert z["last"]["seconds"] == 60
             assert (z["level"], z["best_level"]) == (2, 1)
-            assert z["coming"] == ["walker", "dog"]
+            assert z["coming"] == ["walker", "dog", "ogre"]
             kills = z["last"]["kills"]
             assert kills[str(ben_id)] > 0 and kills[str(guest_id)] > 0
             assert z["kills"] == kills

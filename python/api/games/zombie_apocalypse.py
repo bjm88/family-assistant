@@ -1,11 +1,11 @@
 """Rules of Zombie Apocalypse.
 
-A co-operative tower defence for one to four players, seen from above.
+A co-operative tower defence for one or two players, seen from above.
 The family's house stands across the middle of the map. Zombies come in
 waves from off the top and bottom of the screen, walk to the house and
 attack it. The house starts with ``HOUSE_HP`` points; if any are left
 when the clock runs out the players have survived the level, and the
-next one is harder.
+next one is harder. Every level ends with an ogre, or several.
 
 Each player slides left and right along the top or the bottom wall of
 the house, and can change walls. They always face out, and every weapon
@@ -33,6 +33,9 @@ say as little as possible over the network:
   boulders are worked out here, from where the zombies are at the time.
 * **Players say where they are** (``zm``, and with every shot); the
   server keeps them on the walls and passes it on.
+* **Each player has a guard dog** that lives in the house, runs out at
+  zombies that get close and comes back for a rest. The dogs are run
+  here (:meth:`Round._run_dogs`) and the phones are told where they are.
 
 :class:`Round` is one level being played. It knows nothing about
 sockets or the database; :mod:`.zombie_live` drives it.
@@ -84,8 +87,6 @@ CROSS_SECONDS = 0.25
 PLAYER_STARTS: Tuple[Tuple[int, float], ...] = (
     (TOP, 0.35),
     (BOTTOM, 0.65),
-    (TOP, 0.65),
-    (BOTTOM, 0.35),
 )
 MAX_PLAYERS = len(PLAYER_STARTS)
 # A bolt or bullet hits a zombie that is within this of its line, on
@@ -101,6 +102,13 @@ MAX_WAVE = 50
 # usual wave, and grows by this much by the end.
 WAVE_START = 0.35
 WAVE_GROWTH = 1.65
+
+# Every level ends with an ogre (more of them on higher levels). They
+# reach the house with about this long left on the clock.
+BOSS_KIND = "ogre"
+BOSS_SECONDS_LEFT = 16.0
+BOSS_EVERY_LEVELS = 3
+MAX_BOSSES = 5
 
 DURATIONS: Tuple[int, ...] = (60, 120, 180, 300)
 DEFAULT_DURATION = 120
@@ -275,6 +283,71 @@ ZOMBIE_TYPES: Dict[str, ZombieType] = {
     )
 }
 ZOMBIE_KEYS: Tuple[str, ...] = tuple(ZOMBIE_TYPES)
+
+# ---------------------------------------------------------------------------
+# Guard dogs
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GuardDog:
+    key: str
+    name: str
+    breed: str
+    hp: float      # strength: how much of a mauling it takes before it runs home
+    bite: float    # attack: the damage one bite does
+    speed: float   # map units a second
+    blurb: str
+
+
+GUARD_DOGS: Dict[str, GuardDog] = {
+    d.key: d
+    for d in (
+        GuardDog(
+            "juno", "Juno", "Bernese mountain dog", hp=100, bite=32, speed=125,
+            blurb="Good at everything: sturdy, a solid bite and quick enough.",
+        ),
+        GuardDog(
+            "wynnie", "Wynnie", "Newfoundland", hp=180, bite=46, speed=80,
+            blurb="Big and black. Takes a beating and bites hard, but takes her time.",
+        ),
+        GuardDog(
+            "wolf", "Wolf", "Husky and spaniel mix", hp=60, bite=26, speed=200,
+            blurb="Small, white and very fast. Gets hurt easily.",
+        ),
+        GuardDog(
+            "missy", "Missy", "English bulldog", hp=100, bite=64, speed=80,
+            blurb="Slow on her short legs, but nothing bites harder.",
+        ),
+    )
+}
+GUARD_DOG_KEYS: Tuple[str, ...] = tuple(GUARD_DOGS)
+DEFAULT_GUARD_DOG = "juno"
+
+# A dog goes for zombies on foot that come within this of a wall...
+GUARD_RANGE = 110.0
+# ...bites this often, from this close (on top of the zombie's size)...
+GUARD_BITE_EVERY = 0.5
+GUARD_BITE_REACH = 7.0
+# ...and comes home after this many kills, or sooner if it gets hurt.
+GUARD_MAX_KILLS = 3
+# Zombies this close to a dog (on top of their size) maul it, this many
+# times harder than they hit the house.
+GUARD_MAUL_REACH = 12.0
+GUARD_MAUL = 5.0
+# Then it rests in the house: this long after an easy outing, up to
+# this long when it came home badly hurt. It never dies.
+GUARD_REST: Tuple[float, float] = (10.0, 20.0)
+# Where each player's dog lies in the house, as an offset from its
+# middle, in the order the players joined.
+GUARD_HOMES: Tuple[float, ...] = (-100.0, 100.0)
+DOG_HOME, DOG_OUT, DOG_BACK = 0, 1, 2
+
+
+def clean_guard_dog(raw: Any) -> Optional[str]:
+    """The guard dog a player picked, if there is such a dog."""
+    return raw if isinstance(raw, str) and raw in GUARD_DOGS else None
+
 
 # Bats weave from side to side as they fly in; the weave dies away as
 # they reach the house. Same numbers as in the React app.
@@ -493,10 +566,12 @@ def difficulty(level: int, players: int) -> Dict[str, Any]:
 
     Higher levels bring tougher, faster zombies, more of them at once,
     waves closer together and new kinds. More players means more
-    zombies, so a full house isn't a walkover.
+    zombies, so two players don't have it easier than one.
 
     ``wave_budget`` is the size of a wave half-way through the level,
     in walkers; ``wave_every`` the seconds between waves at that point.
+    ``types`` are the kinds the waves are made of, and ``bosses`` how
+    many ogres turn up for the end of the level whatever the waves had.
     """
     step = max(1, min(MAX_LEVEL, int(level))) - 1
     team = max(1, min(MAX_PLAYERS, int(players)))
@@ -509,7 +584,17 @@ def difficulty(level: int, players: int) -> Dict[str, Any]:
         "wave_budget": (6.0 + 0.7 * step) * crowd,
         "both_sides": max(0.0, min(0.8, 0.12 * (step - 1))),
         "types": [z.key for z in ZOMBIE_TYPES.values() if z.from_level <= step + 1],
+        "bosses": min(MAX_BOSSES, 1 + step // BOSS_EVERY_LEVELS),
     }
+
+
+def kinds_coming(level: int, players: int) -> List[str]:
+    """Every kind of zombie a level has, in the usual order."""
+    diff = difficulty(level, players)
+    kinds = set(diff["types"])
+    if diff["bosses"]:
+        kinds.add(BOSS_KIND)
+    return [key for key in ZOMBIE_KEYS if key in kinds]
 
 
 def build_level(
@@ -520,7 +605,9 @@ def build_level(
     The same arguments always give the same level. Waves start a
     second or two in and keep coming until just before the end; each
     spends a budget on zombies picked at random from the kinds this
-    level has, and comes in from the top, the bottom, or both.
+    level has, and comes in from the top, the bottom, or both. The
+    level's ogres set off so as to reach the house for the last
+    ``BOSS_SECONDS_LEFT`` seconds.
     """
     rng = random.Random(seed)
     trees = build_trees(seed)
@@ -555,6 +642,14 @@ def build_level(
             )
         side = -side
         t += diff["wave_every"] * (1.2 - 0.5 * gone) * rng.uniform(0.85, 1.15)
+    side = rng.choice((-1, 1))
+    for n in range(diff["bosses"]):
+        boss = _spawn(rng, ZOMBIE_TYPES[BOSS_KIND], diff, trees, side, t0=0.0)
+        walk = boss.arrive
+        boss.t0 = round(max(1.0, duration - BOSS_SECONDS_LEFT - walk - 2.5 * n), 2)
+        boss.arrive = boss.t0 + walk
+        zombies.append(boss)
+        side = -side
     zombies.sort(key=lambda z: z.t0)
     for index, zombie in enumerate(zombies, start=1):
         zombie.id = index
@@ -637,6 +732,43 @@ class _Fighter:
         return track_y(self.side)
 
 
+class _Dog:
+    """A player's guard dog: at home in the house, out biting, or on its way back."""
+
+    __slots__ = (
+        "fighter", "kind", "hx", "hy", "x", "y", "hp", "state", "kills", "total",
+        "target", "bite_at", "ready_at", "sent",
+    )
+
+    def __init__(self, fighter: _Fighter, kind: GuardDog) -> None:
+        self.fighter = fighter
+        self.kind = kind
+        self.hx = HOUSE_X + GUARD_HOMES[fighter.slot % len(GUARD_HOMES)]
+        self.hy = HOUSE_Y
+        self.x, self.y = self.hx, self.hy
+        self.hp = kind.hp
+        self.state = DOG_HOME
+        self.kills = 0           # this outing
+        self.total = 0           # this level
+        self.target: Optional[Zombie] = None
+        self.bite_at = 0.0
+        self.ready_at = 0.0      # when its rest is over
+        # As the phones were last told; a snapshot says where it starts.
+        self.sent: List[Any] = self.wire()
+
+    def wire(self) -> List[Any]:
+        """``[player, x, y, state, health %, when its rest ends]``."""
+        resting = self.state == DOG_HOME
+        return [
+            self.fighter.player_id,
+            round(self.x, 1),
+            round(self.y, 1),
+            self.state,
+            int(math.ceil(100 * self.hp / self.kind.hp)),
+            round(self.ready_at, 1) if resting else 0,
+        ]
+
+
 class _Roll:
     """A boulder on its way out from the house."""
 
@@ -680,9 +812,10 @@ class Round:
         level: int,
         duration: float,
         seed: int,
-        players: Sequence[Tuple[int, Sequence[str]]],
+        players: Sequence[Sequence[Any]],
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """``players`` is ``(player id, weapons picked[, guard dog])`` for each."""
         if not players:
             raise ValueError("a round needs at least one player")
         self.level = int(level)
@@ -693,13 +826,16 @@ class Round:
         self.house = float(HOUSE_HP)
         self.over: Optional[str] = None  # 'won' or 'lost'
         self.fighters: Dict[int, _Fighter] = {}
-        for slot, (player_id, picks) in enumerate(players[:MAX_PLAYERS]):
-            self.fighters[player_id] = _Fighter(
+        self.dogs: Dict[int, _Dog] = {}
+        for slot, (player_id, picks, *more) in enumerate(players[:MAX_PLAYERS]):
+            fighter = self.fighters[player_id] = _Fighter(
                 player_id,
                 slot,
                 clean_loadout(list(picks)) or DEFAULT_LOADOUT,
                 self.duration,
             )
+            dog = clean_guard_dog(more[0] if more else None) or DEFAULT_GUARD_DOG
+            self.dogs[player_id] = _Dog(fighter, GUARD_DOGS[dog])
         self.trees = build_trees(seed)
         self.zombies = build_level(level, len(self.fighters), duration, seed)
         self._by_id = {z.id: z for z in self.zombies}
@@ -740,6 +876,8 @@ class Round:
             for roll in self._rolls:
                 self._roll_on(roll, dt)
             self._rolls = [roll for roll in self._rolls if roll.gone < roll.limit]
+        if self.dogs and t > 0:
+            self._run_dogs(dt)
         bite = 0.0
         for zombie in self._active.values():
             if t < zombie.until:
@@ -953,6 +1091,103 @@ class Round:
             ):
                 self._damage(zombie, roll.weapon.damage, roll.fighter)
 
+    # ---- guard dogs --------------------------------------------------------
+
+    def _run_dogs(self, dt: float) -> None:
+        """Move the dogs on by ``dt``, in steps small enough to bite on time."""
+        left = dt
+        while left > 1e-9:
+            step = min(left, 0.1)
+            left -= step
+            for dog in self.dogs.values():
+                self._run_dog(dog, self.t - left, step)
+
+    def _run_dog(self, dog: _Dog, t: float, dt: float) -> None:
+        kind = dog.kind
+        if dog.state == DOG_HOME:
+            if t < dog.ready_at:
+                return
+            dog.hp = kind.hp  # rested
+            dog.target = self._dog_target(dog, t)
+            if dog.target is None:
+                return
+            dog.state, dog.kills = DOG_OUT, 0
+        if dog.state == DOG_OUT:
+            zombie = dog.target
+            if zombie is None or not zombie.alive:
+                zombie = dog.target = self._dog_target(dog, t)
+            if zombie is None:
+                dog.state = DOG_BACK  # nothing left to chase
+                return
+            zx, zy = zombie.position(t)
+            reach = zombie.radius + GUARD_BITE_REACH
+            gap = math.hypot(zx - dog.x, zy - dog.y)
+            if gap > reach:
+                move = min(kind.speed * dt, gap - reach * 0.8)
+                dog.x += (zx - dog.x) / gap * move
+                dog.y += (zy - dog.y) / gap * move
+            elif t >= dog.bite_at:
+                dog.bite_at = t + GUARD_BITE_EVERY
+                self._damage(zombie, kind.bite, dog.fighter)
+                if not zombie.alive:
+                    dog.kills += 1
+                    dog.total += 1
+                    dog.target = None
+                    if dog.kills >= GUARD_MAX_KILLS:
+                        dog.state = DOG_BACK
+                        return
+            # Whatever is within reach of the dog bites back.
+            harm = 0.0
+            for other in self._active.values():
+                if other.flying or t < other.until:
+                    continue
+                ox, oy = other.position(t)
+                if math.hypot(ox - dog.x, oy - dog.y) <= other.radius + GUARD_MAUL_REACH:
+                    harm += other.dps
+            if harm:
+                dog.hp -= harm * GUARD_MAUL * dt
+                if dog.hp <= 0:
+                    dog.hp = 0.0
+                    dog.target = None
+                    dog.state = DOG_BACK
+            return
+        # On its way home, where nothing can get at it.
+        gap = math.hypot(dog.hx - dog.x, dog.hy - dog.y)
+        move = kind.speed * dt
+        if gap > move:
+            dog.x += (dog.hx - dog.x) / gap * move
+            dog.y += (dog.hy - dog.y) / gap * move
+            return
+        dog.x, dog.y = dog.hx, dog.hy
+        dog.state = DOG_HOME
+        if dog.kills or dog.hp < kind.hp:
+            short, long = GUARD_REST
+            dog.ready_at = t + short + (long - short) * (1.0 - dog.hp / kind.hp)
+        dog.kills = 0
+
+    def _dog_target(self, dog: _Dog, t: float) -> Optional[Zombie]:
+        """The zombie on foot nearest the dog, of those close to the house."""
+        taken = {
+            other.target.id
+            for other in self.dogs.values()
+            if other is not dog and other.target is not None
+        }
+        best: Optional[Zombie] = None
+        nearest = math.inf
+        for zombie in self._active.values():
+            if zombie.flying:
+                continue
+            x, y = zombie.position(t)
+            out = HOUSE_TOP - y if y < HOUSE_Y else y - HOUSE_BOTTOM
+            if out > GUARD_RANGE:
+                continue
+            gap = math.hypot(x - dog.x, y - dog.y)
+            if zombie.id in taken:
+                gap += GUARD_RANGE  # leave it to the other dog if there is a choice
+            if gap < nearest:
+                best, nearest = zombie, gap
+        return best
+
     # ---- what the phones are told ---------------------------------------
 
     def drain(self) -> Optional[Dict[str, Any]]:
@@ -962,9 +1197,15 @@ class Round:
         running, so the phones can keep their clocks in step.
         """
         house = int(math.ceil(self.house))
+        dogs = []
+        for dog in self.dogs.values():
+            wire = dog.wire()
+            if wire != dog.sent:
+                dog.sent = wire
+                dogs.append(wire)
         quiet = not (
             self._hurt or self._fired or self._switched or self._acked
-            or self._frozen or self._moved
+            or self._frozen or self._moved or dogs
         )
         if (
             quiet
@@ -992,6 +1233,8 @@ class Round:
         if self._switched:
             batch["w"] = [[pid, index] for pid, index in self._switched.items()]
             self._switched = {}
+        if dogs:
+            batch["g"] = dogs
         if self._acked:
             batch["a"] = {str(pid): number for pid, number in self._acked.items()}
             self._acked = {}
@@ -1032,6 +1275,10 @@ class Round:
                 }
                 for f in self.fighters.values()
             ],
+            "dogs": [
+                {"dog": dog.kind.key, "home": [dog.hx, dog.hy], "at": dog.wire()}
+                for dog in self.dogs.values()
+            ],
             "ammo": fighter.ammo if fighter is not None else None,
             "ack": fighter.ack if fighter is not None else 0,
         }
@@ -1048,6 +1295,8 @@ class Round:
             "zombies": len(self.zombies),
             "kills": {str(f.player_id): f.kills for f in self.fighters.values()},
             "shots": {str(f.player_id): f.shots for f in self.fighters.values()},
+            # Of each player's kills, the ones their dog made.
+            "dog_kills": {str(d.fighter.player_id): d.total for d in self.dogs.values()},
         }
 
 
@@ -1147,4 +1396,20 @@ def rules_view() -> Dict[str, Any]:
         ],
         "bat_weave": BAT_WEAVE,
         "bat_weave_rate": BAT_WEAVE_RATE,
+        "guard_dogs": [
+            {
+                "key": d.key,
+                "name": d.name,
+                "breed": d.breed,
+                "hp": d.hp,
+                "bite": d.bite,
+                "speed": d.speed,
+                "blurb": d.blurb,
+            }
+            for d in GUARD_DOGS.values()
+        ],
+        "default_guard_dog": DEFAULT_GUARD_DOG,
+        "guard_range": GUARD_RANGE,
+        "guard_max_kills": GUARD_MAX_KILLS,
+        "guard_rest": list(GUARD_REST),
     }
