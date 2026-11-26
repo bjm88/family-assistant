@@ -17,7 +17,7 @@ import type {
 import type { LiveMessage } from "../useGameSocket";
 import { ZombieEngine } from "./engine";
 import type { Hud, Phase } from "./engine";
-import { WeaponIcon, ZombieIcon } from "./icons";
+import { DogIcon, WeaponIcon, ZombieIcon } from "./icons";
 import { Survivor } from "./Survivor";
 import { isSurvivorStyle, SURVIVOR_BY_KEY, SURVIVORS } from "./survivors";
 import "./zombies.css";
@@ -25,7 +25,8 @@ import "./zombies.css";
 // Zombie Apocalypse, as a player sees it on /play/<token>:
 //
 //   welcome  → who invited you, pick a character and a shirt, join
-//   setup    → the team, your weapons, how long to hold out, "Start level N"
+//   setup    → the team, your weapons and guard dog, how long to hold
+//              out, "Start level N"
 //   level    → the map (engine.ts) with the clock above it and the
 //              controls below; then back to setup for the next one
 //
@@ -718,6 +719,28 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
     act({ type: "loadout", weapons: next });
   };
 
+  // The same for their guard dog.
+  const dogs = useMemo(() => new Map(rules.guard_dogs.map((d) => [d.key, d])), [rules]);
+  const myDog = zombie.guard_dogs[String(meId)] ?? rules.default_guard_dog;
+  const [dog, setDog] = useState(myDog);
+  const dogTouched = useRef(0);
+  useEffect(() => {
+    if (Date.now() - dogTouched.current > 1500) setDog(myDog);
+  }, [myDog]);
+  const pickDog = (key: string) => {
+    if (key === dog || !online) return;
+    dogTouched.current = Date.now();
+    setDog(key);
+    act({ type: "guard_dog", dog: key });
+  };
+  const dogOf = (playerId: number) =>
+    dogs.get(playerId === meId ? dog : zombie.guard_dogs[String(playerId)] ?? rules.default_guard_dog);
+  const collarOf = (p: GamePlayer | undefined) => (SHIRT_COLORS[p?.avatar_color ?? "blue"] ?? SHIRT_COLORS.blue).main;
+  const myCollar = collarOf(game.players.find((p) => p.player_id === meId));
+  const strongest = Math.max(...rules.guard_dogs.map((d) => d.hp));
+  const sharpest = Math.max(...rules.guard_dogs.map((d) => d.bite));
+  const fastest = Math.max(...rules.guard_dogs.map((d) => d.speed));
+
   const links = new Map((game.invites ?? []).map((i) => [i.player_id, i]));
   const share = async (playerId: number) => {
     const invite = links.get(playerId);
@@ -789,17 +812,25 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
               {joined
                 .filter((p) => String(p.player_id) in last.kills)
                 .sort((a, b) => (last.kills[String(b.player_id)] ?? 0) - (last.kills[String(a.player_id)] ?? 0))
-                .map((p) => (
-                  <li key={p.player_id} className="flex items-center gap-2 rounded-xl bg-white/[0.07] px-2 py-1">
-                    <Portrait player={p} size={30} />
-                    <span className="min-w-0 flex-1 truncate font-bold">
-                      {p.player_id === meId ? "You" : p.name}
-                    </span>
-                    <span className="flex items-center gap-1 font-black tabular-nums">
-                      <Skull className="h-4 w-4 text-[color:var(--za-green)]" /> {last.kills[String(p.player_id)] ?? 0}
-                    </span>
-                  </li>
-                ))}
+                .map((p) => {
+                  const bitten = last.dog_kills?.[String(p.player_id)] ?? 0;
+                  return (
+                    <li key={p.player_id} className="flex items-center gap-2 rounded-xl bg-white/[0.07] px-2 py-1">
+                      <Portrait player={p} size={30} />
+                      <span className="min-w-0 flex-1 leading-tight">
+                        <span className="block truncate font-bold">{p.player_id === meId ? "You" : p.name}</span>
+                        {bitten > 0 && (
+                          <span className="za-soft block truncate text-[11px] font-semibold">
+                            {bitten} of them {dogOf(p.player_id)?.name ?? "the dog"}'s
+                          </span>
+                        )}
+                      </span>
+                      <span className="flex items-center gap-1 font-black tabular-nums">
+                        <Skull className="h-4 w-4 text-[color:var(--za-green)]" /> {last.kills[String(p.player_id)] ?? 0}
+                      </span>
+                    </li>
+                  );
+                })}
             </ul>
           </section>
         )}
@@ -861,6 +892,43 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
         </section>
 
         <section className="za-card p-4">
+          <h2 className="text-lg font-black">Your guard dog</h2>
+          <p className="za-soft text-xs font-semibold">
+            Waits in the house and runs out at zombies that get close. After {rules.guard_max_kills} kills, or when it
+            gets hurt, it comes back in for a rest of {rules.guard_rest[0]} to {rules.guard_rest[1]} seconds.
+          </p>
+          <div className="mt-3 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Your guard dog">
+            {rules.guard_dogs.map((d) => (
+              <button
+                key={d.key}
+                type="button"
+                role="radio"
+                aria-checked={dog === d.key}
+                onClick={() => pickDog(d.key)}
+                className="za-pick p-2 text-left"
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className="za-dog-plate">
+                    <DogIcon dog={d.key} size={46} collar={myCollar} />
+                  </span>
+                  <div className="min-w-0 flex-1 leading-tight">
+                    <div className="text-sm font-black">{d.name}</div>
+                    <div className="za-soft text-[11px] font-bold">{d.breed}</div>
+                  </div>
+                  {dog === d.key && <Check className="h-4 w-4 shrink-0 text-[color:var(--za-green)]" strokeWidth={4} />}
+                </div>
+                <div className="mt-2 space-y-1">
+                  <Stat label="Strength" value={d.hp / strongest} wide />
+                  <Stat label="Bite" value={d.bite / sharpest} wide />
+                  <Stat label="Speed" value={d.speed / fastest} wide />
+                </div>
+                <p className="za-soft mt-1.5 text-[11px] font-semibold leading-snug">{d.blurb}</p>
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="za-card p-4">
           <h2 className="text-lg font-black">The team</h2>
           <ul className="mt-2 space-y-1.5">
             {joined.map((p) => (
@@ -873,13 +941,15 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
                   </div>
                   <div className="za-soft truncate text-xs">
                     {p.connected ? "Ready" : "Stepped away"}
-                    {(zombie.kills[String(p.player_id)] ?? 0) > 0 && ` · ${zombie.kills[String(p.player_id)]} zombies so far`}
+                    {` · with ${dogOf(p.player_id)?.name ?? "a dog"}`}
+                    {(zombie.kills[String(p.player_id)] ?? 0) > 0 && ` · ${zombie.kills[String(p.player_id)]} zombies`}
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center">
                   {(p.player_id === meId ? picks : zombie.loadouts[String(p.player_id)] ?? []).map((key) => (
-                    <WeaponIcon key={key} weapon={key} className="h-6 w-9" />
+                    <WeaponIcon key={key} weapon={key} className="h-6 w-8" />
                   ))}
+                  <DogIcon dog={dogOf(p.player_id)?.key ?? rules.default_guard_dog} size={30} collar={collarOf(p)} />
                 </div>
               </li>
             ))}
@@ -909,8 +979,8 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
             <div className="mt-3 rounded-xl border-2 border-dashed border-white/20 px-3 py-2.5">
               <div className="text-sm font-extrabold">Bring in help with a link</div>
               <p className="za-soft text-xs">
-                Up to {game.max_players} can defend the house. Whoever opens the link types their name, picks a
-                character and is in.
+                {game.max_players === 2 ? "Two" : `Up to ${game.max_players}`} can defend the house. Whoever opens the
+                link types their name, picks a character and is in.
               </p>
               <div className="mt-2 flex gap-2">
                 <button
@@ -934,9 +1004,10 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
         <section className="za-card px-4 py-3 text-sm">
           <h2 className="font-black">How to play</h2>
           <ul className="za-soft mt-1 list-disc space-y-0.5 pl-5 font-semibold">
-            <li>Slide a thumb across the map to move along the house. Touch above the house to defend the top wall, below it for the bottom.</li>
+            <li>Everything is under the map. Slide the bar to move along the wall; the arrows in the corner turn you round to defend the other wall.</li>
             <li>Tap a weapon to fire it straight ahead. Hold the fast ones down.</li>
-            <li>The team wins the level if the house is still standing when the clock runs out.</li>
+            <li>Your dog looks after itself: out to bite whatever gets close, back in for a rest.</li>
+            <li>An ogre comes at the end of every level. If the house is still standing when the clock runs out, you win.</li>
           </ul>
         </section>
 
@@ -961,10 +1032,12 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
   );
 }
 
-function Stat({ label, value }: { label: string; value: number }) {
+function Stat({ label, value, wide }: { label: string; value: number; wide?: boolean }) {
   return (
     <div className="flex items-center gap-1.5">
-      <span className="za-soft w-11 shrink-0 text-[10px] font-bold uppercase leading-none">{label}</span>
+      <span className={cn("za-soft shrink-0 text-[10px] font-bold uppercase leading-none", wide ? "w-[3.4rem]" : "w-11")}>
+        {label}
+      </span>
       <span className="za-bar flex-1">
         <span style={{ width: `${Math.round(Math.max(0.04, Math.min(1, value)) * 100)}%` }} />
       </span>
