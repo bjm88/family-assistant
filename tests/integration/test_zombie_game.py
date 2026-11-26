@@ -49,13 +49,15 @@ class _Clock:
 
 
 def _round(
-    level=1, players=1, duration=120, seed=7, picks=("shotgun", "machine_gun"), dogs=()
+    level=1, players=1, duration=120, seed=7, picks=("shotgun", "machine_gun"), dogs=(),
+    tnt=False,
 ):
     """A level with a clock the test moves by hand.
 
     ``dogs`` names each player's guard dog. Left empty the dogs are
     shut out of the level, so a test about weapons sees only what the
-    weapons did.
+    weapons did. No TNT lands either unless ``tnt`` says so, for the
+    same reason.
     """
     clock = _Clock()
     rnd = za.Round(
@@ -67,6 +69,8 @@ def _round(
     )
     if not dogs:
         rnd.dogs.clear()
+    if not tnt:
+        rnd._tnt_at = math.inf
     return rnd, clock
 
 
@@ -121,6 +125,14 @@ def _plant(rnd, x: float, y: float, *, kind: str = "walker", hp: float = 500, dp
     return zombie
 
 
+def _crate(rnd, x: float, y: float, seconds: float = za.TNT_SECONDS):
+    """A crate of TNT standing at ``(x, y)``."""
+    rnd._crate_ids += 1
+    crate = za._Crate(rnd._crate_ids, x, y, rnd.t + seconds)
+    rnd.crates[crate.id] = crate
+    return crate
+
+
 def _clear(rnd) -> None:
     """Take every zombie off the map and stop new ones arriving."""
     rnd._active.clear()
@@ -137,7 +149,7 @@ def test_every_weapon_has_a_reach_a_speed_a_damage_and_is_single_hit_or_area():
     w = za.WEAPONS
     assert list(w) == [
         "crossbow", "machine_gun", "sniper", "shotgun", "flamethrower", "grenade",
-        "snowball", "boulder",
+        "snowball", "chainsaw",
     ]
     for weapon in w.values():
         assert weapon.range > 0 and weapon.speed > 0 and weapon.reload > 0
@@ -148,8 +160,8 @@ def test_every_weapon_has_a_reach_a_speed_a_damage_and_is_single_hit_or_area():
     single = {k for k, weapon in w.items() if not weapon.area}
     assert single == {"crossbow", "machine_gun", "sniper"}
 
-    # The crossbow is the one that never runs out.
-    assert [k for k, weapon in w.items() if weapon.ammo is None] == ["crossbow"]
+    # The crossbow never runs out, and nor does the chainsaw.
+    assert [k for k, weapon in w.items() if weapon.ammo is None] == ["crossbow", "chainsaw"]
     # Machine gun: single hit, the fastest shots of the three.
     assert w["machine_gun"].reload < w["crossbow"].reload < w["sniper"].reload
     # Sniper rifle: slowest to reload, reaches furthest — right to the
@@ -159,37 +171,50 @@ def test_every_weapon_has_a_reach_a_speed_a_damage_and_is_single_hit_or_area():
     to_edge = za.track_y(za.TOP)
     assert to_edge == za.WORLD_H - za.track_y(za.BOTTOM)
     assert w["sniper"].range > to_edge > w["machine_gun"].range > w["crossbow"].range
-    # Flamethrower: area damage, but a shorter reach than anything else.
-    assert w["flamethrower"].range == min(x.range for x in w.values())
+    # Flamethrower: area damage, but a shorter reach than any other gun.
     assert w["flamethrower"].range < w["shotgun"].range < w["crossbow"].range
+    # Chainsaw: for close combat. It reaches the crowd against the wall
+    # the player is standing behind, and no further.
+    saw = w["chainsaw"]
+    assert saw.given and za.GIVEN_WEAPONS == ("chainsaw",)
+    assert saw.range == min(x.range for x in w.values()) < w["flamethrower"].range / 2
+    assert za.TRACK_INSET + za.PILE_DEPTH <= saw.range < za.TRACK_INSET + za.PILE_DEPTH + 10
+    assert saw.area and saw.reload < 0.2
     # Grenade: the big blast.
     assert w["grenade"].kind == "lob" and w["grenade"].radius >= 60
     # Snowball: freezes an area and hurts nobody.
     assert w["snowball"].kind == "lob" and w["snowball"].damage == 0
     assert w["snowball"].freeze >= 3 and w["snowball"].radius >= 60
-    # Boulder: rolls right across the map; everybody has two, no more.
-    assert w["boulder"].kind == "roll" and w["boulder"].ammo == 2 and w["boulder"].given
-    assert za.GIVEN_WEAPONS == ("boulder",)
+    # Boulders are nobody's to carry: they are roped to the house.
+    assert "boulder" not in w
+    assert za.BOULDER.kind == "roll" and za.BOULDER.range > to_edge
+    # There is plenty of everything: a machine gun can be fired for
+    # over half a minute without a pause, a flamethrower for longer.
+    assert {k: weapon.ammo for k, weapon in w.items() if weapon.ammo} == {
+        "machine_gun": 360, "sniper": 28, "shotgun": 52, "flamethrower": 520,
+        "grenade": 18, "snowball": 20,
+    }
+    assert w["machine_gun"].ammo * w["machine_gun"].reload > 30
+    assert w["flamethrower"].ammo * w["flamethrower"].reload > 40
 
 
-def test_a_loadout_is_the_crossbow_two_picked_weapons_and_two_boulders():
+def test_a_loadout_is_the_crossbow_two_picked_weapons_and_the_chainsaw():
     assert za.clean_loadout(["grenade", "sniper"]) == ["grenade", "sniper"]
     assert za.clean_loadout(["snowball", "flamethrower"]) == ["snowball", "flamethrower"]
     for bad in (["grenade"], ["grenade", "grenade"], ["crossbow", "sniper"],
-                ["boulder", "sniper"], ["grenade", "sniper", "shotgun"],
+                ["boulder", "sniper"], ["chainsaw", "sniper"], ["grenade", "sniper", "shotgun"],
                 ["grenade", "laser"], "grenade", None):
         assert za.clean_loadout(bad) is None, bad
 
     rnd, _ = _round(picks=("grenade", "sniper"))
     fighter = rnd.fighters[1]
-    assert fighter.weapons == ["crossbow", "grenade", "sniper", "boulder"]
-    assert fighter.ammo == [None, za.WEAPONS["grenade"].ammo, za.WEAPONS["sniper"].ammo, 2]
-    # A longer level comes with more ammunition, but never more boulders.
+    assert fighter.weapons == ["crossbow", "grenade", "sniper", "chainsaw"]
+    assert fighter.ammo == [None, za.WEAPONS["grenade"].ammo, za.WEAPONS["sniper"].ammo, None]
+    # A longer level comes with more ammunition, and a shorter one with less.
     longer, _ = _round(duration=300, picks=("grenade", "sniper"))
-    assert longer.fighters[1].ammo[1] > fighter.ammo[1]
-    assert longer.fighters[1].ammo[3] == 2
+    assert longer.fighters[1].ammo == [None, 45, 70, None]
     shorter, _ = _round(duration=60, picks=("grenade", "sniper"))
-    assert shorter.fighters[1].ammo[3] == 2
+    assert shorter.fighters[1].ammo == [None, 9, 14, None]
 
 
 def test_shots_use_up_ammunition_and_cannot_be_fired_faster_than_the_weapon_reloads():
@@ -244,7 +269,7 @@ def test_a_weapon_that_was_just_switched_to_is_ready_to_fire():
     # Staying on a weapon doesn't make it ready.
     rnd.switch(1, {"w": 0})
     assert not rnd.fire(1, {"w": 0})
-    assert rnd.fighters[1].ammo == [None, za.WEAPONS["sniper"].ammo - 2, za.WEAPONS["grenade"].ammo - 1, 2]
+    assert rnd.fighters[1].ammo == [None, za.WEAPONS["sniper"].ammo - 2, za.WEAPONS["grenade"].ammo - 1, None]
 
 
 def test_nobody_can_shoot_before_the_countdown_ends():
@@ -775,7 +800,7 @@ def test_bats_weave_as_they_fly_in_and_zombies_walk_straight():
 
 
 # ---------------------------------------------------------------------------
-# Snowballs and boulders
+# Snowballs, the chainsaw and the boulders at the house
 # ---------------------------------------------------------------------------
 
 
@@ -838,49 +863,431 @@ def test_a_snowball_freezes_the_group_where_it_lands_and_hurts_nobody():
     assert walker.clock(110.0) == pytest.approx(walker.stop + 1.0)
 
 
-def test_a_boulder_rolls_straight_out_and_flattens_everything_in_its_way():
+def test_the_chainsaw_cuts_up_what_is_at_the_wall_in_front_and_reaches_no_further():
     rnd, clock = _round(players=2)
-    boulder = za.WEAPONS["boulder"]
+    saw = za.WEAPONS["chainsaw"]
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + 5)
+    _clear(rnd)
+    wall = za.HOUSE_TOP
+    # A crowd piled up against the wall, as deep as it gets...
+    pile = [_plant(rnd, 150 + dx, wall - 8 - gap, hp=60) for dx, gap in
+            ((0, 0), (-9, 6), (8, 12), (-3, 20), (4, za.PILE_DEPTH))]
+    bat = _plant(rnd, 150, wall - 18, kind="bat", hp=30)
+    # ...one still on its way in, more along the wall, and one at the other wall.
+    coming = _plant(rnd, 150, wall - za.PILE_DEPTH - 30)
+    along = [_plant(rnd, 150 - 45, wall - 12), _plant(rnd, 150 + 45, wall - 12)]
+    behind = _plant(rnd, 150, za.HOUSE_BOTTOM + 12)
+    rnd.drain()
+
+    assert rnd.fighters[1].weapons[3] == "chainsaw"
+    assert rnd.fire(1, {"w": 3, "x": 150, "d": za.TOP})
+    # One bite of the saw hurts everything it reaches, all alike.
+    assert all(z.max_hp - z.hp == saw.damage for z in [*pile, bat])
+    assert all(z.hp == z.max_hp for z in [coming, *along, behind])
+    assert rnd.drain()["f"] == [[1, 3, 150.0, za.TOP, 0.0]]
+    # Held down it goes through the lot in a second or so...
+    for _ in range(8):
+        clock.now += saw.reload
+        rnd.advance(saw.reload)
+        assert rnd.fire(1, {"w": 3, "x": 150, "d": za.TOP})
+    assert not any(z.alive for z in [*pile, bat])
+    assert rnd.fighters[1].kills == 6
+    # ...and whatever it couldn't reach hasn't a scratch.
+    assert all(z.hp == z.max_hp for z in [coming, *along, behind])
+    # It can't be fired any faster than it runs.
+    assert sum(rnd.fire(1, {"w": 3, "x": 150, "d": za.TOP}) for _ in range(30)) < 6
+    # Step along the wall, or turn round, and it reaches those too.
+    clock.now += 1
+    assert rnd.fire(1, {"w": 3, "x": 150 + 45, "d": za.TOP})
+    assert along[1].hp < along[1].max_hp == along[0].hp
+    clock.now += 1
+    assert rnd.fire(1, {"w": 3, "x": 150, "d": za.BOTTOM})
+    assert behind.hp < behind.max_hp
+    # It never runs out.
+    for _ in range(500):
+        clock.now += saw.reload
+        assert rnd.fire(1, {"w": 3, "x": 150 - 45, "d": za.TOP})
+    assert not along[0].alive and rnd.fighters[1].ammo[3] is None
+
+
+def test_boulders_roped_to_the_house_roll_up_and_down_the_map_once_a_level_for_each_side():
+    boulder = za.BOULDER
+    left, right = za.SMASH_X
+    # One lot towards each end of the house, the same distance from the middle.
+    assert za.HOUSE_LEFT < left < za.HOUSE_X < right < za.HOUSE_RIGHT
+    assert za.HOUSE_X - left == right - za.HOUSE_X
+    assert za.rules_view()["smash"] == {
+        "x": [left, right], "apart": za.SMASH_APART, "out": za.SMASH_OUT,
+        "radius": boulder.radius, "speed": boulder.speed, "range": boulder.range,
+    }
+    reach = za.SMASH_APART + boulder.radius  # either side of the middle of a lane
+
+    rnd, clock = _round(players=2)
+    assert rnd.snapshot(1)["smash"] == [1, 1]
+    # They stay roped up during the countdown.
+    assert not rnd.smash(1, {"b": 0})
     _advance(rnd, clock, za.COUNTDOWN_SECONDS + 5)
     _clear(rnd)
     rnd.drain()
-    wall = za.HOUSE_TOP
-    in_its_way = [
-        _plant(rnd, 150, wall - 15),
-        _plant(rnd, 160, wall - 70, kind="dog"),
-        _plant(rnd, 138, wall - 150, kind="bat"),
-        _plant(rnd, 150, wall - 240, kind="ogre", hp=900),
+    top, bottom = za.HOUSE_TOP, za.HOUSE_BOTTOM
+    in_the_way = [
+        _plant(rnd, left, top - 15),
+        _plant(rnd, left - reach + 2, top - 70, kind="dog"),
+        _plant(rnd, left + reach - 2, top - 150, kind="bat"),
+        _plant(rnd, left + 10, top - 250, kind="ogre", hp=900),
+        _plant(rnd, left - 12, bottom + 15, kind="vampire"),
+        _plant(rnd, left + 30, bottom + 250, kind="ogre", hp=900),
     ]
-    beside = [_plant(rnd, 150 + 45, wall - 15), _plant(rnd, 150 - 60, wall - 150, kind="ogre")]
-    behind = _plant(rnd, 150, za.HOUSE_BOTTOM + 15)
+    beside = [
+        _plant(rnd, left - reach - 14, top - 15),
+        _plant(rnd, left + reach + 24, top - 150, kind="ogre"),
+        _plant(rnd, left + reach + 14, bottom + 100),
+    ]
+    other_end = [_plant(rnd, right, top - 15), _plant(rnd, right + 10, bottom + 200, kind="ogre", hp=900)]
 
-    assert rnd.fire(1, {"w": 3, "x": 150, "d": za.TOP})
-    assert rnd.drain()["f"] == [[1, 3, 150.0, za.TOP, 0.0]]
-    # It takes its time: the nearest is flattened first, the furthest last.
+    for bad in ({}, {"b": 2}, {"b": -1}, {"b": "0"}, {"b": True}, {"b": None}):
+        assert not rnd.smash(1, bad)
+    assert not rnd.smash(99, {"b": 0})
+    assert rnd.smashes == [True, True] and rnd.drain() is None
+
+    # Anybody can cut them loose: here the second player does.
+    assert rnd.smash(2, {"b": 0})
+    batch = rnd.drain()
+    assert batch["b"] == [[0, 2]]
+    # Two roll up the map from the top wall and two down it from the bottom.
+    assert sorted((roll.x, roll.y, roll.uy) for roll in rnd._rolls) == [
+        (left - za.SMASH_APART, top, -1.0), (left - za.SMASH_APART, bottom, 1.0),
+        (left + za.SMASH_APART, top, -1.0), (left + za.SMASH_APART, bottom, 1.0),
+    ]
+    # Side by side nothing can slip between them, and they clear a lane
+    # about a hundred wide.
+    assert za.SMASH_APART < boulder.radius + min(z.radius for z in za.ZOMBIE_TYPES.values())
+    assert 2 * reach >= 80
+
+    # They take their time: the nearest are flattened first, the furthest last.
     _advance(rnd, clock, 0.2)
-    assert [z.alive for z in in_its_way] == [False, True, True, True]
+    assert [z.alive for z in in_the_way] == [False, True, True, True, False, True]
     _advance(rnd, clock, 0.7)
-    assert [z.alive for z in in_its_way] == [False, False, False, True]
+    assert [z.alive for z in in_the_way] == [False, False, False, True, False, True]
     _advance(rnd, clock, 1.0)
-    # Everything in its path, whatever it is and however strong...
-    assert not any(z.alive for z in in_its_way)
-    assert rnd.fighters[1].kills == 4
-    # ...and nothing beside it, or at the other wall.
-    assert all(z.alive and z.hp == z.max_hp for z in [*beside, behind])
-    # It rolls off the edge of the map and is gone.
+    # Everything in their way, whatever it is and however strong...
+    assert not any(z.alive for z in in_the_way)
+    assert rnd.fighters[2].kills == 6 and rnd.fighters[1].kills == 0
+    # ...and nothing beside the lane, or at the other end of the house.
+    assert all(z.alive and z.hp == z.max_hp for z in [*beside, *other_end])
+    # They roll off the edge of the map and are gone.
     _advance(rnd, clock, 2.0)
     assert rnd._rolls == []
 
-    # From the bottom wall it rolls down the map.
-    clock.now += 2
-    assert rnd.fire(1, {"w": 3, "x": 150, "d": za.BOTTOM})
-    _advance(rnd, clock, 0.5)
-    assert not behind.alive
+    # Once a level for each side, whoever asks.
+    assert not rnd.smash(1, {"b": 0}) and not rnd.smash(2, {"b": 0})
+    assert rnd.snapshot(1)["smash"] == [0, 1]
+    assert rnd.smash(1, {"b": 1})
+    assert rnd.drain()["b"] == [[1, 1]]
+    _advance(rnd, clock, 2.0)
+    assert not any(z.alive for z in other_end) and rnd.fighters[1].kills == 2
+    assert all(z.alive for z in beside)
+    assert not rnd.smash(1, {"b": 1})
+    assert rnd.snapshot(2)["smash"] == [0, 0]
+    # They are back for the next level.
+    assert _round(level=2)[0].smashes == [True, True]
 
-    # Two a level, however long the level and whatever else is carried.
-    clock.now += 2
-    assert not rnd.fire(1, {"w": 3})
-    assert rnd.fighters[1].ammo[3] == 0 and rnd.fighters[2].ammo[3] == 2
+
+# ---------------------------------------------------------------------------
+# TNT
+# ---------------------------------------------------------------------------
+
+
+def _crowd(rnd, count: int, *, wall: int = za.TOP, out: float = 100.0):
+    """``count`` zombies standing about in front of a wall, doing no harm."""
+    edge = za.HOUSE_TOP if wall == za.TOP else za.HOUSE_BOTTOM
+    return [
+        _plant(rnd, 70 + (i * 37) % 220, edge + wall * (out + (i * 13) % 40), dps=0)
+        for i in range(count)
+    ]
+
+
+def _landings(count: int, seed: int, seconds: float = 280.0) -> List[Any]:
+    """Every crate that lands in a long level with ``count`` zombies standing in it."""
+    rnd, clock = _round(duration=300, seed=seed, tnt=True)
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + 1)
+    _clear(rnd)
+    _crowd(rnd, count)
+    landed = []
+    while rnd.t < seconds:
+        _advance(rnd, clock, 0.5)
+        for wire in (rnd.drain() or {}).get("c", ()):
+            landed.append((rnd.t, wire))
+            del rnd.crates[wire[0]]  # make room for the next
+    return landed
+
+
+def test_tnt_lands_among_the_zombies_and_oftener_the_more_of_them_there_are():
+    # With nothing on the map there is nothing to blow up, and none comes.
+    assert _landings(0, seed=1) == []
+
+    few = [_landings(4, seed) for seed in range(1, 7)]
+    many = [_landings(45, seed) for seed in range(1, 7)]
+    # Every half a minute or so with a handful about...
+    assert all(4 <= len(landed) <= 12 for landed in few)
+    # ...and every six to ten seconds in an invasion.
+    assert all(28 <= len(landed) <= 46 for landed in many)
+    assert sum(map(len, many)) > 3 * sum(map(len, few))
+    # No two levels get them at the same moments or in the same places.
+    assert len({tuple((x, y) for _t, (_id, x, y, _until) in landed) for landed in many}) == len(many)
+
+    for landed in many:
+        times = [t for t, _wire in landed]
+        # None in the first seconds, nor straight after another.
+        assert times[0] >= za.TNT_FIRST
+        assert all(b - a >= za.TNT_GAP - 0.5 for a, b in zip(times, times[1:]))
+        assert [wire[0] for _t, wire in landed] == list(range(1, len(landed) + 1))
+
+    rnd, clock = _round(duration=300, seed=3, tnt=True)
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + 1)
+    _clear(rnd)
+    crowd = _crowd(rnd, 45, wall=za.BOTTOM)
+    near, far = za.TNT_BAND
+    crossbow = za.WEAPONS["crossbow"]
+    seen = 0
+    while rnd.t < 250:
+        _advance(rnd, clock, 0.5)
+        for crate_id, x, y, until in (rnd.drain() or {}).get("c", ()):
+            seen += 1
+            crate = rnd.crates.pop(crate_id)
+            assert (crate.x, crate.y) == (x, y)
+            assert until == pytest.approx(rnd.t + za.TNT_SECONDS, abs=0.6)
+            # In front of the wall the zombies are at, where a player can
+            # stand in front of it and reach it with any crossbow...
+            assert za.TRACK_LEFT <= x <= za.TRACK_RIGHT
+            assert near <= y - za.HOUSE_BOTTOM <= far
+            assert y - za.track_y(za.BOTTOM) < crossbow.range
+            # ...in among them, and not in a tree.
+            assert min(math.dist((x, y), z.position(rnd.t)) for z in crowd) < 45
+            assert sum(
+                math.dist((x, y), z.position(rnd.t)) < za.TNT.radius for z in crowd
+            ) >= 5
+            assert all(math.dist((x, y), (tx, ty)) > r + za.TNT_SIZE for tx, ty, r in rnd.trees)
+    assert seen >= 10
+
+
+def test_no_more_than_three_crates_stand_at_once_and_one_nobody_shoots_is_taken_away():
+    rnd, clock = _round(duration=300, seed=5, tnt=True)
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + 1)
+    _clear(rnd)
+    _crowd(rnd, 45)
+    born: Dict[int, float] = {}
+    most = 0
+    while rnd.t < 200:
+        _advance(rnd, clock, 0.5)
+        for crate_id, _x, _y, until in (rnd.drain() or {}).get("c", ()):
+            born[crate_id] = rnd.t
+            assert until - rnd.t == pytest.approx(za.TNT_SECONDS, abs=0.6)
+        crates = list(rnd.crates.values())
+        most = max(most, len(crates))
+        assert len(crates) <= za.TNT_MAX
+        # Each has a place of its own.
+        assert all(
+            math.dist((a.x, a.y), (b.x, b.y)) >= za.TNT_APART
+            for i, a in enumerate(crates) for b in crates[i + 1:]
+        )
+        # Left alone, each stands for its 25 seconds and no longer.
+        assert all(rnd.t < c.until for c in crates)
+        assert {c.id for c in crates} == {
+            crate_id for crate_id, t in born.items() if rnd.t - t < za.TNT_SECONDS - 0.6
+        } | {c.id for c in crates}
+    assert most == za.TNT_MAX
+    assert len(born) > za.TNT_MAX  # the old ones made way for new
+    # A phone that connects is told which are standing.
+    assert rnd.snapshot(1)["tnt"] == [c.wire() for c in rnd.crates.values()]
+    assert all(len(wire) == 4 for wire in rnd.snapshot(1)["tnt"])
+    # None of it hurt anybody.
+    assert all(z.hp == z.max_hp for z in rnd._active.values())
+
+
+def test_shooting_tnt_blows_up_everything_around_it_like_a_big_grenade():
+    tnt, grenade = za.TNT, za.WEAPONS["grenade"]
+    # A grenade's blast, and then some.
+    assert tnt.radius > grenade.radius and tnt.damage > grenade.damage
+    assert tnt.falloff == grenade.falloff
+    rules = za.rules_view()["tnt"]
+    assert rules == {"radius": tnt.radius, "size": za.TNT_SIZE, "seconds": za.TNT_SECONDS}
+
+    rnd, clock = _round(players=2)
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + 5)
+    _clear(rnd)
+    wall = za.HOUSE_TOP
+    crate = _crate(rnd, 180, wall - 100)
+    beside = _plant(rnd, 180, wall - 108, hp=100)
+    near = [_plant(rnd, 180 + dx, wall - 100 + dy, hp=100) for dx, dy in
+            ((-30, 10), (25, -25), (0, 45), (-50, -20))]
+    edge = _plant(rnd, 180 + tnt.radius, wall - 100, hp=1000)
+    bat = _plant(rnd, 150, wall - 140, kind="bat", hp=40)
+    ogre = _plant(rnd, 215, wall - 60, kind="ogre", hp=400)
+    outside = [
+        _plant(rnd, 180 - tnt.radius - 30, wall - 100),
+        _plant(rnd, 180, wall - 100 - tnt.radius - 30),
+        _plant(rnd, 180, za.HOUSE_BOTTOM + 20),
+    ]
+    rnd.drain()
+
+    # The bolt has to have been fired, from in front of the crate, on
+    # its side of the house, and to have been able to reach it.
+    assert not rnd.hit(1, {"s": 1, "c": crate.id})
+    for n, (bad, weapon) in enumerate((
+        ({"x": 180 + 40, "d": za.TOP}, 0),
+        ({"x": 180, "d": za.BOTTOM}, 0),
+    ), start=1):
+        clock.now += 1
+        assert rnd.fire(1, {"w": weapon, "s": n, **bad})
+        assert not rnd.hit(1, {"s": n, "c": crate.id})
+    far = _crate(rnd, 100, wall - 250)
+    clock.now += 1
+    assert rnd.fire(1, {"w": 0, "x": 100, "d": za.TOP, "s": 5})
+    assert not rnd.hit(1, {"s": 5, "c": far.id})
+    del rnd.crates[far.id]
+    for n, bad in enumerate(({"c": 999}, {"c": "1"}, {"c": None}, {}), start=10):
+        clock.now += 1
+        assert rnd.fire(1, {"w": 0, "x": 180, "d": za.TOP, "s": n})
+        assert not rnd.hit(1, {"s": n, **bad})
+    assert crate.id in rnd.crates and all(z.hp == z.max_hp for z in rnd._active.values())
+    rnd.drain()
+
+    # One bolt, a little off the middle of the crate, and up it goes.
+    clock.now += 1
+    assert rnd.fire(1, {"w": 0, "x": 180 + za.TNT_SIZE, "d": za.TOP, "s": 20})
+    assert rnd.hit(1, {"s": 20, "c": crate.id})
+    assert rnd.crates == {}
+    # Everything round it is caught, on the ground or in the air...
+    assert not beside.alive and not bat.alive and not any(z.alive for z in near)
+    assert rnd.fighters[1].kills == 6 and rnd.fighters[2].kills == 0
+    # ...less and less towards the edge...
+    assert edge.max_hp - edge.hp == pytest.approx(
+        tnt.damage * (1 - (1 - tnt.falloff) * (tnt.radius - edge.radius) / tnt.radius), rel=0.01
+    )
+    assert tnt.damage * tnt.falloff < edge.max_hp - edge.hp < tnt.damage * 0.5
+    # ...an ogre is hurt badly but not killed...
+    assert ogre.alive and 0 < ogre.hp < 0.6 * ogre.max_hp
+    # ...and what is further off, or at the other wall, is untouched.
+    assert all(z.alive and z.hp == z.max_hp for z in outside)
+    # The house isn't hurt by it.
+    assert rnd.house == za.HOUSE_HP
+
+    batch = rnd.drain()
+    assert batch["x"] == [[crate.id, 1]]
+    assert {zid for zid, _hp, by in batch["d"] if by == 1} == {
+        z.id for z in [beside, bat, *near, edge, ogre]
+    }
+    assert "c" not in batch and rnd.snapshot(1)["tnt"] == []
+    # It only goes off once.
+    clock.now += 1
+    assert rnd.fire(2, {"w": 0, "x": 180, "d": za.TOP, "s": 1})
+    assert not rnd.hit(2, {"s": 1, "c": crate.id})
+
+
+def test_anything_that_hurts_sets_tnt_off_and_one_crate_sets_off_the_next():
+    wall = za.HOUSE_TOP
+
+    def level(picks):
+        rnd, clock = _round(picks=picks)
+        _advance(rnd, clock, za.COUNTDOWN_SECONDS + 5)
+        _clear(rnd)
+        return rnd, clock
+
+    # A shotgun, when the crate is in its wedge...
+    rnd, clock = level(("shotgun", "flamethrower"))
+    crate = _crate(rnd, 180, wall - 60)
+    victim = _plant(rnd, 180 + 70, wall - 60, hp=50)
+    aside = _crate(rnd, 60, wall - 60)
+    assert rnd.fire(1, {"w": 1, "x": 180, "d": za.TOP})
+    assert not victim.alive and list(rnd.crates) == [aside.id]
+    # ...and a flamethrower, if the crate is near enough to the wall.
+    out_of_reach = _crate(rnd, 300, wall - 150)
+    victim = _plant(rnd, 60 + 60, wall - 80, hp=50)
+    clock.now += 1
+    assert rnd.fire(1, {"w": 2, "x": 300, "d": za.TOP})
+    assert rnd.fire(1, {"w": 2, "x": 60, "d": za.TOP})
+    assert not victim.alive and list(rnd.crates) == [out_of_reach.id]
+
+    # A grenade that lands near one, but not a snowball.
+    rnd, clock = level(("grenade", "snowball"))
+    crate = _crate(rnd, 180, wall - 120)
+    by_it = _plant(rnd, 150, wall - 90)
+    victim = _plant(rnd, 180 + 60, wall - 170, hp=50)  # out of the grenade's reach
+    assert rnd.fire(1, {"w": 2, "x": 150, "d": za.TOP, "r": 100})
+    _advance(rnd, clock, 1.0)
+    assert by_it.until > rnd.t and crate.id in rnd.crates
+    assert victim.alive and victim.hp == victim.max_hp
+    assert rnd.fire(1, {"w": 1, "x": 150, "d": za.TOP, "r": 100})
+    _advance(rnd, clock, 1.0)
+    assert rnd.crates == {} and not victim.alive
+    assert by_it.alive and rnd.fighters[1].kills == 1
+
+    # A boulder that rolls over one.
+    rnd, clock = level(("grenade", "snowball"))
+    lane = za.SMASH_X[0] + za.SMASH_APART
+    crate = _crate(rnd, lane + 20, wall - 90)
+    missed = _crate(rnd, lane + 90, wall - 140)
+    victim = _plant(rnd, lane + 80, wall - 60, hp=50)
+    assert rnd.smash(1, {"b": 0})
+    _advance(rnd, clock, 0.2)
+    assert victim.alive and len(rnd.crates) == 2  # not there yet
+    _advance(rnd, clock, 2.0)
+    assert not victim.alive
+    # The one it missed was close enough to the first to go up with it,
+    # and both count for whoever set the first off.
+    assert rnd.crates == {}
+    batch = rnd.drain()
+    assert sorted(batch["x"]) == [[crate.id, 1], [missed.id, 1]]
+
+    # Guard dogs and zombies walk straight past them.
+    rnd, clock = _round(dogs=("wolf",))
+    _advance(rnd, clock, za.COUNTDOWN_SECONDS + 5)
+    _clear(rnd)
+    crate = _crate(rnd, 180, wall - 40)
+    prey = _plant(rnd, 180, wall - 40, hp=40, dps=0)
+    _advance(rnd, clock, 6.0)
+    assert not prey.alive and crate.id in rnd.crates
+
+
+def test_tnt_makes_an_invasion_easier_to_survive():
+    """A player who shoots the crates loses less of the house than one who can't."""
+
+    def play(seed: int, tnt: bool) -> float:
+        rnd, clock = _round(level=4, seed=seed, tnt=tnt)
+        crossbow = za.WEAPONS["crossbow"]
+        shot = 0
+        while rnd.over is None:
+            _advance(rnd, clock, crossbow.reload)
+            shot += 1
+            crowded = [
+                c for c in rnd.crates.values()
+                if sum(
+                    math.dist((c.x, c.y), z.position(rnd.t)) < za.TNT.radius * 0.7
+                    for z in rnd._active.values()
+                ) >= 3
+            ]
+            if crowded:
+                crate = crowded[0]
+                assert rnd.fire(1, {"w": 0, "x": crate.x, "d": _side_of(crate.y), "s": shot})
+                assert rnd.hit(1, {"s": shot, "c": crate.id})
+                continue
+            reachable = sorted(
+                (z for z in rnd._active.values() if _out(z, rnd.t) <= crossbow.range),
+                key=lambda z: z.arrive,
+            )
+            if reachable:
+                _shoot(rnd, clock, 1, reachable[0], shot=shot)
+        return rnd.house
+
+    seeds = (3, 21, 50)
+    without = [play(seed, tnt=False) for seed in seeds]
+    with_tnt = [play(seed, tnt=True) for seed in seeds]
+    # With only a crossbow, level 4 is touch and go...
+    assert min(without) == 0 and max(without) < 400
+    # ...and the TNT is what gets the house through it.
+    assert min(with_tnt) > 200
+    assert sum(with_tnt) > sum(without) + 500
 
 
 # ---------------------------------------------------------------------------
@@ -943,7 +1350,8 @@ def test_updates_say_only_what_changed_and_a_snapshot_says_everything():
     # One starts on the top wall and one on the bottom.
     assert [p["side"] for p in snap["p"]] == [za.TOP, za.BOTTOM]
     assert all(za.TRACK_LEFT < p["x"] < za.TRACK_RIGHT for p in snap["p"])
-    assert snap["ammo"] == [None, za.WEAPONS["shotgun"].ammo, za.WEAPONS["machine_gun"].ammo, 2]
+    assert snap["ammo"] == [None, za.WEAPONS["shotgun"].ammo, za.WEAPONS["machine_gun"].ammo, None]
+    assert snap["smash"] == [1, 1] and snap["tnt"] == []
     assert snap["dead"] == [] and snap["hp"] == []
     # Someone watching has no weapons of their own.
     assert rnd.snapshot(None)["ammo"] is None and rnd.snapshot(77)["ammo"] is None
@@ -1325,8 +1733,8 @@ def test_one_player_sets_up_and_loses_the_house_by_standing_still(
         assert playing["status"] == "playing" and playing["zombie"]["fighting"] == [me]
         snap = _until(ben, lambda m: m["type"] == "zs")
         assert snap["level"] == 1 and snap["house"] == 1000 and snap["t"] <= 0
-        assert snap["p"][0]["weapons"] == ["crossbow", "grenade", "sniper", "boulder"]
-        assert snap["ammo"] == [None, 9, 14, 2]
+        assert snap["p"][0]["weapons"] == ["crossbow", "grenade", "sniper", "chainsaw"]
+        assert snap["ammo"] == [None, 18, 28, None]
         assert len(snap["trees"]) == 6
         assert [(d["dog"], d["at"][0], d["at"][3]) for d in snap["dogs"]] == [("missy", me, 0)]
         assert zombie_live.is_live(game["game_id"])
@@ -1384,14 +1792,23 @@ def _where(zombie: Dict[str, Any], t: float):
     return corners[-1]
 
 
-def _fight(driver, shooters: Dict[int, Any], snap: Dict[str, Any]) -> Dict[str, Any]:
+def _fight(
+    driver, shooters: Dict[int, Any], snap: Dict[str, Any],
+    seen: Optional[Dict[str, List[Any]]] = None,
+) -> Dict[str, Any]:
     """Step in front of the nearest zombies and shoot them with crossbows
     until the level is over.
 
     ``driver`` is the socket the updates are read from; ``shooters``
-    maps player ids to the sockets their shots are sent on.
+    maps player ids to the sockets their shots are sent on. The first
+    of them shoots every crate of TNT as it lands, and the last cuts
+    the boulders loose, the left ones a third of the way through the
+    level and the right ones at two thirds. What the phones are told
+    about either (``x`` and ``b``) is added to ``seen``.
     """
+    roped = [index for index, there in enumerate(snap["smash"]) if there]
     zombies = {wire[0]: _rail(wire) for wire in snap["z"]}
+    crates = {wire[0]: wire for wire in snap.get("tnt", ())}
     shot = 0
     while True:
         message = driver.receive_json()
@@ -1404,7 +1821,24 @@ def _fight(driver, shooters: Dict[int, Any], snap: Dict[str, Any]) -> Dict[str, 
             zombies[wire[0]] = _rail(wire)  # a vampire has set off
         for zid, hp, _by in message.get("d", ()):
             zombies[zid]["hp"] = hp
+        for wire in message.get("c", ()):
+            crates[wire[0]] = wire  # a crate of TNT has landed
+        for crate_id, _by in message.get("x", ()):
+            crates.pop(crate_id, None)
+        if seen is not None:
+            for key in ("x", "b"):
+                seen.setdefault(key, []).extend(message.get(key, ()))
         if t < 0:
+            continue
+        if roped and t > snap["dur"] * (3 - len(roped)) / 3:
+            list(shooters.values())[-1].send_json({"type": "zb", "b": roped.pop(0)})
+        if crates:
+            # The first player shoots a crate as soon as there is one.
+            crate_id, x, y, _until_ = crates.pop(next(iter(crates)))
+            ws = next(iter(shooters.values()))
+            shot += 1
+            ws.send_json({"type": "zf", "w": 0, "x": x, "d": _side_of(y), "s": shot, "q": shot})
+            ws.send_json({"type": "zh", "s": shot, "c": crate_id, "q": shot})
             continue
         nearest = []
         for z in zombies.values():
@@ -1423,8 +1857,11 @@ def _fight(driver, shooters: Dict[int, Any], snap: Dict[str, Any]) -> Dict[str, 
 
 
 def test_a_family_member_and_a_guest_survive_a_level_together_and_move_up(
-    client, household, players, fast_levels
+    client, household, players, fast_levels, monkeypatch
 ):
+    # Crates of TNT land as often as they are let.
+    monkeypatch.setattr(za, "TNT_RATE", 2.0)
+    monkeypatch.setattr(za, "TNT_MAX_RATE", 2.0)
     hh = household
     game = _zombie_game(client, hh)
     gid = game["game_id"]
@@ -1458,7 +1895,13 @@ def test_a_family_member_and_a_guest_survive_a_level_together_and_move_up(
             guest_snap = _until(guest, lambda m: m["type"] == "zs")
             assert guest_snap["z"] == snap["z"]  # both phones have the same level
 
-            won = _fight(ben, {ben_id: ben, guest_id: guest}, snap)
+            assert snap["tnt"] == [] and snap["smash"] == [1, 1]
+            seen: Dict[str, List[Any]] = {}
+            won = _fight(ben, {ben_id: ben, guest_id: guest}, snap, seen)
+            # Ben shot the crates of TNT as they landed...
+            assert len(seen["x"]) >= 3 and {by for _crate_id, by in seen["x"]} == {ben_id}
+            # ...and the guest cut the boulders loose, one side and then the other.
+            assert seen["b"] == [[0, guest_id], [1, guest_id]]
             z = won["zombie"]
             assert z["last"]["won"] is True and z["last"]["house"] > 0
             assert z["last"]["seconds"] == 60
