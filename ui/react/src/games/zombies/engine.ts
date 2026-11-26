@@ -28,6 +28,8 @@ import { isSurvivorStyle } from "./survivors";
 // The server (python/api/games/zombie_apocalypse.py) sends the whole
 // level once — every zombie's rail and when it sets off — and after
 // that only what changed: who got hurt, who fired, the house's points.
+// (And a vampire's rail when it sets off: there is only ever one, so
+// when the next comes depends on when the last was killed.)
 // Where each zombie is comes from the clock alone, with the same sums
 // the server does (`locate` here, `Zombie.position` there).
 //
@@ -279,13 +281,15 @@ interface Batch {
   f?: number[][];
   m?: number[][];
   w?: number[][];
+  /** Zombies setting off now that weren't in the snapshot, as they are there. */
+  z?: number[][];
   /** Guard dogs: player, x, y, state, health %, when its rest ends. */
   g?: number[][];
   a?: Record<string, number>;
   o?: string;
 }
 
-const spot = { x: 0, y: 0, te: 0, leg: 0 };
+const spot = { x: 0, y: 0, te: 0, dx: 0 };
 
 /**
  * Where a zombie is at `t`, into `spot`. The same sums as
@@ -315,7 +319,7 @@ function locate(z: Zed, t: number, rules: ZombieRules) {
   spot.x = x;
   spot.y = y;
   spot.te = te;
-  spot.leg = leg;
+  spot.dx = bx - ax;
 }
 
 /** How much of a spray reaches a zombie: `cone_share` on the server. */
@@ -487,49 +491,10 @@ export class ZombieEngine {
     this.sync(snap.t, at);
     this.t = snap.t;
 
-    const kinds = rules.zombies;
     this.zeds = [];
     this.byId.clear();
     for (const row of snap.z) {
-      const path = row.slice(5);
-      const cum = [0];
-      for (let i = 2; i < path.length; i += 2) {
-        cum.push(cum[cum.length - 1] + Math.hypot(path[i] - path[i - 2], path[i + 1] - path[i - 1]));
-      }
-      const dist = cum[cum.length - 1] || 1;
-      const kind = kinds[row[1]] ?? kinds[0];
-      const look = ZOMBIE_LOOK[kind.key] ?? ZOMBIE_LOOK.walker;
-      const art = row[0] % look.variants;
-      // Those from the bottom of the map walk up the screen.
-      const back = path[1] > rules.house.y;
-      const z: Zed = {
-        id: row[0],
-        kind,
-        look,
-        art,
-        back,
-        code: (kinds.indexOf(kind) * 4 + art) * 2 + (back ? 1 : 0),
-        t0: row[2],
-        speed: row[3],
-        maxHp: row[4],
-        hp: row[4],
-        path,
-        cum,
-        dist,
-        arrive: row[2] + dist / row[3],
-        phase: (row[0] * 2.399) % TAU,
-        alive: true,
-        stop: 0,
-        until: -1e9,
-        lag: 0,
-        pend: 0,
-        gone: false,
-        x: path[0],
-        y: path[1],
-        te: 0,
-        atHouse: false,
-        hurtAt: -10,
-      };
+      const z = this.zed(row);
       this.zeds.push(z);
       this.byId.set(z.id, z);
     }
@@ -614,11 +579,73 @@ export class ZombieEngine {
     this.emitHud();
   }
 
+  /** A zombie as the server sends it: id, kind, when it sets off, speed, health, then its rail. */
+  private zed(row: number[]): Zed {
+    const kinds = this.rules.zombies;
+    const path = row.slice(5);
+    const cum = [0];
+    for (let i = 2; i < path.length; i += 2) {
+      cum.push(cum[cum.length - 1] + Math.hypot(path[i] - path[i - 2], path[i + 1] - path[i - 1]));
+    }
+    const dist = cum[cum.length - 1] || 1;
+    const kind = kinds[row[1]] ?? kinds[0];
+    const look = ZOMBIE_LOOK[kind.key] ?? ZOMBIE_LOOK.walker;
+    const z: Zed = {
+      id: row[0],
+      kind,
+      look,
+      art: 0,
+      // Those from the bottom of the map walk up the screen.
+      back: path[1] > this.rules.house.y,
+      code: 0,
+      t0: row[2],
+      speed: row[3],
+      maxHp: row[4],
+      hp: row[4],
+      path,
+      cum,
+      dist,
+      arrive: row[2] + dist / row[3],
+      phase: (row[0] * 2.399) % TAU,
+      alive: true,
+      stop: 0,
+      until: -1e9,
+      lag: 0,
+      pend: 0,
+      gone: false,
+      x: path[0],
+      y: path[1],
+      te: 0,
+      atHouse: false,
+      hurtAt: -10,
+    };
+    this.wear(z, look.turns ? (path[2] < path[0] ? 1 : 0) : row[0] % look.variants);
+    return z;
+  }
+
+  /** Which of its kind's pictures a zombie is drawn with. */
+  private wear(z: Zed, art: number) {
+    z.art = art;
+    z.code = (this.rules.zombies.indexOf(z.kind) * 4 + art) * 2 + (z.back ? 1 : 0);
+  }
+
   private apply(batch: Batch, at: number) {
     const now = at / 1000;
     this.sync(batch.t, at);
     if (batch.h < this.house) this.houseHurtAt = now;
     this.house = batch.h;
+
+    if (batch.z) {
+      for (const row of batch.z) {
+        if (this.byId.has(row[0])) continue;
+        const z = this.zed(row);
+        this.byId.set(z.id, z);
+        // It has set off, so it goes among those that have: everything
+        // before `next` in the list.
+        this.zeds.splice(this.next++, 0, z);
+        this.active.push(z);
+      }
+    }
 
     if (batch.d) {
       for (const [id, hp, by] of batch.d) {
@@ -955,6 +982,7 @@ export class ZombieEngine {
       z.y = spot.y;
       z.te = spot.te;
       z.atHouse = spot.te >= z.arrive;
+      if (z.look.turns && spot.dx && z.art !== (spot.dx < 0 ? 1 : 0)) this.wear(z, 1 - z.art);
     }
     if (dead) this.active = this.active.filter((z) => z.alive);
 

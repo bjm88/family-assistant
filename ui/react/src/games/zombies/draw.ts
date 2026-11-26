@@ -95,7 +95,8 @@ function shape(ctx: Ctx, points: number[], fill: string, stroke?: string) {
 /**
  * `step` runs from 0 to 1 over one stride (or one flap), and round
  * again; `attacking` once the zombie is at the house; `back` when it
- * is walking away from the viewer. `variant` picks its clothes.
+ * is walking away from the viewer. `variant` picks its clothes, or
+ * for one that turns (see `ZombieLook`) says which way it is heading.
  */
 export type ZombiePainter = (ctx: Ctx, step: number, attacking: boolean, back: boolean, variant: number) => void;
 
@@ -346,6 +347,129 @@ export const drawBat: ZombiePainter = (ctx, step, _attacking, back) => {
   }
 };
 
+const VAMPIRE_SKIN = "#dfe3ec";
+const VAMPIRE_HAIR = "#0e0d13";
+const VAMPIRE_SUIT = "#2a2636";
+const CAPE = "#17141f";
+const CAPE_LINING = "#b8142f";
+// Seen from behind it is all cape: a pale edge keeps it from being lost in the grass.
+const CAPE_RIM = "#8f84b8";
+
+/** `variant` is the way it is darting: 0 to the right of the screen, 1 to the left. */
+export const drawVampire: ZombiePainter = (ctx, step, attacking, back, variant) => {
+  const a = step * TAU;
+  const stride = Math.sin(a);
+  // It leans into its run, and stands up straight to claw at the wall.
+  const lean = attacking ? 0 : variant ? -1 : 1;
+  const flap = Math.cos(a) * 1.4;
+  ctx.lineWidth = 0.8;
+  ctx.lineJoin = "round";
+
+  // The cape hangs from its shoulders to its ankles and streams out behind.
+  const top = lean * 3;
+  const trail = -lean * 4.5;
+  const cape = (fill: string, inset: number, rim?: string, drop = 0) => {
+    shape(
+      ctx,
+      [
+        top - 5.4 + inset, -25.5,
+        top + 5.4 - inset, -25.5,
+        10 - inset + trail + flap, -3.2 + drop,
+        5.2 + trail * 0.8 + flap * 0.6, -1 - inset + drop,
+        trail * 0.7, -3.4 + drop,
+        -5.2 + trail * 0.8 + flap * 0.6, -1 - inset + drop,
+        -10 + inset + trail + flap, -3.2 + drop,
+      ],
+      fill,
+      rim
+    );
+  };
+  if (!back) {
+    cape(CAPE, 0, INK);
+    cape(CAPE_LINING, 1.6);
+  }
+
+  const left = Math.max(0, stride) * 2.6;
+  const right = Math.max(0, -stride) * 2.6;
+  limb(ctx, -2.1 + lean * 1.2, -13, -2.5, -1.5 - left, 2.5, "#1b1924", INK);
+  limb(ctx, 2.1 + lean * 1.2, -13, 2.5, -1.5 - right, 2.5, "#1b1924", INK);
+  blob(ctx, -2.8, -0.9 - left, 2.3, 1.2, "#0b0a0f");
+  blob(ctx, 2.8, -0.9 - right, 2.3, 1.2, "#0b0a0f");
+
+  const pose = () => {
+    ctx.translate(lean * 1.2 + Math.cos(a) * 0.5, -13 - Math.abs(stride) * 0.6);
+    ctx.rotate(lean * 0.16 + stride * 0.05);
+  };
+  ctx.save();
+  pose();
+  const claw = attacking ? Math.cos(a * 2) : 0;
+  const arms = () => {
+    for (const side of [-1, 1]) {
+      const sway = stride * side * 1.1 + claw * side * 2.4;
+      const hx = side * (back ? 6 : 6.4);
+      const hy = back ? -13.5 + sway : -1.2 + sway;
+      limb(ctx, side * 3.8, -10.4, hx, hy, 2.1, VAMPIRE_SUIT, INK);
+      dot(ctx, hx, hy, 1.4, VAMPIRE_SKIN);
+    }
+  };
+  if (back) arms();
+  box(ctx, -4, -12, 8, 12.6, 2, VAMPIRE_SUIT, INK);
+  if (!back) {
+    shape(ctx, [-2, -11.6, 2, -11.6, 0, -5.6], "#eef1f6");
+    dot(ctx, 0, -10.4, 1, "#d6203f");
+    arms();
+  }
+  ctx.restore();
+  if (back) {
+    // The lining shows along the hem.
+    cape(CAPE_LINING, 0, INK, 1.5);
+    cape(CAPE, 0, CAPE_RIM);
+    limb(ctx, top - 2, -22, trail * 0.6 - 3.6 + flap * 0.5, -5.5, 0.6, "rgba(143,132,184,0.5)");
+    limb(ctx, top + 2, -22, trail * 0.6 + 3.6 + flap * 0.5, -5.5, 0.6, "rgba(143,132,184,0.5)");
+  }
+
+  ctx.save();
+  pose();
+  // The collar of the cape stands up on each side of its head.
+  const collar = () => {
+    for (const side of [-1, 1]) {
+      shape(ctx, [side * 1.2, -12.4, side * 6.4, -18.6, side * 5, -10.8], back ? CAPE : CAPE_LINING, back ? CAPE_LINING : INK);
+    }
+  };
+  if (!back) collar();
+  ctx.save();
+  ctx.translate(0, -16.4);
+  ctx.rotate(-lean * 0.06);
+  for (const side of [-1, 1]) {
+    shape(ctx, [side * 3.4, -1.4, side * 5.8, -3.2, side * 3.7, 0.9], VAMPIRE_SKIN, INK);
+  }
+  blob(ctx, 0, 0, 3.9, 4.4, back ? VAMPIRE_HAIR : VAMPIRE_SKIN, back ? CAPE_RIM : INK);
+  if (back) {
+    // The light on its slicked-back hair.
+    limb(ctx, -1.6, -2.6, 0.4, -3.2, 0.7, CAPE_RIM);
+  } else {
+    // Hair slicked back from a widow's peak.
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 3.9, 4.4, 0, Math.PI, TAU);
+    ctx.lineTo(2.3, -2.5);
+    ctx.lineTo(0, -0.9);
+    ctx.lineTo(-2.3, -2.5);
+    ctx.closePath();
+    ctx.fillStyle = VAMPIRE_HAIR;
+    ctx.fill();
+    dot(ctx, -1.7, 0.3, 1.05, "#3a0d16");
+    dot(ctx, 1.7, 0.3, 1.05, "#3a0d16");
+    dot(ctx, -1.7, 0.3, 0.55, "#ff3b3b");
+    dot(ctx, 1.7, 0.3, 0.55, "#ff3b3b");
+    box(ctx, -1.7, 2, 3.4, attacking ? 1.9 : 1.1, 0.5, "#5a0c1a");
+    shape(ctx, [-1.4, 2, -0.6, 2, -1, 3.4], "#ffffff");
+    shape(ctx, [1.4, 2, 0.6, 2, 1, 3.4], "#ffffff");
+  }
+  ctx.restore();
+  if (back) collar();
+  ctx.restore();
+};
+
 /** How each kind of zombie is drawn, and how big a picture it needs. */
 export interface ZombieLook {
   draw: ZombiePainter;
@@ -362,6 +486,11 @@ export interface ZombieLook {
   alt: number;
   /** Different sets of clothes. */
   variants: number;
+  /**
+   * It leans the way it is going, so its two variants are the two
+   * ways: 0 heading for the right of the screen, 1 for the left.
+   */
+  turns?: boolean;
 }
 
 /** The same picture, drawn larger. */
@@ -380,6 +509,8 @@ export const ZOMBIE_LOOK: Record<string, ZombieLook> = {
   dog: { draw: bigger(drawDog, 1.3), w: 18.5, h: 27.5, ax: 9.25, ay: 24.75, rate: 2.6, tall: 22, alt: 0, variants: 1 },
   ogre: { draw: drawOgre, w: 62, h: 62, ax: 31, ay: 57, rate: 0.6, tall: 50, alt: 0, variants: 1 },
   bat: { draw: drawBat, w: 28, h: 20, ax: 14, ay: 11, rate: 3.4, tall: 7, alt: 24, variants: 1 },
+  // A head taller than a zombie.
+  vampire: { draw: drawVampire, w: 36, h: 42, ax: 18, ay: 39, rate: 2.2, tall: 35, alt: 0, variants: 2, turns: true },
 };
 
 /** A block of ice around a frozen zombie `wide` across and `tall` high. */

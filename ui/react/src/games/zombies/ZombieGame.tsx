@@ -1007,7 +1007,9 @@ function Setup({ game, zombie, online, act, flash, onChangeCharacter, onEnd }: S
             <li>Everything is under the map. Slide the bar to move along the wall; the arrows in the corner turn you round to defend the other wall.</li>
             <li>Tap a weapon to fire it straight ahead. Hold the fast ones down.</li>
             <li>Your dog looks after itself: out to bite whatever gets close, back in for a rest.</li>
-            <li>An ogre comes at the end of every level. If the house is still standing when the clock runs out, you win.</li>
+            <li>Ogres start coming half-way through every level, two for each of you or more.</li>
+            <li>Watch for the vampire: fast, never in a straight line, and hard on the walls. There is only ever one.</li>
+            <li>If the house is still standing when the clock runs out, you win.</li>
           </ul>
         </section>
 
