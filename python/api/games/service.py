@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import get_settings
+from . import chinese_checkers as checkers
 from . import zombie_apocalypse as zombies
 from .catalog import AVATAR_COLORS, GAME_TYPES, GameType
 from .turkey_tictactoe import RuleError
@@ -400,7 +401,7 @@ def apply_action(db: Session, token: str, action: Dict[str, Any]) -> models.Game
         elif kind == "start":
             _start(game, player)
         elif kind == "move":
-            _move(game, player, action.get("cell"))
+            _move(game, player, action.get(game_type_of(game).move_key))
         elif kind == "play_again":
             _play_again(game, player)
         else:
@@ -415,9 +416,14 @@ def _join(
     game: models.Game, player: models.GamePlayer, *, style: Any, color: Any
 ) -> None:
     game_def = game_type_of(game)
-    what = "character" if game_def.realtime else "turkey"
+    # "your turkey" -> "turkey"; a marble has only its colour to pick.
+    what = game_def.pick.split()[-1]
     if style not in game_def.styles or color not in AVATAR_COLORS:
-        raise GameError(f"Pick a {what} and a shirt colour first.")
+        raise GameError(
+            "Pick a colour first."
+            if what == "colour"
+            else f"Pick a {what} and a shirt colour first."
+        )
     already_in = player.joined_at is not None
     if already_in and game.status != "lobby":
         raise GameError(f"You can't change {what}s once the game has started.")
@@ -470,11 +476,13 @@ def _start(game: models.Game, player: models.GamePlayer) -> None:
     _deal_round(game)
 
 
-def _move(game: models.Game, player: models.GamePlayer, cell: Any) -> None:
+def _move(game: models.Game, player: models.GamePlayer, move: Any) -> None:
+    """Make a move: a square in Turkey TicTacToe, a marble's path in
+    Chinese Checkers."""
     _require_joined(player)
     if game.status != "playing":
         raise GameError("There's no round being played right now.")
-    state = game_type_of(game).rules.play(game.state, player.game_player_id, cell)
+    state = game_type_of(game).rules.play(game.state, player.game_player_id, move)
     game.state = state
     if state["winner_player_id"] is not None:
         player.wins += 1
@@ -729,6 +737,19 @@ def _zombie_view(game: models.Game, status: str) -> Dict[str, Any]:
     }
 
 
+def _checkers_view(game: models.Game, status: str) -> Dict[str, Any]:
+    """The star board, and the round on it once one has been dealt."""
+    state: Optional[Dict[str, Any]] = None
+    if game.state.get("marbles"):
+        state = {
+            **game.state,
+            "turn_player_id": (
+                checkers.current_player_id(game.state) if status == "playing" else None
+            ),
+        }
+    return {**checkers.layout(), "state": state}
+
+
 # ---------------------------------------------------------------------------
 # What each player sees
 # ---------------------------------------------------------------------------
@@ -788,6 +809,8 @@ def game_view(
     }
     if game_def.realtime:
         view["zombie"] = _zombie_view(game, status)
+    elif game_def.key == checkers.GAME_KEY:
+        view["checkers"] = _checkers_view(game, status)
     return view
 
 

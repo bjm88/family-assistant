@@ -35,13 +35,13 @@ logger = logging.getLogger(__name__)
 
 _SMS_TEMPLATE = (
     "{assistant} here. {inviter} invited you to play {game}! "
-    "Tap to pick your turkey and join: {url}"
+    "Tap to pick {pick} and join: {url}"
 )
 _EMAIL_SUBJECT = "{inviter} invited you to play {game}"
 _EMAIL_BODY = (
     "Hi {name},\n\n"
     "{inviter} started a game of {game} and wants you in. Open this link "
-    "on your phone to pick your turkey and join — there's nothing to "
+    "on your phone to pick {pick} and join — there's nothing to "
     "sign in to:\n\n"
     "{url}\n\n"
     "The link is yours alone and works for the next day.\n\n"
@@ -88,6 +88,7 @@ class _Invite:
     name: str
     inviter: str
     game: str
+    pick: str
     assistant: str
     url: str
     sms_to: Optional[str]
@@ -149,6 +150,7 @@ def _prepare(player_id: int) -> Optional[_Invite]:
             name=name,
             inviter=service.display_name(game.created_by),
             game=GAME_TYPES[game.game_type].name,
+            pick=GAME_TYPES[game.game_type].pick,
             assistant=assistant,
             url=service.play_url(player.join_token),
             sms_to=sms_to,
@@ -174,6 +176,7 @@ def deliver(player_id: int) -> None:
         "assistant": invite.assistant,
         "inviter": invite.inviter,
         "game": invite.game,
+        "pick": invite.pick,
         "name": invite.name,
         "url": invite.url,
     }

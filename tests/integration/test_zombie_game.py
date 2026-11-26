@@ -1076,7 +1076,7 @@ def _join(ws, style="dad", color="red") -> Dict[str, Any]:
 def test_the_games_page_offers_both_games(client, household):
     body = client.get(f"/api/games?family_id={household.family_id}").json()
     catalog = {g["key"]: g for g in body["catalog"]}
-    assert list(catalog) == ["turkey_tictactoe", ZOMBIES]
+    assert list(catalog)[:2] == ["turkey_tictactoe", ZOMBIES]
     zombie = catalog[ZOMBIES]
     assert zombie["name"] == "Zombie Apocalypse"
     assert (zombie["min_players"], zombie["max_players"]) == (1, 2)
