@@ -10,7 +10,12 @@ interface Handlers {
   onError: (message: string) => void;
   /** The connection was lost (or refused). A retry is already scheduled. */
   onDropped: () => void;
+  /** A message that belongs to a level being played live (Zombie Apocalypse). */
+  onLive?: (message: LiveMessage) => void;
 }
+
+/** Anything other than the game's state and errors: `type` says what. */
+export type LiveMessage = { type: string } & Record<string, unknown>;
 
 const PING_EVERY_MS = 25_000;
 // After the phone wakes up, how long to wait for any sign of life
@@ -30,7 +35,7 @@ export function useGameSocket(
   token: string | undefined,
   enabled: boolean,
   handlers: Handlers
-): { status: SocketStatus; send: (action: GameAction) => boolean } {
+): { status: SocketStatus; send: (action: GameAction | LiveMessage) => boolean } {
   const [status, setStatus] = useState<SocketStatus>("connecting");
   const socketRef = useRef<WebSocket | null>(null);
   const handlersRef = useRef(handlers);
@@ -92,6 +97,8 @@ export function useGameSocket(
           handlersRef.current.onState(message.game);
         } else if (message.type === "error") {
           handlersRef.current.onError(message.message ?? "That didn't work.");
+        } else if (typeof message.type === "string" && message.type !== "pong") {
+          handlersRef.current.onLive?.(message as LiveMessage);
         }
       };
       socket.onclose = () => lost(socket);
@@ -123,7 +130,7 @@ export function useGameSocket(
     };
   }, [token, enabled]);
 
-  const send = useCallback((action: GameAction) => {
+  const send = useCallback((action: GameAction | LiveMessage) => {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return false;
     socket.send(JSON.stringify(action));

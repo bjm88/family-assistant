@@ -1,5 +1,5 @@
 import { useId } from "react";
-import type { ShirtColor, TurkeyStyle } from "./types";
+import type { AvatarStyle, ShirtColor, TurkeyStyle } from "./types";
 
 // The cartoon turkeys players pick from. Every turkey is the same bird
 // underneath — tail fan, body, head — wearing a shirt in the player's
@@ -14,6 +14,11 @@ export const TURKEY_STYLES: { key: TurkeyStyle; label: string }[] = [
   { key: "hippie", label: "Hippie" },
   { key: "beer", label: "Cheers" },
 ];
+
+/** A player's turkey, or null for anything that isn't one (another game's character). */
+export function turkeyStyle(style: AvatarStyle | null | undefined): TurkeyStyle | null {
+  return TURKEY_STYLES.some((s) => s.key === style) ? (style as TurkeyStyle) : null;
+}
 
 interface Shirt {
   label: string;

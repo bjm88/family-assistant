@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { cn } from "@/lib/cn";
-import { SHIRT_COLORS, Turkey } from "./Turkey";
+import { SHIRT_COLORS, Turkey, turkeyStyle } from "./Turkey";
 import type { GameBoard, GamePlayer } from "./types";
 
 const ROWS = 10;
@@ -79,6 +79,7 @@ export function TurkeyBoard({ board, players, me, canPlay, selected, onCellTap }
   }
   const winner = board?.winner_player_id != null ? byId.get(board.winner_player_id) : undefined;
   const lineColor = winner?.avatar_color ? SHIRT_COLORS[winner.avatar_color].main : "#e03131";
+  const mine = turkeyStyle(me?.avatar_style);
 
   return (
     <div ref={ref} className="h-full w-full flex items-center justify-center">
@@ -94,6 +95,7 @@ export function TurkeyBoard({ board, players, me, canPlay, selected, onCellTap }
           >
             {cells.map((owner, cell) => {
               const player = owner != null ? byId.get(owner) : undefined;
+              const theirs = turkeyStyle(player?.avatar_style);
               const open = owner == null && canPlay;
               const picked = open && selected === cell;
               const won = winning.has(cell);
@@ -126,19 +128,19 @@ export function TurkeyBoard({ board, players, me, canPlay, selected, onCellTap }
                       : null),
                   }}
                 >
-                  {player?.avatar_style && player.avatar_color && (
+                  {theirs && player?.avatar_color && (
                     <span className={cn("block", won ? "tg-win-turkey" : "tg-placed")}>
                       <Turkey
-                        style={player.avatar_style}
+                        style={theirs}
                         color={player.avatar_color}
                         size={turkeySize}
                         title={player.name}
                       />
                     </span>
                   )}
-                  {picked && me?.avatar_style && me.avatar_color && (
+                  {picked && mine && me?.avatar_color && (
                     <span className="tg-ghost block">
-                      <Turkey style={me.avatar_style} color={me.avatar_color} size={turkeySize} />
+                      <Turkey style={mine} color={me.avatar_color} size={turkeySize} />
                     </span>
                   )}
                 </button>

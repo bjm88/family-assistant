@@ -1,0 +1,302 @@
+/* Zombie Apocalypse — a dark night, toxic green and a little blood. */
+
+.zombie-theme {
+  --za-ink: #eaf5e3;
+  --za-ink-soft: #9db59a;
+  --za-green: #9ae66e;
+  --za-blood: #e03131;
+  --za-amber: #ffd43b;
+  --za-panel: rgba(18, 28, 22, 0.94);
+  --za-line: rgba(154, 230, 110, 0.22);
+  color: var(--za-ink);
+  background:
+    radial-gradient(90% 50% at 50% 0%, rgba(86, 140, 60, 0.35) 0%, transparent 70%),
+    linear-gradient(180deg, #16241b 0%, #0e1712 55%, #1a1020 100%);
+}
+
+/* The level itself: nothing scrolls, zooms or gets selected while
+   thumbs are busy. */
+.zombie-screen {
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.za-title {
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  color: var(--za-green);
+  text-shadow: 0 2px 0 #0b120d, 0 0 18px rgba(154, 230, 110, 0.35);
+}
+
+.za-card {
+  background: var(--za-panel);
+  border: 1.5px solid var(--za-line);
+  border-radius: 18px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+}
+
+.za-soft { color: var(--za-ink-soft); }
+
+.za-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 9999px;
+  padding: 0.8rem 1.4rem;
+  font-weight: 800;
+  font-size: 1rem;
+  line-height: 1.1;
+  transition: transform 80ms ease, filter 120ms ease, opacity 120ms ease;
+}
+.za-btn:active { transform: translateY(1px) scale(0.985); }
+.za-btn:disabled { opacity: 0.45; pointer-events: none; }
+.za-btn-primary {
+  color: #0d1a10;
+  background: linear-gradient(180deg, #b6f08d 0%, #74c948 100%);
+  box-shadow: 0 4px 0 #3d7a22, 0 8px 18px rgba(116, 201, 72, 0.25);
+}
+.za-btn-primary:hover { filter: brightness(1.06); }
+.za-btn-danger {
+  color: #fff;
+  background: linear-gradient(180deg, #f03e3e 0%, #c92a2a 100%);
+  box-shadow: 0 4px 0 #7d1a1a;
+}
+.za-btn-quiet {
+  color: var(--za-ink);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1.5px solid rgba(255, 255, 255, 0.18);
+}
+.za-btn-quiet:hover { background: rgba(255, 255, 255, 0.12); }
+
+.za-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.09);
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.za-input {
+  width: 100%;
+  border-radius: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.35);
+  padding: 0.6rem 0.75rem;
+  font-size: 1.125rem;
+  font-weight: 700;
+  color: var(--za-ink);
+  outline: none;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.za-input::placeholder { font-size: 0.875rem; font-weight: 600; color: var(--za-ink-soft); }
+.za-input:focus { border-color: var(--za-green); }
+
+/* A thing to pick: a character, a weapon, a level length. */
+.za-pick {
+  border-radius: 14px;
+  border: 2px solid transparent;
+  background: rgba(255, 255, 255, 0.06);
+  transition: border-color 120ms ease, background-color 120ms ease, opacity 120ms ease;
+}
+.za-pick[aria-pressed="true"],
+.za-pick[aria-checked="true"] {
+  border-color: var(--za-green);
+  background: rgba(154, 230, 110, 0.14);
+}
+.za-pick:disabled { opacity: 0.5; }
+
+.za-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+.za-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--za-green);
+}
+
+/* ---- The level ---------------------------------------------------------- */
+
+.za-stage {
+  position: relative;
+  min-height: 0;
+  flex: 1 1 0%;
+  background: #0b120d;
+}
+.za-stage canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+
+.za-weapons {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  /* Thumb-sized on a phone; on a wide screen they stay together in the middle. */
+  padding: 6px max(6px, calc((100% - 560px) / 2)) 8px;
+  background: #0b120d;
+}
+
+/* A weapon's button: tap it and it fires. */
+.za-weapon {
+  position: relative;
+  display: flex;
+  height: 76px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(180deg, #26342b 0%, #18221c 100%);
+  box-shadow: 0 3px 0 #070b08;
+  touch-action: none;
+}
+.za-weapon:active { transform: translateY(2px); box-shadow: 0 1px 0 #070b08; }
+.za-weapon-held {
+  border-color: var(--za-green);
+  background: linear-gradient(180deg, #34502f 0%, #1f3320 100%);
+}
+.za-weapon-empty { opacity: 0.35; }
+.za-weapon svg { position: relative; width: 52px; height: 34px; }
+.za-weapon-name {
+  position: relative;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 2px;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+  color: var(--za-ink-soft);
+}
+.za-weapon-ammo {
+  position: absolute;
+  right: 5px;
+  top: 3px;
+  font-size: 12px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  color: var(--za-amber);
+}
+.za-weapon-key {
+  position: absolute;
+  left: 6px;
+  top: 3px;
+  font-size: 10px;
+  font-weight: 800;
+  color: rgba(255, 255, 255, 0.35);
+}
+
+/* Reloading: a shade that drains off the button. */
+.za-reload {
+  position: absolute;
+  inset: 0;
+  transform-origin: 50% 100%;
+  background: rgba(0, 0, 0, 0.62);
+  animation: za-reload linear both;
+  pointer-events: none;
+}
+@keyframes za-reload {
+  from { transform: scaleY(1); }
+  to { transform: scaleY(0); }
+}
+
+.za-outcome {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  padding: 1rem;
+  text-align: center;
+  background: rgba(8, 12, 9, 0.55);
+  animation: za-fade 250ms ease-out both;
+  pointer-events: none;
+}
+.za-outcome h2 {
+  font-size: 2.75rem;
+  font-weight: 900;
+  line-height: 1;
+  animation: za-slam 420ms cubic-bezier(0.2, 1.4, 0.4, 1) both;
+}
+.za-won h2 { color: var(--za-green); text-shadow: 0 3px 0 #0b120d, 0 0 26px rgba(154, 230, 110, 0.6); }
+.za-lost h2 { color: #ff6b6b; text-shadow: 0 3px 0 #0b120d, 0 0 26px rgba(224, 49, 49, 0.6); }
+
+.za-overlay {
+  background: rgba(6, 10, 8, 0.72);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+  animation: za-fade 200ms ease-out both;
+}
+.za-rise { animation: za-rise 340ms cubic-bezier(0.2, 1.2, 0.4, 1) both; }
+.za-sway { animation: za-sway 1.6s ease-in-out infinite; transform-origin: 50% 90%; }
+
+@keyframes za-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes za-rise {
+  from { transform: translateY(22px) scale(0.95); opacity: 0; }
+  to { transform: translateY(0) scale(1); opacity: 1; }
+}
+@keyframes za-slam {
+  from { transform: scale(2.2); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+@keyframes za-sway {
+  0%, 100% { transform: rotate(-3deg); }
+  50% { transform: rotate(3deg); }
+}
+
+.za-dots::after {
+  content: "";
+  animation: za-dots 1.4s steps(4, end) infinite;
+}
+@keyframes za-dots {
+  0% { content: ""; }
+  25% { content: "."; }
+  50% { content: ".."; }
+  75% { content: "..."; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .za-rise,
+  .za-sway,
+  .za-overlay,
+  .za-outcome,
+  .za-outcome h2 {
+    animation: none;
+  }
+}
+
+/* The number keys fire the weapons too; only say so where there are keys. */
+.za-weapon-key { display: none; }
+@media (hover: hover) and (pointer: fine) {
+  .za-weapon-key { display: block; }
+}

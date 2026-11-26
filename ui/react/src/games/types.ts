@@ -15,6 +15,20 @@ export type TurkeyStyle =
   | "hippie"
   | "beer";
 
+/** Who a player is in Zombie Apocalypse. */
+export type SurvivorStyle =
+  | "army_guy"
+  | "army_girl"
+  | "dad"
+  | "mom"
+  | "girl"
+  | "boy"
+  | "uncle"
+  | "grandma";
+
+/** A turkey in Turkey TicTacToe, a character in Zombie Apocalypse. */
+export type AvatarStyle = TurkeyStyle | SurvivorStyle;
+
 export type ShirtColor =
   | "red"
   | "orange"
@@ -33,7 +47,7 @@ export interface GamePlayer {
   kind: PlayerKind;
   is_host: boolean;
   joined: boolean;
-  avatar_style: TurkeyStyle | null;
+  avatar_style: AvatarStyle | null;
   avatar_color: ShirtColor | null;
   wins: number;
   connected: boolean;
@@ -66,6 +80,94 @@ export interface GameInviteLink {
   invite_detail: string | null;
 }
 
+// ---- Zombie Apocalypse (see python/api/games/zombie_apocalypse.py) ------
+
+export type WeaponKind = "shot" | "cone" | "lob" | "roll";
+
+export interface ZombieWeapon {
+  key: string;
+  name: string;
+  /** shot: one bolt; cone: a spray; lob: thrown, bursts where it lands; roll: a boulder. */
+  kind: WeaponKind;
+  area: boolean;
+  damage: number;
+  /** How far it reaches, in map units. */
+  range: number;
+  /** Map units a second. */
+  speed: number;
+  /** Seconds between shots. */
+  reload: number;
+  /** Shots for a two-minute level; null = never runs out. */
+  ammo: number | null;
+  spread: number;
+  radius: number;
+  falloff: number;
+  /** Seconds the zombies it catches stand frozen. */
+  freeze: number;
+  /** Everyone carries it; it isn't one of the weapons a player picks. */
+  given: boolean;
+  blurb: string;
+}
+
+export interface ZombieKind {
+  key: string;
+  name: string;
+  hp: number;
+  speed: number;
+  radius: number;
+  flying: boolean;
+  from_level: number;
+}
+
+export interface ZombieRules {
+  world: { w: number; h: number };
+  house: { x: number; y: number; w: number; h: number; hp: number };
+  /** Where players stand: between left and right, on the top or the bottom wall. */
+  track: { left: number; right: number; top: number; bottom: number };
+  move_speed: number;
+  cross_seconds: number;
+  shot_width: number;
+  pile_depth: number;
+  countdown: number;
+  default_weapon: string;
+  loadout_picks: number;
+  default_loadout: string[];
+  weapons: ZombieWeapon[];
+  zombies: ZombieKind[];
+  bat_weave: number;
+  bat_weave_rate: number;
+}
+
+export interface ZombieLevelResult {
+  level: number;
+  won: boolean;
+  house: number;
+  seconds: number;
+  duration: number;
+  zombies: number;
+  /** By player id. */
+  kills: Record<string, number>;
+  shots: Record<string, number>;
+}
+
+export interface ZombieView {
+  /** The level that is being played, or will be next. */
+  level: number;
+  /** Seconds a level lasts. */
+  duration: number;
+  durations: number[];
+  /** By player id: the two weapons each player picked. */
+  loadouts: Record<string, string[]>;
+  /** Who is in the level being played. */
+  fighting: number[];
+  last: ZombieLevelResult | null;
+  best_level: number;
+  kills: Record<string, number>;
+  /** The kinds of zombie the next level has. */
+  coming: string[];
+  rules: ZombieRules;
+}
+
 /** The game as anyone may see it. */
 export interface GameBase {
   game_id: number;
@@ -81,6 +183,8 @@ export interface GameBase {
   is_full: boolean;
   players: GamePlayer[];
   board: GameBoard | null;
+  /** Only for Zombie Apocalypse. */
+  zombie?: ZombieView;
 }
 
 /** What a player sees on /play/<token>. */
@@ -105,8 +209,10 @@ export interface GuestSeat {
 }
 
 export type GameAction =
-  | { type: "join"; style: TurkeyStyle; color: ShirtColor }
+  | { type: "join"; style: AvatarStyle; color: ShirtColor }
   | { type: "start" }
+  | { type: "loadout"; weapons: string[] }
+  | { type: "settings"; duration: number }
   | { type: "move"; cell: number }
   | { type: "play_again" }
   | { type: "end" };
@@ -120,6 +226,8 @@ export interface GameCatalogEntry {
   min_players: number;
   max_players: number;
   can_play_ai: boolean;
+  /** Played live rather than in turns. */
+  realtime: boolean;
 }
 
 export interface GamePerson {
@@ -138,7 +246,7 @@ export interface GameSummaryPlayer {
   kind: PlayerKind;
   is_host: boolean;
   joined: boolean;
-  avatar_style: TurkeyStyle | null;
+  avatar_style: AvatarStyle | null;
   avatar_color: ShirtColor | null;
   wins: number;
   invite_status: InviteStatus;
@@ -170,6 +278,8 @@ export interface LeaderboardEntry {
   name: string;
   wins: number;
   games: number;
+  /** Zombie Apocalypse only: the highest level survived. */
+  best?: number;
 }
 
 export interface GamesOverview {
