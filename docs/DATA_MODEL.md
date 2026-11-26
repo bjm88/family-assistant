@@ -511,7 +511,8 @@ row holds:
   `marble` and only the color is a choice). Turn order is the order
   people joined in, with the AI last; a color belongs to one player per
   game. The
-  AI is given a turkey when the game is started.
+  AI is given a turkey (a marble in Chinese Checkers) when the game is
+  started.
 - **`wins`** — rounds won in this game; in Zombie Apocalypse, levels
   the player fought in and survived. The hall of fame on the Games
   page is the sum of this per game type and per family member, guest

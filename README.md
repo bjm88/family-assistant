@@ -441,7 +441,20 @@ races them to the point opposite; the first to fill it wins the round.
 - The scoreboard above the board shows how many marbles each player has
   home. Who opens rotates each round, wins are counted per player, and
   someone who joins during a round watches it and plays in the next.
-- There is no AI opponent for this game.
+- **Playing against Avi.** Tick **Play against Avi AI** when starting
+  the game, as in Turkey TicTacToe; Avi takes a seat and a color (it
+  gives its color up if you want it), and other people can still join.
+  Avi waits for your marble to finish its move on screen, thinks for
+  about a second, then makes its own, which is played back like anyone
+  else's. The three levels:
+  - **Medium** (the default) plays a sound game: it heads for the far
+    point, brings its back marbles up, and finds most chains of hops.
+    It slips up the way a person does: it loses track of a long chain
+    part way along and stops short, overlooks a marble, or picks the
+    second-best move.
+  - **Easy** mostly just moves forward and misses a lot more.
+  - **Hard** follows every chain to its end and also weighs what a
+    move sets up for its next turn and what it hands you.
 
 How it works:
 
@@ -452,9 +465,9 @@ How it works:
   connection (locked, switched apps, bad signal) the page reconnects by
   itself and catches up. The game is stored in Postgres, so restarting
   the API doesn't lose it.
-- Avi's moves are chosen by rules written for this game
-  (`python/api/games/turkey_ai.py`), not by a language model, so they
-  cost nothing and need no network. The API plays them itself and
+- Avi's moves are chosen by rules written for each game
+  (`python/api/games/turkey_ai.py`, `python/api/games/checkers_ai.py`),
+  not by a language model, so they cost nothing and need no network. The API plays them itself and
   pushes them to the players like any other move; if the API restarts
   while it is Avi's turn, Avi moves when the next player reconnects.
 - A personal link is for one person in one game. It lets its holder
@@ -1344,6 +1357,7 @@ family-assistant/
 │   │   ├── ai_turns.py            plays the AI's turn when it comes round
 │   │   ├── zombie_apocalypse.py · zombie_live.py   rules and the live level of Zombie Apocalypse
 │   │   ├── chinese_checkers.py    rules: the 121-hole star, steps and chains of hops
+│   │   ├── checkers_ai.py         how the AI player picks a marble's move (easy / medium / hard)
 │   │   ├── service.py             start / join / move / play again / end, and what each player sees
 │   │   ├── invites.py             text + email each invitee their join link
 │   │   └── hub.py                 live WebSocket connections per game
